@@ -1,0 +1,77 @@
+name: Staging Deploy
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "agent/**"
+      - "control-plane/**"
+      - "images/**"
+      - "infra/**"
+      - ".github/workflows/staging-deploy.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: dd-staging
+  cancel-in-progress: true
+
+env:
+  RUSTFLAGS: "-Dwarnings"
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release binaries
+        run: cargo build --workspace --release
+
+      - uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+      - uses: hashicorp/setup-packer@v3
+      - run: pip install ansible
+
+      - name: Bake GCP agent image
+        env:
+          GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+        run: |
+          set -euo pipefail
+          sha12="$(echo "${{ github.sha }}" | cut -c1-12)"
+          ansible-playbook infra/ansible/playbooks/gcp-image-bake.yml \
+            -e source_image_project=ubuntu-os-cloud \
+            -e source_image_family=ubuntu-2404-lts-amd64 \
+            -e "target_image_name=dd-agent-main-${sha12}" \
+            -e target_image_family=dd-agent-main \
+            -e "dd_agent_binary_path=${GITHUB_WORKSPACE}/target/release/dd-agent" \
+            -e "dd_cp_binary_path=${GITHUB_WORKSPACE}/target/release/dd-cp" \
+            -e "packer_template_path=${GITHUB_WORKSPACE}/images/packer/gcp-agent-image.pkr.hcl" \
+            -e "source_sha=${{ github.sha }}"
+
+      - name: Deploy
+        env:
+          GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+          DD_CP_ADMIN_PASSWORD: ${{ secrets.DD_CP_ADMIN_PASSWORD }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.DD_CP_CF_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.DD_CP_CF_ACCOUNT_ID }}
+          CLOUDFLARE_ZONE_ID: ${{ secrets.DD_CP_CF_ZONE_ID }}
+          DD_DOMAIN: ${{ vars.DD_CF_DOMAIN || 'devopsdefender.com' }}
+          DD_GIT_SHA: ${{ github.sha }}
+        run: |
+          ansible-playbook infra/ansible/playbooks/gcp-deploy.yml \
+            -e num_tiny_agents=1 -e num_standard_agents=0 -e num_llm_agents=0
+
+      - name: Smoke check
+        run: |
+          url="https://app-staging.${{ vars.DD_CF_DOMAIN || 'devopsdefender.com' }}"
+          for i in $(seq 1 30); do
+            curl -fsS "${url}/health" >/dev/null 2>&1 && echo "Healthy!" && exit 0
+            echo "  attempt ${i}/30..." && sleep 10
+          done
+          echo "::warning::Not healthy within 5 minutes"

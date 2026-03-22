@@ -1,0 +1,217 @@
+---
+- name: Deploy control plane and agent on baremetal
+  hosts: all
+  gather_facts: false
+  vars:
+    image_path_local: ""
+    dd_env: staging
+    dd_cp_admin_password: ""
+    dd_cp_cf_api_token: ""
+    dd_cp_cf_account_id: ""
+    dd_cp_cf_zone_id: ""
+    dd_cp_cf_domain: devopsdefender.com
+    dd_cp_git_sha: ""
+    dd_cp_nonce_enforcement: optional
+    dd_cp_tcb_enforcement: warn
+    dd_cp_rtmr_enforcement: warn
+    dd_skip_attestation: true
+    agent_node_size: standard
+    cp_memory: 4G
+    cp_cpus: 4
+    agent_memory: 8G
+    agent_cpus: 4
+    vfio_device: ""
+    vm_scripts_dir: "{{ playbook_dir }}/../../scripts"
+    devopsdefender_base_dir: /var/lib/devopsdefender
+    cp_port_forward: "8080:8080"
+  tasks:
+    - name: Install prerequisites
+      ansible.builtin.apt:
+        name:
+          - qemu-system-x86
+          - qemu-utils
+          - cloud-image-utils
+          - genisoimage
+          - jq
+          - curl
+        state: present
+        update_cache: true
+      become: true
+
+    - name: Check /dev/kvm exists
+      ansible.builtin.stat:
+        path: /dev/kvm
+      register: kvm_check
+
+    - name: Fail if /dev/kvm is missing
+      ansible.builtin.fail:
+        msg: "/dev/kvm not found - KVM support is required"
+      when: not kvm_check.stat.exists
+
+    - name: Create required directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - "{{ devopsdefender_base_dir }}/images"
+        - "{{ devopsdefender_base_dir }}/vms"
+        - /tmp/dd-deploy/scripts
+      become: true
+
+    - name: Copy VM scripts to remote host
+      ansible.builtin.copy:
+        src: "{{ vm_scripts_dir }}/{{ item }}"
+        dest: "/tmp/dd-deploy/scripts/{{ item }}"
+        mode: "0755"
+      loop:
+        - vm-launch.sh
+        - vm-stop.sh
+        - vm-status.sh
+
+    - name: Copy baked qcow2 image to remote host
+      ansible.builtin.copy:
+        src: "{{ image_path_local }}"
+        dest: "{{ devopsdefender_base_dir }}/images/dd-baremetal.qcow2"
+        mode: "0644"
+      become: true
+      when: image_path_local | length > 0
+
+    - name: Template control-plane config
+      ansible.builtin.template:
+        src: "{{ playbook_dir }}/templates/control-plane.json.j2"
+        dest: /tmp/dd-deploy/control-plane.json
+        mode: "0600"
+
+    - name: Template agent config
+      ansible.builtin.template:
+        src: "{{ playbook_dir }}/templates/agent.json.j2"
+        dest: /tmp/dd-deploy/agent.json
+        mode: "0600"
+
+    - name: Stop old CP VM
+      ansible.builtin.command:
+        argv:
+          - /tmp/dd-deploy/scripts/vm-stop.sh
+          - "dd-cp-{{ dd_env }}"
+          - --clean
+      failed_when: false
+      changed_when: stop_cp.rc == 0
+      register: stop_cp
+      become: true
+
+    - name: Stop old agent VM
+      ansible.builtin.command:
+        argv:
+          - /tmp/dd-deploy/scripts/vm-stop.sh
+          - "dd-agent-{{ dd_env }}"
+          - --clean
+      failed_when: false
+      changed_when: stop_agent.rc == 0
+      register: stop_agent
+      become: true
+
+    - name: Launch CP VM
+      ansible.builtin.command:
+        argv:
+          - /tmp/dd-deploy/scripts/vm-launch.sh
+          - --image
+          - "{{ devopsdefender_base_dir }}/images/dd-baremetal.qcow2"
+          - --name
+          - "dd-cp-{{ dd_env }}"
+          - --config
+          - /tmp/dd-deploy/control-plane.json
+          - --config-mode
+          - control-plane
+          - --memory
+          - "{{ cp_memory }}"
+          - --cpus
+          - "{{ cp_cpus }}"
+          - --port-forward
+          - "{{ cp_port_forward }}"
+      become: true
+
+    - name: Wait for CP health
+      ansible.builtin.uri:
+        url: "http://localhost:8080/health"
+        method: GET
+        status_code: 200
+        return_content: true
+      register: cp_health
+      retries: 60
+      delay: 5
+      until: cp_health.status == 200
+
+    - name: Build agent VM launch args
+      ansible.builtin.set_fact:
+        agent_launch_args:
+          - /tmp/dd-deploy/scripts/vm-launch.sh
+          - --image
+          - "{{ devopsdefender_base_dir }}/images/dd-baremetal.qcow2"
+          - --name
+          - "dd-agent-{{ dd_env }}"
+          - --config
+          - /tmp/dd-deploy/agent.json
+          - --config-mode
+          - agent
+          - --memory
+          - "{{ agent_memory }}"
+          - --cpus
+          - "{{ agent_cpus }}"
+
+    - name: Add VFIO device to agent VM args
+      ansible.builtin.set_fact:
+        agent_launch_args: "{{ agent_launch_args + ['--vfio-device', vfio_device] }}"
+      when: vfio_device | length > 0
+
+    - name: Launch agent VM
+      ansible.builtin.command:
+        argv: "{{ agent_launch_args }}"
+      become: true
+
+    - name: Wait for agent registration
+      ansible.builtin.uri:
+        url: "http://localhost:8080/api/v1/agents"
+        method: GET
+        return_content: true
+        status_code: 200
+      register: agents_poll
+      retries: 60
+      delay: 5
+      until: (agents_poll.json | default([]) | length) > 0
+
+    - name: Smoke test - health
+      ansible.builtin.uri:
+        url: "http://localhost:8080/health"
+        method: GET
+        status_code: 200
+        return_content: true
+      register: smoke_health
+
+    - name: Smoke test - agent list
+      ansible.builtin.uri:
+        url: "http://localhost:8080/api/v1/agents"
+        method: GET
+        status_code: 200
+        return_content: true
+      register: smoke_agents
+
+    - name: Print smoke test results
+      ansible.builtin.debug:
+        msg:
+          - "Health: {{ smoke_health.json }}"
+          - "Agents: {{ smoke_agents.json | length }} registered"
+
+    - name: Show VM status
+      ansible.builtin.command:
+        argv:
+          - /tmp/dd-deploy/scripts/vm-status.sh
+      register: vm_status
+      changed_when: false
+      failed_when: false
+      become: true
+
+    - name: Print VM status
+      ansible.builtin.debug:
+        var: vm_status.stdout_lines
+      when: vm_status.stdout_lines is defined

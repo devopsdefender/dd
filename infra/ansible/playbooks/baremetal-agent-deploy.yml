@@ -1,0 +1,246 @@
+---
+- name: Build image and deploy agent on baremetal
+  hosts: all
+  gather_facts: false
+  vars:
+    dd_env: staging
+    cp_url: ""
+    dd_skip_attestation: true
+    agent_node_size: standard
+    agent_memory: 8G
+    agent_cpus: 4
+    vfio_device: ""
+    vm_scripts_dir: "{{ playbook_dir }}/../../scripts"
+    devopsdefender_base_dir: /var/lib/devopsdefender
+    # Image build vars (set by workflow)
+    agent_binary_local: ""
+    cp_binary_local: ""
+    packer_template_dir: ""
+    image_name: dd-baremetal-agent
+  tasks:
+    # ── Prerequisites ───────────────────────────────────────────────────
+    - name: Install prerequisites
+      ansible.builtin.apt:
+        name:
+          - qemu-system-x86
+          - qemu-utils
+          - cloud-image-utils
+          - genisoimage
+          - jq
+          - curl
+        state: present
+        update_cache: true
+      become: true
+
+    - name: Check /dev/kvm exists
+      ansible.builtin.stat:
+        path: /dev/kvm
+      register: kvm_check
+
+    - name: Fail if /dev/kvm is missing
+      ansible.builtin.fail:
+        msg: "/dev/kvm not found - KVM support is required"
+      when: not kvm_check.stat.exists
+
+    - name: Create system directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - "{{ devopsdefender_base_dir }}/images"
+        - "{{ devopsdefender_base_dir }}/vms"
+      become: true
+
+    - name: Clean stale deploy workspace
+      ansible.builtin.file:
+        path: /tmp/dd-deploy
+        state: absent
+      become: true
+
+    - name: Create deploy workspace
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - /tmp/dd-deploy/scripts
+        - /tmp/dd-deploy/packer-build
+
+    # ── Build image on target (if binaries provided) ────────────────────
+    - name: Install Packer
+      when: agent_binary_local | length > 0
+      block:
+        - name: Check if packer is installed
+          ansible.builtin.command: packer version
+          register: packer_check
+          failed_when: false
+          changed_when: false
+
+        - name: Download Packer
+          ansible.builtin.unarchive:
+            src: https://releases.hashicorp.com/packer/1.11.2/packer_1.11.2_linux_amd64.zip
+            dest: /usr/local/bin
+            remote_src: true
+            mode: "0755"
+          become: true
+          when: packer_check.rc != 0
+
+    - name: Build baremetal image on target
+      when: agent_binary_local | length > 0
+      block:
+        - name: Copy dd-agent binary to target
+          ansible.builtin.copy:
+            src: "{{ agent_binary_local }}"
+            dest: /tmp/dd-deploy/dd-agent
+            mode: "0755"
+
+        - name: Copy dd-cp binary to target
+          ansible.builtin.copy:
+            src: "{{ cp_binary_local }}"
+            dest: /tmp/dd-deploy/dd-cp
+            mode: "0755"
+          when: cp_binary_local | length > 0
+
+        - name: Copy packer template directory to target
+          ansible.builtin.copy:
+            src: "{{ packer_template_dir }}/"
+            dest: /tmp/dd-deploy/packer-build/
+            mode: preserve
+
+        - name: Generate Packer SSH keypair
+          ansible.builtin.command:
+            cmd: ssh-keygen -t ed25519 -f /tmp/dd-deploy/packer-ssh-key -N "" -q
+            creates: /tmp/dd-deploy/packer-ssh-key
+
+        - name: Read Packer SSH public key
+          ansible.builtin.slurp:
+            src: /tmp/dd-deploy/packer-ssh-key.pub
+          register: packer_ssh_pub
+
+        - name: Render cloud-init user-data
+          ansible.builtin.shell: |
+            SSH_PUB_KEY="{{ packer_ssh_pub.content | b64decode | trim }}"
+            sed -e "s|__SSH_USERNAME__|packer|g" \
+                -e "s|__SSH_PUB_KEY__|${SSH_PUB_KEY}|g" \
+                /tmp/dd-deploy/packer-build/templates/baremetal-user-data.tmpl \
+                > /tmp/dd-deploy/user-data
+          changed_when: true
+
+        - name: Render meta-data
+          ansible.builtin.shell: |
+            sed -e "s|__VM_NAME__|{{ image_name }}|g" \
+                /tmp/dd-deploy/packer-build/templates/baremetal-meta-data.tmpl \
+                > /tmp/dd-deploy/meta-data
+          changed_when: true
+
+        - name: Initialize Packer
+          ansible.builtin.command:
+            cmd: packer init baremetal-agent-image.pkr.hcl
+            chdir: /tmp/dd-deploy/packer-build
+          become: true
+
+        - name: Build baremetal image
+          ansible.builtin.command:
+            chdir: /tmp/dd-deploy/packer-build
+            argv:
+              - packer
+              - build
+              - -var
+              - "agent_binary_path=/tmp/dd-deploy/dd-agent"
+              - -var
+              - "cp_binary_path={{ '/tmp/dd-deploy/dd-cp' if cp_binary_local | length > 0 else '' }}"
+              - -var
+              - "ssh_private_key_file=/tmp/dd-deploy/packer-ssh-key"
+              - -var
+              - "cloud_init_user_data_path=/tmp/dd-deploy/user-data"
+              - -var
+              - "cloud_init_meta_data_path=/tmp/dd-deploy/meta-data"
+              - -var
+              - "vm_name={{ image_name }}"
+              - -var
+              - "output_directory=/tmp/dd-deploy/image-output"
+              - baremetal-agent-image.pkr.hcl
+          become: true
+
+        - name: Copy built image to images directory
+          ansible.builtin.shell: |
+            IMAGE=$(find /tmp/dd-deploy/image-output -type f -not -name '*.lock' | head -1)
+            if [ -z "$IMAGE" ]; then
+              echo "No image found in /tmp/dd-deploy/image-output" >&2
+              exit 1
+            fi
+            cp "$IMAGE" "{{ devopsdefender_base_dir }}/images/dd-baremetal.qcow2"
+            chmod 0644 "{{ devopsdefender_base_dir }}/images/dd-baremetal.qcow2"
+            echo "Copied $IMAGE"
+          become: true
+          changed_when: true
+
+    # ── Deploy agent VM ─────────────────────────────────────────────────
+    - name: Copy VM scripts
+      ansible.builtin.copy:
+        src: "{{ vm_scripts_dir }}/{{ item }}"
+        dest: "/tmp/dd-deploy/scripts/{{ item }}"
+        mode: "0755"
+      loop:
+        - vm-launch.sh
+        - vm-stop.sh
+        - vm-status.sh
+
+    - name: Template agent config
+      ansible.builtin.template:
+        src: "{{ playbook_dir }}/templates/agent.json.j2"
+        dest: /tmp/dd-deploy/agent.json
+        mode: "0600"
+
+    - name: Stop old agent VM
+      ansible.builtin.command:
+        argv:
+          - /tmp/dd-deploy/scripts/vm-stop.sh
+          - "dd-agent-{{ dd_env }}"
+          - --clean
+      failed_when: false
+      changed_when: stop_agent.rc == 0
+      register: stop_agent
+      become: true
+
+    - name: Build agent VM launch args
+      ansible.builtin.set_fact:
+        agent_launch_args:
+          - /tmp/dd-deploy/scripts/vm-launch.sh
+          - --image
+          - "{{ devopsdefender_base_dir }}/images/dd-baremetal.qcow2"
+          - --name
+          - "dd-agent-{{ dd_env }}"
+          - --config
+          - /tmp/dd-deploy/agent.json
+          - --config-mode
+          - agent
+          - --memory
+          - "{{ agent_memory }}"
+          - --cpus
+          - "{{ agent_cpus }}"
+
+    - name: Add VFIO device to agent VM args
+      ansible.builtin.set_fact:
+        agent_launch_args: "{{ agent_launch_args + ['--vfio-device', vfio_device] }}"
+      when: vfio_device | length > 0
+
+    - name: Launch agent VM
+      ansible.builtin.command:
+        argv: "{{ agent_launch_args }}"
+      become: true
+
+    - name: Show VM status
+      ansible.builtin.command:
+        argv:
+          - /tmp/dd-deploy/scripts/vm-status.sh
+      register: vm_status
+      changed_when: false
+      failed_when: false
+      become: true
+
+    - name: Print VM status
+      ansible.builtin.debug:
+        var: vm_status.stdout_lines
+      when: vm_status.stdout_lines is defined

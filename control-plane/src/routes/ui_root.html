@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>DevOps Defender - Control Plane</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            margin: 0;
+            padding: 0;
+            background: #0f172a;
+            color: #e2e8f0;
+        }
+        .header {
+            background: #1e293b;
+            border-bottom: 1px solid #334155;
+            padding: 1rem 2rem;
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+        }
+        .header h1 {
+            margin: 0;
+            font-size: 1.25rem;
+            color: #38bdf8;
+        }
+        .header span {
+            color: #94a3b8;
+            font-size: 0.875rem;
+        }
+        .container {
+            max-width: 1200px;
+            margin: 2rem auto;
+            padding: 0 2rem;
+        }
+        .card {
+            background: #1e293b;
+            border: 1px solid #334155;
+            border-radius: 0.5rem;
+            padding: 1.5rem;
+            margin-bottom: 1rem;
+        }
+        .card h2 {
+            margin-top: 0;
+            color: #38bdf8;
+            font-size: 1rem;
+        }
+        .status-ok { color: #4ade80; }
+        .status-warn { color: #fbbf24; }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>DevOps Defender</h1>
+        <span>Control Plane Admin</span>
+    </div>
+    <div class="container">
+        <div class="card">
+            <h2>System Status</h2>
+            <p class="status-ok">Control plane is running.</p>
+            <p>Use the REST API to manage agents, deployments, and accounts.</p>
+        </div>
+        <div class="card">
+            <h2>Quick Links</h2>
+            <ul>
+                <li><code>GET /health</code> - Health check</li>
+                <li><code>GET /api/v1/agents</code> - List agents</li>
+                <li><code>POST /api/v1/deploy</code> - Deploy workload</li>
+                <li><code>GET /api/v1/apps</code> - List applications</li>
+            </ul>
+        </div>
+    </div>
+</body>
+</html>

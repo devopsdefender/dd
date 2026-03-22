@@ -1,0 +1,253 @@
+---
+- name: Bake GCP image via packer
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    source_image_project: ""
+    source_image_name: ""
+    source_image_family: ""
+    target_image_name: ""
+    target_image_family: ""
+    target_image_description: "DevOps Defender image bake"
+    target_image_labels: ""
+    source_sha: ""
+    dd_agent_binary_path: ""
+    dd_cp_binary_path: ""
+    packer_template_path: ""
+    build_zone: ""
+    build_machine_type: ""
+    build_boot_disk_gb: ""
+    bake_metadata_path: ""
+  tasks:
+    - name: Validate required vars
+      ansible.builtin.assert:
+        that:
+          - lookup('env', 'GCP_PROJECT_ID') | length > 0
+          - source_image_project | length > 0
+          - target_image_name | length > 0
+          - (source_image_name | length > 0) or (source_image_family | length > 0)
+        fail_msg: "GCP_PROJECT_ID, source_image_project, target_image_name, and one of source_image_name/source_image_family are required"
+
+    - name: Bake image directly with gcloud + packer
+      ansible.builtin.shell: |
+        set -euo pipefail
+
+        fail() {
+          echo "::error::$*"
+          exit 1
+        }
+
+        require_cmd() {
+          local name="$1"
+          command -v "$name" >/dev/null 2>&1 || fail "Missing required command: $name"
+        }
+
+        trim() {
+          echo "${1:-}" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//'
+        }
+
+        sanitize_label_value() {
+          local value
+          value="$(echo "${1:-}" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9_-]+/-/g; s/^[-_]+//; s/[-_]+$//; s/[-_]{2,}/-/g')"
+          [ -n "$value" ] || value="na"
+          echo "${value:0:63}"
+        }
+
+        sanitize_label_key() {
+          local key
+          key="$(echo "${1:-}" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9_-]+/-/g; s/^-+//; s/-+$//; s/-{2,}/-/g')"
+          [ -n "$key" ] || key="x"
+          if ! [[ "$key" =~ ^[a-z] ]]; then
+            key="x-$key"
+          fi
+          echo "${key:0:63}"
+        }
+
+        write_bake_metadata() {
+          local reused_flag="$1"
+          [ -n "${BAKE_METADATA_PATH:-}" ] || return 0
+          mkdir -p "$(dirname "$BAKE_METADATA_PATH")"
+          jq -cn \
+            --arg target_project "$GCP_PROJECT_ID" \
+            --arg target_image_name "$TARGET_IMAGE_NAME" \
+            --arg target_image_family "$TARGET_IMAGE_FAMILY" \
+            --arg source_image_project "$SOURCE_IMAGE_PROJECT" \
+            --arg source_selector "$source_selector" \
+            --arg source_value "$source_value" \
+            --arg source_image_name_resolved "$resolved_source_name" \
+            --arg source_image_family_resolved "$resolved_source_family" \
+            --arg source_image_self_link "$resolved_source_self_link" \
+            --arg source_sha "$SOURCE_SHA" \
+            --argjson reused "$reused_flag" \
+            '{
+              target_project: $target_project,
+              target_image_name: $target_image_name,
+              target_image_family: $target_image_family,
+              source_image_project: $source_image_project,
+              source_selector: $source_selector,
+              source_value: $source_value,
+              source_image_name_resolved: $source_image_name_resolved,
+              source_image_family_resolved: $source_image_family_resolved,
+              source_image_self_link: $source_image_self_link,
+              source_sha: $source_sha,
+              build_tool: "packer",
+              reused: $reused
+            }' > "$BAKE_METADATA_PATH"
+        }
+
+        require_cmd gcloud
+        require_cmd jq
+        require_cmd packer
+
+        [ -n "${GCP_PROJECT_ID:-}" ] || fail "Missing required value: GCP_PROJECT_ID"
+        [ -n "${SOURCE_IMAGE_PROJECT:-}" ] || fail "Missing required value: SOURCE_IMAGE_PROJECT"
+        [ -n "${TARGET_IMAGE_NAME:-}" ] || fail "Missing required value: TARGET_IMAGE_NAME"
+        if [ -z "${SOURCE_IMAGE_NAME:-}" ] && [ -z "${SOURCE_IMAGE_FAMILY:-}" ]; then
+          fail "Set SOURCE_IMAGE_NAME or SOURCE_IMAGE_FAMILY."
+        fi
+
+        BUILD_ZONE="$(trim "${BUILD_ZONE:-us-central1-b}")"
+        BUILD_MACHINE_TYPE="$(trim "${BUILD_MACHINE_TYPE:-e2-standard-4}")"
+        BUILD_BOOT_DISK_GB="$(trim "${BUILD_BOOT_DISK_GB:-200}")"
+        TARGET_IMAGE_FAMILY="$(trim "${TARGET_IMAGE_FAMILY:-}")"
+        TARGET_IMAGE_DESCRIPTION="$(trim "${TARGET_IMAGE_DESCRIPTION:-DevOps Defender image bake}")"
+        TARGET_IMAGE_LABELS="$(trim "${TARGET_IMAGE_LABELS:-}")"
+        SOURCE_SHA="$(trim "${SOURCE_SHA:-}")"
+        BAKE_METADATA_PATH="$(trim "${BAKE_METADATA_PATH:-}")"
+        DD_AGENT_BINARY_PATH="$(trim "${DD_AGENT_BINARY_PATH:-}")"
+        DD_CP_BINARY_PATH="$(trim "${DD_CP_BINARY_PATH:-}")"
+        PACKER_TEMPLATE_PATH="$(trim "${PACKER_TEMPLATE_PATH:-packer/gcp-agent-image.pkr.hcl}")"
+
+        if ! [[ "${BUILD_BOOT_DISK_GB}" =~ ^[0-9]+$ ]]; then
+          fail "BUILD_BOOT_DISK_GB must be an integer; got '${BUILD_BOOT_DISK_GB}'."
+        fi
+
+        [ -f "$PACKER_TEMPLATE_PATH" ] || fail "Missing packer template: $PACKER_TEMPLATE_PATH"
+
+        AGENT_BINARY_PATH=""
+        if [ -n "$DD_AGENT_BINARY_PATH" ]; then
+          [ -f "$DD_AGENT_BINARY_PATH" ] || fail "Configured DD_AGENT_BINARY_PATH does not exist: $DD_AGENT_BINARY_PATH"
+          chmod 0755 "$DD_AGENT_BINARY_PATH" || fail "Could not make DD_AGENT_BINARY_PATH executable: $DD_AGENT_BINARY_PATH"
+          AGENT_BINARY_PATH="$DD_AGENT_BINARY_PATH"
+        else
+          require_cmd cargo
+          cargo build --bin dd-agent --release
+          [ -x "target/release/dd-agent" ] || fail "dd-agent binary not found after build: target/release/dd-agent"
+          AGENT_BINARY_PATH="target/release/dd-agent"
+        fi
+
+        CP_BINARY_PATH=""
+        if [ -n "$DD_CP_BINARY_PATH" ]; then
+          [ -f "$DD_CP_BINARY_PATH" ] || fail "Configured DD_CP_BINARY_PATH does not exist: $DD_CP_BINARY_PATH"
+          chmod 0755 "$DD_CP_BINARY_PATH" || fail "Could not make DD_CP_BINARY_PATH executable: $DD_CP_BINARY_PATH"
+          CP_BINARY_PATH="$DD_CP_BINARY_PATH"
+        fi
+
+        source_selector=""
+        source_value=""
+        resolved_source_name=""
+        resolved_source_family=""
+        resolved_source_self_link=""
+        packer_source_image_name=""
+        packer_source_image_family=""
+
+        if [ -n "${SOURCE_IMAGE_NAME:-}" ]; then
+          gcloud compute images describe "$SOURCE_IMAGE_NAME" --project "$SOURCE_IMAGE_PROJECT" >/dev/null 2>&1 \
+            || fail "Configured source image '$SOURCE_IMAGE_NAME' not found in project '$SOURCE_IMAGE_PROJECT'."
+          source_selector="name"
+          source_value="$SOURCE_IMAGE_NAME"
+          packer_source_image_name="$SOURCE_IMAGE_NAME"
+          resolved_source_name="$(gcloud compute images describe "$SOURCE_IMAGE_NAME" --project "$SOURCE_IMAGE_PROJECT" --format='value(name)')"
+          resolved_source_family="$(gcloud compute images describe "$SOURCE_IMAGE_NAME" --project "$SOURCE_IMAGE_PROJECT" --format='value(family)')"
+          resolved_source_self_link="$(gcloud compute images describe "$SOURCE_IMAGE_NAME" --project "$SOURCE_IMAGE_PROJECT" --format='value(selfLink)')"
+        fi
+
+        if [ -z "$source_selector" ] && [ -n "${SOURCE_IMAGE_FAMILY:-}" ]; then
+          gcloud compute images describe-from-family "$SOURCE_IMAGE_FAMILY" --project "$SOURCE_IMAGE_PROJECT" >/dev/null 2>&1 \
+            || fail "Configured source image family '$SOURCE_IMAGE_FAMILY' not found in project '$SOURCE_IMAGE_PROJECT'."
+          source_selector="family"
+          source_value="$SOURCE_IMAGE_FAMILY"
+          packer_source_image_family="$SOURCE_IMAGE_FAMILY"
+          resolved_source_name="$(gcloud compute images describe-from-family "$SOURCE_IMAGE_FAMILY" --project "$SOURCE_IMAGE_PROJECT" --format='value(name)')"
+          resolved_source_family="$(gcloud compute images describe-from-family "$SOURCE_IMAGE_FAMILY" --project "$SOURCE_IMAGE_PROJECT" --format='value(family)')"
+          resolved_source_self_link="$(gcloud compute images describe-from-family "$SOURCE_IMAGE_FAMILY" --project "$SOURCE_IMAGE_PROJECT" --format='value(selfLink)')"
+        fi
+
+        if gcloud compute images describe "$TARGET_IMAGE_NAME" --project "$GCP_PROJECT_ID" >/dev/null 2>&1; then
+          echo "Image already exists: ${GCP_PROJECT_ID}/${TARGET_IMAGE_NAME}"
+          write_bake_metadata true
+          exit 0
+        fi
+
+        labels_json="$(jq -cn \
+          --arg source_image "$(sanitize_label_value "$resolved_source_name")" \
+          --arg source_project "$(sanitize_label_value "$SOURCE_IMAGE_PROJECT")" \
+          '{devopsdefender: "managed", dd_image_bake: "true", dd_source_image: $source_image, dd_source_project: $source_project}')"
+
+        if [ -n "$SOURCE_SHA" ]; then
+          labels_json="$(echo "$labels_json" | jq --arg sha "$(sanitize_label_value "${SOURCE_SHA:0:12}")" '. + {dd_git_sha: $sha}')"
+        fi
+
+        if [ -n "$TARGET_IMAGE_LABELS" ]; then
+          IFS=',' read -r -a extra_labels <<< "$TARGET_IMAGE_LABELS"
+          for item in "${extra_labels[@]}"; do
+            item="$(trim "$item")"
+            [ -n "$item" ] || continue
+            [[ "$item" == *=* ]] || fail "Invalid TARGET_IMAGE_LABELS entry '$item' (expected key=value)."
+            key="$(sanitize_label_key "$(trim "${item%%=*}")")"
+            value="$(sanitize_label_value "$(trim "${item#*=}")")"
+            labels_json="$(echo "$labels_json" | jq --arg k "$key" --arg v "$value" '. + {($k): $v}')"
+          done
+        fi
+        labels_json="$(echo "$labels_json" | jq -c '.')"
+
+        packer init "$PACKER_TEMPLATE_PATH"
+        packer build \
+          -color=false \
+          -var "project_id=${GCP_PROJECT_ID}" \
+          -var "build_zone=${BUILD_ZONE}" \
+          -var "build_machine_type=${BUILD_MACHINE_TYPE}" \
+          -var "build_boot_disk_gb=${BUILD_BOOT_DISK_GB}" \
+          -var "target_image_name=${TARGET_IMAGE_NAME}" \
+          -var "target_image_family=${TARGET_IMAGE_FAMILY}" \
+          -var "target_image_description=${TARGET_IMAGE_DESCRIPTION}" \
+          -var "source_image_project=${SOURCE_IMAGE_PROJECT}" \
+          -var "source_image_name=${packer_source_image_name}" \
+          -var "source_image_family=${packer_source_image_family}" \
+          -var "image_labels_json=${labels_json}" \
+          -var "agent_binary_path=${AGENT_BINARY_PATH}" \
+          ${CP_BINARY_PATH:+-var "cp_binary_path=${CP_BINARY_PATH}"} \
+          "$PACKER_TEMPLATE_PATH"
+
+        gcloud compute images describe "$TARGET_IMAGE_NAME" --project "$GCP_PROJECT_ID" >/dev/null 2>&1 \
+          || fail "Packer completed but target image was not found: ${GCP_PROJECT_ID}/${TARGET_IMAGE_NAME}"
+
+        write_bake_metadata false
+        echo "Image bake completed: ${GCP_PROJECT_ID}/${TARGET_IMAGE_NAME}"
+      args:
+        executable: /bin/bash
+        chdir: "{{ playbook_dir }}/../.."
+      environment:
+        GCP_PROJECT_ID: "{{ lookup('env', 'GCP_PROJECT_ID') }}"
+        SOURCE_IMAGE_PROJECT: "{{ source_image_project }}"
+        SOURCE_IMAGE_NAME: "{{ source_image_name }}"
+        SOURCE_IMAGE_FAMILY: "{{ source_image_family }}"
+        TARGET_IMAGE_NAME: "{{ target_image_name }}"
+        TARGET_IMAGE_FAMILY: "{{ target_image_family }}"
+        TARGET_IMAGE_DESCRIPTION: "{{ target_image_description }}"
+        TARGET_IMAGE_LABELS: "{{ target_image_labels }}"
+        SOURCE_SHA: "{{ source_sha }}"
+        DD_AGENT_BINARY_PATH: "{{ dd_agent_binary_path }}"
+        DD_CP_BINARY_PATH: "{{ dd_cp_binary_path }}"
+        PACKER_TEMPLATE_PATH: "{{ packer_template_path }}"
+        BUILD_ZONE: "{{ build_zone }}"
+        BUILD_MACHINE_TYPE: "{{ build_machine_type }}"
+        BUILD_BOOT_DISK_GB: "{{ build_boot_disk_gb }}"
+        BAKE_METADATA_PATH: "{{ bake_metadata_path }}"
+      register: bake_cmd
+      changed_when: "'Image already exists:' not in bake_cmd.stdout"
+
+    - name: Print bake summary
+      ansible.builtin.debug:
+        var: bake_cmd.stdout_lines

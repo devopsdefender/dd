@@ -1,0 +1,24 @@
+[package]
+name = "dd-agent"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "dd_agent"
+path = "src/lib.rs"
+
+[[bin]]
+name = "dd-agent"
+path = "src/bin/dd-agent/main.rs"
+
+[dependencies]
+base64 = "0.22"
+bollard = "0.18"
+chrono = { version = "0.4", features = ["serde"] }
+futures-util = "0.3"
+reqwest = { version = "0.12", features = ["blocking", "json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "process", "rt-multi-thread", "time"] }
+uuid = { version = "1", features = ["serde", "v4"] }

@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -euo pipefail
+mkdir -p /etc/devopsdefender
+cat > /etc/devopsdefender/agent.json <<'EOF_CONFIG'
+{{ agent_config_json }}
+EOF_CONFIG
+chmod 0600 /etc/devopsdefender/agent.json
+systemctl daemon-reload || true
+systemctl disable --now devopsdefender-control-plane.service || true
+systemctl enable devopsdefender-agent.service || true
+systemctl restart devopsdefender-agent.service || true
