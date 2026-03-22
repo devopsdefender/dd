@@ -65,10 +65,17 @@ jobs:
           gh api repos/devopsdefender/private-llm/contents/docker-compose.yml \
             -H "Accept: application/vnd.github.raw" > /tmp/compose.yml
           COMPOSE_B64=$(base64 -w0 /tmp/compose.yml)
-          curl -sf -X POST "${CP_URL}/api/v1/deploy" \
+          RESPONSE=$(curl -s -w "\n%{http_code}" -X POST "${CP_URL}/api/v1/deploy" \
             -H "Authorization: Bearer ${OIDC_TOKEN}" \
             -H "Content-Type: application/json" \
-            -d "{\"app_name\":\"private-llm\",\"app_version\":\"${{ github.sha }}\",\"compose\":\"${COMPOSE_B64}\",\"node_size\":\"standard\"}"
+            -d "{\"app_name\":\"private-llm\",\"app_version\":\"${{ github.sha }}\",\"compose\":\"${COMPOSE_B64}\",\"node_size\":\"standard\"}")
+          HTTP_CODE=$(echo "${RESPONSE}" | tail -1)
+          BODY=$(echo "${RESPONSE}" | sed '$d')
+          echo "HTTP ${HTTP_CODE}: ${BODY}"
+          if [ "${HTTP_CODE}" -lt 200 ] || [ "${HTTP_CODE}" -ge 300 ]; then
+            echo "::error::LLM deploy failed: ${BODY}"
+            exit 1
+          fi
 
       - name: Cleanup
         if: always()
