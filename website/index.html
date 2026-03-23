@@ -3,8 +3,8 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>DevOps Defender - Confidential Computing for CI/CD</title>
-  <meta name="description" content="Deploy Docker apps to hardware-verified Intel TDX enclaves. Secure your CI/CD pipeline with confidential computing, remote attestation, and GitHub OIDC.">
+  <title>DevOps Defender - Self-Hosted Confidential Computing</title>
+  <meta name="description" content="The open-source, self-hosted alternative to managed confidential computing. Deploy any Docker app to Intel TDX enclaves you control — no vendor lock-in, no secrets to manage.">
   <link rel="stylesheet" href="style.css">
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🛡</text></svg>">
 </head>
@@ -43,26 +43,25 @@
   <header class="hero" id="hero">
     <div class="hero-bg"></div>
     <div class="container hero-content">
-      <div class="hero-badge">Open Source Confidential Computing Platform</div>
-      <h1>Secure Your CI/CD Pipeline with <span class="hero-highlight">Confidential Computing</span></h1>
+      <div class="hero-badge">Open Source · Self-Hosted · No Vendor Lock-In</div>
+      <h1>Run Your Own <span class="hero-highlight">Confidential Computing</span> Platform</h1>
       <p class="hero-subtitle">
-        Deploy unmodified Docker applications to hardware-verified Intel TDX enclaves.
-        Every workload runs in a Trusted Execution Environment with remote attestation,
-        memory encryption, and cryptographic proof of integrity.
+        Deploy any Docker app to hardware-secured enclaves on infrastructure you own and control.
+        No secrets to manage, no ports to expose, no code changes required — and no SaaS bill.
       </p>
       <div class="hero-actions">
-        <a href="#quickstart" class="btn btn-primary btn-lg">Get Started</a>
+        <a href="#quickstart" class="btn btn-primary btn-lg">Deploy Your First App</a>
         <a href="https://github.com/devopsdefender/control-plane" class="btn btn-outline btn-lg">View on GitHub</a>
       </div>
       <div class="hero-stats">
         <div class="hero-stat">
-          <span class="hero-stat-value">TDX</span>
-          <span class="hero-stat-label">Intel Trust Domain Extensions</span>
+          <span class="hero-stat-value">Self-Hosted</span>
+          <span class="hero-stat-label">Your Infra, Your Data</span>
         </div>
         <div class="hero-stat-divider"></div>
         <div class="hero-stat">
-          <span class="hero-stat-value">Zero Trust</span>
-          <span class="hero-stat-label">Hardware-Rooted Attestation</span>
+          <span class="hero-stat-value">Open Source</span>
+          <span class="hero-stat-label">Apache 2.0 — Audit Everything</span>
         </div>
         <div class="hero-stat-divider"></div>
         <div class="hero-stat">
@@ -84,8 +83,8 @@
               <path d="M7 11V7a5 5 0 0 1 10 0v4"></path>
             </svg>
           </div>
-          <h3>Hardware Isolation</h3>
-          <p>Every workload runs inside an Intel TDX virtual machine with encrypted memory that even the hypervisor cannot read.</p>
+          <h3>Your Infra, Your Rules</h3>
+          <p>Self-host on any Intel TDX hardware. No SaaS dependency, no data leaving your environment, no vendor to trust or pay.</p>
         </div>
         <div class="value-card">
           <div class="value-icon">
@@ -94,8 +93,8 @@
               <path d="M9 12l2 2 4-4"></path>
             </svg>
           </div>
-          <h3>Remote Attestation</h3>
-          <p>Cryptographic proof from Intel hardware that your code is running unmodified in a genuine TDX enclave before any secrets are released.</p>
+          <h3>Hardware-Backed Trust</h3>
+          <p>Intel CPU hardware cryptographically proves your code is running unmodified and isolated — before any workload starts. No assumptions, just math.</p>
         </div>
         <div class="value-card">
           <div class="value-icon">
@@ -104,8 +103,8 @@
               <polyline points="8 6 2 12 8 18"></polyline>
             </svg>
           </div>
-          <h3>Unmodified Docker</h3>
-          <p>Bring your existing Docker images. No SDK, no code changes, no special toolchains. If it runs in Docker, it runs in a TDX enclave.</p>
+          <h3>Zero Code Changes</h3>
+          <p>Bring your existing Docker images. No SDK, no rewrites, no special toolchains. If it runs in Docker, it runs in a hardened enclave today.</p>
         </div>
       </div>
     </div>
@@ -116,7 +115,7 @@
     <div class="container">
       <div class="section-header">
         <h2>How It Works</h2>
-        <p>From code commit to verified enclave deployment in four steps.</p>
+        <p>From code commit to running in a hardware-secured enclave — four steps, no magic.</p>
       </div>
 
       <div class="flow-diagram">
@@ -130,8 +129,8 @@
               <line x1="9" y1="15" x2="15" y2="15"></line>
             </svg>
           </div>
-          <h3>Register Application</h3>
-          <p>Define your app with its Docker image reference, expected measurements, and the GitHub organization authorized to deploy it.</p>
+          <h3>Register Your App</h3>
+          <p>Tell the control plane about your app: the Docker image, and which GitHub organization is allowed to deploy it. That's it.</p>
         </div>
 
         <div class="flow-connector">
@@ -150,8 +149,8 @@
               <polyline points="16 16 12 12 8 16"></polyline>
             </svg>
           </div>
-          <h3>Publish Version</h3>
-          <p>Push your container image to a registry. DevOps Defender records the content digest as the expected image measurement for attestation.</p>
+          <h3>Push Your Image</h3>
+          <p>Push your container image to any registry. DevOps Defender pins the exact content digest so only that version can run — no surprises.</p>
         </div>
 
         <div class="flow-connector">
@@ -168,8 +167,8 @@
               <path d="M12 8v4M12 16h.01"></path>
             </svg>
           </div>
-          <h3>Measure Enclave</h3>
-          <p>The TDX hardware generates a cryptographic attestation quote binding the VM identity, firmware, kernel, and rootfs into a verifiable measurement chain.</p>
+          <h3>Hardware Verifies Everything</h3>
+          <p>The Intel CPU generates a signed proof that your VM booted with the right firmware, kernel, and filesystem — before your container ever starts.</p>
         </div>
 
         <div class="flow-connector">
@@ -188,8 +187,8 @@
               <path d="M7 8l3 3-3 3M12 14h4"></path>
             </svg>
           </div>
-          <h3>Deploy to TDX</h3>
-          <p>Your Docker container launches inside the verified TDX enclave. The control plane monitors health via heartbeats and enforces attestation continuously.</p>
+          <h3>Ship It — Securely</h3>
+          <p>Your container launches inside the verified enclave. The control plane continuously monitors each agent; anything that fails attestation gets quarantined automatically.</p>
         </div>
       </div>
     </div>
@@ -406,8 +405,8 @@
   <section class="tee-section" id="tee">
     <div class="container">
       <div class="section-header">
-        <h2>Trusted Execution Environments</h2>
-        <p>Intel TDX provides hardware-enforced isolation for entire virtual machines, not just application enclaves.</p>
+        <h2>What Makes It Secure</h2>
+        <p>Intel TDX protects entire virtual machines in hardware — your hypervisor, cloud provider, and even your own ops team can't read workload memory.</p>
       </div>
 
       <div class="tee-grid">
@@ -418,14 +417,14 @@
               <path d="M7 11V7a5 5 0 0 1 10 0v4"></path>
               <circle cx="12" cy="16" r="1"></circle>
             </svg>
-            <h3>Hardware Memory Encryption</h3>
+            <h3>Memory Nobody Else Can Read</h3>
           </div>
-          <p>Intel TDX encrypts all VM memory with AES-256-XTS using per-TD keys managed entirely in hardware. The hypervisor, other VMs, and even physical memory probes cannot access your data.</p>
+          <p>All VM memory is encrypted in hardware. The hypervisor, other tenants, and even physical memory probes can't access your data — only the CPU can decrypt it.</p>
           <ul class="tee-features">
-            <li>Per-VM encryption keys generated by CPU microcode</li>
-            <li>Keys never exposed to software, including firmware</li>
-            <li>Integrity protection against memory replay attacks</li>
-            <li>Full VM isolation, not just process-level</li>
+            <li>Per-VM encryption keys generated inside the CPU</li>
+            <li>Keys never exposed to any software layer</li>
+            <li>Protection against memory replay and tampering</li>
+            <li>Full VM isolation, not just process-level sandboxing</li>
           </ul>
         </div>
 
@@ -435,14 +434,14 @@
               <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path>
               <path d="M9 12l2 2 4-4"></path>
             </svg>
-            <h3>Remote Attestation</h3>
+            <h3>Proof the Right Code Is Running</h3>
           </div>
-          <p>Before releasing any secrets, verify the enclave is genuine. The TDX quote contains cryptographic measurements of the entire software stack, signed by Intel-provisioned keys.</p>
+          <p>Before any workload gets access to secrets, the Intel CPU issues a signed attestation quote — cryptographic proof of exactly what software booted and what's running inside.</p>
           <ul class="tee-features">
-            <li>MRTD: Measures the initial TD configuration and firmware</li>
-            <li>RTMR[0-1]: Firmware and kernel boot chain</li>
-            <li>RTMR[2]: dm-verity root filesystem hash</li>
-            <li>RTMR[3]: Application-level measurements</li>
+            <li>Initial firmware configuration measured at VM start</li>
+            <li>Firmware and kernel boot chain measured in sequence</li>
+            <li>Root filesystem integrity verified before mount</li>
+            <li>Application container measured at launch</li>
           </ul>
         </div>
 
@@ -453,14 +452,14 @@
               <polyline points="8 6 2 12 8 18"></polyline>
               <line x1="14" y1="4" x2="10" y2="20"></line>
             </svg>
-            <h3>Unmodified Docker Apps</h3>
+            <h3>No Code Changes Required</h3>
           </div>
-          <p>Unlike SGX enclaves that require a specialized SDK, TDX protects entire VMs. Your Docker containers run without any code changes inside a confidential virtual machine.</p>
+          <p>Unlike older enclave tech that required rewriting apps with a special SDK, TDX protects entire VMs. Your existing Docker containers run as-is inside a confidential environment.</p>
           <ul class="tee-features">
-            <li>Standard OCI container images, any base image</li>
-            <li>No SDK or library dependencies required</li>
+            <li>Standard OCI images, any base image, any language</li>
+            <li>No SDK or library dependencies to add</li>
             <li>Full Linux environment inside the enclave</li>
-            <li>Podman container runtime for rootless execution</li>
+            <li>Rootless container runtime for defense-in-depth</li>
           </ul>
         </div>
 
@@ -471,14 +470,14 @@
               <polyline points="3.27 6.96 12 12.01 20.73 6.96"></polyline>
               <line x1="12" y1="22.08" x2="12" y2="12"></line>
             </svg>
-            <h3>Measured Boot Chain</h3>
+            <h3>Tamper-Proof Boot Chain</h3>
           </div>
-          <p>Every component in the boot sequence is measured into TDX runtime measurement registers before execution, creating an unforgeable chain of trust from CPU silicon to your application.</p>
+          <p>Every component from firmware to your app is measured into hardware registers before it runs. An unforgeable chain of trust from CPU silicon to container — you can verify it yourself.</p>
           <ul class="tee-features">
-            <li>OVMF firmware measured by TDX module into MRTD</li>
-            <li>Kernel and initramfs measured into RTMR[0]</li>
-            <li>dm-verity rootfs integrity measured into RTMR[2]</li>
-            <li>Application identity extended into RTMR[3]</li>
+            <li>Firmware measured by the CPU at VM launch</li>
+            <li>Kernel and initramfs measured before execution</li>
+            <li>Read-only filesystem with integrity verification</li>
+            <li>Application identity locked in at container start</li>
           </ul>
         </div>
       </div>
@@ -490,7 +489,7 @@
     <div class="container">
       <div class="section-header">
         <h2>Defense in Depth</h2>
-        <p>Multiple independent security layers ensure that a compromise of any single component does not breach the system.</p>
+        <p>Layered security so that no single failure — hardware, software, or human — can compromise your workloads.</p>
       </div>
 
       <div class="security-grid">
@@ -503,8 +502,8 @@
             </svg>
           </div>
           <div class="security-content">
-            <h4>Nonce Challenge Protocol</h4>
-            <p>Every attestation request includes a unique server-generated nonce bound to the TDX quote's report data field. This prevents replay attacks and ensures freshness of every attestation.</p>
+            <h4>No Stale Attestations</h4>
+            <p>Every verification challenge is unique and time-bound. An attacker can't replay an old proof — each attestation is fresh or it's rejected.</p>
           </div>
         </div>
 
@@ -515,8 +514,8 @@
             </svg>
           </div>
           <div class="security-content">
-            <h4>dm-verity Root Filesystem</h4>
-            <p>The agent VM boots with a read-only root filesystem protected by dm-verity. Any modification to the filesystem causes I/O errors, making persistent rootkits impossible.</p>
+            <h4>Tamper-Evident Filesystem</h4>
+            <p>The agent VM boots with a read-only, integrity-verified filesystem. Any modification causes an immediate I/O error — persistent rootkits have nowhere to hide.</p>
           </div>
         </div>
 
@@ -528,8 +527,8 @@
             </svg>
           </div>
           <div class="security-content">
-            <h4>TCB Enforcement</h4>
-            <p>The Trusted Computing Base is pinned to specific versions. The control plane rejects agents whose firmware, kernel, or TDX module versions do not match the expected TCB.</p>
+            <h4>Pinned Software Stack</h4>
+            <p>Firmware, kernel, and runtime versions are locked. Agents running anything unexpected are rejected before they can touch a workload.</p>
           </div>
         </div>
 
@@ -541,8 +540,8 @@
             </svg>
           </div>
           <div class="security-content">
-            <h4>Continuous Monitoring</h4>
-            <p>Agents send periodic heartbeats with fresh attestation evidence. If an agent fails to attest or measurements drift, it is immediately quarantined from the fleet.</p>
+            <h4>Continuous Health Checks</h4>
+            <p>Agents continuously re-attest to the control plane. If anything drifts or goes silent, that agent is quarantined from the fleet automatically.</p>
           </div>
         </div>
 
@@ -553,8 +552,8 @@
             </svg>
           </div>
           <div class="security-content">
-            <h4>Cloudflare Tunnel Isolation</h4>
-            <p>Each agent receives a scoped Cloudflare tunnel token during registration. Traffic never traverses the open internet; all communication is encrypted end-to-end through Cloudflare's network.</p>
+            <h4>No Open Ports</h4>
+            <p>Agents reach out through an encrypted tunnel — no inbound firewall rules, no exposed services. Your workloads are unreachable from the open internet by default.</p>
           </div>
         </div>
 
@@ -565,8 +564,8 @@
             </svg>
           </div>
           <div class="security-content">
-            <h4>Ownership via Label Matching</h4>
-            <p>Agents are labeled with their GitHub organization. Deploy requests are authorized by matching the OIDC token's repository owner claim against the agent's ownership label. No shared secrets, no API keys.</p>
+            <h4>No Shared Secrets</h4>
+            <p>Authorization is tied to your GitHub organization identity — no API keys to rotate, no credentials to leak. If your GitHub org can push, it can deploy. That's it.</p>
           </div>
         </div>
       </div>
@@ -577,8 +576,8 @@
   <section class="oidc-section" id="github-oidc">
     <div class="container">
       <div class="section-header">
-        <h2>Deploy with GitHub OIDC</h2>
-        <p>No API keys. No shared secrets. Deploy directly from GitHub Actions using OpenID Connect tokens.</p>
+        <h2>Deploy from GitHub Actions — No Credentials Needed</h2>
+        <p>GitHub vouches for your identity. DevOps Defender trusts GitHub. You never touch a secret.</p>
       </div>
 
       <div class="oidc-layout">
@@ -586,29 +585,29 @@
           <div class="oidc-step">
             <div class="oidc-step-num">1</div>
             <div class="oidc-step-content">
-              <h4>GitHub Issues a JWT</h4>
-              <p>Your GitHub Actions workflow requests an OIDC token from GitHub's token endpoint. This JWT contains claims about the repository, organization, branch, and workflow that triggered the deployment.</p>
+              <h4>GitHub Proves Who You Are</h4>
+              <p>When your workflow runs, GitHub issues a signed token saying: this deployment came from this repo, this org, this branch. No passwords, no API keys — GitHub's identity is the credential.</p>
             </div>
           </div>
           <div class="oidc-step">
             <div class="oidc-step-num">2</div>
             <div class="oidc-step-content">
-              <h4>Control Plane Verifies the Token</h4>
-              <p>DevOps Defender validates the JWT signature against GitHub's JWKS endpoint, checks the audience claim, and extracts the <code>repository_owner</code> to determine which organization is deploying.</p>
+              <h4>Control Plane Checks the Signature</h4>
+              <p>DevOps Defender verifies the token signature directly against GitHub's public keys. If it's genuine and the org matches, the deploy is authorized — no lookup tables, no stored secrets.</p>
             </div>
           </div>
           <div class="oidc-step">
             <div class="oidc-step-num">3</div>
             <div class="oidc-step-content">
-              <h4>Ownership Match Authorizes Deploy</h4>
-              <p>The control plane matches the JWT's <code>repository_owner</code> against agents labeled with <code>github:org/&lt;name&gt;</code>. Only agents owned by the deploying organization receive the workload.</p>
+              <h4>Only Your Agents Receive the Workload</h4>
+              <p>The control plane routes the deployment only to agents registered under your organization. Other orgs on the same platform can't touch your workloads — and vice versa.</p>
             </div>
           </div>
           <div class="oidc-step">
             <div class="oidc-step-num">4</div>
             <div class="oidc-step-content">
-              <h4>Workload Deploys to Attested Agents</h4>
-              <p>The container image is pulled and launched inside the TDX enclave. No secrets were exchanged, stored, or rotated. The entire auth flow is stateless and ephemeral.</p>
+              <h4>Container Launches, Nothing to Clean Up</h4>
+              <p>Your app starts inside the verified enclave. No secrets were created, stored, or rotated. The entire auth flow is stateless — there's nothing to breach after the fact.</p>
             </div>
           </div>
         </div>
@@ -649,17 +648,17 @@
     <div class="container">
       <div class="section-header">
         <h2>Quick Start</h2>
-        <p>Get your first workload running in a TDX enclave in minutes.</p>
+        <p>Get your first workload running in a hardware-secured enclave in minutes — on infra you own.</p>
       </div>
 
       <div class="quickstart-steps">
         <div class="qs-step">
           <div class="qs-step-header">
             <span class="qs-step-num">Step 1</span>
-            <h3>Register Your Application</h3>
+            <h3>Register Your App</h3>
           </div>
           <div class="qs-step-body">
-            <p>Register your app with the control plane. This defines the container image, expected measurements, and which GitHub organization is authorized to deploy.</p>
+            <p>Tell your self-hosted control plane about the app: the container image and which GitHub organization owns it. One API call.</p>
             <div class="code-block">
               <div class="code-header">
                 <span class="code-filename">Terminal</span>
@@ -682,7 +681,7 @@ curl -X POST https://devopsdefender.com/api/v1/apps \
             <h3>Add the GitHub Action</h3>
           </div>
           <div class="qs-step-body">
-            <p>Add the DevOps Defender deploy action to your workflow. The action handles OIDC token acquisition and deployment automatically.</p>
+            <p>Drop the deploy action into your workflow. It handles everything — no credentials to configure, no secrets to store in GitHub.</p>
             <div class="code-block">
               <div class="code-header">
                 <span class="code-filename">.github/workflows/deploy.yml</span>
@@ -704,10 +703,10 @@ curl -X POST https://devopsdefender.com/api/v1/apps \
         <div class="qs-step">
           <div class="qs-step-header">
             <span class="qs-step-num">Step 3</span>
-            <h3>Verify and Monitor</h3>
+            <h3>Verify It Yourself</h3>
           </div>
           <div class="qs-step-body">
-            <p>Check that your agent registered successfully and the workload is running inside a verified TDX enclave.</p>
+            <p>Confirm your agent is registered and the workload is live inside a verified enclave. You can inspect every attestation — it's your infrastructure.</p>
             <div class="code-block">
               <div class="code-header">
                 <span class="code-filename">Terminal</span>
@@ -731,11 +730,11 @@ curl https://devopsdefender.com/api/v1/agents/{id}/logs</code></pre>
   <section class="cta-section">
     <div class="container">
       <div class="cta-content">
-        <h2>Ready to deploy with confidence?</h2>
-        <p>DevOps Defender is open source. Inspect the code, audit the measurements, and verify the attestation yourself.</p>
+        <h2>Your infra. Your data. Your rules.</h2>
+        <p>DevOps Defender is fully open source — inspect every line, audit every measurement, run it wherever you want. No SaaS. No lock-in. No surprises.</p>
         <div class="cta-actions">
           <a href="https://github.com/devopsdefender/control-plane" class="btn btn-primary btn-lg">View on GitHub</a>
-          <a href="#quickstart" class="btn btn-outline-light btn-lg">Get Started</a>
+          <a href="#quickstart" class="btn btn-outline-light btn-lg">Deploy Your First App</a>
         </div>
       </div>
     </div>
@@ -756,7 +755,7 @@ curl https://devopsdefender.com/api/v1/agents/{id}/logs</code></pre>
             </span>
             <span class="logo-text">DevOps Defender</span>
           </a>
-          <p>Confidential computing for CI/CD pipelines. Deploy Docker apps to hardware-verified Intel TDX enclaves.</p>
+          <p>The open-source, self-hosted confidential computing platform. Deploy any Docker app to hardware-secured enclaves you own and control.</p>
         </div>
 
         <div class="footer-links-group">
