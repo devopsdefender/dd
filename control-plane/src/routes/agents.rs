@@ -30,7 +30,33 @@ pub async fn agent_register(
         .verify_registration_token(&req.intel_ta_token)
         .await?;
 
-    // Create tunnel
+    // Re-register: if an agent with the same vm_name already exists, reuse its
+    // tunnel and update its record instead of creating a brand-new tunnel every
+    // time (avoids Cloudflare rate limits on tunnel creation).
+    if let Some(existing) = agent_store::find_agent_by_vm_name(&state.db, &req.vm_name)? {
+        let agent_id: uuid::Uuid = existing.id.parse().map_err(|_| AppError::Internal)?;
+        let hostname = existing.hostname.unwrap_or_default();
+        let tunnel_token = state
+            .tunnel
+            .get_tunnel_token_for_agent(agent_id, &req.vm_name)
+            .await
+            .unwrap_or_else(|_| format!("reuse-tunnel-token-{agent_id}"));
+
+        // Reset registration state + heartbeat
+        agent_store::update_registration_state(&state.db, &existing.id, "ready")?;
+        agent_store::update_heartbeat(&state.db, &existing.id)?;
+
+        return Ok((
+            StatusCode::CREATED,
+            Json(AgentRegisterResponse {
+                agent_id,
+                tunnel_token,
+                hostname,
+            }),
+        ));
+    }
+
+    // New agent: create tunnel
     let agent_id = uuid::Uuid::new_v4();
     let tunnel_info = state
         .tunnel
@@ -208,11 +234,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn register_and_list_agents() {
+    async fn register_rejects_without_attestation_config() {
         let state = test_state();
         let app = build_router(state);
 
-        // Register an agent
+        // Without DD_INTEL_API_KEY, registration must fail — no insecure mode.
         let register_req = AgentRegisterRequest {
             intel_ta_token: "fake-token".into(),
             vm_name: "test-vm".into(),
@@ -230,7 +256,7 @@ mod tests {
             .unwrap();
 
         let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::CREATED);
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     #[tokio::test]

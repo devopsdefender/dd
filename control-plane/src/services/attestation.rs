@@ -46,11 +46,26 @@ impl AttestationService {
         }
     }
 
-    /// Create a service that skips real verification (for tests / local dev).
-    pub fn insecure_for_tests() -> Self {
-        Self {
-            verifier: None,
-            env: RuntimeEnv::Local,
+    /// Build from environment. Uses ITA verifier when DD_INTEL_API_KEY is set.
+    /// Without the key, attestation verification will reject all tokens —
+    /// this is intentional: there is no "insecure" mode.
+    pub fn from_env() -> Self {
+        let env = RuntimeEnv::detect();
+        if let Ok(api_key) = std::env::var("DD_INTEL_API_KEY") {
+            let jwks_url = std::env::var("DD_ITA_JWKS_URL")
+                .unwrap_or_else(|_| "https://portal.trustauthority.intel.com/certs".into());
+            let issuer = std::env::var("DD_ITA_ISSUER").ok();
+            let audience = std::env::var("DD_ITA_AUDIENCE").ok().or(Some(api_key));
+            Self {
+                verifier: Some(ItaVerifier::new(jwks_url, issuer, audience)),
+                env,
+            }
+        } else {
+            eprintln!("dd-cp: DD_INTEL_API_KEY not set — attestation verification will reject all registration attempts");
+            Self {
+                verifier: None,
+                env,
+            }
         }
     }
 
@@ -80,14 +95,9 @@ impl AttestationService {
                 let claims = v.verify_attestation_token(token).await?;
                 Ok(extract_attestation(&claims))
             }
-            None => {
-                // Insecure mode: accept anything
-                Ok(VerifiedAttestation {
-                    mrtd: Some("insecure-local-mrtd".into()),
-                    tcb_status: Some("UpToDate".into()),
-                    rtmrs: vec![],
-                })
-            }
+            None => Err(AppError::Config(
+                "attestation verifier not configured (DD_INTEL_API_KEY required)".into(),
+            )),
         }
     }
 }
@@ -113,15 +123,6 @@ fn extract_attestation(claims: &AttestationClaims) -> VerifiedAttestation {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[tokio::test]
-    async fn insecure_mode_accepts_anything() {
-        let svc = AttestationService::insecure_for_tests();
-        let result = svc.verify_registration_token("fake-token").await;
-        assert!(result.is_ok());
-        let att = result.unwrap();
-        assert_eq!(att.mrtd, Some("insecure-local-mrtd".into()));
-    }
 
     #[test]
     fn staging_allows_no_verifier() {

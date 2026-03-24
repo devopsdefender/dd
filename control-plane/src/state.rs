@@ -55,9 +55,9 @@ impl AppState {
             db: db.clone(),
             settings: SettingsStore::new(db),
             nonce: NonceService::new(env_u64("DD_CP_NONCE_TTL_SECONDS", 300)),
-            attestation: AttestationService::insecure_for_tests(),
-            github_oidc: GithubOidcService::disabled_for_tests(),
-            tunnel: TunnelService::disabled_for_tests(),
+            attestation: AttestationService::from_env(),
+            github_oidc: GithubOidcService::from_env(),
+            tunnel: TunnelService::from_env(),
             check_ingest_token: std::env::var("DD_CP_CHECK_INGEST_TOKEN").ok(),
             heartbeat_interval_seconds: env_u64("DD_CP_HEARTBEAT_INTERVAL_SECONDS", 30),
             check_timeout_seconds: env_u64("DD_CP_CHECK_TIMEOUT_SECONDS", 10),
@@ -70,6 +70,8 @@ impl AppState {
     }
 
     /// Build AppState suitable for testing with an in-memory DB.
+    /// Uses from_env() for all services — tests that need specific service
+    /// behaviour should set the appropriate env vars or mock at the route level.
     pub fn for_testing(db: Db) -> Self {
         Self {
             boot_id: "test-boot-id".into(),
@@ -79,9 +81,9 @@ impl AppState {
             db: db.clone(),
             settings: SettingsStore::new(db),
             nonce: NonceService::new(300),
-            attestation: AttestationService::insecure_for_tests(),
-            github_oidc: GithubOidcService::disabled_for_tests(),
-            tunnel: TunnelService::disabled_for_tests(),
+            attestation: AttestationService::from_env(),
+            github_oidc: GithubOidcService::from_env(),
+            tunnel: TunnelService::from_env(),
             check_ingest_token: Some("test-ingest-token".into()),
             heartbeat_interval_seconds: 30,
             check_timeout_seconds: 10,

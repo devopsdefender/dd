@@ -1,7 +1,19 @@
+# Baremetal Staging Deploy
+#
+# Builds the agent + control-plane binaries, bakes a VM image on the staging
+# host via Packer, and launches the new agent VM.
+#
+# Trigger: automatic on pull_request targeting main (validates before merge).
+# Host/user/memory/cpus come from infra/ansible/inventory/staging.yml — no
+# inline overrides needed.
+#
+# App deployment (private-llm etc.) is handled by the private-llm repo,
+# not here. This workflow owns infra only.
+
 name: Baremetal Staging Deploy
 
 on:
-  push:
+  pull_request:
     branches: [main]
     paths:
       - "agent/**"
@@ -16,67 +28,59 @@ concurrency:
   cancel-in-progress: true
 
 permissions:
-  id-token: write
   contents: read
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    environment: staging
+
     steps:
+      # ── Build binaries ──────────────────────────────────────────────────
       - uses: actions/checkout@v4
+
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+
+      # Build both dd-agent and dd-cp in release mode
       - run: cargo build --workspace --release
+
       - run: pip install ansible
 
+      # ── SSH setup ───────────────────────────────────────────────────────
+      # Write the deploy key to the path the inventory expects (/tmp/deploy-key)
       - name: Set up SSH
         run: |
-          mkdir -p ~/.ssh
-          echo "${{ secrets.BAREMETAL_SSH_KEY }}" > ~/.ssh/deploy_key
-          chmod 600 ~/.ssh/deploy_key
-          ssh-keyscan -H "${{ vars.BAREMETAL_STAGING_HOST }}" >> ~/.ssh/known_hosts 2>/dev/null
+          echo "${{ secrets.BAREMETAL_SSH_KEY }}" > /tmp/deploy-key
+          chmod 600 /tmp/deploy-key
+          ssh-keyscan -H 57.130.10.246 >> ~/.ssh/known_hosts 2>/dev/null || true
 
+      # ── Deploy agent VM ─────────────────────────────────────────────────
+      # Runs the baremetal-agent-deploy playbook against the staging inventory.
+      # Secrets are passed as Ansible extra-vars (never written to disk).
       - name: Deploy agent to staging host
         env:
           ANSIBLE_HOST_KEY_CHECKING: "false"
         run: |
           sha12="$(echo "${{ github.sha }}" | cut -c1-12)"
           ansible-playbook infra/ansible/playbooks/baremetal-agent-deploy.yml \
-            -i "${{ vars.BAREMETAL_STAGING_HOST }}," \
-            -u "${{ vars.BAREMETAL_STAGING_USER }}" \
-            --private-key ~/.ssh/deploy_key \
+            -i infra/ansible/inventory/staging.yml \
             -e "agent_binary_local=${GITHUB_WORKSPACE}/target/release/dd-agent" \
             -e "cp_binary_local=${GITHUB_WORKSPACE}/target/release/dd-cp" \
             -e "packer_template_dir=${GITHUB_WORKSPACE}/images/packer" \
             -e "image_name=dd-baremetal-${sha12}" \
-            -e "dd_env=staging" \
-            -e "cp_url=https://app-staging.${{ vars.DD_CF_DOMAIN || 'devopsdefender.com' }}" \
-            -e "dd_skip_attestation=true" \
-            -e "agent_node_size=standard"
+            -e "dd_cp_admin_password=${{ secrets.DD_CP_ADMIN_PASSWORD }}" \
+            -e "dd_cp_cf_api_token=${{ secrets.DD_CP_CF_API_TOKEN }}" \
+            -e "dd_cp_cf_account_id=${{ secrets.DD_CP_CF_ACCOUNT_ID }}" \
+            -e "dd_cp_cf_zone_id=${{ secrets.DD_CP_CF_ZONE_ID }}" \
+            -e "dd_intel_api_key=${{ secrets.INTEL_API_KEY }}" \
+            -e "dd_cp_git_sha=${sha12}" \
+            -e "dd_intel_api_key=${{ secrets.INTEL_API_KEY }}" \
+            -e "dd_cp_admin_password=${{ secrets.DD_CP_ADMIN_PASSWORD }}" \
+            -e "dd_cp_cf_api_token=${{ secrets.DD_CP_CF_API_TOKEN }}" \
+            -e "dd_cp_cf_account_id=${{ secrets.DD_CP_CF_ACCOUNT_ID }}" \
+            -e "dd_cp_cf_zone_id=${{ secrets.DD_CP_CF_ZONE_ID }}"
 
-      - name: Deploy private-llm (CPU mode)
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          CP_URL="https://app-staging.${{ vars.DD_CF_DOMAIN || 'devopsdefender.com' }}"
-          OIDC_TOKEN=$(curl -s -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
-            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=devopsdefender" | jq -r '.value')
-          gh api repos/devopsdefender/private-llm/contents/docker-compose.yml \
-            -H "Accept: application/vnd.github.raw" > /tmp/compose.yml
-          COMPOSE_B64=$(base64 -w0 /tmp/compose.yml)
-          RESPONSE=$(curl -s -w "\n%{http_code}" -X POST "${CP_URL}/api/v1/deploy" \
-            -H "Authorization: Bearer ${OIDC_TOKEN}" \
-            -H "Content-Type: application/json" \
-            -d "{\"app_name\":\"private-llm\",\"app_version\":\"${{ github.sha }}\",\"compose\":\"${COMPOSE_B64}\",\"node_size\":\"standard\"}")
-          HTTP_CODE=$(echo "${RESPONSE}" | tail -1)
-          BODY=$(echo "${RESPONSE}" | sed '$d')
-          echo "HTTP ${HTTP_CODE}: ${BODY}"
-          if [ "${HTTP_CODE}" -lt 200 ] || [ "${HTTP_CODE}" -ge 300 ]; then
-            echo "::error::LLM deploy failed: ${BODY}"
-            exit 1
-          fi
-
-      - name: Cleanup
+      # ── Cleanup ─────────────────────────────────────────────────────────
+      - name: Cleanup SSH key
         if: always()
-        run: rm -f ~/.ssh/deploy_key
+        run: rm -f /tmp/deploy-key

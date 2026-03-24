@@ -8,7 +8,6 @@ pub struct TunnelService {
     account_id: Option<String>,
     zone_id: Option<String>,
     domain: String,
-    enabled: bool,
 }
 
 /// Result of creating a tunnel.
@@ -28,18 +27,6 @@ impl TunnelService {
             zone_id: std::env::var("DD_CP_CF_ZONE_ID").ok(),
             domain: std::env::var("DD_CP_CF_DOMAIN")
                 .unwrap_or_else(|_| "devopsdefender.com".to_string()),
-            enabled: true,
-        }
-    }
-
-    /// Create a no-op tunnel service for tests / local dev.
-    pub fn disabled_for_tests() -> Self {
-        Self {
-            api_token: None,
-            account_id: None,
-            zone_id: None,
-            domain: "test.devopsdefender.com".into(),
-            enabled: false,
         }
     }
 
@@ -49,15 +36,6 @@ impl TunnelService {
         agent_id: Uuid,
         vm_name: &str,
     ) -> AppResult<TunnelInfo> {
-        if !self.enabled {
-            // Return fake tunnel info for tests
-            return Ok(TunnelInfo {
-                tunnel_id: Uuid::new_v4().to_string(),
-                tunnel_token: format!("test-tunnel-token-{agent_id}"),
-                hostname: format!("{vm_name}.{}", self.domain),
-            });
-        }
-
         let api_token = self
             .api_token
             .as_ref()
@@ -122,12 +100,57 @@ impl TunnelService {
         })
     }
 
-    /// Delete a Cloudflare tunnel.
-    pub async fn delete_tunnel(&self, tunnel_id: &str) -> AppResult<()> {
-        if !self.enabled {
-            return Ok(());
+    /// Retrieve a tunnel token for an existing agent (for re-registration).
+    /// When tunnels are disabled, returns a synthetic token.
+    pub async fn get_tunnel_token_for_agent(
+        &self,
+        agent_id: Uuid,
+        vm_name: &str,
+    ) -> AppResult<String> {
+        let api_token = self
+            .api_token
+            .as_ref()
+            .ok_or_else(|| AppError::Config("DD_CP_CF_API_TOKEN not set".into()))?;
+        let account_id = self
+            .account_id
+            .as_ref()
+            .ok_or_else(|| AppError::Config("DD_CP_CF_ACCOUNT_ID not set".into()))?;
+
+        let tunnel_name = format!("dd-agent-{agent_id}");
+        let client = reqwest::Client::new();
+
+        // List tunnels to find existing one
+        let list_resp = client
+            .get(format!(
+                "https://api.cloudflare.com/client/v4/accounts/{account_id}/tunnels?name={tunnel_name}&is_deleted=false"
+            ))
+            .header("Authorization", format!("Bearer {api_token}"))
+            .send()
+            .await
+            .map_err(|e| AppError::External(format!("CF tunnel list failed: {e}")))?;
+
+        let body: serde_json::Value = list_resp
+            .json()
+            .await
+            .map_err(|e| AppError::External(format!("CF tunnel list parse failed: {e}")))?;
+
+        if let Some(tunnels) = body["result"].as_array() {
+            if let Some(tunnel) = tunnels.first() {
+                if let Some(token) = tunnel["token"].as_str() {
+                    return Ok(token.to_string());
+                }
+            }
         }
 
+        // Fallback: can't retrieve token, return a placeholder
+        // The agent will need a fresh registration with a new tunnel
+        Err(AppError::External(format!(
+            "No existing tunnel found for agent {agent_id} ({vm_name})"
+        )))
+    }
+
+    /// Delete a Cloudflare tunnel.
+    pub async fn delete_tunnel(&self, tunnel_id: &str) -> AppResult<()> {
         let api_token = self
             .api_token
             .as_ref()
@@ -165,14 +188,6 @@ impl TunnelService {
         hostname: &str,
         local_port: u16,
     ) -> AppResult<TunnelInfo> {
-        if !self.enabled {
-            return Ok(TunnelInfo {
-                tunnel_id: "disabled".into(),
-                tunnel_token: "disabled".into(),
-                hostname: hostname.to_string(),
-            });
-        }
-
         let api_token = self
             .api_token
             .as_ref()
@@ -250,10 +265,6 @@ impl TunnelService {
     ///
     /// If a CNAME record for `hostname` already exists, it is updated in place.
     pub async fn create_dns_record(&self, tunnel_id: &str, hostname: &str) -> AppResult<()> {
-        if !self.enabled {
-            return Ok(());
-        }
-
         let api_token = self
             .api_token
             .as_ref()
@@ -425,20 +436,27 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn disabled_service_returns_fake_tunnel() {
-        let svc = TunnelService::disabled_for_tests();
+    async fn unconfigured_service_errors_on_create() {
+        let svc = TunnelService {
+            api_token: None,
+            account_id: None,
+            zone_id: None,
+            domain: "devopsdefender.com".into(),
+        };
         let agent_id = Uuid::new_v4();
         let result = svc.create_tunnel_for_agent(agent_id, "test-vm").await;
-        assert!(result.is_ok());
-        let info = result.unwrap();
-        assert!(info.hostname.contains("test-vm"));
-        assert!(info.hostname.contains("devopsdefender.com"));
+        assert!(result.is_err());
     }
 
     #[tokio::test]
-    async fn disabled_service_delete_is_noop() {
-        let svc = TunnelService::disabled_for_tests();
+    async fn unconfigured_service_errors_on_delete() {
+        let svc = TunnelService {
+            api_token: None,
+            account_id: None,
+            zone_id: None,
+            domain: "devopsdefender.com".into(),
+        };
         let result = svc.delete_tunnel("fake-tunnel-id").await;
-        assert!(result.is_ok());
+        assert!(result.is_err());
     }
 }

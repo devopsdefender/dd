@@ -14,6 +14,7 @@ MEMORY="4G"
 CPUS="2"
 PORT_FORWARDS=()
 VFIO_DEVICE=""
+TDX="false"
 VM_DIR="/var/lib/devopsdefender/vms"
 CONFIG_MODE="agent"  # agent or control-plane
 
@@ -28,6 +29,7 @@ Usage: $0 [options]
   --cpus N              VM CPUs (default: 2)
   --port-forward H:G    Forward host port H to guest port G (repeatable)
   --vfio-device ADDR    PCI device to pass through via VFIO (e.g. 0d:00.0)
+  --tdx                 Launch as Intel TDX confidential VM (requires TDX host)
 EOF
   exit 1
 }
@@ -42,6 +44,7 @@ while [[ $# -gt 0 ]]; do
     --cpus) CPUS="$2"; shift 2 ;;
     --port-forward) PORT_FORWARDS+=("$2"); shift 2 ;;
     --vfio-device) VFIO_DEVICE="$2"; shift 2 ;;
+    --tdx) TDX="true"; shift ;;
     --help|-h) usage ;;
     *) echo "Unknown option: $1" >&2; usage ;;
   esac
@@ -124,17 +127,38 @@ fi
 # Build QEMU command.
 QEMU_ARGS=(
   qemu-system-x86_64
-  -enable-kvm
-  -machine q35
   -cpu host
   -m "$MEMORY"
   -smp "$CPUS"
-  -drive "file=${OVERLAY},format=qcow2,if=virtio"
-  -drive "file=${CIDATA_ISO},format=raw,if=virtio,readonly=on"
   -display none
-  -serial file:${VM_WORK_DIR}/${VM_NAME}.log
   -daemonize
   -pidfile "${VM_WORK_DIR}/${VM_NAME}.pid"
+)
+
+if [ "$TDX" = "true" ]; then
+  # TDX confidential VM: requires TDVF firmware, vsock for quote generation.
+  # Use -accel kvm (not -enable-kvm) — required for TDX machine type.
+  TDVF_FIRMWARE="/usr/share/ovmf/OVMF.fd"
+  if [ ! -f "$TDVF_FIRMWARE" ]; then
+    echo "Error: TDVF firmware not found: $TDVF_FIRMWARE" >&2
+    exit 1
+  fi
+  QEMU_ARGS+=(
+    -accel kvm
+    -object '{"qom-type":"tdx-guest","id":"tdx","quote-generation-socket":{"type":"vsock","cid":"2","port":"4050"}}'
+    -machine q35,kernel_irqchip=split,confidential-guest-support=tdx,hpet=off
+    -bios "$TDVF_FIRMWARE"
+    -device vhost-vsock-pci,guest-cid=3
+  )
+  echo "    TDX: enabled (confidential VM)"
+else
+  QEMU_ARGS+=(-accel kvm -machine q35)
+fi
+
+QEMU_ARGS+=(
+  -drive "file=${OVERLAY},format=qcow2,if=virtio"
+  -drive "file=${CIDATA_ISO},format=raw,if=virtio,readonly=on"
+  -serial "file:${VM_WORK_DIR}/${VM_NAME}.log"
 )
 
 # Pass through VFIO device (GPU) if requested.
@@ -160,6 +184,7 @@ echo "==> Launching VM: ${VM_NAME}"
 echo "    Memory: ${MEMORY}, CPUs: ${CPUS}"
 echo "    Overlay: ${OVERLAY}"
 echo "    Config mode: ${CONFIG_MODE}"
+echo "    TDX: ${TDX}"
 echo "    SSH port: ${SSH_PORT}"
 if [ -n "$VFIO_DEVICE" ]; then
   echo "    VFIO device: ${VFIO_DEVICE}"
@@ -192,6 +217,7 @@ cat > "${VM_WORK_DIR}/vm-info.json" <<INFO
   "ssh_port": ${SSH_PORT},
   "port_forwards": "$(IFS=,; echo "${PORT_FORWARDS[*]+"${PORT_FORWARDS[*]}"}")",
   "vfio_device": "${VFIO_DEVICE}",
+  "tdx": ${TDX},
   "started_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 }
 INFO

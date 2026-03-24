@@ -106,11 +106,8 @@ Central management API for agent registration, deployment orchestration, health 
 
 **Deployment:** Multi-stage Dockerfile (Rust builder → debian bookworm-slim runtime with cloudflared).
 
-**Infrastructure** (`infra/`): Ansible playbooks for GCP and baremetal deployments. Key playbooks:
-- `gcp-control-plane-new.yml` — launch TDX-enabled GCP VM for control plane
-- `gcp-vm-fleet-new.yml` — launch agent fleet
-- `gcp-image-bake.yml` — build VM images
-- `baremetal-deploy.yml` — bare metal deployment
+**Infrastructure** (`infra/`): Ansible playbooks for deploying agent VMs via KVM on dedicated OVH hardware. Key playbook:
+- `baremetal-agent-deploy.yml` — build image via Packer + deploy agent as KVM VM on OVH dedicated server
 
 ### images/ (Packer)
 
@@ -201,9 +198,9 @@ cd private-llm && docker compose up
 
 All infrastructure is managed through GitHub Actions. **Never SSH into hosts, run Ansible locally, or attempt manual fixes on VMs.** If staging or production is down, trigger the appropriate GitHub Actions workflow.
 
-**Staging** (`staging-deploy.yml`) — auto-deploys on push to `main`. Pipeline: build → bake GCP agent image → cleanup old VMs → deploy via Ansible → smoke check `app-staging.devopsdefender.com/health`.
+**Staging** (`baremetal-staging-deploy.yml`) — auto-deploys on push to `main`. Deploys the agent as a KVM VM on a dedicated OVH server. Pipeline: build → Packer bake on host → deploy agent VM via KVM → deploy private-llm.
 
-**Production** (`production-deploy.yml`) — manual trigger only (`workflow_dispatch`). Inputs: `num_tiny_agents`, `num_standard_agents`, `num_llm_agents`. Same pipeline as staging.
+**Production** (`baremetal-production-deploy.yml`) — manual trigger only (`workflow_dispatch`). Deploys the agent as a KVM VM on dedicated OVH hardware with GPU passthrough. Inputs: `vfio_device`, `agent_memory`, `agent_cpus`.
 
 **Health check URLs:**
 - Staging: `https://app-staging.devopsdefender.com/health`
@@ -212,18 +209,18 @@ All infrastructure is managed through GitHub Actions. **Never SSH into hosts, ru
 **To deploy or fix an environment**, use `gh workflow run` or the GitHub Actions UI:
 ```bash
 # Trigger staging deploy
-gh workflow run staging-deploy.yml --repo devopsdefender/control-plane
+gh workflow run baremetal-staging-deploy.yml
 
 # Trigger production deploy
-gh workflow run production-deploy.yml --repo devopsdefender/control-plane \
-  -f num_tiny_agents=0 -f num_standard_agents=0 -f num_llm_agents=1
+gh workflow run baremetal-production-deploy.yml \
+  -f vfio_device=0d:00.0 -f agent_memory=128G -f agent_cpus=32
 ```
 
 ## CI/CD Pipelines
 
 Each component has its own GitHub Actions workflows:
 - **agent**: `ci.yml` (check/test/fmt/clippy), `release.yml` (build binary + GitHub release)
-- **control-plane**: `ci.yml`, `staging-deploy.yml`, `production-deploy.yml`, `release.yml`
+- **control-plane**: `ci.yml`, `baremetal-staging-deploy.yml`, `baremetal-production-deploy.yml`, `release.yml`
 - **images**: `baremetal-image.yml` (Packer build on self-hosted runner)
 - **private-llm**: `deploy.yml` (OIDC-authenticated deployment to DD platform)
 - **website**: `pages.yml` (GitHub Pages deployment)

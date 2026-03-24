@@ -74,6 +74,11 @@ pub struct AgentRuntimeConfig {
     /// Catch-all key/value pairs forwarded as environment variables.
     #[serde(default)]
     pub raw_kv: HashMap<String, String>,
+
+    /// Skip TDX attestation — set via agent.json for non-TDX environments (e.g. staging).
+    /// Not settable via environment variable to prevent accidental prod bypass.
+    #[serde(default)]
+    pub skip_attestation: bool,
 }
 
 fn default_mode() -> AgentMode {
@@ -93,6 +98,7 @@ impl Default for AgentRuntimeConfig {
             provided_app: None,
             port: None,
             raw_kv: HashMap::new(),
+            skip_attestation: false,
         }
     }
 }
