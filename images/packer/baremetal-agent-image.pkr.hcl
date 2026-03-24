@@ -107,15 +107,20 @@ build {
   name    = "dd-baremetal-agent"
   sources = ["source.qemu.baremetal"]
 
+  provisioner "shell-local" {
+    inline = [
+      "if [ -n \"${var.cp_binary_path}\" ] && [ -f \"${var.cp_binary_path}\" ]; then cp \"${var.cp_binary_path}\" /tmp/dd-cp-upload; else touch /tmp/dd-cp-upload; fi"
+    ]
+  }
+
   provisioner "file" {
     source      = var.agent_binary_path
     destination = "/tmp/dd-agent"
   }
 
   provisioner "file" {
-    source      = var.cp_binary_path
+    source      = "/tmp/dd-cp-upload"
     destination = "/tmp/dd-cp"
-    only        = [for s in ["source.qemu.baremetal"] : s if var.cp_binary_path != ""]
   }
 
   provisioner "shell" {

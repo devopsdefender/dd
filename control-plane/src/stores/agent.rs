@@ -88,6 +88,25 @@ pub fn get_agent(db: &Db, id: &str) -> AppResult<Option<AgentRow>> {
     Ok(result)
 }
 
+/// Find an agent by VM name (most recent first).
+pub fn find_agent_by_vm_name(db: &Db, vm_name: &str) -> AppResult<Option<AgentRow>> {
+    let conn = db.lock().unwrap();
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, vm_name, status, registration_state, hostname, tunnel_id, \
+             mrtd, tcb_status, node_size, datacenter, github_owner, created_at, last_heartbeat_at \
+             FROM agents WHERE vm_name = ?1 ORDER BY created_at DESC LIMIT 1",
+        )
+        .map_err(|_| AppError::Internal)?;
+
+    let result = stmt
+        .query_row(params![vm_name], row_to_agent)
+        .optional()
+        .map_err(|_| AppError::Internal)?;
+
+    Ok(result)
+}
+
 /// List all agents.
 pub fn list_agents(db: &Db) -> AppResult<Vec<AgentRow>> {
     let conn = db.lock().unwrap();

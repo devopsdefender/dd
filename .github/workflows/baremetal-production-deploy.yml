@@ -1,24 +1,43 @@
+# Baremetal Production Deploy
+#
+# Builds the agent + control-plane binaries, bakes a VM image on the production
+# host via Packer, and launches the new agent VM.
+#
+# Trigger: automatic on push to main (after PR has been validated on staging).
+# Dispatch inputs let you override GPU PCI address, memory, and CPU count —
+# but sensible defaults come from infra/ansible/inventory/production.yml.
+#
+# App deployment (private-llm etc.) is handled by the private-llm repo,
+# not here. This workflow owns infra only.
+
 name: Baremetal Production Deploy
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - "agent/**"
+      - "control-plane/**"
+      - "images/**"
+      - "infra/**"
+      - ".github/workflows/baremetal-*"
   workflow_dispatch:
     inputs:
       vfio_device:
-        description: "PCI address for GPU passthrough"
+        description: "PCI address for GPU passthrough (e.g. 0d:00.0)"
         default: "0d:00.0"
       agent_memory:
-        description: "Agent VM memory"
-        default: "128G"
+        description: "Agent VM memory (overrides inventory default)"
+        default: ""
       agent_cpus:
-        description: "Agent VM CPUs"
-        default: "32"
+        description: "Agent VM CPUs (overrides inventory default)"
+        default: ""
 
 concurrency:
   group: dd-baremetal-production
-  cancel-in-progress: false
+  cancel-in-progress: false   # Never cancel an in-progress production deploy
 
 permissions:
-  id-token: write
   contents: read
 
 jobs:
@@ -26,55 +45,60 @@ jobs:
     runs-on: ubuntu-latest
     environment: production
     steps:
+      # ── Build binaries ──────────────────────────────────────────────────
       - uses: actions/checkout@v4
+
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+
+      # Build both dd-agent and dd-cp in release mode
       - run: cargo build --workspace --release
+
       - run: pip install ansible
 
+      # ── SSH setup ───────────────────────────────────────────────────────
+      # Write the deploy key to the path the inventory expects (/tmp/deploy-key)
       - name: Set up SSH
         run: |
-          mkdir -p ~/.ssh
-          echo "${{ secrets.BAREMETAL_SSH_KEY }}" > ~/.ssh/deploy_key
-          chmod 600 ~/.ssh/deploy_key
-          ssh-keyscan -H "${{ vars.BAREMETAL_PRODUCTION_HOST }}" >> ~/.ssh/known_hosts 2>/dev/null
+          echo "${{ secrets.BAREMETAL_SSH_KEY }}" > /tmp/deploy-key
+          chmod 600 /tmp/deploy-key
+          ssh-keyscan -H 162.222.34.121 >> ~/.ssh/known_hosts 2>/dev/null || true
 
+      # ── Deploy agent VM ─────────────────────────────────────────────────
+      # Runs the baremetal-agent-deploy playbook against the production inventory.
+      # Build-time vars and GPU passthrough are passed with -e.
+      # Workflow dispatch inputs override inventory defaults when provided.
       - name: Deploy agent to production host
         env:
           ANSIBLE_HOST_KEY_CHECKING: "false"
         run: |
           sha12="$(echo "${{ github.sha }}" | cut -c1-12)"
+          EXTRA_VARS=(
+            -e "agent_binary_local=${GITHUB_WORKSPACE}/target/release/dd-agent"
+            -e "cp_binary_local=${GITHUB_WORKSPACE}/target/release/dd-cp"
+            -e "packer_template_dir=${GITHUB_WORKSPACE}/images/packer"
+            -e "image_name=dd-baremetal-${sha12}"
+            -e "vfio_device=${{ inputs.vfio_device || '0d:00.0' }}"
+          )
+          # Only override inventory defaults when the dispatch input is non-empty
+          if [ -n "${{ inputs.agent_memory }}" ]; then
+            EXTRA_VARS+=(-e "agent_memory=${{ inputs.agent_memory }}")
+          fi
+          if [ -n "${{ inputs.agent_cpus }}" ]; then
+            EXTRA_VARS+=(-e "agent_cpus=${{ inputs.agent_cpus }}")
+          fi
+          EXTRA_VARS+=(
+            -e "dd_intel_api_key=${{ secrets.INTEL_API_KEY }}"
+            -e "dd_cp_admin_password=${{ secrets.DD_CP_ADMIN_PASSWORD }}"
+            -e "dd_cp_cf_api_token=${{ secrets.DD_CP_CF_API_TOKEN }}"
+            -e "dd_cp_cf_account_id=${{ secrets.DD_CP_CF_ACCOUNT_ID }}"
+            -e "dd_cp_cf_zone_id=${{ secrets.DD_CP_CF_ZONE_ID }}"
+          )
           ansible-playbook infra/ansible/playbooks/baremetal-agent-deploy.yml \
-            -i "${{ vars.BAREMETAL_PRODUCTION_HOST }}," \
-            -u "${{ vars.BAREMETAL_PRODUCTION_USER }}" \
-            --private-key ~/.ssh/deploy_key \
-            -e "agent_binary_local=${GITHUB_WORKSPACE}/target/release/dd-agent" \
-            -e "cp_binary_local=${GITHUB_WORKSPACE}/target/release/dd-cp" \
-            -e "packer_template_dir=${GITHUB_WORKSPACE}/images/packer" \
-            -e "image_name=dd-baremetal-${sha12}" \
-            -e "dd_env=production" \
-            -e "cp_url=https://app.${{ vars.DD_CF_DOMAIN || 'devopsdefender.com' }}" \
-            -e "dd_skip_attestation=true" \
-            -e "agent_node_size=llm" \
-            -e "agent_memory=${{ inputs.agent_memory }}" \
-            -e "agent_cpus=${{ inputs.agent_cpus }}" \
-            -e "vfio_device=${{ inputs.vfio_device }}"
+            -i infra/ansible/inventory/production.yml \
+            "${EXTRA_VARS[@]}"
 
-      - name: Deploy private-llm (H100 GPU mode)
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          CP_URL="https://app.${{ vars.DD_CF_DOMAIN || 'devopsdefender.com' }}"
-          OIDC_TOKEN=$(curl -s -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
-            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=devopsdefender" | jq -r '.value')
-          gh api repos/devopsdefender/private-llm/contents/docker-compose.h100.yml \
-            -H "Accept: application/vnd.github.raw" > /tmp/compose.yml
-          COMPOSE_B64=$(base64 -w0 /tmp/compose.yml)
-          curl -sf -X POST "${CP_URL}/api/v1/deploy" \
-            -H "Authorization: Bearer ${OIDC_TOKEN}" \
-            -H "Content-Type: application/json" \
-            -d "{\"app_name\":\"private-llm\",\"app_version\":\"${{ github.sha }}\",\"compose\":\"${COMPOSE_B64}\",\"node_size\":\"llm\"}"
-
-      - name: Cleanup
+      # ── Cleanup ─────────────────────────────────────────────────────────
+      - name: Cleanup SSH key
         if: always()
-        run: rm -f ~/.ssh/deploy_key
+        run: rm -f /tmp/deploy-key

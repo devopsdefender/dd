@@ -109,6 +109,7 @@ Type=simple
 User=root
 Environment=DD_AGENT_MODE=control-plane
 Environment=DD_CONFIG=/etc/devopsdefender/control-plane.json
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
 ExecStart=/usr/local/bin/dd-agent
 Restart=on-failure
 RestartSec=5

@@ -49,38 +49,63 @@ async fn run_agent_mode(cfg: AgentRuntimeConfig) {
         }
     };
 
-    // 2. Obtain a challenge nonce from the control plane.
-    let challenge = match fetch_challenge(&http, &cp_url).await {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("dd-agent: challenge failed: {e}");
-            std::process::exit(1);
-        }
-    };
+    // 2–4. Challenge → attest → register (with retry + backoff).
+    let max_retries = 30u32;
+    let mut registration = None;
 
-    eprintln!(
-        "dd-agent: received nonce (expires in {}s)",
-        challenge.expires_in_seconds
-    );
-
-    // 3. Generate a TDX quote embedding the nonce as report data.
-    let quote_b64 = match dd_agent::attestation::tsm::generate_tdx_quote_base64() {
-        Ok(q) => q,
-        Err(e) => {
-            eprintln!("dd-agent: TDX quote generation failed: {e}");
-            std::process::exit(1);
-        }
-    };
-
-    // 4. Register with the control plane.
-    let registration =
-        match register_agent(&http, &cp_url, &challenge.nonce, &quote_b64, &cfg).await {
-            Ok(r) => r,
+    for attempt in 1..=max_retries {
+        // 2. Obtain a challenge nonce from the control plane.
+        let challenge = match fetch_challenge(&http, &cp_url).await {
+            Ok(c) => c,
             Err(e) => {
-                eprintln!("dd-agent: registration failed: {e}");
-                std::process::exit(1);
+                eprintln!("dd-agent: challenge failed (attempt {attempt}/{max_retries}): {e}");
+                backoff_sleep(attempt).await;
+                continue;
             }
         };
+
+        eprintln!(
+            "dd-agent: received nonce (expires in {}s)",
+            challenge.expires_in_seconds
+        );
+
+        // 3. Generate a TDX quote embedding the nonce as report data.
+        // skip_attestation is only settable via agent.json (not env vars) to prevent
+        // accidental bypass in production. Staging sets this to true via Ansible.
+        let quote_b64 = if cfg.skip_attestation {
+            eprintln!("dd-agent: skip_attestation=true (non-TDX host), skipping quote generation");
+            String::new()
+        } else {
+            match dd_agent::attestation::tsm::generate_tdx_quote_base64() {
+                Ok(q) => q,
+                Err(e) => {
+                    eprintln!("dd-agent: TDX quote generation failed (attempt {attempt}/{max_retries}): {e}");
+                    backoff_sleep(attempt).await;
+                    continue;
+                }
+            }
+        };
+
+        // 4. Register with the control plane.
+        match register_agent(&http, &cp_url, &challenge.nonce, &quote_b64, &cfg).await {
+            Ok(r) => {
+                registration = Some(r);
+                break;
+            }
+            Err(e) => {
+                eprintln!("dd-agent: registration failed (attempt {attempt}/{max_retries}): {e}");
+                backoff_sleep(attempt).await;
+            }
+        }
+    }
+
+    let registration = match registration {
+        Some(r) => r,
+        None => {
+            eprintln!("dd-agent: registration failed after {max_retries} attempts, exiting");
+            std::process::exit(1);
+        }
+    };
 
     eprintln!(
         "dd-agent: registered as {} at {}",
@@ -107,7 +132,7 @@ async fn fetch_challenge(
     http: &reqwest::Client,
     cp_url: &str,
 ) -> Result<AgentChallengeResponse, String> {
-    let url = format!("{cp_url}/api/agents/challenge");
+    let url = format!("{cp_url}/api/v1/agents/challenge");
     let resp = http
         .get(&url)
         .send()
@@ -130,11 +155,11 @@ async fn register_agent(
     quote_b64: &str,
     cfg: &AgentRuntimeConfig,
 ) -> Result<AgentRegisterResponse, String> {
-    let url = format!("{cp_url}/api/agents/register");
+    let url = format!("{cp_url}/api/v1/agents/register");
 
     let body = serde_json::json!({
         "nonce": nonce,
-        "quote": quote_b64,
+        "intel_ta_token": quote_b64,
         "vm_name": hostname(),
         "node_size": cfg.node_size,
         "datacenter": cfg.datacenter,
@@ -223,7 +248,7 @@ async fn run_workloads(cfg: &AgentRuntimeConfig) -> Result<(), String> {
 }
 
 async fn heartbeat_loop(http: &reqwest::Client, cp_url: &str, agent_id: &str) {
-    let url = format!("{cp_url}/api/agents/{agent_id}/heartbeat");
+    let url = format!("{cp_url}/api/v1/agents/{agent_id}/heartbeat");
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
 
     loop {
@@ -269,7 +294,13 @@ async fn check_cloudflared() {
 fn run_control_plane_mode(cfg: AgentRuntimeConfig) {
     eprintln!("dd-agent: starting control plane (dd-cp)");
 
-    let mut cmd = std::process::Command::new("dd-cp");
+    // Use absolute path so the binary is found regardless of systemd PATH restrictions.
+    let dd_cp = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("dd-cp")))
+        .filter(|p| p.exists())
+        .unwrap_or_else(|| std::path::PathBuf::from("/usr/local/bin/dd-cp"));
+    let mut cmd = std::process::Command::new(&dd_cp);
 
     // Forward relevant configuration as environment variables.
     if let Some(ref dc) = cfg.datacenter {
@@ -302,6 +333,12 @@ fn run_control_plane_mode(cfg: AgentRuntimeConfig) {
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────
+
+/// Exponential backoff: 5s, 10s, 20s, … capped at 60s.
+async fn backoff_sleep(attempt: u32) {
+    let secs = std::cmp::min(5 * 2u64.saturating_pow(attempt.saturating_sub(1)), 60);
+    tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+}
 
 /// Best-effort hostname for this VM.
 fn hostname() -> String {

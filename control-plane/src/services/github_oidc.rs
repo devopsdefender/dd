@@ -22,11 +22,6 @@ impl GithubOidcService {
         }
     }
 
-    /// Create a disabled service for tests.
-    pub fn disabled_for_tests() -> Self {
-        Self { verifier: None }
-    }
-
     /// Verify a GitHub OIDC token and return the claims.
     pub async fn verify_token(&self, token: &str) -> AppResult<serde_json::Value> {
         match &self.verifier {
