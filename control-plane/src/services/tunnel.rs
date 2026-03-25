@@ -202,7 +202,87 @@ impl TunnelService {
 
         let client = reqwest::Client::new();
 
-        // 1. Create the tunnel.
+        // 1. Try to find an existing tunnel with this name first.
+        let existing = self
+            .find_tunnel_by_name(&client, api_token, account_id, &tunnel_name)
+            .await?;
+
+        let (tunnel_id, tunnel_token) = if let Some(existing_id) = existing {
+            // Tunnel already exists — delete and recreate so we get a fresh token.
+            // (CF doesn't expose the token after initial creation.)
+            let _ = self.delete_tunnel(&existing_id).await;
+
+            let (id, token) = self
+                .create_tunnel_raw(&client, api_token, account_id, &tunnel_name, &tunnel_secret)
+                .await?;
+            (id, token)
+        } else {
+            self.create_tunnel_raw(&client, api_token, account_id, &tunnel_name, &tunnel_secret)
+                .await?
+        };
+
+        // 2. Configure tunnel ingress to route to localhost.
+        self.configure_tunnel_ingress(
+            &tunnel_id,
+            hostname,
+            &format!("http://localhost:{local_port}"),
+        )
+        .await?;
+
+        // 3. Create DNS CNAME record.
+        self.create_dns_record(&tunnel_id, hostname).await?;
+
+        // 4. Spawn cloudflared.
+        Self::spawn_cloudflared(&tunnel_token)?;
+
+        Ok(TunnelInfo {
+            tunnel_id,
+            tunnel_token,
+            hostname: hostname.to_string(),
+        })
+    }
+
+    /// Look up an existing tunnel by name, returning its ID if found.
+    async fn find_tunnel_by_name(
+        &self,
+        client: &reqwest::Client,
+        api_token: &str,
+        account_id: &str,
+        tunnel_name: &str,
+    ) -> AppResult<Option<String>> {
+        let resp = client
+            .get(format!(
+                "https://api.cloudflare.com/client/v4/accounts/{account_id}/cfd_tunnel?name={tunnel_name}&is_deleted=false"
+            ))
+            .header("Authorization", format!("Bearer {api_token}"))
+            .send()
+            .await;
+
+        match resp {
+            Ok(r) if r.status().is_success() => {
+                let body: serde_json::Value = r
+                    .json()
+                    .await
+                    .map_err(|e| AppError::External(format!("CF tunnel list parse: {e}")))?;
+                Ok(body["result"]
+                    .as_array()
+                    .and_then(|arr| arr.first())
+                    .and_then(|t| t["id"].as_str())
+                    .map(|s| s.to_string()))
+            }
+            _ => Ok(None), // Non-fatal: if lookup fails, fall through to create.
+        }
+    }
+
+    /// Low-level tunnel creation — returns (tunnel_id, tunnel_token).
+    async fn create_tunnel_raw(
+        &self,
+        client: &reqwest::Client,
+        api_token: &str,
+        account_id: &str,
+        tunnel_name: &str,
+        tunnel_secret: &str,
+    ) -> AppResult<(String, String)> {
         let create_resp = client
             .post(format!(
                 "https://api.cloudflare.com/client/v4/accounts/{account_id}/cfd_tunnel"
@@ -237,28 +317,10 @@ impl TunnelService {
             .to_string();
         let tunnel_token = resp_body["result"]["token"]
             .as_str()
-            .unwrap_or(&tunnel_secret)
+            .unwrap_or(tunnel_secret)
             .to_string();
 
-        // 2. Configure tunnel ingress to route to localhost.
-        self.configure_tunnel_ingress(
-            &tunnel_id,
-            hostname,
-            &format!("http://localhost:{local_port}"),
-        )
-        .await?;
-
-        // 3. Create DNS CNAME record.
-        self.create_dns_record(&tunnel_id, hostname).await?;
-
-        // 4. Spawn cloudflared.
-        Self::spawn_cloudflared(&tunnel_token)?;
-
-        Ok(TunnelInfo {
-            tunnel_id,
-            tunnel_token,
-            hostname: hostname.to_string(),
-        })
+        Ok((tunnel_id, tunnel_token))
     }
 
     /// Create or update a CNAME DNS record pointing to a tunnel.
