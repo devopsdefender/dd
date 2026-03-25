@@ -4,6 +4,7 @@ mod oci;
 
 use config::{AgentMode, AgentRuntimeConfig};
 use dd_agent::api::{AgentChallengeResponse, AgentRegisterResponse};
+use dd_agent::attestation::ita::ItaClient;
 
 // ── Entry point ────────────────────────────────────────────────────────────
 
@@ -52,6 +53,20 @@ async fn run_agent_mode(cfg: AgentRuntimeConfig) {
     // 2–4. Challenge → attest → register (with retry + backoff).
     let max_retries = 30u32;
     let mut registration = None;
+    let ita_api_key = match &cfg.intel_api_key {
+        Some(key) if !key.is_empty() => key.clone(),
+        _ => {
+            eprintln!("dd-agent: intel_api_key / DD_INTEL_API_KEY not set");
+            std::process::exit(1);
+        }
+    };
+    let ita_client = match ItaClient::new("https://api.trustauthority.intel.com", &ita_api_key) {
+        Ok(client) => client,
+        Err(e) => {
+            eprintln!("dd-agent: failed to initialize ITA client: {e}");
+            std::process::exit(1);
+        }
+    };
 
     for attempt in 1..=max_retries {
         // 2. Obtain a challenge nonce from the control plane.
@@ -69,12 +84,43 @@ async fn run_agent_mode(cfg: AgentRuntimeConfig) {
             challenge.expires_in_seconds
         );
 
-        // 3. Generate a TDX quote embedding the nonce as report data.
-        let quote_b64 = match dd_agent::attestation::tsm::generate_tdx_quote_base64() {
-            Ok(q) => q,
+        let runtime_data = challenge.nonce.as_bytes();
+        let runtime_data_b64 = dd_agent::attestation::ita::encode_runtime_data(runtime_data);
+
+        let ita_nonce = match ita_client.get_nonce().await {
+            Ok(nonce) => nonce,
             Err(e) => {
                 eprintln!(
+                    "dd-agent: ITA nonce fetch failed (attempt {attempt}/{max_retries}): {e}"
+                );
+                backoff_sleep(attempt).await;
+                continue;
+            }
+        };
+
+        let report_data = dd_agent::attestation::ita::build_report_data(&ita_nonce, runtime_data);
+
+        // 3. Generate a TDX quote embedding the ITA nonce hash as report data.
+        let quote_b64 =
+            match dd_agent::attestation::tsm::generate_tdx_quote_base64(Some(&report_data)) {
+                Ok(q) => q,
+                Err(e) => {
+                    eprintln!(
                     "dd-agent: TDX quote generation failed (attempt {attempt}/{max_retries}): {e}"
+                );
+                    backoff_sleep(attempt).await;
+                    continue;
+                }
+            };
+
+        let ita_token = match ita_client
+            .attest(&quote_b64, &ita_nonce, Some(&runtime_data_b64))
+            .await
+        {
+            Ok(token) => token,
+            Err(e) => {
+                eprintln!(
+                    "dd-agent: ITA attestation failed (attempt {attempt}/{max_retries}): {e}"
                 );
                 backoff_sleep(attempt).await;
                 continue;
@@ -82,7 +128,7 @@ async fn run_agent_mode(cfg: AgentRuntimeConfig) {
         };
 
         // 4. Register with the control plane.
-        match register_agent(&http, &cp_url, &challenge.nonce, &quote_b64, &cfg).await {
+        match register_agent(&http, &cp_url, &challenge.nonce, &ita_token, &cfg).await {
             Ok(r) => {
                 registration = Some(r);
                 break;
@@ -147,14 +193,14 @@ async fn register_agent(
     http: &reqwest::Client,
     cp_url: &str,
     nonce: &str,
-    quote_b64: &str,
+    ita_token: &str,
     cfg: &AgentRuntimeConfig,
 ) -> Result<AgentRegisterResponse, String> {
     let url = format!("{cp_url}/api/v1/agents/register");
 
     let body = serde_json::json!({
         "nonce": nonce,
-        "intel_ta_token": quote_b64,
+        "intel_ta_token": ita_token,
         "vm_name": hostname(),
         "node_size": cfg.node_size,
         "datacenter": cfg.datacenter,

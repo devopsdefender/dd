@@ -10,7 +10,7 @@ pub fn run_measure_mode() {
     // In a real TDX VM this would generate a live quote.  When running
     // outside a TDX environment the tsm calls will fail, which is
     // expected during development.
-    match tsm::generate_tdx_quote_base64() {
+    match tsm::generate_tdx_quote_base64(None) {
         Ok(b64_quote) => match tsm::parse_tdx_quote_base64(&b64_quote) {
             Ok(parsed) => {
                 println!("mrtd:        {}", parsed.mrtd_hex());

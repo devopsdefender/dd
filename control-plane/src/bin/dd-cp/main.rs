@@ -1,7 +1,7 @@
 use dd_control_plane::config::CpConfig;
 use dd_control_plane::db;
 use dd_control_plane::routes;
-use dd_control_plane::services::attestation::{AttestationService, RuntimeEnv};
+use dd_control_plane::services::attestation::AttestationService;
 use dd_control_plane::services::github_oidc::GithubOidcService;
 use dd_control_plane::services::tunnel::TunnelService;
 use dd_control_plane::state::AppState;
@@ -23,13 +23,12 @@ async fn main() {
     let mut state = AppState::from_env(db);
 
     // Override with real services if configured
-    let env = RuntimeEnv::detect();
     if let Ok(ita_url) = std::env::var("DD_CP_ITA_JWKS_URL") {
         let ita_issuer = std::env::var("DD_CP_ITA_ISSUER").ok();
         let ita_audience = std::env::var("DD_CP_ITA_AUDIENCE").ok();
         let verifier =
             dd_control_plane::attestation::ita::ItaVerifier::new(ita_url, ita_issuer, ita_audience);
-        state.attestation = AttestationService::new(verifier, env);
+        state.attestation = AttestationService::new(verifier);
     }
 
     if std::env::var("DD_CP_CF_API_TOKEN").is_ok() {

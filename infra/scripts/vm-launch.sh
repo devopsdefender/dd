@@ -103,7 +103,6 @@ write_files:
 $(echo "$CONFIG_CONTENT" | sed 's/^/      /')
 
 runcmd:
-  - modprobe tdx_guest || true
   - systemctl daemon-reload
   - systemctl disable --now ${SYSTEMD_DISABLE} || true
   - systemctl enable --now ${SYSTEMD_ENABLE}

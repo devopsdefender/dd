@@ -4,21 +4,21 @@ use crate::common::error::{AppError, AppResult};
 /// Runtime environment classification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuntimeEnv {
-    Local,
     Staging,
     Production,
 }
 
 impl RuntimeEnv {
     /// Detect runtime environment from DD_ENV or DD_CP_ENV env vars.
+    /// Panics if neither is set — every deployment must declare its environment.
     pub fn detect() -> Self {
         let val = std::env::var("DD_ENV")
             .or_else(|_| std::env::var("DD_CP_ENV"))
-            .unwrap_or_default();
+            .expect("DD_ENV or DD_CP_ENV must be set (staging or production)");
         match val.to_lowercase().as_str() {
             "production" | "prod" => RuntimeEnv::Production,
             "staging" | "stage" => RuntimeEnv::Staging,
-            _ => RuntimeEnv::Local,
+            other => panic!("unknown DD_ENV value '{other}' — must be 'staging' or 'production'"),
         }
     }
 }
@@ -31,26 +31,36 @@ pub struct VerifiedAttestation {
     pub rtmrs: Vec<String>,
 }
 
-/// High-level attestation service that wraps ItaVerifier with environment-specific policy.
+/// High-level attestation service that wraps ItaVerifier.
+/// There is no insecure mode — every environment requires real attestation.
 #[derive(Clone)]
 pub struct AttestationService {
     verifier: Option<ItaVerifier>,
-    env: RuntimeEnv,
 }
 
 impl AttestationService {
-    pub fn new(verifier: ItaVerifier, env: RuntimeEnv) -> Self {
+    pub fn new(verifier: ItaVerifier) -> Self {
         Self {
             verifier: Some(verifier),
-            env,
         }
+    }
+
+    /// Build an AttestationService with no verifier — only for tests.
+    /// All registration attempts will be rejected.
+    #[cfg(test)]
+    pub fn reject_all() -> Self {
+        Self { verifier: None }
     }
 
     /// Build from environment. Uses ITA verifier when DD_INTEL_API_KEY is set.
     /// Without the key, attestation verification will reject all tokens —
     /// this is intentional: there is no "insecure" mode.
+    ///
+    /// Panics if DD_ENV is not set (ensures every deployment declares its environment).
     pub fn from_env() -> Self {
-        let env = RuntimeEnv::detect();
+        // Force environment declaration — no silent fallback to "local".
+        let _env = RuntimeEnv::detect();
+
         if let Ok(api_key) = std::env::var("DD_INTEL_API_KEY") {
             let jwks_url = std::env::var("DD_ITA_JWKS_URL")
                 .unwrap_or_else(|_| "https://portal.trustauthority.intel.com/certs".into());
@@ -58,30 +68,22 @@ impl AttestationService {
             let audience = std::env::var("DD_ITA_AUDIENCE").ok().or(Some(api_key));
             Self {
                 verifier: Some(ItaVerifier::new(jwks_url, issuer, audience)),
-                env,
             }
         } else {
             eprintln!("dd-cp: DD_INTEL_API_KEY not set — attestation verification will reject all registration attempts");
-            Self {
-                verifier: None,
-                env,
-            }
+            Self { verifier: None }
         }
     }
 
     /// Validate that runtime requirements are met for the current environment.
+    /// All environments require a configured ITA verifier — there is no insecure mode.
     pub fn validate_runtime_requirements(&self) -> AppResult<()> {
-        match self.env {
-            RuntimeEnv::Production | RuntimeEnv::Staging => {
-                if self.verifier.is_none() {
-                    return Err(AppError::Config(
-                        "staging and production require a configured ITA verifier".into(),
-                    ));
-                }
-                Ok(())
-            }
-            RuntimeEnv::Local => Ok(()),
+        if self.verifier.is_none() {
+            return Err(AppError::Config(
+                "DD_INTEL_API_KEY is required — attestation verifier must be configured".into(),
+            ));
         }
+        Ok(())
     }
 
     /// Verify an agent registration token, returning attestation data.
@@ -125,20 +127,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn staging_requires_verifier() {
-        let svc = AttestationService {
-            verifier: None,
-            env: RuntimeEnv::Staging,
-        };
+    fn no_verifier_is_rejected() {
+        let svc = AttestationService { verifier: None };
         assert!(svc.validate_runtime_requirements().is_err());
     }
 
     #[test]
-    fn production_requires_verifier() {
-        let svc = AttestationService {
-            verifier: None,
-            env: RuntimeEnv::Production,
-        };
-        assert!(svc.validate_runtime_requirements().is_err());
+    fn empty_token_is_rejected() {
+        let svc = AttestationService { verifier: None };
+        let result = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(svc.verify_registration_token(""));
+        assert!(result.is_err());
     }
 }

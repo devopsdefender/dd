@@ -167,7 +167,7 @@ pub fn generate_tdx_quote(report_root: &str, user_data: &[u8]) -> AppResult<Vec<
 /// Generate a TDX quote and return it as a base64-encoded string.
 ///
 /// Uses the default configfs-tsm report path.
-pub fn generate_tdx_quote_base64() -> AppResult<String> {
+pub fn generate_tdx_quote_base64(user_data: Option<&[u8]>) -> AppResult<String> {
     use base64::Engine;
 
     // Create a unique report entry under configfs-tsm.
@@ -178,7 +178,7 @@ pub fn generate_tdx_quote_base64() -> AppResult<String> {
     std::fs::create_dir_all(&report_root)
         .map_err(|e| AppError::External(format!("create tsm report dir: {e}")))?;
 
-    let quote_bytes = generate_tdx_quote(&report_root, &[])?;
+    let quote_bytes = generate_tdx_quote(&report_root, user_data.unwrap_or(&[]))?;
 
     // Clean up.
     let _ = std::fs::remove_dir_all(&report_root);

@@ -70,8 +70,8 @@ impl AppState {
     }
 
     /// Build AppState suitable for testing with an in-memory DB.
-    /// Uses from_env() for all services — tests that need specific service
-    /// behaviour should set the appropriate env vars or mock at the route level.
+    /// Uses reject_all() for attestation — no env vars needed.
+    #[cfg(test)]
     pub fn for_testing(db: Db) -> Self {
         Self {
             boot_id: "test-boot-id".into(),
@@ -81,7 +81,7 @@ impl AppState {
             db: db.clone(),
             settings: SettingsStore::new(db),
             nonce: NonceService::new(300),
-            attestation: AttestationService::from_env(),
+            attestation: AttestationService::reject_all(),
             github_oidc: GithubOidcService::from_env(),
             tunnel: TunnelService::from_env(),
             check_ingest_token: Some("test-ingest-token".into()),

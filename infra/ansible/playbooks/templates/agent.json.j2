@@ -3,5 +3,5 @@
   "control_plane_url": "{{ cp_url | default('http://localhost:8080') }}",
   "node_size": "{{ agent_node_size | default('standard') }}",
   "datacenter": "{{ dd_env }}",
-  "skip_attestation": {{ dd_skip_attestation | default(false) | lower }}
+  "intel_api_key": "{{ dd_intel_api_key }}"
 }
