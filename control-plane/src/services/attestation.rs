@@ -72,16 +72,12 @@ impl AttestationService {
     /// Validate that runtime requirements are met for the current environment.
     pub fn validate_runtime_requirements(&self) -> AppResult<()> {
         match self.env {
-            RuntimeEnv::Production => {
+            RuntimeEnv::Production | RuntimeEnv::Staging => {
                 if self.verifier.is_none() {
                     return Err(AppError::Config(
-                        "production requires a configured ITA verifier".into(),
+                        "staging and production require a configured ITA verifier".into(),
                     ));
                 }
-                Ok(())
-            }
-            RuntimeEnv::Staging => {
-                // Staging allows missing verifier but logs a warning
                 Ok(())
             }
             RuntimeEnv::Local => Ok(()),
@@ -89,19 +85,9 @@ impl AttestationService {
     }
 
     /// Verify an agent registration token, returning attestation data.
-    ///
-    /// When running in staging/local mode and the token is empty (i.e. the agent
-    /// set skip_attestation=true), verification is bypassed and a synthetic
-    /// VerifiedAttestation with no claims is returned. This allows non-TDX
-    /// staging environments to register agents without real quotes.
     pub async fn verify_registration_token(&self, token: &str) -> AppResult<VerifiedAttestation> {
-        // In non-production environments, an empty token signals skip_attestation.
-        if token.is_empty() && self.env != RuntimeEnv::Production {
-            return Ok(VerifiedAttestation {
-                mrtd: None,
-                tcb_status: Some("skipped-non-tdx".into()),
-                rtmrs: Vec::new(),
-            });
+        if token.is_empty() {
+            return Err(AppError::Config("attestation token is required".into()));
         }
 
         match &self.verifier {
@@ -139,12 +125,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn staging_allows_no_verifier() {
+    fn staging_requires_verifier() {
         let svc = AttestationService {
             verifier: None,
             env: RuntimeEnv::Staging,
         };
-        assert!(svc.validate_runtime_requirements().is_ok());
+        assert!(svc.validate_runtime_requirements().is_err());
     }
 
     #[test]

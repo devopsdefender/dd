@@ -103,6 +103,7 @@ write_files:
 $(echo "$CONFIG_CONTENT" | sed 's/^/      /')
 
 runcmd:
+  - modprobe tdx_guest || true
   - systemctl daemon-reload
   - systemctl disable --now ${SYSTEMD_DISABLE} || true
   - systemctl enable --now ${SYSTEMD_ENABLE}
@@ -146,8 +147,11 @@ if [ "$TDX" = "true" ]; then
   QEMU_ARGS+=(
     -accel kvm
     -object '{"qom-type":"tdx-guest","id":"tdx","quote-generation-socket":{"type":"vsock","cid":"2","port":"4050"}}'
-    -machine q35,kernel_irqchip=split,confidential-guest-support=tdx,hpet=off
+    -object "memory-backend-ram,id=mem0,size=${MEMORY}"
+    -machine q35,kernel_irqchip=split,confidential-guest-support=tdx,memory-backend=mem0,hpet=off
     -bios "$TDVF_FIRMWARE"
+    -nodefaults
+    -vga none
     -device vhost-vsock-pci,guest-cid=3
   )
   echo "    TDX: enabled (confidential VM)"

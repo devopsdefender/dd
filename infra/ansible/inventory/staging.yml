@@ -13,5 +13,4 @@ all:
     agent_memory: 8G
     agent_cpus: 4
     agent_node_size: standard
-    agent_tdx: false          # TDX guest launch fails on kernel 6.8 + this QEMU build
-    dd_skip_attestation: true # no TSM interface without TDX guest mode
+    agent_tdx: true           # Staging agents must launch with TDX enabled for attestation

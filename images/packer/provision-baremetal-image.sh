@@ -73,6 +73,22 @@ apt-get update
 apt-get install -y --no-install-recommends nvidia-container-toolkit
 nvidia-ctk runtime configure --runtime=docker || true
 
+# ── TDX guest support (attestation via configfs-tsm) ─────────────────────
+# The generic kernel has CONFIG_TDX_GUEST_DRIVER=m but the module lives in
+# linux-modules-extra, which cloud images sometimes omit. Install it to
+# ensure tdx_guest.ko is present for quote generation.
+GUEST_KERNEL="$(ls /boot/vmlinuz-* 2>/dev/null | head -1 | sed 's|/boot/vmlinuz-||')"
+if [ -n "$GUEST_KERNEL" ]; then
+  apt-get update
+  apt-get install -y --no-install-recommends "linux-modules-extra-${GUEST_KERNEL}" || true
+fi
+
+cat > /etc/modules-load.d/tdx-guest.conf <<'MODULES'
+# Load TDX guest modules for attestation quote generation.
+# These are no-ops on non-TDX VMs.
+tdx_guest
+MODULES
+
 # ── Create config directory ───────────────────────────────────────────────
 install -d -m 0755 /etc/devopsdefender
 

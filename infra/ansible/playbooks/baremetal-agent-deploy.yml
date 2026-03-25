@@ -10,6 +10,7 @@
     agent_cpus: "{{ hostvars[inventory_hostname].agent_cpus | default('4') }}"
     cp_memory: "{{ hostvars[inventory_hostname].cp_memory | default('4G') }}"
     cp_cpus: "{{ hostvars[inventory_hostname].cp_cpus | default('4') }}"
+    agent_tdx: "{{ hostvars[inventory_hostname].agent_tdx | default(true) }}"
     # CP secrets (passed from CI via -e)
     dd_cp_admin_password: ""
     dd_cp_cf_api_token: ""

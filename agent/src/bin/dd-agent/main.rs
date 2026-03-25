@@ -70,19 +70,14 @@ async fn run_agent_mode(cfg: AgentRuntimeConfig) {
         );
 
         // 3. Generate a TDX quote embedding the nonce as report data.
-        // skip_attestation is only settable via agent.json (not env vars) to prevent
-        // accidental bypass in production. Staging sets this to true via Ansible.
-        let quote_b64 = if cfg.skip_attestation {
-            eprintln!("dd-agent: skip_attestation=true (non-TDX host), skipping quote generation");
-            String::new()
-        } else {
-            match dd_agent::attestation::tsm::generate_tdx_quote_base64() {
-                Ok(q) => q,
-                Err(e) => {
-                    eprintln!("dd-agent: TDX quote generation failed (attempt {attempt}/{max_retries}): {e}");
-                    backoff_sleep(attempt).await;
-                    continue;
-                }
+        let quote_b64 = match dd_agent::attestation::tsm::generate_tdx_quote_base64() {
+            Ok(q) => q,
+            Err(e) => {
+                eprintln!(
+                    "dd-agent: TDX quote generation failed (attempt {attempt}/{max_retries}): {e}"
+                );
+                backoff_sleep(attempt).await;
+                continue;
             }
         };
 
