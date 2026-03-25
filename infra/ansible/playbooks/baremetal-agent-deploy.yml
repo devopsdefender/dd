@@ -10,6 +10,7 @@
     agent_cpus: "{{ hostvars[inventory_hostname].agent_cpus | default('4') }}"
     cp_memory: "{{ hostvars[inventory_hostname].cp_memory | default('4G') }}"
     cp_cpus: "{{ hostvars[inventory_hostname].cp_cpus | default('4') }}"
+    cp_local_vm: "{{ hostvars[inventory_hostname].cp_local_vm | default(true) }}"
     agent_tdx: "{{ hostvars[inventory_hostname].agent_tdx | default(true) }}"
     # CP secrets (passed from CI via -e)
     dd_cp_admin_password: ""
@@ -196,12 +197,24 @@
         - vm-status.sh
 
     # ── Deploy control-plane VM ────────────────────────────────────────
+    - name: Stop local control-plane VM when staging CP is external
+      ansible.builtin.command:
+        argv:
+          - /tmp/dd-deploy/scripts/vm-stop.sh
+          - "dd-cp-{{ dd_env }}"
+          - --clean
+      failed_when: false
+      changed_when: stop_cp_external.rc == 0
+      register: stop_cp_external
+      become: true
+      when: not (cp_local_vm | bool)
+
     - name: Template control-plane config
       ansible.builtin.template:
         src: "{{ playbook_dir }}/templates/control-plane.json.j2"
         dest: /tmp/dd-deploy/control-plane.json
         mode: "0600"
-      when: dd_cp_cf_api_token | length > 0
+      when: (dd_cp_cf_api_token | length > 0) and (cp_local_vm | bool)
 
     - name: Stop old control-plane VM
       ansible.builtin.command:
@@ -213,7 +226,7 @@
       changed_when: stop_cp.rc == 0
       register: stop_cp
       become: true
-      when: dd_cp_cf_api_token | length > 0
+      when: (dd_cp_cf_api_token | length > 0) and (cp_local_vm | bool)
 
     - name: Launch control-plane VM
       ansible.builtin.command:
@@ -234,7 +247,7 @@
           - --port-forward
           - "{{ cp_host_port | default('9090') }}:8080"
       become: true
-      when: dd_cp_cf_api_token | length > 0
+      when: (dd_cp_cf_api_token | length > 0) and (cp_local_vm | bool)
 
     - name: Wait for control-plane health
       ansible.builtin.uri:
@@ -246,7 +259,7 @@
       retries: 30
       delay: 5
       until: cp_health.status == 200
-      when: dd_cp_cf_api_token | length > 0
+      when: (dd_cp_cf_api_token | length > 0) and (cp_local_vm | bool)
 
     # ── Deploy agent VM ─────────────────────────────────────────────────
     - name: Template agent config

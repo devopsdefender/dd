@@ -8,6 +8,7 @@ all:
   vars:
     dd_env: staging
     datacenter: ovh-eu
+    cp_local_vm: false      # staging CP runs on GCP; do not boot dd-cp locally on OVH
     cp_memory: 4G
     cp_cpus: 4
     agent_memory: 8G
