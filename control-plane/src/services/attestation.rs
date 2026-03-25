@@ -89,7 +89,21 @@ impl AttestationService {
     }
 
     /// Verify an agent registration token, returning attestation data.
+    ///
+    /// When running in staging/local mode and the token is empty (i.e. the agent
+    /// set skip_attestation=true), verification is bypassed and a synthetic
+    /// VerifiedAttestation with no claims is returned. This allows non-TDX
+    /// staging environments to register agents without real quotes.
     pub async fn verify_registration_token(&self, token: &str) -> AppResult<VerifiedAttestation> {
+        // In non-production environments, an empty token signals skip_attestation.
+        if token.is_empty() && self.env != RuntimeEnv::Production {
+            return Ok(VerifiedAttestation {
+                mrtd: None,
+                tcb_status: Some("skipped-non-tdx".into()),
+                rtmrs: Vec::new(),
+            });
+        }
+
         match &self.verifier {
             Some(v) => {
                 let claims = v.verify_attestation_token(token).await?;
