@@ -69,16 +69,11 @@ jobs:
             -e "packer_template_dir=${GITHUB_WORKSPACE}/images/packer" \
             -e "image_name=dd-baremetal-${sha12}" \
             -e "dd_cp_admin_password=${{ secrets.DD_CP_ADMIN_PASSWORD }}" \
-            -e "dd_cp_cf_api_token=${{ secrets.DD_CP_CF_API_TOKEN }}" \
-            -e "dd_cp_cf_account_id=${{ secrets.DD_CP_CF_ACCOUNT_ID }}" \
-            -e "dd_cp_cf_zone_id=${{ secrets.DD_CP_CF_ZONE_ID }}" \
+            -e "dd_cp_cf_api_token=${{ secrets.STAGING_CF_API_TOKEN }}" \
+            -e "dd_cp_cf_account_id=${{ secrets.STAGING_CF_ACCOUNT_ID }}" \
+            -e "dd_cp_cf_zone_id=${{ secrets.STAGING_CF_ZONE_ID }}" \
             -e "dd_intel_api_key=${{ secrets.INTEL_API_KEY }}" \
-            -e "dd_cp_git_sha=${sha12}" \
-            -e "dd_intel_api_key=${{ secrets.INTEL_API_KEY }}" \
-            -e "dd_cp_admin_password=${{ secrets.DD_CP_ADMIN_PASSWORD }}" \
-            -e "dd_cp_cf_api_token=${{ secrets.DD_CP_CF_API_TOKEN }}" \
-            -e "dd_cp_cf_account_id=${{ secrets.DD_CP_CF_ACCOUNT_ID }}" \
-            -e "dd_cp_cf_zone_id=${{ secrets.DD_CP_CF_ZONE_ID }}"
+            -e "dd_cp_git_sha=${sha12}"
 
       # ── Cleanup ─────────────────────────────────────────────────────────
       - name: Cleanup SSH key
