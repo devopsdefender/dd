@@ -5,9 +5,47 @@ use dd_control_plane::services::attestation::AttestationService;
 use dd_control_plane::services::github_oidc::GithubOidcService;
 use dd_control_plane::services::tunnel::TunnelService;
 use dd_control_plane::state::AppState;
+use serde::Deserialize;
+
+#[derive(Debug, Deserialize)]
+struct FileConfig {
+    #[serde(default)]
+    raw_kv: std::collections::HashMap<String, String>,
+}
+
+fn load_raw_env_from_config_file() {
+    let config_path = match std::env::var("DD_CONFIG") {
+        Ok(path) => path,
+        Err(_) => return,
+    };
+
+    let text = match std::fs::read_to_string(&config_path) {
+        Ok(text) => text,
+        Err(err) => {
+            eprintln!("  warning: failed to read DD_CONFIG file {config_path}: {err}");
+            return;
+        }
+    };
+
+    let file_cfg: FileConfig = match serde_json::from_str(&text) {
+        Ok(cfg) => cfg,
+        Err(err) => {
+            eprintln!("  warning: failed to parse DD_CONFIG file {config_path}: {err}");
+            return;
+        }
+    };
+
+    for (key, value) in file_cfg.raw_kv {
+        if std::env::var_os(&key).is_none() {
+            unsafe { std::env::set_var(key, value) };
+        }
+    }
+}
 
 #[tokio::main]
 async fn main() {
+    load_raw_env_from_config_file();
+
     let config = CpConfig::from_env();
 
     eprintln!("DevOps Defender Control Plane starting...");
