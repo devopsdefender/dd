@@ -46,33 +46,53 @@ pub struct AgentRegisterResponse {
 }
 
 // ---------------------------------------------------------------------------
-// Deploy
+// Deployments
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct DeployRequest {
-    pub compose: String,
+pub struct AgentDeployRequest {
+    pub image: String,
     #[serde(default)]
-    pub config: Option<String>,
+    pub env: Vec<String>,
     #[serde(default)]
-    pub app_name: Option<String>,
-    #[serde(default)]
-    pub app_version: Option<String>,
-    #[serde(default)]
-    pub agent_name: Option<String>,
-    #[serde(default)]
-    pub node_size: Option<String>,
-    #[serde(default)]
-    pub datacenter: Option<String>,
-    #[serde(default)]
-    pub dry_run: Option<bool>,
+    pub cmd: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct DeployResponse {
+pub struct AgentDeployResponse {
     pub deployment_id: Uuid,
     pub agent_id: Uuid,
     pub status: DeploymentStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AgentDeploymentResponse {
+    pub image: String,
+    pub env: Vec<String>,
+    pub cmd: Vec<String>,
+    pub deployment_id: Uuid,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AgentDeploymentStatusRequest {
+    pub status: String,
+    #[serde(default)]
+    pub exit_code: Option<i32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(untagged)]
+pub enum CpAttestationResponse {
+    Attested {
+        quote_b64: String,
+        mrtd: String,
+        tcb_status: String,
+        attested: bool,
+    },
+    Unattested {
+        attested: bool,
+        reason: String,
+    },
 }
 
 // ---------------------------------------------------------------------------

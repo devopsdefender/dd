@@ -1,8 +1,9 @@
 pub mod accounts;
 pub mod admin;
 pub mod agents;
+pub mod attestation;
 pub mod auth;
-pub mod deploy;
+pub mod deployments;
 pub mod health;
 pub mod stats;
 pub mod ui;
@@ -32,12 +33,25 @@ pub fn build_router(state: AppState) -> Router {
             "/api/v1/agents/{id}/heartbeat",
             post(agents::agent_heartbeat),
         )
+        .route(
+            "/api/v1/agents/{id}/deployment",
+            get(deployments::get_agent_deployment),
+        )
+        .route(
+            "/api/v1/agents/{id}/deploy",
+            post(deployments::deploy_to_agent),
+        )
+        .route(
+            "/api/v1/agents/{id}/deployment/{deployment_id}/status",
+            post(deployments::update_agent_deployment_status),
+        )
         .route("/api/v1/agents/{id}/checks", post(agents::ingest_check))
         .route("/api/v1/agents/{id}/checks", get(agents::list_checks))
-        // Deploy
-        .route("/api/v1/deploy", post(deploy::deploy))
-        .route("/api/v1/deployments", get(deploy::list_deployments))
-        .route("/api/v1/deployments/{id}", get(deploy::get_deployment))
+        // Deployments
+        .route("/api/v1/deployments", get(deployments::list_deployments))
+        .route("/api/v1/deployments/{id}", get(deployments::get_deployment))
+        // Control plane self-attestation
+        .route("/api/v1/attestation", get(attestation::get_attestation))
         // Stats
         .route("/api/v1/stats/apps", get(stats::app_stats))
         .route("/api/v1/stats/agents", get(stats::agent_stats))

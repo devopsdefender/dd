@@ -8,43 +8,40 @@ use crate::db::Db;
 pub struct DeploymentRow {
     pub id: String,
     pub agent_id: String,
-    pub app_name: Option<String>,
-    pub app_version: Option<String>,
-    pub compose: String,
-    pub config: Option<String>,
+    pub image: String,
+    pub env: Vec<String>,
+    pub cmd: Vec<String>,
     pub status: String,
     pub created_at: String,
     pub updated_at: String,
 }
 
 fn row_to_deployment(row: &rusqlite::Row<'_>) -> rusqlite::Result<DeploymentRow> {
+    let env_json: String = row.get("env")?;
+    let cmd_json: String = row.get("cmd")?;
     Ok(DeploymentRow {
         id: row.get("id")?,
         agent_id: row.get("agent_id")?,
-        app_name: row.get("app_name")?,
-        app_version: row.get("app_version")?,
-        compose: row.get("compose")?,
-        config: row.get("config")?,
+        image: row.get("image")?,
+        env: serde_json::from_str(&env_json).map_err(serde_to_sql_error)?,
+        cmd: serde_json::from_str(&cmd_json).map_err(serde_to_sql_error)?,
         status: row.get("status")?,
         created_at: row.get("created_at")?,
         updated_at: row.get("updated_at")?,
     })
 }
 
-/// Insert a new deployment.
 pub fn insert_deployment(db: &Db, dep: &DeploymentRow) -> AppResult<()> {
     let conn = db.lock().unwrap();
     conn.execute(
-        "INSERT INTO deployments (id, agent_id, app_name, app_version, compose, config, \
-         status, created_at, updated_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        "INSERT INTO deployments (id, agent_id, image, env, cmd, status, created_at, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         params![
             dep.id,
             dep.agent_id,
-            dep.app_name,
-            dep.app_version,
-            dep.compose,
-            dep.config,
+            dep.image,
+            serde_json::to_string(&dep.env).map_err(|_| AppError::Internal)?,
+            serde_json::to_string(&dep.cmd).map_err(|_| AppError::Internal)?,
             dep.status,
             dep.created_at,
             dep.updated_at,
@@ -55,13 +52,11 @@ pub fn insert_deployment(db: &Db, dep: &DeploymentRow) -> AppResult<()> {
     Ok(())
 }
 
-/// Get a deployment by ID.
 pub fn get_deployment(db: &Db, id: &str) -> AppResult<Option<DeploymentRow>> {
     let conn = db.lock().unwrap();
     let mut stmt = conn
         .prepare(
-            "SELECT id, agent_id, app_name, app_version, compose, config, \
-             status, created_at, updated_at \
+            "SELECT id, agent_id, image, env, cmd, status, created_at, updated_at \
              FROM deployments WHERE id = ?1",
         )
         .map_err(|_| AppError::Internal)?;
@@ -74,28 +69,24 @@ pub fn get_deployment(db: &Db, id: &str) -> AppResult<Option<DeploymentRow>> {
     Ok(result)
 }
 
-/// List deployments, optionally filtering by agent_id.
 pub fn list_deployments(db: &Db, agent_id: Option<&str>) -> AppResult<Vec<DeploymentRow>> {
     let conn = db.lock().unwrap();
 
     let (query, bind_val) = if let Some(aid) = agent_id {
         (
-            "SELECT id, agent_id, app_name, app_version, compose, config, \
-             status, created_at, updated_at \
+            "SELECT id, agent_id, image, env, cmd, status, created_at, updated_at \
              FROM deployments WHERE agent_id = ?1 ORDER BY created_at DESC",
             Some(aid.to_string()),
         )
     } else {
         (
-            "SELECT id, agent_id, app_name, app_version, compose, config, \
-             status, created_at, updated_at \
+            "SELECT id, agent_id, image, env, cmd, status, created_at, updated_at \
              FROM deployments ORDER BY created_at DESC",
             None,
         )
     };
 
     let mut stmt = conn.prepare(query).map_err(|_| AppError::Internal)?;
-
     let rows = if let Some(ref v) = bind_val {
         stmt.query_map(params![v], row_to_deployment)
             .map_err(|_| AppError::Internal)?
@@ -111,7 +102,6 @@ pub fn list_deployments(db: &Db, agent_id: Option<&str>) -> AppResult<Vec<Deploy
     Ok(deployments)
 }
 
-/// Update deployment status.
 pub fn update_deployment_status(db: &Db, id: &str, status: &str) -> AppResult<bool> {
     let now = chrono::Utc::now().to_rfc3339();
     let conn = db.lock().unwrap();
@@ -138,6 +128,10 @@ impl<T> OptionalExt<T> for Result<T, rusqlite::Error> {
     }
 }
 
+fn serde_to_sql_error(err: serde_json::Error) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(err))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -161,10 +155,10 @@ mod tests {
             node_size: None,
             datacenter: None,
             github_owner: None,
+            deployment_id: None,
             created_at: chrono::Utc::now().to_rfc3339(),
             last_heartbeat_at: None,
         };
-        // Ignore error if agent already exists
         let _ = agent_store::insert_agent(db, &agent);
     }
 
@@ -173,10 +167,9 @@ mod tests {
         DeploymentRow {
             id: id.into(),
             agent_id: agent_id.into(),
-            app_name: Some("test-app".into()),
-            app_version: Some("1.0.0".into()),
-            compose: "version: '3'\nservices: {}".into(),
-            config: None,
+            image: "ghcr.io/devopsdefender/workload:latest".into(),
+            env: vec!["KEY=VALUE".into()],
+            cmd: vec!["/bin/server".into()],
             status: "pending".into(),
             created_at: now.clone(),
             updated_at: now,
@@ -190,9 +183,9 @@ mod tests {
         let dep = make_deployment("d1", "a1");
         insert_deployment(&db, &dep).unwrap();
 
-        let fetched = get_deployment(&db, "d1").unwrap();
-        assert!(fetched.is_some());
-        assert_eq!(fetched.unwrap().app_name, Some("test-app".into()));
+        let fetched = get_deployment(&db, "d1").unwrap().unwrap();
+        assert_eq!(fetched.image, "ghcr.io/devopsdefender/workload:latest");
+        assert_eq!(fetched.env, vec!["KEY=VALUE"]);
     }
 
     #[test]

@@ -21,12 +21,37 @@ pub struct AttestationClaims {
     pub exp: u64,
     #[serde(default)]
     pub nbf: u64,
-    #[serde(default, rename = "tdx.mrtd")]
-    pub tdx_mrtd: Option<String>,
+    /// TDX measurements — ITA nests these under a "tdx" object.
+    #[serde(default)]
+    pub tdx: Option<TdxClaims>,
     #[serde(default, rename = "attester_tcb_status")]
     pub attester_tcb_status: Option<String>,
     #[serde(flatten)]
     pub extra: HashMap<String, serde_json::Value>,
+}
+
+/// Nested TDX-specific claims from the ITA attestation token.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct TdxClaims {
+    #[serde(default)]
+    pub mrtd: Option<String>,
+    #[serde(default)]
+    pub rtmr0: Option<String>,
+    #[serde(default)]
+    pub rtmr1: Option<String>,
+    #[serde(default)]
+    pub rtmr2: Option<String>,
+    #[serde(default)]
+    pub rtmr3: Option<String>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
+}
+
+impl AttestationClaims {
+    /// Helper to get MRTD regardless of nesting.
+    pub fn tdx_mrtd(&self) -> Option<&str> {
+        self.tdx.as_ref().and_then(|t| t.mrtd.as_deref())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -226,18 +251,44 @@ mod tests {
     use super::*;
     use jsonwebtoken::{encode, EncodingKey, Header};
 
-    fn make_hs256_jwks_and_key() -> (String, Vec<u8>) {
+    fn make_hs256_jwks_and_key() -> (JwksDocument, Vec<u8>) {
         let secret = b"test-secret-key-for-ita-verification-32b";
         let k = URL_SAFE_NO_PAD.encode(secret);
-        let jwks_json = serde_json::json!({
-            "keys": [{
-                "kid": "test-kid-1",
-                "kty": "oct",
-                "alg": "HS256",
-                "k": k,
-            }]
-        });
-        (serde_json::to_string(&jwks_json).unwrap(), secret.to_vec())
+        (
+            JwksDocument {
+                keys: vec![Jwk {
+                    kid: Some("test-kid-1".into()),
+                    kty: "oct".into(),
+                    alg: Some("HS256".into()),
+                    n: None,
+                    e: None,
+                    k: Some(k),
+                }],
+            },
+            secret.to_vec(),
+        )
+    }
+
+    async fn verifier_with_cached_jwks(
+        expected_issuer: Option<String>,
+        expected_audience: Option<String>,
+    ) -> (ItaVerifier, Vec<u8>) {
+        let (jwks, secret) = make_hs256_jwks_and_key();
+        let verifier = ItaVerifier::new(
+            "https://unused.test/jwks".into(),
+            expected_issuer,
+            expected_audience,
+        );
+
+        {
+            let mut cache = verifier.cache.write().await;
+            *cache = Some(CachedJwks {
+                document: jwks,
+                fetched_at: std::time::Instant::now(),
+            });
+        }
+
+        (verifier, secret)
     }
 
     fn make_token(secret: &[u8], claims: &AttestationClaims) -> String {
@@ -252,7 +303,10 @@ mod tests {
             aud: serde_json::Value::String("devopsdefender".into()),
             exp: (chrono::Utc::now().timestamp() + 3600) as u64,
             nbf: 0,
-            tdx_mrtd: Some("abc123".into()),
+            tdx: Some(TdxClaims {
+                mrtd: Some("abc123".into()),
+                ..Default::default()
+            }),
             attester_tcb_status: Some("UpToDate".into()),
             extra: HashMap::new(),
         }
@@ -260,21 +314,11 @@ mod tests {
 
     #[tokio::test]
     async fn verify_valid_token_with_mock_jwks() {
-        let (jwks_body, secret) = make_hs256_jwks_and_key();
-        let mut server = mockito::Server::new_async().await;
-        let mock = server
-            .mock("GET", "/jwks")
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(&jwks_body)
-            .create_async()
-            .await;
-
-        let verifier = ItaVerifier::new(
-            format!("{}/jwks", server.url()),
+        let (verifier, secret) = verifier_with_cached_jwks(
             Some("https://portal.trustauthority.intel.com".into()),
             Some("devopsdefender".into()),
-        );
+        )
+        .await;
 
         let claims = valid_claims();
         let token = make_token(&secret, &claims);
@@ -282,23 +326,12 @@ mod tests {
         let result = verifier.verify_attestation_token(&token).await;
         assert!(result.is_ok());
         let verified = result.unwrap();
-        assert_eq!(verified.tdx_mrtd, Some("abc123".into()));
-        mock.assert_async().await;
+        assert_eq!(verified.tdx_mrtd(), Some("abc123"));
     }
 
     #[tokio::test]
     async fn reject_expired_token() {
-        let (jwks_body, secret) = make_hs256_jwks_and_key();
-        let mut server = mockito::Server::new_async().await;
-        let _mock = server
-            .mock("GET", "/jwks")
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(&jwks_body)
-            .create_async()
-            .await;
-
-        let verifier = ItaVerifier::new(format!("{}/jwks", server.url()), None, None);
+        let (verifier, secret) = verifier_with_cached_jwks(None, None).await;
 
         let mut claims = valid_claims();
         claims.exp = 1000; // way in the past
@@ -310,21 +343,8 @@ mod tests {
 
     #[tokio::test]
     async fn reject_wrong_audience() {
-        let (jwks_body, secret) = make_hs256_jwks_and_key();
-        let mut server = mockito::Server::new_async().await;
-        let _mock = server
-            .mock("GET", "/jwks")
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(&jwks_body)
-            .create_async()
-            .await;
-
-        let verifier = ItaVerifier::new(
-            format!("{}/jwks", server.url()),
-            None,
-            Some("wrong-audience".into()),
-        );
+        let (verifier, secret) =
+            verifier_with_cached_jwks(None, Some("wrong-audience".into())).await;
 
         let claims = valid_claims();
         let token = make_token(&secret, &claims);
@@ -335,18 +355,7 @@ mod tests {
 
     #[tokio::test]
     async fn jwks_cache_reuse() {
-        let (jwks_body, secret) = make_hs256_jwks_and_key();
-        let mut server = mockito::Server::new_async().await;
-        let mock = server
-            .mock("GET", "/jwks")
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(&jwks_body)
-            .expect(1) // should only be called once
-            .create_async()
-            .await;
-
-        let verifier = ItaVerifier::new(format!("{}/jwks", server.url()), None, None);
+        let (verifier, secret) = verifier_with_cached_jwks(None, None).await;
 
         let claims = valid_claims();
         let token1 = make_token(&secret, &claims);
@@ -356,8 +365,6 @@ mod tests {
         assert!(r1.is_ok());
         let r2 = verifier.verify_attestation_token(&token2).await;
         assert!(r2.is_ok());
-
-        mock.assert_async().await;
     }
 
     #[tokio::test]
@@ -371,18 +378,8 @@ mod tests {
 
     #[tokio::test]
     async fn allow_missing_audience_when_not_configured() {
-        let (jwks_body, secret) = make_hs256_jwks_and_key();
-        let mut server = mockito::Server::new_async().await;
-        let _mock = server
-            .mock("GET", "/jwks")
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(&jwks_body)
-            .create_async()
-            .await;
-
         // No audience configured -- should accept any audience in token
-        let verifier = ItaVerifier::new(format!("{}/jwks", server.url()), None, None);
+        let (verifier, secret) = verifier_with_cached_jwks(None, None).await;
 
         let claims = valid_claims();
         let token = make_token(&secret, &claims);

@@ -19,6 +19,7 @@ pub struct AgentRow {
     pub node_size: Option<String>,
     pub datacenter: Option<String>,
     pub github_owner: Option<String>,
+    pub deployment_id: Option<String>,
     pub created_at: String,
     pub last_heartbeat_at: Option<String>,
 }
@@ -36,6 +37,7 @@ fn row_to_agent(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentRow> {
         node_size: row.get("node_size")?,
         datacenter: row.get("datacenter")?,
         github_owner: row.get("github_owner")?,
+        deployment_id: row.get("deployment_id")?,
         created_at: row.get("created_at")?,
         last_heartbeat_at: row.get("last_heartbeat_at")?,
     })
@@ -46,8 +48,8 @@ pub fn insert_agent(db: &Db, agent: &AgentRow) -> AppResult<()> {
     let conn = db.lock().unwrap();
     conn.execute(
         "INSERT INTO agents (id, vm_name, status, registration_state, hostname, tunnel_id, \
-         mrtd, tcb_status, node_size, datacenter, github_owner, created_at, last_heartbeat_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+         mrtd, tcb_status, node_size, datacenter, github_owner, deployment_id, created_at, \
+         last_heartbeat_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
         params![
             agent.id,
             agent.vm_name,
@@ -60,6 +62,7 @@ pub fn insert_agent(db: &Db, agent: &AgentRow) -> AppResult<()> {
             agent.node_size,
             agent.datacenter,
             agent.github_owner,
+            agent.deployment_id,
             agent.created_at,
             agent.last_heartbeat_at,
         ],
@@ -75,8 +78,8 @@ pub fn get_agent(db: &Db, id: &str) -> AppResult<Option<AgentRow>> {
     let mut stmt = conn
         .prepare(
             "SELECT id, vm_name, status, registration_state, hostname, tunnel_id, \
-             mrtd, tcb_status, node_size, datacenter, github_owner, created_at, last_heartbeat_at \
-             FROM agents WHERE id = ?1",
+             mrtd, tcb_status, node_size, datacenter, github_owner, deployment_id, created_at, \
+             last_heartbeat_at FROM agents WHERE id = ?1",
         )
         .map_err(|_| AppError::Internal)?;
 
@@ -94,8 +97,8 @@ pub fn find_agent_by_vm_name(db: &Db, vm_name: &str) -> AppResult<Option<AgentRo
     let mut stmt = conn
         .prepare(
             "SELECT id, vm_name, status, registration_state, hostname, tunnel_id, \
-             mrtd, tcb_status, node_size, datacenter, github_owner, created_at, last_heartbeat_at \
-             FROM agents WHERE vm_name = ?1 ORDER BY created_at DESC LIMIT 1",
+             mrtd, tcb_status, node_size, datacenter, github_owner, deployment_id, created_at, \
+             last_heartbeat_at FROM agents WHERE vm_name = ?1 ORDER BY created_at DESC LIMIT 1",
         )
         .map_err(|_| AppError::Internal)?;
 
@@ -113,8 +116,8 @@ pub fn list_agents(db: &Db) -> AppResult<Vec<AgentRow>> {
     let mut stmt = conn
         .prepare(
             "SELECT id, vm_name, status, registration_state, hostname, tunnel_id, \
-             mrtd, tcb_status, node_size, datacenter, github_owner, created_at, last_heartbeat_at \
-             FROM agents ORDER BY created_at DESC",
+             mrtd, tcb_status, node_size, datacenter, github_owner, deployment_id, created_at, \
+             last_heartbeat_at FROM agents ORDER BY created_at DESC",
         )
         .map_err(|_| AppError::Internal)?;
 
@@ -145,6 +148,18 @@ pub fn update_agent_status(db: &Db, id: &str, status: &str) -> AppResult<bool> {
         .execute(
             "UPDATE agents SET status = ?1 WHERE id = ?2",
             params![status, id],
+        )
+        .map_err(|_| AppError::Internal)?;
+    Ok(count > 0)
+}
+
+/// Assign or clear the deployment currently associated with an agent.
+pub fn update_agent_deployment(db: &Db, id: &str, deployment_id: Option<&str>) -> AppResult<bool> {
+    let conn = db.lock().unwrap();
+    let count = conn
+        .execute(
+            "UPDATE agents SET deployment_id = ?1 WHERE id = ?2",
+            params![deployment_id, id],
         )
         .map_err(|_| AppError::Internal)?;
     Ok(count > 0)
@@ -184,8 +199,9 @@ pub fn find_available_agent(
     let conn = db.lock().unwrap();
     let mut query = String::from(
         "SELECT id, vm_name, status, registration_state, hostname, tunnel_id, \
-         mrtd, tcb_status, node_size, datacenter, github_owner, created_at, last_heartbeat_at \
-         FROM agents WHERE status = 'undeployed' AND registration_state = 'ready'",
+         mrtd, tcb_status, node_size, datacenter, github_owner, deployment_id, created_at, \
+         last_heartbeat_at FROM agents WHERE status = 'undeployed' AND registration_state = 'ready' \
+         AND deployment_id IS NULL",
     );
     let mut bind_values: Vec<String> = Vec::new();
 
@@ -251,6 +267,7 @@ mod tests {
             node_size: None,
             datacenter: None,
             github_owner: None,
+            deployment_id: None,
             created_at: Utc::now().to_rfc3339(),
             last_heartbeat_at: None,
         }

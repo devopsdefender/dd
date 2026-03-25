@@ -1,4 +1,4 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct AgentChallengeResponse {
@@ -11,4 +11,18 @@ pub struct AgentRegisterResponse {
     pub agent_id: String,
     pub tunnel_token: String,
     pub hostname: String,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct AgentDeploymentResponse {
+    pub image: String,
+    pub env: Vec<String>,
+    pub cmd: Vec<String>,
+    pub deployment_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct AgentDeploymentStatusRequest {
+    pub status: String,
+    pub exit_code: Option<i32>,
 }

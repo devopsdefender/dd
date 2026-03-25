@@ -7,6 +7,7 @@ use crate::api::{
     AgentRegisterRequest, AgentRegisterResponse,
 };
 use crate::common::error::AppError;
+use crate::services::nonce::ConsumeResult;
 use crate::state::AppState;
 use crate::stores::{agent as agent_store, health as health_store};
 
@@ -24,10 +25,24 @@ pub async fn agent_register(
     State(state): State<AppState>,
     Json(req): Json<AgentRegisterRequest>,
 ) -> Result<(StatusCode, Json<AgentRegisterResponse>), AppError> {
-    // Verify attestation token
+    match state.nonce.consume(&req.nonce).await {
+        ConsumeResult::Ok => {}
+        ConsumeResult::Missing => {
+            return Err(AppError::InvalidInput(
+                "registration nonce is missing or already used".into(),
+            ));
+        }
+        ConsumeResult::Expired => {
+            return Err(AppError::InvalidInput(
+                "registration nonce has expired".into(),
+            ));
+        }
+    }
+
+    // Verify attestation quote.
     let attestation = state
         .attestation
-        .verify_registration_token(&req.intel_ta_token)
+        .verify_registration_token(&req.intel_ta_token, &req.nonce)
         .await?;
 
     // Re-register: if an agent with the same vm_name already exists, reuse its
@@ -76,6 +91,7 @@ pub async fn agent_register(
         node_size: req.node_size,
         datacenter: req.datacenter,
         github_owner: req.github_owner,
+        deployment_id: None,
         created_at: chrono::Utc::now().to_rfc3339(),
         last_heartbeat_at: None,
     };
@@ -236,13 +252,14 @@ mod tests {
     #[tokio::test]
     async fn register_rejects_without_attestation_config() {
         let state = test_state();
+        let nonce = state.nonce.issue().await;
         let app = build_router(state);
 
         // Without DD_INTEL_API_KEY, registration must fail — no insecure mode.
         let register_req = AgentRegisterRequest {
             intel_ta_token: "fake-token".into(),
             vm_name: "test-vm".into(),
-            nonce: "test-nonce".into(),
+            nonce,
             node_size: None,
             datacenter: None,
             github_owner: None,

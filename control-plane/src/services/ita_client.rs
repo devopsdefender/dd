@@ -1,22 +1,12 @@
 use crate::common::error::{AppError, AppResult};
-use base64::Engine;
-use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
-use ring::digest;
+use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ItaNonce {
-    pub val: String,
-    pub iat: String,
-    pub signature: String,
-}
+const DEFAULT_ITA_API_URL: &str = "https://api.trustauthority.intel.com";
 
 #[derive(Debug, Serialize)]
 struct ItaAttestRequest<'a> {
     quote: &'a str,
-    verifier_nonce: &'a ItaNonce,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    runtime_data: Option<&'a str>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -31,12 +21,21 @@ pub struct ItaClient {
 }
 
 impl ItaClient {
+    pub fn from_env() -> AppResult<Self> {
+        let api_key = std::env::var("DD_INTEL_API_KEY")
+            .map_err(|_| AppError::Config("DD_INTEL_API_KEY is required".into()))?;
+        let api_url =
+            std::env::var("DD_ITA_API_URL").unwrap_or_else(|_| DEFAULT_ITA_API_URL.to_string());
+        Self::new(api_url, api_key)
+    }
+
     pub fn new(api_url: impl Into<String>, api_key: impl AsRef<str>) -> AppResult<Self> {
         let mut headers = HeaderMap::new();
         let api_key = HeaderValue::from_str(api_key.as_ref())
             .map_err(|e| AppError::Config(format!("invalid Intel API key header value: {e}")))?;
         headers.insert("x-api-key", api_key);
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
 
         let http = reqwest::Client::builder()
             .default_headers(headers)
@@ -49,40 +48,9 @@ impl ItaClient {
         })
     }
 
-    pub async fn get_nonce(&self) -> AppResult<ItaNonce> {
-        let url = format!("{}/appraisal/v1/nonce", self.api_url);
-        let resp = self
-            .http
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| AppError::External(format!("GET {url}: {e}")))?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(AppError::External(format!(
-                "GET {url}: status {status}: {body}"
-            )));
-        }
-
-        resp.json::<ItaNonce>()
-            .await
-            .map_err(|e| AppError::External(format!("parse ITA nonce response: {e}")))
-    }
-
-    pub async fn attest(
-        &self,
-        quote_b64: &str,
-        nonce: &ItaNonce,
-        runtime_data_b64: Option<&str>,
-    ) -> AppResult<String> {
+    pub async fn attest(&self, quote_b64: &str) -> AppResult<String> {
         let url = format!("{}/appraisal/v1/attest", self.api_url);
-        let body = ItaAttestRequest {
-            quote: quote_b64,
-            verifier_nonce: nonce,
-            runtime_data: runtime_data_b64,
-        };
+        let body = ItaAttestRequest { quote: quote_b64 };
 
         let resp = self
             .http
@@ -109,25 +77,6 @@ impl ItaClient {
     }
 }
 
-pub fn build_report_data(ita_nonce: &ItaNonce, runtime_data: &[u8]) -> [u8; 64] {
-    let input = [
-        ita_nonce.val.as_bytes(),
-        b"|",
-        ita_nonce.iat.as_bytes(),
-        b"|",
-        runtime_data,
-    ]
-    .concat();
-    let digest = digest::digest(&digest::SHA512, &input);
-    let mut report_data = [0u8; 64];
-    report_data.copy_from_slice(digest.as_ref());
-    report_data
-}
-
-pub fn encode_runtime_data(runtime_data: &[u8]) -> String {
-    base64::engine::general_purpose::STANDARD.encode(runtime_data)
-}
-
 fn parse_token_response(body: &str) -> AppResult<String> {
     let trimmed = body.trim();
     if trimmed.is_empty() {
@@ -148,20 +97,6 @@ fn parse_token_response(body: &str) -> AppResult<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn build_report_data_hashes_nonce_and_runtime_data() {
-        let nonce = ItaNonce {
-            val: "nonce-val".into(),
-            iat: "2026-03-25T00:00:00Z".into(),
-            signature: "sig".into(),
-        };
-
-        let report_data = build_report_data(&nonce, b"cp-nonce");
-
-        let expected = digest::digest(&digest::SHA512, b"nonce-val|2026-03-25T00:00:00Z|cp-nonce");
-        assert_eq!(report_data.as_slice(), expected.as_ref());
-    }
 
     #[test]
     fn parse_token_response_accepts_raw_or_json() {

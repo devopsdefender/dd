@@ -12,6 +12,7 @@ CREATE TABLE IF NOT EXISTS agents (
     node_size TEXT,
     datacenter TEXT,
     github_owner TEXT,
+    deployment_id TEXT REFERENCES deployments(id),
     created_at TEXT NOT NULL,
     last_heartbeat_at TEXT
 );
@@ -27,10 +28,9 @@ CREATE TABLE IF NOT EXISTS agent_control_credentials (
 CREATE TABLE IF NOT EXISTS deployments (
     id TEXT PRIMARY KEY,
     agent_id TEXT NOT NULL REFERENCES agents(id),
-    app_name TEXT,
-    app_version TEXT,
-    compose TEXT NOT NULL,
-    config TEXT,
+    image TEXT NOT NULL,
+    env TEXT NOT NULL,
+    cmd TEXT NOT NULL DEFAULT '[]',
     status TEXT NOT NULL DEFAULT 'pending',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
