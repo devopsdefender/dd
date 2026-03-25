@@ -149,7 +149,7 @@ impl TunnelService {
         )))
     }
 
-    /// Delete a Cloudflare tunnel.
+    /// Delete a Cloudflare tunnel, first cleaning up any active connections.
     pub async fn delete_tunnel(&self, tunnel_id: &str) -> AppResult<()> {
         let api_token = self
             .api_token
@@ -161,6 +161,17 @@ impl TunnelService {
             .ok_or_else(|| AppError::Config("DD_CP_CF_ACCOUNT_ID not set".into()))?;
 
         let client = reqwest::Client::new();
+
+        // First: clean up active connections so the delete doesn't fail.
+        let _ = client
+            .delete(format!(
+                "https://api.cloudflare.com/client/v4/accounts/{account_id}/cfd_tunnel/{tunnel_id}/connections"
+            ))
+            .header("Authorization", format!("Bearer {api_token}"))
+            .send()
+            .await;
+
+        // Then: delete the tunnel itself.
         let resp = client
             .delete(format!(
                 "https://api.cloudflare.com/client/v4/accounts/{account_id}/cfd_tunnel/{tunnel_id}"
