@@ -327,8 +327,6 @@ fn build_command_argv(
 
     if req.cmd.is_empty() {
         argv.extend(prepared.cmd.clone());
-    } else if argv.is_empty() {
-        argv.extend(req.cmd.clone());
     } else {
         argv.extend(req.cmd.clone());
     }
