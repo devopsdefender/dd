@@ -4,8 +4,8 @@ all:
       ansible_host: 57.130.10.246  # OVH dedicated server — agent runs as KVM VM on this host
       ansible_user: ubuntu
       ansible_ssh_private_key_file: "{{ lookup('env', 'SSH_KEY_PATH') | default('/tmp/deploy-key', true) }}"
-      cp_url: "https://app-staging.devopsdefender.com"
-      cp_public_hostname: "app-staging.devopsdefender.com"
+      cp_url: "https://app-staging.slopandmop.com"
+      cp_public_hostname: "app-staging.slopandmop.com"
   vars:
     dd_env: staging
     datacenter: ovh-eu
