@@ -75,7 +75,6 @@ jobs:
             -e "dd_intel_api_key=${{ secrets.INTEL_API_KEY }}"
             -e "dd_cp_git_sha=${sha12}"
           )
-<<<<<<< HEAD
           ansible-playbook infra/ansible/playbooks/baremetal-agent-deploy.yml \
             -i infra/ansible/inventory/staging.yml \
             "${EXTRA_VARS[@]}"
