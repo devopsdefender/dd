@@ -1,6 +1,5 @@
 {
-  "mode": "agent",
-  "control_plane_url": "{{ cp_url | default('http://localhost:8080') }}",
+  "control_plane_url": "{{ cp_url }}",
   "node_size": "{{ agent_node_size | default('standard') }}",
   "datacenter": "{{ dd_env }}"
 }

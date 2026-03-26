@@ -5,6 +5,24 @@
   vars:
     dd_env: "{{ hostvars[inventory_hostname].dd_env | default('staging') }}"
     cp_url: "{{ hostvars[inventory_hostname].cp_url | default('') }}"
+    cp_public_hostname: >-
+      {{
+        hostvars[inventory_hostname].cp_public_hostname
+        | default(
+            cp_url
+            | regex_replace('^https?://', '')
+            | regex_replace('/.*$', ''),
+            true
+          )
+      }}
+    dd_cp_cf_domain: >-
+      {{
+        hostvars[inventory_hostname].dd_cp_cf_domain
+        | default(
+            cp_public_hostname | regex_replace('^[^.]+\\.', ''),
+            true
+          )
+      }}
     agent_node_size: "{{ hostvars[inventory_hostname].agent_node_size | default('standard') }}"
     agent_memory: "{{ hostvars[inventory_hostname].agent_memory | default('8G') }}"
     agent_cpus: "{{ hostvars[inventory_hostname].agent_cpus | default('4') }}"
@@ -50,6 +68,16 @@
       ansible.builtin.fail:
         msg: "/dev/kvm not found - KVM support is required"
       when: not kvm_check.stat.exists
+
+    - name: Fail if cp_url is missing
+      ansible.builtin.fail:
+        msg: "cp_url must be set explicitly in inventory for agent mode"
+      when: cp_url | trim | length == 0
+
+    - name: Fail if cp_public_hostname is missing
+      ansible.builtin.fail:
+        msg: "cp_public_hostname must be set explicitly or derivable from cp_url"
+      when: cp_public_hostname | trim | length == 0
 
     - name: Create system directories
       ansible.builtin.file:

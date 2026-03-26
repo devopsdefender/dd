@@ -1,5 +1,5 @@
 {
-  "mode": "control-plane",
+  "bootstrap_cp": true,
   "raw_kv": {
     "DD_CP_BIND_ADDR": "0.0.0.0:8080",
     "DD_CP_DATABASE_URL": "sqlite://devopsdefender.db?mode=rwc",
@@ -7,8 +7,8 @@
     "DD_CP_CF_API_TOKEN": "{{ dd_cp_cf_api_token }}",
     "DD_CP_CF_ACCOUNT_ID": "{{ dd_cp_cf_account_id }}",
     "DD_CP_CF_ZONE_ID": "{{ dd_cp_cf_zone_id }}",
-    "DD_CP_CF_DOMAIN": "{{ dd_cp_cf_domain | default('devopsdefender.com') }}",
-    "DD_CP_PUBLIC_HOSTNAME": "app-{{ dd_env }}.devopsdefender.com",
+    "DD_CP_CF_DOMAIN": "{{ dd_cp_cf_domain }}",
+    "DD_CP_PUBLIC_HOSTNAME": "{{ cp_public_hostname }}",
     "DD_ENV": "{{ dd_env }}",
     "DD_INTEL_API_KEY": "{{ dd_intel_api_key }}",
     "DD_CP_GIT_SHA": "{{ dd_cp_git_sha | default('') }}",
