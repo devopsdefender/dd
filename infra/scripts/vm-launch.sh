@@ -37,6 +37,45 @@ require_cmd() {
   }
 }
 
+detect_libvirt_qemu_owner() {
+  if [ -n "${LIBVIRT_QEMU_USER:-}" ]; then
+    LIBVIRT_QEMU_GROUP="${LIBVIRT_QEMU_GROUP:-$(id -gn "$LIBVIRT_QEMU_USER" 2>/dev/null || true)}"
+    return 0
+  fi
+
+  for candidate in libvirt-qemu qemu; do
+    if id -u "$candidate" >/dev/null 2>&1; then
+      LIBVIRT_QEMU_USER="$candidate"
+      LIBVIRT_QEMU_GROUP="$(id -gn "$candidate")"
+      return 0
+    fi
+  done
+
+  LIBVIRT_QEMU_USER=""
+  LIBVIRT_QEMU_GROUP=""
+}
+
+prepare_runtime_permissions() {
+  if [ "$(id -u)" -ne 0 ]; then
+    return 0
+  fi
+
+  detect_libvirt_qemu_owner
+  if [ -z "$LIBVIRT_QEMU_USER" ] || [ -z "$LIBVIRT_QEMU_GROUP" ]; then
+    return 0
+  fi
+
+  chown "$LIBVIRT_QEMU_USER:$LIBVIRT_QEMU_GROUP" "$VM_WORK_DIR"
+  chmod 0770 "$VM_WORK_DIR"
+
+  chown "$LIBVIRT_QEMU_USER:$LIBVIRT_QEMU_GROUP" "$OVERLAY" "$CIDATA_ISO"
+  chmod 0660 "$OVERLAY" "$CIDATA_ISO"
+
+  touch "$SERIAL_LOG"
+  chown "$LIBVIRT_QEMU_USER:$LIBVIRT_QEMU_GROUP" "$SERIAL_LOG"
+  chmod 0660 "$SERIAL_LOG"
+}
+
 to_mib() {
   local value number unit
   value="${1^^}"
@@ -151,18 +190,38 @@ MEMORY_MIB="$(to_mib "$MEMORY")"
 DOMAIN_XML="${VM_WORK_DIR}/${VM_NAME}.xml"
 SERIAL_LOG="${VM_WORK_DIR}/${VM_NAME}.log"
 
+prepare_runtime_permissions
+
 QEMU_NS=""
 LAUNCH_SECURITY=""
 QEMU_COMMANDLINE=""
+FEATURES_EXTRA=""
+CLOCK_XML="  <clock offset='utc'/>\n"
+PM_XML=""
+MEMORY_BACKING_XML=""
+OS_OPEN_TAG="  <os firmware='efi'>"
+LOADER_XML=""
 if [ "$TDX" = "true" ]; then
-  QEMU_NS=" xmlns:qemu='http://libvirt.org/schemas/domain/qemu/1.0'"
-  LAUNCH_SECURITY="  <launchSecurity type='tdx'/>\n"
-  QEMU_COMMANDLINE+="  <qemu:commandline>\n"
-  QEMU_COMMANDLINE+="    <qemu:arg value='-object'/>\n"
-  QEMU_COMMANDLINE+="    <qemu:arg value='memory-backend-ram,id=mem0,size=${MEMORY}'/>\n"
-  QEMU_COMMANDLINE+="    <qemu:arg value='-machine'/>\n"
-  QEMU_COMMANDLINE+="    <qemu:arg value='q35,kernel_irqchip=split,confidential-guest-support=tdx,memory-backend=mem0,hpet=off'/>\n"
-  QEMU_COMMANDLINE+="  </qemu:commandline>\n"
+  MEMORY_BACKING_XML+="  <memoryBacking>\n"
+  MEMORY_BACKING_XML+="    <source type='anonymous'/>\n"
+  MEMORY_BACKING_XML+="    <access mode='private'/>\n"
+  MEMORY_BACKING_XML+="  </memoryBacking>\n"
+  OS_OPEN_TAG="  <os>"
+  LOADER_XML+="    <loader type='rom' readonly='yes'>/usr/share/qemu/OVMF.fd</loader>\n"
+  LAUNCH_SECURITY+="  <launchSecurity type='tdx'>\n"
+  LAUNCH_SECURITY+="    <policy>0x10000000</policy>\n"
+  LAUNCH_SECURITY+="    <quoteGenerationService>\n"
+  LAUNCH_SECURITY+="      <SocketAddress type='vsock' cid='2' port='4050'/>\n"
+  LAUNCH_SECURITY+="    </quoteGenerationService>\n"
+  LAUNCH_SECURITY+="  </launchSecurity>\n"
+  FEATURES_EXTRA+="    <ioapic driver='qemu'/>\n"
+  CLOCK_XML="  <clock offset='utc'>\n"
+  CLOCK_XML+="    <timer name='hpet' present='no'/>\n"
+  CLOCK_XML+="  </clock>\n"
+  PM_XML+="  <pm>\n"
+  PM_XML+="    <suspend-to-mem enabled='no'/>\n"
+  PM_XML+="    <suspend-to-disk enabled='no'/>\n"
+  PM_XML+="  </pm>\n"
 fi
 
 HOSTDEV_XML=""
@@ -183,21 +242,20 @@ cat > "$DOMAIN_XML" <<EOF
   <name>${VM_NAME}</name>
   <memory unit='MiB'>${MEMORY_MIB}</memory>
   <currentMemory unit='MiB'>${MEMORY_MIB}</currentMemory>
-  <vcpu placement='static'>${CPUS}</vcpu>
-  <os firmware='efi'>
+$(printf "%b" "$MEMORY_BACKING_XML")  <vcpu placement='static'>${CPUS}</vcpu>
+$(printf "%b" "$OS_OPEN_TAG")
     <type arch='x86_64' machine='q35'>hvm</type>
-    <boot dev='hd'/>
+$(printf "%b" "$LOADER_XML")    <boot dev='hd'/>
   </os>
 $(printf "%b" "$LAUNCH_SECURITY")  <features>
     <acpi/>
     <apic/>
-  </features>
+$(printf "%b" "$FEATURES_EXTRA")  </features>
   <cpu mode='host-passthrough' check='none'/>
-  <clock offset='utc'/>
-  <on_poweroff>destroy</on_poweroff>
+$(printf "%b" "$CLOCK_XML")  <on_poweroff>destroy</on_poweroff>
   <on_reboot>restart</on_reboot>
   <on_crash>destroy</on_crash>
-  <devices>
+$(printf "%b" "$PM_XML")  <devices>
     <emulator>/usr/bin/qemu-system-x86_64</emulator>
     <disk type='file' device='disk'>
       <driver name='qemu' type='qcow2' cache='none'/>
@@ -221,10 +279,6 @@ $(printf "%b" "$LAUNCH_SECURITY")  <features>
     <console type='pty'>
       <target type='serial' port='0'/>
     </console>
-    <graphics type='none'/>
-    <video>
-      <model type='none'/>
-    </video>
     <rng model='virtio'>
       <backend model='random'>/dev/urandom</backend>
     </rng>
