@@ -1,16 +1,12 @@
-# Baremetal Staging Deploy
+# OVH Staging VM Deploy
 #
-# Builds the agent + control-plane binaries, bakes a VM image on the staging
-# host via Packer, and launches the new agent VM.
+# Builds the agent image, bakes a qcow2 on the OVH staging host, and launches
+# the example-app VM there via libvirt so it is visible in `virsh list`.
 #
-# Trigger: automatic on pull_request targeting main (validates before merge).
-# Host/user/memory/cpus come from infra/ansible/inventory/staging.yml — no
-# inline overrides needed.
-#
-# App deployment (private-llm etc.) is handled by the private-llm repo,
-# not here. This workflow owns infra only.
+# The control plane and first/bootstrap validation agent stay on GCP.
+# This workflow only maintains the OVH VM that the example app targets.
 
-name: Baremetal Staging Deploy
+name: OVH Staging VM Deploy
 
 on:
   pull_request:
@@ -35,29 +31,23 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # ── Build binaries ──────────────────────────────────────────────────
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
-      # Build both dd-agent and dd-cp in release mode
-      - run: cargo build --workspace --release
+      - name: Build release binaries
+        run: cargo build --workspace --release
 
       - run: pip install ansible
 
-      # ── SSH setup ───────────────────────────────────────────────────────
-      # Write the deploy key to the path the inventory expects (/tmp/deploy-key)
       - name: Set up SSH
         run: |
           echo "${{ secrets.BAREMETAL_SSH_KEY }}" > /tmp/deploy-key
           chmod 600 /tmp/deploy-key
           ssh-keyscan -H 57.130.10.246 >> ~/.ssh/known_hosts 2>/dev/null || true
 
-      # ── Deploy agent VM ─────────────────────────────────────────────────
-      # Runs the baremetal-agent-deploy playbook against the staging inventory.
-      # Secrets are passed as Ansible extra-vars (never written to disk).
-      - name: Deploy agent to staging host
+      - name: Deploy OVH staging VM
         env:
           ANSIBLE_HOST_KEY_CHECKING: "false"
         run: |
@@ -67,21 +57,11 @@ jobs:
             -e "cp_binary_local=${GITHUB_WORKSPACE}/target/release/dd-cp"
             -e "packer_template_dir=${GITHUB_WORKSPACE}/images/packer"
             -e "image_name=dd-baremetal-${sha12}"
-            -e "dd_cp_admin_password=${{ secrets.DD_CP_ADMIN_PASSWORD }}"
-            # Temporary unblock: staging-specific CF secrets are currently failing
-            # auth on tunnel create, so use the last known-good shared DD creds
-            # until the staging Cloudflare credentials are corrected.
-            -e "dd_cp_cf_api_token=${{ secrets.DD_CP_CF_API_TOKEN }}"
-            -e "dd_cp_cf_account_id=${{ secrets.DD_CP_CF_ACCOUNT_ID }}"
-            -e "dd_cp_cf_zone_id=${{ secrets.DD_CP_CF_ZONE_ID }}"
-            -e "dd_intel_api_key=${{ secrets.INTEL_API_KEY }}"
-            -e "dd_cp_git_sha=${sha12}"
           )
           ansible-playbook infra/ansible/playbooks/baremetal-agent-deploy.yml \
             -i infra/ansible/inventory/staging.yml \
             "${EXTRA_VARS[@]}"
 
-      # ── Cleanup ─────────────────────────────────────────────────────────
       - name: Cleanup SSH key
         if: always()
         run: rm -f /tmp/deploy-key

@@ -7,8 +7,6 @@ all:
       cp_url: "https://app.devopsdefender.com"
   vars:
     dd_env: production
-    cp_memory: 8G
-    cp_cpus: 8
     agent_memory: 64G
     agent_cpus: 16
     agent_node_size: llm

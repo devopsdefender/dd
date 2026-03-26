@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+set -euo pipefail
+exec > >(tee -a /var/log/devopsdefender-control-plane-bootstrap.log /dev/ttyS0) 2>&1
+mkdir -p /etc/devopsdefender
+cat > /etc/devopsdefender/control-plane.json <<'EOF_CONFIG'
+{{ control_plane_config_json }}
+EOF_CONFIG
+chmod 0600 /etc/devopsdefender/control-plane.json
+systemctl daemon-reload || true
+systemctl disable --now devopsdefender-agent.service || true
+systemctl enable devopsdefender-control-plane.service || true
+systemctl restart devopsdefender-control-plane.service || true
+echo "__DD_CP_LOCAL_HEALTH_WAIT__ port={{ cp_port }}"
+for _ in $(seq 1 150); do
+  if curl -fsS "http://127.0.0.1:{{ cp_port }}/health" >/dev/null 2>&1; then
+    echo "__DD_CP_LOCAL_HEALTH_OK__"
+    break
+  fi
+  sleep 2
+done

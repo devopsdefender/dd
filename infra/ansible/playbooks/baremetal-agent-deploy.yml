@@ -5,47 +5,18 @@
   vars:
     dd_env: "{{ hostvars[inventory_hostname].dd_env | default('staging') }}"
     cp_url: "{{ hostvars[inventory_hostname].cp_url | default('') }}"
-    cp_public_hostname: >-
-      {{
-        hostvars[inventory_hostname].cp_public_hostname
-        | default(
-            cp_url
-            | regex_replace('^https?://', '')
-            | regex_replace('/.*$', ''),
-            true
-          )
-      }}
-    dd_cp_cf_domain: >-
-      {{
-        hostvars[inventory_hostname].dd_cp_cf_domain
-        | default(
-            cp_public_hostname | regex_replace('^[^.]+\\.', ''),
-            true
-          )
-      }}
     agent_node_size: "{{ hostvars[inventory_hostname].agent_node_size | default('standard') }}"
     agent_memory: "{{ hostvars[inventory_hostname].agent_memory | default('8G') }}"
     agent_cpus: "{{ hostvars[inventory_hostname].agent_cpus | default('4') }}"
-    cp_memory: "{{ hostvars[inventory_hostname].cp_memory | default('4G') }}"
-    cp_cpus: "{{ hostvars[inventory_hostname].cp_cpus | default('4') }}"
-    cp_local_vm: "{{ hostvars[inventory_hostname].cp_local_vm | default(true) }}"
     agent_tdx: "{{ hostvars[inventory_hostname].agent_tdx | default(true) }}"
-    # CP secrets (passed from CI via -e)
-    dd_cp_admin_password: ""
-    dd_cp_cf_api_token: ""
-    dd_cp_cf_account_id: ""
-    dd_cp_cf_zone_id: ""
-    dd_intel_api_key: ""
     vfio_device: ""
     vm_scripts_dir: "{{ playbook_dir }}/../../scripts"
     devopsdefender_base_dir: /var/lib/devopsdefender
-    # Image build vars (set by workflow)
     agent_binary_local: ""
     cp_binary_local: ""
     packer_template_dir: ""
     image_name: dd-baremetal-agent
   tasks:
-    # ── Prerequisites ───────────────────────────────────────────────────
     - name: Install prerequisites
       ansible.builtin.apt:
         name:
@@ -55,9 +26,54 @@
           - genisoimage
           - jq
           - curl
+          - libvirt-clients
+          - libvirt-daemon-system
+          - virtinst
         state: present
         update_cache: true
       become: true
+
+    - name: Start libvirt
+      ansible.builtin.systemd:
+        name: libvirtd
+        enabled: true
+        state: started
+      become: true
+
+    - name: Probe default libvirt network
+      ansible.builtin.command:
+        argv:
+          - virsh
+          - net-info
+          - default
+      register: libvirt_default_net
+      failed_when: false
+      changed_when: false
+      become: true
+
+    - name: Start default libvirt network
+      ansible.builtin.command:
+        argv:
+          - virsh
+          - net-start
+          - default
+      register: libvirt_net_start
+      failed_when: false
+      changed_when: libvirt_net_start.rc == 0
+      become: true
+      when: libvirt_default_net.rc == 0
+
+    - name: Autostart default libvirt network
+      ansible.builtin.command:
+        argv:
+          - virsh
+          - net-autostart
+          - default
+      register: libvirt_net_autostart
+      failed_when: false
+      changed_when: libvirt_net_autostart.rc == 0
+      become: true
+      when: libvirt_default_net.rc == 0
 
     - name: Check /dev/kvm exists
       ansible.builtin.stat:
@@ -71,13 +87,8 @@
 
     - name: Fail if cp_url is missing
       ansible.builtin.fail:
-        msg: "cp_url must be set explicitly in inventory for agent mode"
+        msg: "cp_url must point at the external control plane"
       when: cp_url | trim | length == 0
-
-    - name: Fail if cp_public_hostname is missing
-      ansible.builtin.fail:
-        msg: "cp_public_hostname must be set explicitly or derivable from cp_url"
-      when: cp_public_hostname | trim | length == 0
 
     - name: Create system directories
       ansible.builtin.file:
@@ -104,7 +115,6 @@
         - /tmp/dd-deploy/scripts
         - /tmp/dd-deploy/packer-build
 
-    # ── Build image on target (if binaries provided) ────────────────────
     - name: Install Packer
       when: agent_binary_local | length > 0
       block:
@@ -213,7 +223,6 @@
           become: true
           changed_when: true
 
-    # ── Copy VM lifecycle scripts ─────────────────────────────────────
     - name: Copy VM scripts
       ansible.builtin.copy:
         src: "{{ vm_scripts_dir }}/{{ item }}"
@@ -224,72 +233,6 @@
         - vm-stop.sh
         - vm-status.sh
 
-    # ── Deploy control-plane VM ────────────────────────────────────────
-    - name: Stop local control-plane VM when staging CP is external
-      ansible.builtin.command:
-        argv:
-          - /tmp/dd-deploy/scripts/vm-stop.sh
-          - "dd-cp-{{ dd_env }}"
-          - --clean
-      failed_when: false
-      changed_when: stop_cp_external.rc == 0
-      register: stop_cp_external
-      become: true
-      when: not (cp_local_vm | bool)
-
-    - name: Template control-plane config
-      ansible.builtin.template:
-        src: "{{ playbook_dir }}/templates/control-plane.json.j2"
-        dest: /tmp/dd-deploy/control-plane.json
-        mode: "0600"
-      when: (dd_cp_cf_api_token | length > 0) and (cp_local_vm | bool)
-
-    - name: Stop old control-plane VM
-      ansible.builtin.command:
-        argv:
-          - /tmp/dd-deploy/scripts/vm-stop.sh
-          - "dd-cp-{{ dd_env }}"
-          - --clean
-      failed_when: false
-      changed_when: stop_cp.rc == 0
-      register: stop_cp
-      become: true
-      when: (dd_cp_cf_api_token | length > 0) and (cp_local_vm | bool)
-
-    - name: Launch control-plane VM
-      ansible.builtin.command:
-        argv:
-          - /tmp/dd-deploy/scripts/vm-launch.sh
-          - --image
-          - "{{ devopsdefender_base_dir }}/images/dd-baremetal.qcow2"
-          - --name
-          - "dd-cp-{{ dd_env }}"
-          - --config
-          - /tmp/dd-deploy/control-plane.json
-          - --config-mode
-          - control-plane
-          - --memory
-          - "{{ cp_memory }}"
-          - --cpus
-          - "{{ cp_cpus }}"
-          - --port-forward
-          - "{{ cp_host_port | default('9090') }}:8080"
-      become: true
-      when: (dd_cp_cf_api_token | length > 0) and (cp_local_vm | bool)
-
-    - name: Wait for control-plane health
-      ansible.builtin.uri:
-        url: "http://localhost:{{ cp_host_port | default('9090') }}/health"
-        method: GET
-        return_content: true
-        status_code: 200
-      register: cp_health
-      retries: 30
-      delay: 5
-      until: cp_health.status == 200
-      when: (dd_cp_cf_api_token | length > 0) and (cp_local_vm | bool)
-
-    # ── Deploy agent VM ─────────────────────────────────────────────────
     - name: Template agent config
       ansible.builtin.template:
         src: "{{ playbook_dir }}/templates/agent.json.j2"
@@ -327,7 +270,7 @@
     - name: Add TDX flag to agent VM args
       ansible.builtin.set_fact:
         agent_launch_args: "{{ agent_launch_args + ['--tdx'] }}"
-      when: agent_tdx | default(true) | bool
+      when: agent_tdx | bool
 
     - name: Add VFIO device to agent VM args
       ansible.builtin.set_fact:
@@ -341,22 +284,39 @@
 
     - name: Wait for agent to register with control plane
       ansible.builtin.uri:
-        url: "{{ cp_url | default('') }}/api/v1/agents"
+        url: "{{ cp_url }}/api/v1/agents"
         method: GET
         return_content: true
         status_code: 200
       register: agents_poll
       retries: 60
       delay: 5
-      until: >
-        (agents_poll.json | default([]))
-        | selectattr('registration_state', 'equalto', 'ready')
-        | selectattr('vm_name', 'equalto', 'dd-agent-' + dd_env)
-        | list | length > 0
+      until: >-
+        (
+          (
+            ((agents_poll.json | default({})).agents | default([]))
+            if ((agents_poll.json | default({})) is mapping)
+            else (agents_poll.json | default([]))
+          )
+          | selectattr('registration_state', 'equalto', 'ready')
+          | selectattr('vm_name', 'equalto', 'dd-agent-' + dd_env)
+          | list
+          | length
+        ) > 0
 
     - name: Print registered agents
       ansible.builtin.debug:
-        msg: "{{ agents_poll.json | selectattr('registration_state', 'equalto', 'ready') | selectattr('vm_name', 'equalto', 'dd-agent-' + dd_env) | list }}"
+        msg: >-
+          {{
+            (
+              ((agents_poll.json | default({})).agents | default([]))
+              if ((agents_poll.json | default({})) is mapping)
+              else (agents_poll.json | default([]))
+            )
+            | selectattr('registration_state', 'equalto', 'ready')
+            | selectattr('vm_name', 'equalto', 'dd-agent-' + dd_env)
+            | list
+          }}
 
     - name: Show VM status
       ansible.builtin.command:

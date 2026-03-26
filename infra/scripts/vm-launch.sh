@@ -1,10 +1,5 @@
 #!/usr/bin/env bash
-# Launch a QEMU/KVM VM from a baked qcow2 image.
-#
-# Usage:
-#   ./vm-launch.sh --image /path/to/base.qcow2 --name dd-cp-staging \
-#     --config /path/to/config.json --memory 8G --cpus 4 \
-#     --port-forward 8080:8080
+# Launch a libvirt-managed VM from a baked qcow2 image.
 set -euo pipefail
 
 IMAGE=""
@@ -16,7 +11,8 @@ PORT_FORWARDS=()
 VFIO_DEVICE=""
 TDX="false"
 VM_DIR="/var/lib/devopsdefender/vms"
-CONFIG_MODE="agent"  # agent or control-plane
+CONFIG_MODE="agent"
+LIBVIRT_NETWORK="${LIBVIRT_NETWORK:-default}"
 
 usage() {
   cat <<EOF
@@ -27,11 +23,48 @@ Usage: $0 [options]
   --config-mode MODE    Config target: agent (default) or control-plane
   --memory SIZE         VM memory (default: 4G)
   --cpus N              VM CPUs (default: 2)
-  --port-forward H:G    Forward host port H to guest port G (repeatable)
+  --port-forward H:G    Recorded for metadata only in libvirt mode
   --vfio-device ADDR    PCI device to pass through via VFIO (e.g. 0d:00.0)
-  --tdx                 Launch as Intel TDX confidential VM (requires TDX host)
+  --tdx                 Request Intel TDX launch settings
 EOF
   exit 1
+}
+
+require_cmd() {
+  command -v "$1" >/dev/null 2>&1 || {
+    echo "Error: required command not found: $1" >&2
+    exit 1
+  }
+}
+
+to_mib() {
+  local value number unit
+  value="${1^^}"
+  if [[ "$value" =~ ^([0-9]+)([GM])I?B?$ ]]; then
+    number="${BASH_REMATCH[1]}"
+    unit="${BASH_REMATCH[2]}"
+  elif [[ "$value" =~ ^([0-9]+)$ ]]; then
+    echo "$value"
+    return 0
+  else
+    echo "Error: unsupported memory value '$1' (use 4096, 4G, 8192M)" >&2
+    exit 1
+  fi
+
+  if [ "$unit" = "G" ]; then
+    echo $((number * 1024))
+  else
+    echo "$number"
+  fi
+}
+
+escape_xml() {
+  sed \
+    -e 's/&/\&amp;/g' \
+    -e 's/</\&lt;/g' \
+    -e 's/>/\&gt;/g' \
+    -e "s/'/\&apos;/g" \
+    -e 's/"/\&quot;/g'
 }
 
 while [[ $# -gt 0 ]]; do
@@ -55,28 +88,21 @@ if [ -z "$IMAGE" ] || [ -z "$VM_NAME" ] || [ -z "$CONFIG_FILE" ]; then
   usage
 fi
 
-if [ ! -f "$IMAGE" ]; then
-  echo "Error: base image not found: $IMAGE" >&2
-  exit 1
-fi
+require_cmd virsh
+require_cmd qemu-img
 
-if [ ! -f "$CONFIG_FILE" ]; then
-  echo "Error: config file not found: $CONFIG_FILE" >&2
-  exit 1
-fi
+[ -f "$IMAGE" ] || { echo "Error: base image not found: $IMAGE" >&2; exit 1; }
+[ -f "$CONFIG_FILE" ] || { echo "Error: config file not found: $CONFIG_FILE" >&2; exit 1; }
 
-# Create VM working directory.
 VM_WORK_DIR="${VM_DIR}/${VM_NAME}"
 mkdir -p "$VM_WORK_DIR"
 
-# Create copy-on-write overlay from base image.
 OVERLAY="${VM_WORK_DIR}/${VM_NAME}.qcow2"
 if [ ! -f "$OVERLAY" ]; then
   echo "==> Creating overlay image from base"
   qemu-img create -b "$(realpath "$IMAGE")" -F qcow2 -f qcow2 "$OVERLAY"
 fi
 
-# Determine config target path inside cloud-init.
 if [ "$CONFIG_MODE" = "control-plane" ]; then
   CONFIG_DEST="/etc/devopsdefender/control-plane.json"
   SYSTEMD_ENABLE="devopsdefender-control-plane.service"
@@ -87,11 +113,8 @@ else
   SYSTEMD_DISABLE="devopsdefender-control-plane.service"
 fi
 
-# Generate cloud-init ISO for config injection.
 CIDATA_DIR="${VM_WORK_DIR}/cidata"
 mkdir -p "$CIDATA_DIR"
-
-# Escape JSON for embedding in cloud-init write_files.
 CONFIG_CONTENT="$(cat "$CONFIG_FILE")"
 
 cat > "${CIDATA_DIR}/user-data" <<USERDATA
@@ -114,9 +137,9 @@ local-hostname: ${VM_NAME}
 METADATA
 
 CIDATA_ISO="${VM_WORK_DIR}/cidata.iso"
-if command -v cloud-localds &>/dev/null; then
+if command -v cloud-localds >/dev/null 2>&1; then
   cloud-localds "$CIDATA_ISO" "${CIDATA_DIR}/user-data" "${CIDATA_DIR}/meta-data"
-elif command -v genisoimage &>/dev/null; then
+elif command -v genisoimage >/dev/null 2>&1; then
   genisoimage -output "$CIDATA_ISO" -volid cidata -joliet -rock \
     "${CIDATA_DIR}/user-data" "${CIDATA_DIR}/meta-data"
 else
@@ -124,103 +147,128 @@ else
   exit 1
 fi
 
-# Build QEMU command.
-QEMU_ARGS=(
-  qemu-system-x86_64
-  -cpu host
-  -m "$MEMORY"
-  -smp "$CPUS"
-  -display none
-  -daemonize
-  -pidfile "${VM_WORK_DIR}/${VM_NAME}.pid"
-)
+MEMORY_MIB="$(to_mib "$MEMORY")"
+DOMAIN_XML="${VM_WORK_DIR}/${VM_NAME}.xml"
+SERIAL_LOG="${VM_WORK_DIR}/${VM_NAME}.log"
 
+QEMU_NS=""
+LAUNCH_SECURITY=""
+QEMU_COMMANDLINE=""
 if [ "$TDX" = "true" ]; then
-  # TDX confidential VM: requires TDVF firmware, vsock for quote generation.
-  # Use -accel kvm (not -enable-kvm) — required for TDX machine type.
-  TDVF_FIRMWARE="/usr/share/ovmf/OVMF.fd"
-  if [ ! -f "$TDVF_FIRMWARE" ]; then
-    echo "Error: TDVF firmware not found: $TDVF_FIRMWARE" >&2
-    exit 1
-  fi
-  QEMU_ARGS+=(
-    -accel kvm
-    -object '{"qom-type":"tdx-guest","id":"tdx","quote-generation-socket":{"type":"vsock","cid":"2","port":"4050"}}'
-    -object "memory-backend-ram,id=mem0,size=${MEMORY}"
-    -machine q35,kernel_irqchip=split,confidential-guest-support=tdx,memory-backend=mem0,hpet=off
-    -bios "$TDVF_FIRMWARE"
-    -nodefaults
-    -vga none
-    -device vhost-vsock-pci,guest-cid=3
-  )
-  echo "    TDX: enabled (confidential VM)"
-else
-  QEMU_ARGS+=(-accel kvm -machine q35)
+  QEMU_NS=" xmlns:qemu='http://libvirt.org/schemas/domain/qemu/1.0'"
+  LAUNCH_SECURITY="  <launchSecurity type='tdx'/>\n"
+  QEMU_COMMANDLINE+="  <qemu:commandline>\n"
+  QEMU_COMMANDLINE+="    <qemu:arg value='-object'/>\n"
+  QEMU_COMMANDLINE+="    <qemu:arg value='memory-backend-ram,id=mem0,size=${MEMORY}'/>\n"
+  QEMU_COMMANDLINE+="    <qemu:arg value='-machine'/>\n"
+  QEMU_COMMANDLINE+="    <qemu:arg value='q35,kernel_irqchip=split,confidential-guest-support=tdx,memory-backend=mem0,hpet=off'/>\n"
+  QEMU_COMMANDLINE+="  </qemu:commandline>\n"
 fi
 
-QEMU_ARGS+=(
-  -drive "file=${OVERLAY},format=qcow2,if=virtio"
-  -drive "file=${CIDATA_ISO},format=raw,if=virtio,readonly=on"
-  -serial "file:${VM_WORK_DIR}/${VM_NAME}.log"
-)
-
-# Pass through VFIO device (GPU) if requested.
+HOSTDEV_XML=""
 if [ -n "$VFIO_DEVICE" ]; then
-  QEMU_ARGS+=(-device "vfio-pci,host=${VFIO_DEVICE}")
+  domain_hex="${VFIO_DEVICE%%:*}"
+  remainder="${VFIO_DEVICE#*:}"
+  bus_hex="${remainder%%.*}"
+  function_hex="${remainder##*.}"
+  HOSTDEV_XML+="    <hostdev mode='subsystem' type='pci' managed='yes'>\n"
+  HOSTDEV_XML+="      <source>\n"
+  HOSTDEV_XML+="        <address domain='0x0000' bus='0x${domain_hex}' slot='0x${bus_hex}' function='0x${function_hex}'/>\n"
+  HOSTDEV_XML+="      </source>\n"
+  HOSTDEV_XML+="    </hostdev>\n"
 fi
 
-# Build port forwarding netdev.
-HOSTFWD_ARGS=""
-for pf in "${PORT_FORWARDS[@]+"${PORT_FORWARDS[@]}"}"; do
-  host_port="${pf%%:*}"
-  guest_port="${pf##*:}"
-  HOSTFWD_ARGS="${HOSTFWD_ARGS},hostfwd=tcp::${host_port}-:${guest_port}"
-done
+cat > "$DOMAIN_XML" <<EOF
+<domain type='kvm'${QEMU_NS}>
+  <name>${VM_NAME}</name>
+  <memory unit='MiB'>${MEMORY_MIB}</memory>
+  <currentMemory unit='MiB'>${MEMORY_MIB}</currentMemory>
+  <vcpu placement='static'>${CPUS}</vcpu>
+  <os firmware='efi'>
+    <type arch='x86_64' machine='q35'>hvm</type>
+    <boot dev='hd'/>
+  </os>
+$(printf "%b" "$LAUNCH_SECURITY")  <features>
+    <acpi/>
+    <apic/>
+  </features>
+  <cpu mode='host-passthrough' check='none'/>
+  <clock offset='utc'/>
+  <on_poweroff>destroy</on_poweroff>
+  <on_reboot>restart</on_reboot>
+  <on_crash>destroy</on_crash>
+  <devices>
+    <emulator>/usr/bin/qemu-system-x86_64</emulator>
+    <disk type='file' device='disk'>
+      <driver name='qemu' type='qcow2' cache='none'/>
+      <source file='$(printf "%s" "$OVERLAY" | escape_xml)'/>
+      <target dev='vda' bus='virtio'/>
+    </disk>
+    <disk type='file' device='cdrom'>
+      <driver name='qemu' type='raw'/>
+      <source file='$(printf "%s" "$CIDATA_ISO" | escape_xml)'/>
+      <target dev='sda' bus='sata'/>
+      <readonly/>
+    </disk>
+    <interface type='network'>
+      <source network='${LIBVIRT_NETWORK}'/>
+      <model type='virtio'/>
+    </interface>
+    <serial type='file'>
+      <source path='$(printf "%s" "$SERIAL_LOG" | escape_xml)'/>
+      <target type='isa-serial' port='0'/>
+    </serial>
+    <console type='pty'>
+      <target type='serial' port='0'/>
+    </console>
+    <graphics type='none'/>
+    <video>
+      <model type='none'/>
+    </video>
+    <rng model='virtio'>
+      <backend model='random'>/dev/urandom</backend>
+    </rng>
+$(printf "%b" "$HOSTDEV_XML")  </devices>
+$(printf "%b" "$QEMU_COMMANDLINE")</domain>
+EOF
 
-# Always forward SSH on a high port for debugging.
-SSH_PORT=$((10000 + RANDOM % 50000))
-HOSTFWD_ARGS="${HOSTFWD_ARGS},hostfwd=tcp::${SSH_PORT}-:22"
+if virsh dominfo "$VM_NAME" >/dev/null 2>&1; then
+  echo "Error: domain '$VM_NAME' already exists; stop it first" >&2
+  exit 1
+fi
 
-QEMU_ARGS+=(-netdev "user,id=net0${HOSTFWD_ARGS}" -device "virtio-net-pci,netdev=net0")
-
-echo "==> Launching VM: ${VM_NAME}"
+echo "==> Defining libvirt domain: ${VM_NAME}"
 echo "    Memory: ${MEMORY}, CPUs: ${CPUS}"
 echo "    Overlay: ${OVERLAY}"
 echo "    Config mode: ${CONFIG_MODE}"
+echo "    Libvirt network: ${LIBVIRT_NETWORK}"
 echo "    TDX: ${TDX}"
-echo "    SSH port: ${SSH_PORT}"
 if [ -n "$VFIO_DEVICE" ]; then
   echo "    VFIO device: ${VFIO_DEVICE}"
 fi
 for pf in "${PORT_FORWARDS[@]+"${PORT_FORWARDS[@]}"}"; do
-  echo "    Port forward: ${pf}"
+  echo "    Recorded port forward hint: ${pf}"
 done
 
-"${QEMU_ARGS[@]}" </dev/null
+virsh define "$DOMAIN_XML" >/dev/null
+virsh start "$VM_NAME" >/dev/null
 
-PID_FILE="${VM_WORK_DIR}/${VM_NAME}.pid"
-if [ -f "$PID_FILE" ]; then
-  PID="$(cat "$PID_FILE")"
-  echo "==> VM started with PID ${PID}"
-  echo "    PID file: ${PID_FILE}"
-  echo "    SSH: ssh -p ${SSH_PORT} ubuntu@localhost"
-else
-  echo "Warning: PID file not created, VM may not have started" >&2
-fi
+STATE="$(virsh domstate "$VM_NAME" | tr -d '\r' | xargs)"
+echo "==> VM started with libvirt state: ${STATE}"
+echo "    Inspect with: virsh list --all"
 
-# Write metadata for vm-status.sh / vm-stop.sh.
 cat > "${VM_WORK_DIR}/vm-info.json" <<INFO
 {
   "name": "${VM_NAME}",
-  "pid_file": "${PID_FILE}",
   "overlay": "${OVERLAY}",
   "config_mode": "${CONFIG_MODE}",
   "memory": "${MEMORY}",
   "cpus": "${CPUS}",
-  "ssh_port": ${SSH_PORT},
+  "libvirt_network": "${LIBVIRT_NETWORK}",
   "port_forwards": "$(IFS=,; echo "${PORT_FORWARDS[*]+"${PORT_FORWARDS[*]}"}")",
   "vfio_device": "${VFIO_DEVICE}",
   "tdx": ${TDX},
+  "xml_path": "${DOMAIN_XML}",
   "started_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 }
 INFO

@@ -1,14 +1,10 @@
 # Baremetal Production Deploy
 #
 # Builds the agent + control-plane binaries, bakes a VM image on the production
-# host via Packer, and launches the new agent VM.
+# host via Packer, and launches the new libvirt-managed OVH VM.
 #
-# Trigger: automatic on push to main (after PR has been validated on staging).
-# Dispatch inputs let you override GPU PCI address, memory, and CPU count —
-# but sensible defaults come from infra/ansible/inventory/production.yml.
-#
-# App deployment (private-llm etc.) is handled by the private-llm repo,
-# not here. This workflow owns infra only.
+# Production keeps its external control plane. This workflow only replaces the
+# application VM on the OVH host.
 
 name: Baremetal Production Deploy
 
@@ -35,7 +31,7 @@ on:
 
 concurrency:
   group: dd-baremetal-production
-  cancel-in-progress: false   # Never cancel an in-progress production deploy
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -45,29 +41,22 @@ jobs:
     runs-on: ubuntu-latest
     environment: production
     steps:
-      # ── Build binaries ──────────────────────────────────────────────────
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
-      # Build both dd-agent and dd-cp in release mode
-      - run: cargo build --workspace --release
+      - name: Build release binaries
+        run: cargo build --workspace --release
 
       - run: pip install ansible
 
-      # ── SSH setup ───────────────────────────────────────────────────────
-      # Write the deploy key to the path the inventory expects (/tmp/deploy-key)
       - name: Set up SSH
         run: |
           echo "${{ secrets.BAREMETAL_SSH_KEY }}" > /tmp/deploy-key
           chmod 600 /tmp/deploy-key
           ssh-keyscan -H 162.222.34.121 >> ~/.ssh/known_hosts 2>/dev/null || true
 
-      # ── Deploy agent VM ─────────────────────────────────────────────────
-      # Runs the baremetal-agent-deploy playbook against the production inventory.
-      # Build-time vars and GPU passthrough are passed with -e.
-      # Workflow dispatch inputs override inventory defaults when provided.
       - name: Deploy agent to production host
         env:
           ANSIBLE_HOST_KEY_CHECKING: "false"
@@ -80,25 +69,16 @@ jobs:
             -e "image_name=dd-baremetal-${sha12}"
             -e "vfio_device=${{ inputs.vfio_device || '0d:00.0' }}"
           )
-          # Only override inventory defaults when the dispatch input is non-empty
           if [ -n "${{ inputs.agent_memory }}" ]; then
             EXTRA_VARS+=(-e "agent_memory=${{ inputs.agent_memory }}")
           fi
           if [ -n "${{ inputs.agent_cpus }}" ]; then
             EXTRA_VARS+=(-e "agent_cpus=${{ inputs.agent_cpus }}")
           fi
-          EXTRA_VARS+=(
-            -e "dd_intel_api_key=${{ secrets.INTEL_API_KEY }}"
-            -e "dd_cp_admin_password=${{ secrets.DD_CP_ADMIN_PASSWORD }}"
-            -e "dd_cp_cf_api_token=${{ secrets.DD_CP_CF_API_TOKEN }}"
-            -e "dd_cp_cf_account_id=${{ secrets.DD_CP_CF_ACCOUNT_ID }}"
-            -e "dd_cp_cf_zone_id=${{ secrets.DD_CP_CF_ZONE_ID }}"
-          )
           ansible-playbook infra/ansible/playbooks/baremetal-agent-deploy.yml \
             -i infra/ansible/inventory/production.yml \
             "${EXTRA_VARS[@]}"
 
-      # ── Cleanup ─────────────────────────────────────────────────────────
       - name: Cleanup SSH key
         if: always()
         run: rm -f /tmp/deploy-key

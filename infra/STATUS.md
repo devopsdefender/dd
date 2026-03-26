@@ -1,6 +1,12 @@
 # Infra Status
 
-KVM VM deployment on dedicated OVH hardware. GCP playbooks were removed (2026-03-23) — all environments now deploy agents as KVM/QEMU VMs on dedicated OVH servers.
+Current target state:
+
+- Staging control plane: GCP
+- Staging bootstrap/test agent: GCP
+- Staging example-app VM: OVH host, managed by libvirt and visible in `virsh list`
+- Production app VM: OVH host, managed by libvirt and pointed at the external production control plane
+- Cloudflare: still active; only stale records/resources were deleted manually
 
 ## Structure
 
@@ -9,30 +15,34 @@ infra/
 ├── ansible/
 │   ├── ansible.cfg                         # Default inventory: staging.yml
 │   ├── inventory/
-│   │   ├── staging.yml                     # Staging host, vars (memory, cpus, node_size, cp_url)
-│   │   └── production.yml                  # Production host, vars (memory, cpus, node_size, cp_url)
+│   │   ├── staging.yml                     # OVH staging app VM host + external GCP cp_url
+│   │   └── production.yml                  # OVH production app VM host + external cp_url
 │   └── playbooks/
-│       ├── baremetal-agent-deploy.yml       # Build image via Packer + deploy agent VM (used by CI)
+│       ├── baremetal-agent-deploy.yml      # Bake image + deploy libvirt-managed OVH VM
+│       ├── gcp-control-plane-new.yml       # Launch staging control plane on GCP
+│       ├── gcp-deploy.yml                  # Launch staging control plane + first GCP agent
+│       ├── gcp-image-bake.yml              # Bake GCP image
+│       ├── gcp-vm-fleet-new.yml            # Launch GCP agents
 │       └── templates/
-│           ├── agent.json.j2               # Agent config template
-│           └── control-plane.json.j2       # Control-plane config template
+│           ├── agent-startup.sh.j2         # GCP agent startup metadata
+│           └── control-plane-startup.sh.j2 # GCP control-plane startup metadata
 └── scripts/
-    ├── vm-launch.sh                        # Launch QEMU/KVM VM from qcow2 image
-    ├── vm-stop.sh                          # Stop VM by name
-    └── vm-status.sh                        # List running VMs
+    ├── vm-launch.sh                        # Define/start libvirt VM from qcow2 image
+    ├── vm-stop.sh                          # Shutdown + undefine libvirt VM
+    └── vm-status.sh                        # Repo VM summary + virsh list --all
 ```
 
 ## Workflows
 
 | Workflow | Trigger | Playbook |
 |---|---|---|
-| `baremetal-staging-deploy.yml` | Push to main | `baremetal-agent-deploy.yml` |
-| `baremetal-production-deploy.yml` | Manual dispatch | `baremetal-agent-deploy.yml` |
+| `staging-deploy.yml` | Push to `main` / manual | `gcp-deploy.yml` |
+| `baremetal-staging-deploy.yml` | PR / manual | `baremetal-agent-deploy.yml` |
+| `baremetal-production-deploy.yml` | Push to `main` / manual | `baremetal-agent-deploy.yml` |
 
 ## Deploy Flow
 
-1. CI builds `dd-agent` and `dd-cp` binaries
-2. Ansible copies binaries + Packer templates to target host
-3. Packer builds a qcow2 VM image on the host
-4. Old agent VM is stopped and cleaned up
-5. New agent VM is launched via `vm-launch.sh`
+1. `staging-deploy.yml` keeps the control plane and one disposable bootstrap agent on GCP.
+2. `baremetal-staging-deploy.yml` keeps the OVH example-app VM aligned with the current branch.
+3. `baremetal-production-deploy.yml` does the same for production.
+4. OVH VMs are expected to be visible and operable through `virsh list --all`.
