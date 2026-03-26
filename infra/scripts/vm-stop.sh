@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Stop a VM by name.
+# Stop a libvirt-managed VM by name.
 # Usage: ./vm-stop.sh <vm-name> [--clean]
 set -euo pipefail
 
@@ -22,39 +22,39 @@ if [ -z "$VM_NAME" ]; then
 fi
 
 VM_WORK_DIR="${VM_DIR}/${VM_NAME}"
-PID_FILE="${VM_WORK_DIR}/${VM_NAME}.pid"
 
-if [ ! -f "$PID_FILE" ]; then
-  echo "No PID file found for VM '${VM_NAME}' at ${PID_FILE}" >&2
+command -v virsh >/dev/null 2>&1 || {
+  echo "Error: virsh is required" >&2
+  exit 1
+}
+
+if ! virsh dominfo "$VM_NAME" >/dev/null 2>&1; then
+  echo "No libvirt domain found for VM '${VM_NAME}'" >&2
   exit 1
 fi
 
-PID="$(cat "$PID_FILE")"
+STATE="$(virsh domstate "$VM_NAME" | tr -d '\r' | xargs)"
+echo "==> Stopping VM '${VM_NAME}' (state: ${STATE})"
 
-if kill -0 "$PID" 2>/dev/null; then
-  echo "==> Stopping VM '${VM_NAME}' (PID ${PID})"
-  kill "$PID"
-
-  # Wait for process to exit (up to 30s).
+if [ "$STATE" = "running" ] || [ "$STATE" = "paused" ] || [ "$STATE" = "in shutdown" ]; then
+  virsh shutdown "$VM_NAME" >/dev/null || true
   for _ in $(seq 1 30); do
-    if ! kill -0 "$PID" 2>/dev/null; then
+    STATE="$(virsh domstate "$VM_NAME" | tr -d '\r' | xargs)"
+    if [ "$STATE" = "shut off" ]; then
       break
     fi
     sleep 1
   done
-
-  # Force kill if still running.
-  if kill -0 "$PID" 2>/dev/null; then
-    echo "    Force killing PID ${PID}"
-    kill -9 "$PID" 2>/dev/null || true
-  fi
-
-  echo "==> VM '${VM_NAME}' stopped"
-else
-  echo "VM '${VM_NAME}' is not running (PID ${PID})"
 fi
 
-rm -f "$PID_FILE"
+STATE="$(virsh domstate "$VM_NAME" | tr -d '\r' | xargs)"
+if [ "$STATE" != "shut off" ]; then
+  echo "    Force destroying domain ${VM_NAME}"
+  virsh destroy "$VM_NAME" >/dev/null || true
+fi
+
+virsh undefine "$VM_NAME" --nvram >/dev/null 2>&1 || virsh undefine "$VM_NAME" >/dev/null
+echo "==> VM '${VM_NAME}' undefined"
 
 if [ "$CLEAN" = true ]; then
   echo "==> Cleaning up VM directory: ${VM_WORK_DIR}"

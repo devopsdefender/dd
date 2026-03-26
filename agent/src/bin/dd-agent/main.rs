@@ -37,7 +37,6 @@ async fn run_agent_mode(cfg: AgentRuntimeConfig) {
         }
     };
 
-    // 1. Build an HTTP client.
     let http = match reqwest::Client::builder()
         .danger_accept_invalid_certs(false)
         .build()
@@ -49,65 +48,73 @@ async fn run_agent_mode(cfg: AgentRuntimeConfig) {
         }
     };
 
-    // 2. Obtain a challenge nonce from the control plane.
-    let challenge = match fetch_challenge(&http, &cp_url).await {
-        Ok(c) => c,
+    let registration = match register_with_retry(&http, &cp_url, &cfg).await {
+        Ok(r) => r,
         Err(e) => {
-            eprintln!("dd-agent: challenge failed: {e}");
+            eprintln!("dd-agent: registration failed: {e}");
             std::process::exit(1);
         }
     };
-
-    eprintln!(
-        "dd-agent: received nonce (expires in {}s)",
-        challenge.expires_in_seconds
-    );
-
-    // 3. Generate a TDX quote embedding the nonce as report data.
-    let quote_b64 = match dd_agent::attestation::tsm::generate_tdx_quote_base64() {
-        Ok(q) => q,
-        Err(e) => {
-            eprintln!("dd-agent: TDX quote generation failed: {e}");
-            std::process::exit(1);
-        }
-    };
-
-    // 4. Register with the control plane.
-    let registration =
-        match register_agent(&http, &cp_url, &challenge.nonce, &quote_b64, &cfg).await {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("dd-agent: registration failed: {e}");
-                std::process::exit(1);
-            }
-        };
 
     eprintln!(
         "dd-agent: registered as {} at {}",
         registration.agent_id, registration.hostname
     );
 
-    // 5. Start cloudflared tunnel.
     if let Err(e) = start_cloudflared(&registration.tunnel_token).await {
         eprintln!("dd-agent: cloudflared start failed: {e}");
-        // Non-fatal: continue to workload.
     }
 
-    // 6. Run workload containers.
     if let Err(e) = run_workloads(&cfg).await {
         eprintln!("dd-agent: workload launch failed: {e}");
     }
 
-    // 7. Heartbeat / reconciliation loop.
     let agent_id = registration.agent_id.clone();
     heartbeat_loop(&http, &cp_url, &agent_id).await;
+}
+
+async fn register_with_retry(
+    http: &reqwest::Client,
+    cp_url: &str,
+    cfg: &AgentRuntimeConfig,
+) -> Result<AgentRegisterResponse, String> {
+    let max_retries = 30u32;
+
+    for attempt in 1..=max_retries {
+        let challenge = match fetch_challenge(http, cp_url).await {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("dd-agent: challenge failed (attempt {attempt}/{max_retries}): {e}");
+                backoff_sleep(attempt).await;
+                continue;
+            }
+        };
+
+        let quote_b64 = match dd_agent::attestation::tsm::generate_tdx_quote_base64() {
+            Ok(q) => q,
+            Err(e) => {
+                eprintln!("dd-agent: TDX quote generation failed, using fallback: {e}");
+                "no-tdx-available".to_string()
+            }
+        };
+
+        match register_agent(http, cp_url, &challenge.nonce, &quote_b64, cfg).await {
+            Ok(r) => return Ok(r),
+            Err(e) => {
+                eprintln!("dd-agent: registration failed (attempt {attempt}/{max_retries}): {e}");
+                backoff_sleep(attempt).await;
+            }
+        }
+    }
+
+    Err(format!("failed after {max_retries} attempts"))
 }
 
 async fn fetch_challenge(
     http: &reqwest::Client,
     cp_url: &str,
 ) -> Result<AgentChallengeResponse, String> {
-    let url = format!("{cp_url}/api/agents/challenge");
+    let url = format!("{cp_url}/api/v1/agents/challenge");
     let resp = http
         .get(&url)
         .send()
@@ -130,11 +137,11 @@ async fn register_agent(
     quote_b64: &str,
     cfg: &AgentRuntimeConfig,
 ) -> Result<AgentRegisterResponse, String> {
-    let url = format!("{cp_url}/api/agents/register");
+    let url = format!("{cp_url}/api/v1/agents/register");
 
     let body = serde_json::json!({
         "nonce": nonce,
-        "quote": quote_b64,
+        "intel_ta_token": quote_b64,
         "vm_name": hostname(),
         "node_size": cfg.node_size,
         "datacenter": cfg.datacenter,
@@ -223,7 +230,7 @@ async fn run_workloads(cfg: &AgentRuntimeConfig) -> Result<(), String> {
 }
 
 async fn heartbeat_loop(http: &reqwest::Client, cp_url: &str, agent_id: &str) {
-    let url = format!("{cp_url}/api/agents/{agent_id}/heartbeat");
+    let url = format!("{cp_url}/api/v1/agents/{agent_id}/heartbeat");
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
 
     loop {
@@ -309,4 +316,9 @@ fn hostname() -> String {
         .unwrap_or_else(|_| "unknown".into())
         .trim()
         .to_string()
+}
+
+async fn backoff_sleep(attempt: u32) {
+    let secs = std::cmp::min(5 * 2u64.saturating_pow(attempt.saturating_sub(1)), 60);
+    tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
 }
