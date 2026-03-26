@@ -33,7 +33,6 @@ permissions:
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    environment: staging
 
     steps:
       # ── Build binaries ──────────────────────────────────────────────────
