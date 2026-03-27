@@ -8,6 +8,8 @@
     "DD_CP_CF_ACCOUNT_ID": "{{ dd_cp_cf_account_id }}",
     "DD_CP_CF_ZONE_ID": "{{ dd_cp_cf_zone_id }}",
     "DD_CP_CF_DOMAIN": "{{ dd_cp_cf_domain | default('devopsdefender.com') }}",
+    "DD_CP_PUBLIC_HOSTNAME": "app-{{ dd_env }}.{{ dd_cp_cf_domain | default('devopsdefender.com') }}",
+    "DD_CP_GITHUB_OIDC_AUDIENCE": "devopsdefender",
     "DD_ENV": "{{ dd_env }}",
     "DD_CP_GIT_SHA": "{{ dd_cp_git_sha | default('') }}",
     "DD_CP_NONCE_ENFORCEMENT_MODE": "{{ dd_cp_nonce_enforcement | default('optional') }}",
