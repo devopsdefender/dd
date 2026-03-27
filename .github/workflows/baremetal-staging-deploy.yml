@@ -2,7 +2,7 @@ name: Baremetal Staging Deploy
 
 on:
   push:
-    branches: [main]
+    branches: [main, staging]
     paths:
       - "agent/**"
       - "control-plane/**"

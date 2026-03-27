@@ -149,6 +149,34 @@ Landing page for devopsdefender.com, deployed via GitHub Pages.
 - `style.css` — design system (indigo/teal theme, responsive, dark mode support)
 - `CNAME` — GitHub Pages custom domain config
 
+## Development Workflow & Branch Rules
+
+### Branch Protection (Enforced)
+
+- **`main` is protected.** All changes to `main` require a pull request with at least one approving review from a board member / repository owner. Direct pushes to `main` are blocked.
+- **Stale reviews are dismissed** — if you push new commits to a PR, previous approvals are invalidated and re-approval is required.
+
+### Working on Changes
+
+1. **Always work on a feature branch.** Create a branch from `main` (e.g., `feat/my-change`, `fix/bug-description`).
+2. **Push your feature branch** and open a PR targeting `main`.
+3. **Wait for board approval** before merging. Never merge your own PR without an approving review.
+
+### Testing in Staging
+
+- The **`staging` branch** auto-deploys to the staging environment (`app-staging.devopsdefender.com`).
+- You can freely push to `staging` to test changes without approval.
+- To test: merge or push your feature branch into `staging`. This triggers the staging deploy pipeline.
+- The `staging` branch can be force-pushed or reset as needed — it is not protected.
+
+### Summary
+
+| Branch    | Protection | Deploys to  | Approval Required |
+|-----------|-----------|-------------|-------------------|
+| `main`    | Yes       | Production-ready | Yes — board review required |
+| `staging` | No        | Staging     | No — free to test |
+| Feature   | No        | —           | No — work freely  |
+
 ## Build & Development
 
 ### Rust Projects (agent/, control-plane/)
