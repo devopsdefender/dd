@@ -2,8 +2,15 @@ mod config;
 mod measure;
 mod oci;
 
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::Mutex;
+
 use config::{AgentMode, AgentRuntimeConfig};
-use dd_agent::api::{AgentChallengeResponse, AgentRegisterResponse};
+use dd_agent::api::{
+    AgentChallengeResponse, AgentRegisterResponse, HeartbeatResponse, PendingDeployment,
+    UpdateDeploymentStatusRequest,
+};
 
 // ── Entry point ────────────────────────────────────────────────────────────
 
@@ -25,6 +32,16 @@ async fn main() {
         AgentMode::Measure => measure::run_measure_mode(),
     }
 }
+
+// ── Deployment tracking ──────────────────────────────────────────────────
+
+struct DeploymentState {
+    id: String,
+    project_name: String,
+    compose_dir: String,
+}
+
+type ActiveDeployments = Arc<Mutex<HashMap<String, DeploymentState>>>;
 
 // ── Agent mode ─────────────────────────────────────────────────────────────
 
@@ -65,13 +82,21 @@ async fn run_agent_mode(cfg: AgentRuntimeConfig) {
         eprintln!("dd-agent: cloudflared start failed: {e}");
     }
 
+    // Run any statically configured workloads (backwards compat)
     if let Err(e) = run_workloads(&cfg).await {
         eprintln!("dd-agent: workload launch failed: {e}");
     }
 
+    // Ensure deployment directory exists
+    let _ = tokio::fs::create_dir_all("/var/lib/dd/deployments").await;
+
+    let active_deployments: ActiveDeployments = Arc::new(Mutex::new(HashMap::new()));
     let agent_id = registration.agent_id.clone();
-    heartbeat_loop(&http, &cp_url, &agent_id).await;
+
+    heartbeat_loop(&http, &cp_url, &agent_id, active_deployments.clone()).await;
 }
+
+// ── Registration ──────────────────────────────────────────────────────────
 
 async fn register_with_retry(
     http: &reqwest::Client,
@@ -165,6 +190,8 @@ async fn register_agent(
         .map_err(|e| format!("parse register response: {e}"))
 }
 
+// ── Cloudflared ───────────────────────────────────────────────────────────
+
 async fn start_cloudflared(tunnel_token: &str) -> Result<(), String> {
     use tokio::process::Command;
 
@@ -188,6 +215,21 @@ async fn start_cloudflared(tunnel_token: &str) -> Result<(), String> {
         Err(e) => Err(format!("cloudflared wait error: {e}")),
     }
 }
+
+async fn check_cloudflared() {
+    use tokio::process::Command;
+
+    let output = Command::new("pgrep").arg("cloudflared").output().await;
+
+    match output {
+        Ok(o) if o.status.success() => { /* still running */ }
+        _ => {
+            eprintln!("dd-agent: cloudflared not running (may need restart)");
+        }
+    }
+}
+
+// ── Static workloads (backwards compat) ──────────────────────────────────
 
 async fn run_workloads(cfg: &AgentRuntimeConfig) -> Result<(), String> {
     let runtime = oci::DockerOciRuntime::new()?;
@@ -229,46 +271,352 @@ async fn run_workloads(cfg: &AgentRuntimeConfig) -> Result<(), String> {
     Ok(())
 }
 
-async fn heartbeat_loop(http: &reqwest::Client, cp_url: &str, agent_id: &str) {
+// ── Heartbeat loop with deployment processing ────────────────────────────
+
+async fn heartbeat_loop(
+    http: &reqwest::Client,
+    cp_url: &str,
+    agent_id: &str,
+    active_deployments: ActiveDeployments,
+) {
     let url = format!("{cp_url}/api/v1/agents/{agent_id}/heartbeat");
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
 
     loop {
-        interval.tick().await;
+        tokio::select! {
+            _ = interval.tick() => {
+                // Send heartbeat and process any pending deployments
+                match send_heartbeat(http, &url).await {
+                    Ok(resp) => {
+                        if !resp.pending_deployments.is_empty() {
+                            eprintln!(
+                                "dd-agent: received {} pending deployment(s)",
+                                resp.pending_deployments.len()
+                            );
+                            for dep in resp.pending_deployments {
+                                process_deployment(
+                                    http,
+                                    cp_url,
+                                    dep,
+                                    active_deployments.clone(),
+                                )
+                                .await;
+                            }
+                        }
 
-        match http.post(&url).send().await {
-            Ok(resp) if resp.status().is_success() => {
-                // Heartbeat acknowledged.
+                        // Check health of active deployments
+                        check_active_deployments(http, cp_url, active_deployments.clone()).await;
+                    }
+                    Err(e) => {
+                        eprintln!("dd-agent: heartbeat failed: {e}");
+                    }
+                }
+
+                check_cloudflared().await;
             }
-            Ok(resp) => {
-                eprintln!(
-                    "dd-agent: heartbeat rejected (status {}), attempting re-registration",
-                    resp.status()
-                );
-                // In a full implementation we would re-register here.
-                // For now just log and continue.
-            }
-            Err(e) => {
-                eprintln!("dd-agent: heartbeat failed: {e}");
+            _ = tokio::signal::ctrl_c() => {
+                eprintln!("dd-agent: received shutdown signal, cleaning up...");
+                shutdown_deployments(http, cp_url, active_deployments.clone()).await;
+                eprintln!("dd-agent: shutdown complete");
+                return;
             }
         }
-
-        // Check cloudflared is still running.
-        check_cloudflared().await;
     }
 }
 
-async fn check_cloudflared() {
-    use tokio::process::Command;
+async fn send_heartbeat(http: &reqwest::Client, url: &str) -> Result<HeartbeatResponse, String> {
+    let resp = http
+        .post(url)
+        .send()
+        .await
+        .map_err(|e| format!("heartbeat request: {e}"))?;
 
-    let output = Command::new("pgrep").arg("cloudflared").output().await;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        return Err(format!("heartbeat rejected (status {status})"));
+    }
 
-    match output {
-        Ok(o) if o.status.success() => { /* still running */ }
-        _ => {
-            eprintln!("dd-agent: cloudflared not running (may need restart)");
+    resp.json::<HeartbeatResponse>()
+        .await
+        .map_err(|e| format!("parse heartbeat response: {e}"))
+}
+
+// ── Deployment processing ────────────────────────────────────────────────
+
+async fn process_deployment(
+    http: &reqwest::Client,
+    cp_url: &str,
+    dep: PendingDeployment,
+    active_deployments: ActiveDeployments,
+) {
+    let short_id = &dep.id[..8.min(dep.id.len())];
+    let project_name = format!("dd-{short_id}");
+    let compose_dir = format!("/var/lib/dd/deployments/{}", dep.id);
+
+    eprintln!(
+        "dd-agent: deploying {} (app: {}, project: {})",
+        dep.id,
+        dep.app_name.as_deref().unwrap_or("unnamed"),
+        project_name
+    );
+
+    // Write compose file to deployment directory
+    if let Err(e) = write_compose_files(&compose_dir, &dep).await {
+        eprintln!(
+            "dd-agent: failed to write compose files for {}: {e}",
+            dep.id
+        );
+        let _ = report_deployment_status(http, cp_url, &dep.id, "failed", Some(&e)).await;
+        return;
+    }
+
+    // Run docker compose up
+    match run_compose_up(&compose_dir, &project_name).await {
+        Ok(()) => {
+            eprintln!("dd-agent: deployment {} started successfully", dep.id);
+            let _ = report_deployment_status(http, cp_url, &dep.id, "running", None).await;
+
+            let state = DeploymentState {
+                id: dep.id.clone(),
+                project_name,
+                compose_dir,
+            };
+            active_deployments.lock().await.insert(dep.id, state);
+        }
+        Err(e) => {
+            eprintln!("dd-agent: deployment {} failed: {e}", dep.id);
+            let _ = report_deployment_status(http, cp_url, &dep.id, "failed", Some(&e)).await;
         }
     }
+}
+
+async fn write_compose_files(compose_dir: &str, dep: &PendingDeployment) -> Result<(), String> {
+    tokio::fs::create_dir_all(compose_dir)
+        .await
+        .map_err(|e| format!("create dir {compose_dir}: {e}"))?;
+
+    let compose_path = format!("{compose_dir}/docker-compose.yml");
+    tokio::fs::write(&compose_path, &dep.compose)
+        .await
+        .map_err(|e| format!("write compose file: {e}"))?;
+
+    if let Some(config) = &dep.config {
+        let config_path = format!("{compose_dir}/config.json");
+        tokio::fs::write(&config_path, config)
+            .await
+            .map_err(|e| format!("write config file: {e}"))?;
+    }
+
+    Ok(())
+}
+
+async fn run_compose_up(compose_dir: &str, project_name: &str) -> Result<(), String> {
+    use tokio::process::Command;
+
+    let output = Command::new("docker")
+        .args([
+            "compose",
+            "-f",
+            &format!("{compose_dir}/docker-compose.yml"),
+            "-p",
+            project_name,
+            "up",
+            "-d",
+        ])
+        .output()
+        .await
+        .map_err(|e| format!("docker compose up: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("docker compose up failed: {stderr}"));
+    }
+
+    Ok(())
+}
+
+async fn run_compose_down(compose_dir: &str, project_name: &str) -> Result<(), String> {
+    use tokio::process::Command;
+
+    let output = Command::new("docker")
+        .args([
+            "compose",
+            "-f",
+            &format!("{compose_dir}/docker-compose.yml"),
+            "-p",
+            project_name,
+            "down",
+        ])
+        .output()
+        .await
+        .map_err(|e| format!("docker compose down: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("docker compose down failed: {stderr}"));
+    }
+
+    Ok(())
+}
+
+async fn run_compose_ps(compose_dir: &str, project_name: &str) -> Result<String, String> {
+    use tokio::process::Command;
+
+    let output = Command::new("docker")
+        .args([
+            "compose",
+            "-f",
+            &format!("{compose_dir}/docker-compose.yml"),
+            "-p",
+            project_name,
+            "ps",
+            "--format",
+            "json",
+        ])
+        .output()
+        .await
+        .map_err(|e| format!("docker compose ps: {e}"))?;
+
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+async fn run_compose_restart(compose_dir: &str, project_name: &str) -> Result<(), String> {
+    use tokio::process::Command;
+
+    let output = Command::new("docker")
+        .args([
+            "compose",
+            "-f",
+            &format!("{compose_dir}/docker-compose.yml"),
+            "-p",
+            project_name,
+            "restart",
+        ])
+        .output()
+        .await
+        .map_err(|e| format!("docker compose restart: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("docker compose restart failed: {stderr}"));
+    }
+
+    Ok(())
+}
+
+// ── Health monitoring ────────────────────────────────────────────────────
+
+async fn check_active_deployments(
+    http: &reqwest::Client,
+    cp_url: &str,
+    active_deployments: ActiveDeployments,
+) {
+    let deployments = active_deployments.lock().await;
+    let entries: Vec<(String, String, String)> = deployments
+        .values()
+        .map(|d| (d.id.clone(), d.project_name.clone(), d.compose_dir.clone()))
+        .collect();
+    drop(deployments);
+
+    for (dep_id, project_name, compose_dir) in entries {
+        match run_compose_ps(&compose_dir, &project_name).await {
+            Ok(ps_output) => {
+                // Check if any containers have exited
+                if ps_output.contains("\"exited\"") || ps_output.contains("\"dead\"") {
+                    eprintln!(
+                        "dd-agent: deployment {} has unhealthy containers, attempting restart",
+                        dep_id
+                    );
+
+                    // Attempt auto-recovery via restart
+                    match run_compose_restart(&compose_dir, &project_name).await {
+                        Ok(()) => {
+                            eprintln!("dd-agent: deployment {} restarted successfully", dep_id);
+                        }
+                        Err(e) => {
+                            eprintln!("dd-agent: deployment {} restart failed: {e}", dep_id);
+                            let _ = report_deployment_status(
+                                http,
+                                cp_url,
+                                &dep_id,
+                                "failed",
+                                Some(&format!("auto-recovery failed: {e}")),
+                            )
+                            .await;
+                            active_deployments.lock().await.remove(&dep_id);
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "dd-agent: failed to check deployment {} status: {e}",
+                    dep_id
+                );
+            }
+        }
+    }
+}
+
+// ── Status reporting ─────────────────────────────────────────────────────
+
+async fn report_deployment_status(
+    http: &reqwest::Client,
+    cp_url: &str,
+    deployment_id: &str,
+    status: &str,
+    error_message: Option<&str>,
+) -> Result<(), String> {
+    let url = format!("{cp_url}/api/v1/deployments/{deployment_id}/status");
+
+    let body = UpdateDeploymentStatusRequest {
+        status: status.to_string(),
+        error_message: error_message.map(|s| s.to_string()),
+    };
+
+    let resp = http
+        .patch(&url)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("report status: {e}"))?;
+
+    if !resp.status().is_success() {
+        let status_code = resp.status();
+        return Err(format!("report status failed: {status_code}"));
+    }
+
+    Ok(())
+}
+
+// ── Graceful shutdown ────────────────────────────────────────────────────
+
+async fn shutdown_deployments(
+    http: &reqwest::Client,
+    cp_url: &str,
+    active_deployments: ActiveDeployments,
+) {
+    let deployments = active_deployments.lock().await;
+    let entries: Vec<(String, String, String)> = deployments
+        .values()
+        .map(|d| (d.id.clone(), d.project_name.clone(), d.compose_dir.clone()))
+        .collect();
+    drop(deployments);
+
+    for (dep_id, project_name, compose_dir) in entries {
+        eprintln!("dd-agent: stopping deployment {dep_id}...");
+
+        if let Err(e) = run_compose_down(&compose_dir, &project_name).await {
+            eprintln!("dd-agent: failed to stop deployment {dep_id}: {e}");
+        }
+
+        let _ = report_deployment_status(http, cp_url, &dep_id, "stopped", None).await;
+
+        // Clean up deployment directory
+        let _ = tokio::fs::remove_dir_all(&compose_dir).await;
+    }
+
+    active_deployments.lock().await.clear();
 }
 
 // ── Control-plane mode ─────────────────────────────────────────────────────

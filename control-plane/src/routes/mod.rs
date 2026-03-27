@@ -7,7 +7,7 @@ pub mod health;
 pub mod stats;
 pub mod ui;
 
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, patch, post};
 use axum::Router;
 
 use crate::state::AppState;
@@ -38,6 +38,22 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/deploy", post(deploy::deploy))
         .route("/api/v1/deployments", get(deploy::list_deployments))
         .route("/api/v1/deployments/{id}", get(deploy::get_deployment))
+        .route(
+            "/api/v1/deployments/{id}/status",
+            patch(deploy::update_deployment_status),
+        )
+        .route(
+            "/api/v1/deployments/{id}/stop",
+            post(deploy::stop_deployment),
+        )
+        .route(
+            "/api/v1/deployments/{id}/rollback",
+            post(deploy::rollback_deployment),
+        )
+        .route(
+            "/api/v1/deployments/{id}/logs",
+            get(deploy::get_deployment_logs),
+        )
         // Stats
         .route("/api/v1/stats/apps", get(stats::app_stats))
         .route("/api/v1/stats/agents", get(stats::agent_stats))

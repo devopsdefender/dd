@@ -4,11 +4,11 @@ use axum::Json;
 
 use crate::api::{
     AgentChallengeResponse, AgentCheckIngestRequest, AgentCheckIngestResponse,
-    AgentRegisterRequest, AgentRegisterResponse,
+    AgentRegisterRequest, AgentRegisterResponse, HeartbeatResponse, PendingDeployment,
 };
 use crate::common::error::AppError;
 use crate::state::AppState;
-use crate::stores::{agent as agent_store, health as health_store};
+use crate::stores::{agent as agent_store, deployment as deployment_store, health as health_store};
 
 /// GET /api/v1/agents/challenge
 pub async fn agent_challenge(State(state): State<AppState>) -> Json<AgentChallengeResponse> {
@@ -113,13 +113,34 @@ pub async fn reset_agent(
 pub async fn agent_heartbeat(
     State(state): State<AppState>,
     Path(id): Path<String>,
-) -> Result<StatusCode, AppError> {
+) -> Result<Json<HeartbeatResponse>, AppError> {
     let updated = agent_store::update_heartbeat(&state.db, &id)?;
-    if updated {
-        Ok(StatusCode::OK)
-    } else {
-        Err(AppError::NotFound)
+    if !updated {
+        return Err(AppError::NotFound);
     }
+
+    let pending = deployment_store::list_pending_deployments(&state.db, &id)?;
+
+    // Mark pending deployments as deploying so they aren't re-sent on next heartbeat
+    for dep in &pending {
+        deployment_store::update_deployment_status(&state.db, &dep.id, "deploying")?;
+    }
+
+    let pending_deployments = pending
+        .into_iter()
+        .map(|d| PendingDeployment {
+            id: d.id,
+            compose: d.compose,
+            config: d.config,
+            app_name: d.app_name,
+            app_version: d.app_version,
+        })
+        .collect();
+
+    Ok(Json(HeartbeatResponse {
+        ok: true,
+        pending_deployments,
+    }))
 }
 
 /// POST /api/v1/agents/{id}/checks
