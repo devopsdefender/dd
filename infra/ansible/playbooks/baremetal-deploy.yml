@@ -24,6 +24,11 @@
     vm_scripts_dir: "{{ playbook_dir }}/../../scripts"
     devopsdefender_base_dir: /var/lib/devopsdefender
     cp_port_forward: "8080:8080"
+    # On-host image build vars (alternative to image_path_local)
+    agent_binary_local: ""
+    cp_binary_local: ""
+    packer_template_dir: ""
+    image_name: dd-baremetal
   tasks:
     - name: Install prerequisites
       ansible.builtin.apt:
@@ -76,6 +81,127 @@
         mode: "0644"
       become: true
       when: image_path_local | length > 0
+
+    # ── Build image on target (if binaries provided) ────────────────────
+    - name: Install Packer
+      when: agent_binary_local | length > 0 and image_path_local | length == 0
+      block:
+        - name: Check if packer is installed
+          ansible.builtin.command: packer version
+          register: packer_check
+          failed_when: false
+          changed_when: false
+
+        - name: Download Packer
+          ansible.builtin.unarchive:
+            src: https://releases.hashicorp.com/packer/1.11.2/packer_1.11.2_linux_amd64.zip
+            dest: /usr/local/bin
+            remote_src: true
+            mode: "0755"
+          become: true
+          when: packer_check.rc != 0
+
+    - name: Build baremetal image on target
+      when: agent_binary_local | length > 0 and image_path_local | length == 0
+      block:
+        - name: Clean stale build workspace
+          ansible.builtin.file:
+            path: /tmp/dd-deploy/packer-build
+            state: absent
+          become: true
+
+        - name: Create build workspace
+          ansible.builtin.file:
+            path: /tmp/dd-deploy/packer-build
+            state: directory
+            mode: "0755"
+
+        - name: Copy dd-agent binary to target
+          ansible.builtin.copy:
+            src: "{{ agent_binary_local }}"
+            dest: /tmp/dd-deploy/dd-agent
+            mode: "0755"
+
+        - name: Copy dd-cp binary to target
+          ansible.builtin.copy:
+            src: "{{ cp_binary_local }}"
+            dest: /tmp/dd-deploy/dd-cp
+            mode: "0755"
+          when: cp_binary_local | length > 0
+
+        - name: Copy packer template directory to target
+          ansible.builtin.copy:
+            src: "{{ packer_template_dir }}/"
+            dest: /tmp/dd-deploy/packer-build/
+            mode: preserve
+
+        - name: Generate Packer SSH keypair
+          ansible.builtin.command:
+            cmd: ssh-keygen -t ed25519 -f /tmp/dd-deploy/packer-ssh-key -N "" -q
+            creates: /tmp/dd-deploy/packer-ssh-key
+
+        - name: Read Packer SSH public key
+          ansible.builtin.slurp:
+            src: /tmp/dd-deploy/packer-ssh-key.pub
+          register: packer_ssh_pub
+
+        - name: Render cloud-init user-data
+          ansible.builtin.shell: |
+            SSH_PUB_KEY="{{ packer_ssh_pub.content | b64decode | trim }}"
+            sed -e "s|__SSH_USERNAME__|packer|g" \
+                -e "s|__SSH_PUB_KEY__|${SSH_PUB_KEY}|g" \
+                /tmp/dd-deploy/packer-build/templates/baremetal-user-data.tmpl \
+                > /tmp/dd-deploy/user-data
+          changed_when: true
+
+        - name: Render meta-data
+          ansible.builtin.shell: |
+            sed -e "s|__VM_NAME__|{{ image_name }}|g" \
+                /tmp/dd-deploy/packer-build/templates/baremetal-meta-data.tmpl \
+                > /tmp/dd-deploy/meta-data
+          changed_when: true
+
+        - name: Initialize Packer
+          ansible.builtin.command:
+            cmd: packer init baremetal-agent-image.pkr.hcl
+            chdir: /tmp/dd-deploy/packer-build
+          become: true
+
+        - name: Build baremetal image
+          ansible.builtin.command:
+            chdir: /tmp/dd-deploy/packer-build
+            argv:
+              - packer
+              - build
+              - -var
+              - "agent_binary_path=/tmp/dd-deploy/dd-agent"
+              - -var
+              - "cp_binary_path={{ '/tmp/dd-deploy/dd-cp' if cp_binary_local | length > 0 else '' }}"
+              - -var
+              - "ssh_private_key_file=/tmp/dd-deploy/packer-ssh-key"
+              - -var
+              - "cloud_init_user_data_path=/tmp/dd-deploy/user-data"
+              - -var
+              - "cloud_init_meta_data_path=/tmp/dd-deploy/meta-data"
+              - -var
+              - "vm_name={{ image_name }}"
+              - -var
+              - "output_directory=/tmp/dd-deploy/image-output"
+              - baremetal-agent-image.pkr.hcl
+          become: true
+
+        - name: Copy built image to images directory
+          ansible.builtin.shell: |
+            IMAGE=$(find /tmp/dd-deploy/image-output -type f -not -name '*.lock' | head -1)
+            if [ -z "$IMAGE" ]; then
+              echo "No image found in /tmp/dd-deploy/image-output" >&2
+              exit 1
+            fi
+            cp "$IMAGE" "{{ devopsdefender_base_dir }}/images/dd-baremetal.qcow2"
+            chmod 0644 "{{ devopsdefender_base_dir }}/images/dd-baremetal.qcow2"
+            echo "Copied $IMAGE"
+          become: true
+          changed_when: true
 
     - name: Template control-plane config
       ansible.builtin.template:

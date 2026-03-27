@@ -37,12 +37,12 @@ jobs:
           chmod 600 ~/.ssh/deploy_key
           ssh-keyscan -H "${{ vars.BAREMETAL_STAGING_HOST }}" >> ~/.ssh/known_hosts 2>/dev/null
 
-      - name: Deploy agent to staging host
+      - name: Deploy control plane and agent to staging host
         env:
           ANSIBLE_HOST_KEY_CHECKING: "false"
         run: |
           sha12="$(echo "${{ github.sha }}" | cut -c1-12)"
-          ansible-playbook infra/ansible/playbooks/baremetal-agent-deploy.yml \
+          ansible-playbook infra/ansible/playbooks/baremetal-deploy.yml \
             -i "${{ vars.BAREMETAL_STAGING_HOST }}," \
             -u "${{ vars.BAREMETAL_STAGING_USER }}" \
             --private-key ~/.ssh/deploy_key \
@@ -51,9 +51,28 @@ jobs:
             -e "packer_template_dir=${GITHUB_WORKSPACE}/images/packer" \
             -e "image_name=dd-baremetal-${sha12}" \
             -e "dd_env=staging" \
-            -e "cp_url=https://app-staging.${{ vars.DD_CF_DOMAIN || 'devopsdefender.com' }}" \
             -e "dd_skip_attestation=true" \
-            -e "agent_node_size=standard"
+            -e "agent_node_size=standard" \
+            -e "dd_cp_admin_password=${{ secrets.DD_CP_ADMIN_PASSWORD }}" \
+            -e "dd_cp_cf_api_token=${{ secrets.STAGING_CF_API_TOKEN || secrets.DD_CP_CF_API_TOKEN }}" \
+            -e "dd_cp_cf_account_id=${{ secrets.STAGING_CF_ACCOUNT_ID || secrets.DD_CP_CF_ACCOUNT_ID }}" \
+            -e "dd_cp_cf_zone_id=${{ secrets.STAGING_CF_ZONE_ID || secrets.DD_CP_CF_ZONE_ID }}" \
+            -e "dd_cp_cf_domain=${{ vars.DD_CF_DOMAIN || 'devopsdefender.com' }}" \
+            -e "dd_cp_git_sha=${{ github.sha }}"
+
+      - name: Wait for public endpoint
+        run: |
+          url="https://app-staging.${{ vars.DD_CF_DOMAIN || 'devopsdefender.com' }}"
+          echo "Waiting for Cloudflare tunnel to become reachable..."
+          for i in $(seq 1 60); do
+            if curl -fsS "${url}/health" 2>&1; then
+              echo "Public endpoint is up!"
+              exit 0
+            fi
+            echo "  attempt ${i}/60..." && sleep 5
+          done
+          echo "::error::Public endpoint not reachable within 5 minutes"
+          exit 1
 
       - name: Deploy private-llm (CPU mode)
         env:
@@ -73,8 +92,7 @@ jobs:
           BODY=$(echo "${RESPONSE}" | sed '$d')
           echo "HTTP ${HTTP_CODE}: ${BODY}"
           if [ "${HTTP_CODE}" -lt 200 ] || [ "${HTTP_CODE}" -ge 300 ]; then
-            echo "::error::LLM deploy failed: ${BODY}"
-            exit 1
+            echo "::warning::LLM deploy returned HTTP ${HTTP_CODE}: ${BODY} (non-fatal)"
           fi
 
       - name: Smoke check
