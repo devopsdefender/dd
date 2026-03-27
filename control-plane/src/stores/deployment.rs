@@ -13,6 +13,10 @@ pub struct DeploymentRow {
     pub compose: String,
     pub config: Option<String>,
     pub status: String,
+    #[serde(default)]
+    pub error_message: Option<String>,
+    #[serde(default)]
+    pub previous_deployment_id: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -26,18 +30,23 @@ fn row_to_deployment(row: &rusqlite::Row<'_>) -> rusqlite::Result<DeploymentRow>
         compose: row.get("compose")?,
         config: row.get("config")?,
         status: row.get("status")?,
+        error_message: row.get("error_message")?,
+        previous_deployment_id: row.get("previous_deployment_id")?,
         created_at: row.get("created_at")?,
         updated_at: row.get("updated_at")?,
     })
 }
+
+const SELECT_COLS: &str = "id, agent_id, app_name, app_version, compose, config, \
+    status, error_message, previous_deployment_id, created_at, updated_at";
 
 /// Insert a new deployment.
 pub fn insert_deployment(db: &Db, dep: &DeploymentRow) -> AppResult<()> {
     let conn = db.lock().unwrap();
     conn.execute(
         "INSERT INTO deployments (id, agent_id, app_name, app_version, compose, config, \
-         status, created_at, updated_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+         status, error_message, previous_deployment_id, created_at, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         params![
             dep.id,
             dep.agent_id,
@@ -46,6 +55,8 @@ pub fn insert_deployment(db: &Db, dep: &DeploymentRow) -> AppResult<()> {
             dep.compose,
             dep.config,
             dep.status,
+            dep.error_message,
+            dep.previous_deployment_id,
             dep.created_at,
             dep.updated_at,
         ],
@@ -58,13 +69,8 @@ pub fn insert_deployment(db: &Db, dep: &DeploymentRow) -> AppResult<()> {
 /// Get a deployment by ID.
 pub fn get_deployment(db: &Db, id: &str) -> AppResult<Option<DeploymentRow>> {
     let conn = db.lock().unwrap();
-    let mut stmt = conn
-        .prepare(
-            "SELECT id, agent_id, app_name, app_version, compose, config, \
-             status, created_at, updated_at \
-             FROM deployments WHERE id = ?1",
-        )
-        .map_err(|_| AppError::Internal)?;
+    let query = format!("SELECT {SELECT_COLS} FROM deployments WHERE id = ?1");
+    let mut stmt = conn.prepare(&query).map_err(|_| AppError::Internal)?;
 
     let result = stmt
         .query_row(params![id], row_to_deployment)
@@ -80,21 +86,19 @@ pub fn list_deployments(db: &Db, agent_id: Option<&str>) -> AppResult<Vec<Deploy
 
     let (query, bind_val) = if let Some(aid) = agent_id {
         (
-            "SELECT id, agent_id, app_name, app_version, compose, config, \
-             status, created_at, updated_at \
-             FROM deployments WHERE agent_id = ?1 ORDER BY created_at DESC",
+            format!(
+                "SELECT {SELECT_COLS} FROM deployments WHERE agent_id = ?1 ORDER BY created_at DESC"
+            ),
             Some(aid.to_string()),
         )
     } else {
         (
-            "SELECT id, agent_id, app_name, app_version, compose, config, \
-             status, created_at, updated_at \
-             FROM deployments ORDER BY created_at DESC",
+            format!("SELECT {SELECT_COLS} FROM deployments ORDER BY created_at DESC"),
             None,
         )
     };
 
-    let mut stmt = conn.prepare(query).map_err(|_| AppError::Internal)?;
+    let mut stmt = conn.prepare(&query).map_err(|_| AppError::Internal)?;
 
     let rows = if let Some(ref v) = bind_val {
         stmt.query_map(params![v], row_to_deployment)
@@ -111,6 +115,25 @@ pub fn list_deployments(db: &Db, agent_id: Option<&str>) -> AppResult<Vec<Deploy
     Ok(deployments)
 }
 
+/// List pending deployments for a specific agent.
+pub fn list_pending_deployments(db: &Db, agent_id: &str) -> AppResult<Vec<DeploymentRow>> {
+    let conn = db.lock().unwrap();
+    let query = format!(
+        "SELECT {SELECT_COLS} FROM deployments \
+         WHERE agent_id = ?1 AND status = 'pending' ORDER BY created_at ASC"
+    );
+    let mut stmt = conn.prepare(&query).map_err(|_| AppError::Internal)?;
+    let rows = stmt
+        .query_map(params![agent_id], row_to_deployment)
+        .map_err(|_| AppError::Internal)?;
+
+    let mut deployments = Vec::new();
+    for row in rows {
+        deployments.push(row.map_err(|_| AppError::Internal)?);
+    }
+    Ok(deployments)
+}
+
 /// Update deployment status.
 pub fn update_deployment_status(db: &Db, id: &str, status: &str) -> AppResult<bool> {
     let now = chrono::Utc::now().to_rfc3339();
@@ -119,6 +142,24 @@ pub fn update_deployment_status(db: &Db, id: &str, status: &str) -> AppResult<bo
         .execute(
             "UPDATE deployments SET status = ?1, updated_at = ?2 WHERE id = ?3",
             params![status, now, id],
+        )
+        .map_err(|_| AppError::Internal)?;
+    Ok(count > 0)
+}
+
+/// Update deployment status with an error message.
+pub fn update_deployment_status_with_error(
+    db: &Db,
+    id: &str,
+    status: &str,
+    error_message: Option<&str>,
+) -> AppResult<bool> {
+    let now = chrono::Utc::now().to_rfc3339();
+    let conn = db.lock().unwrap();
+    let count = conn
+        .execute(
+            "UPDATE deployments SET status = ?1, error_message = ?2, updated_at = ?3 WHERE id = ?4",
+            params![status, error_message, now, id],
         )
         .map_err(|_| AppError::Internal)?;
     Ok(count > 0)
@@ -178,6 +219,8 @@ mod tests {
             compose: "version: '3'\nservices: {}".into(),
             config: None,
             status: "pending".into(),
+            error_message: None,
+            previous_deployment_id: None,
             created_at: now.clone(),
             updated_at: now,
         }

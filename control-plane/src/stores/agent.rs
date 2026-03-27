@@ -156,7 +156,9 @@ pub fn update_heartbeat(db: &Db, id: &str) -> AppResult<bool> {
     Ok(count > 0)
 }
 
-/// Find an undeployed agent, optionally filtering by node_size and datacenter.
+/// Find an available agent, optionally filtering by node_size and datacenter.
+/// Agents are available once they have completed attestation (registration_state='ready').
+/// Multiple deployments can target the same agent.
 pub fn find_available_agent(
     db: &Db,
     node_size: Option<&str>,
@@ -166,7 +168,7 @@ pub fn find_available_agent(
     let mut query = String::from(
         "SELECT id, vm_name, status, registration_state, hostname, tunnel_id, \
          mrtd, tcb_status, node_size, datacenter, github_owner, created_at, last_heartbeat_at \
-         FROM agents WHERE status = 'undeployed' AND registration_state = 'ready'",
+         FROM agents WHERE registration_state = 'ready'",
     );
     let mut bind_values: Vec<String> = Vec::new();
 

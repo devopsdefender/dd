@@ -76,6 +76,39 @@ pub struct DeployResponse {
 }
 
 // ---------------------------------------------------------------------------
+// Agent heartbeat
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PendingDeployment {
+    pub id: String,
+    pub compose: String,
+    #[serde(default)]
+    pub config: Option<String>,
+    #[serde(default)]
+    pub app_name: Option<String>,
+    #[serde(default)]
+    pub app_version: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HeartbeatResponse {
+    pub ok: bool,
+    pub pending_deployments: Vec<PendingDeployment>,
+}
+
+// ---------------------------------------------------------------------------
+// Deployment status update
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct UpdateDeploymentStatusRequest {
+    pub status: DeploymentStatus,
+    #[serde(default)]
+    pub error_message: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
 // Agent health check ingestion
 // ---------------------------------------------------------------------------
 
