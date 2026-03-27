@@ -77,6 +77,19 @@ jobs:
             exit 1
           fi
 
+      - name: Smoke check
+        run: |
+          url="https://app-staging.${{ vars.DD_CF_DOMAIN || 'devopsdefender.com' }}"
+          for i in $(seq 1 30); do
+            if curl -fsS "${url}/health" 2>&1; then
+              echo "Healthy!"
+              exit 0
+            fi
+            echo "  attempt ${i}/30..." && sleep 10
+          done
+          echo "::error::Staging health check failed — not healthy within 5 minutes"
+          exit 1
+
       - name: Cleanup
         if: always()
         run: rm -f ~/.ssh/deploy_key

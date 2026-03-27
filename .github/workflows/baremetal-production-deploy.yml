@@ -75,6 +75,19 @@ jobs:
             -H "Content-Type: application/json" \
             -d "{\"app_name\":\"private-llm\",\"app_version\":\"${{ github.sha }}\",\"compose\":\"${COMPOSE_B64}\",\"node_size\":\"llm\"}"
 
+      - name: Smoke check
+        run: |
+          url="https://app.${{ vars.DD_CF_DOMAIN || 'devopsdefender.com' }}"
+          for i in $(seq 1 30); do
+            if curl -fsS "${url}/health" 2>&1; then
+              echo "Healthy!"
+              exit 0
+            fi
+            echo "  attempt ${i}/30..." && sleep 10
+          done
+          echo "::error::Production health check failed — not healthy within 5 minutes"
+          exit 1
+
       - name: Cleanup
         if: always()
         run: rm -f ~/.ssh/deploy_key
