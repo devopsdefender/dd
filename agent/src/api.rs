@@ -16,7 +16,14 @@ pub struct AgentRegisterResponse {
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct PendingDeployment {
     pub id: String,
-    pub compose: String,
+    #[serde(default)]
+    pub image: Option<String>,
+    #[serde(default)]
+    pub env: Option<String>,
+    #[serde(default)]
+    pub cmd: Option<String>,
+    #[serde(default)]
+    pub ports: Option<String>,
     #[serde(default)]
     pub config: Option<String>,
     #[serde(default)]
