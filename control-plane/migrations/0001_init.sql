@@ -29,9 +29,15 @@ CREATE TABLE IF NOT EXISTS deployments (
     agent_id TEXT NOT NULL REFERENCES agents(id),
     app_name TEXT,
     app_version TEXT,
-    compose TEXT NOT NULL,
+    compose TEXT,
+    image TEXT,
+    env TEXT,
+    cmd TEXT,
+    ports TEXT,
     config TEXT,
     status TEXT NOT NULL DEFAULT 'pending',
+    error_message TEXT,
+    previous_deployment_id TEXT REFERENCES deployments(id),
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -66,7 +72,7 @@ CREATE TABLE IF NOT EXISTS app_versions (
     id TEXT PRIMARY KEY,
     app_id TEXT NOT NULL REFERENCES apps(id),
     version TEXT NOT NULL,
-    compose TEXT NOT NULL,
+    compose TEXT,
     config TEXT,
     created_at TEXT NOT NULL
 );

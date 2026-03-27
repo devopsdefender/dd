@@ -131,6 +131,10 @@ pub async fn agent_heartbeat(
         .map(|d| PendingDeployment {
             id: d.id,
             compose: d.compose,
+            image: d.image,
+            env: d.env,
+            cmd: d.cmd,
+            ports: d.ports,
             config: d.config,
             app_name: d.app_name,
             app_version: d.app_version,

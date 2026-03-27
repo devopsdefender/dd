@@ -10,7 +10,11 @@ pub struct DeploymentRow {
     pub agent_id: String,
     pub app_name: Option<String>,
     pub app_version: Option<String>,
-    pub compose: String,
+    pub compose: Option<String>,
+    pub image: Option<String>,
+    pub env: Option<String>,
+    pub cmd: Option<String>,
+    pub ports: Option<String>,
     pub config: Option<String>,
     pub status: String,
     #[serde(default)]
@@ -28,6 +32,10 @@ fn row_to_deployment(row: &rusqlite::Row<'_>) -> rusqlite::Result<DeploymentRow>
         app_name: row.get("app_name")?,
         app_version: row.get("app_version")?,
         compose: row.get("compose")?,
+        image: row.get("image")?,
+        env: row.get("env")?,
+        cmd: row.get("cmd")?,
+        ports: row.get("ports")?,
         config: row.get("config")?,
         status: row.get("status")?,
         error_message: row.get("error_message")?,
@@ -37,22 +45,26 @@ fn row_to_deployment(row: &rusqlite::Row<'_>) -> rusqlite::Result<DeploymentRow>
     })
 }
 
-const SELECT_COLS: &str = "id, agent_id, app_name, app_version, compose, config, \
-    status, error_message, previous_deployment_id, created_at, updated_at";
+const SELECT_COLS: &str = "id, agent_id, app_name, app_version, compose, image, env, cmd, ports, \
+    config, status, error_message, previous_deployment_id, created_at, updated_at";
 
 /// Insert a new deployment.
 pub fn insert_deployment(db: &Db, dep: &DeploymentRow) -> AppResult<()> {
     let conn = db.lock().unwrap();
     conn.execute(
-        "INSERT INTO deployments (id, agent_id, app_name, app_version, compose, config, \
-         status, error_message, previous_deployment_id, created_at, updated_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        "INSERT INTO deployments (id, agent_id, app_name, app_version, compose, image, env, cmd, ports, \
+         config, status, error_message, previous_deployment_id, created_at, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
         params![
             dep.id,
             dep.agent_id,
             dep.app_name,
             dep.app_version,
             dep.compose,
+            dep.image,
+            dep.env,
+            dep.cmd,
+            dep.ports,
             dep.config,
             dep.status,
             dep.error_message,
@@ -216,7 +228,11 @@ mod tests {
             agent_id: agent_id.into(),
             app_name: Some("test-app".into()),
             app_version: Some("1.0.0".into()),
-            compose: "version: '3'\nservices: {}".into(),
+            compose: None,
+            image: Some("nginx:latest".into()),
+            env: None,
+            cmd: None,
+            ports: None,
             config: None,
             status: "pending".into(),
             error_message: None,

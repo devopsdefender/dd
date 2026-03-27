@@ -51,7 +51,16 @@ pub struct AgentRegisterResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct DeployRequest {
-    pub compose: String,
+    #[serde(default)]
+    pub compose: Option<String>,
+    #[serde(default)]
+    pub image: Option<String>,
+    #[serde(default)]
+    pub env: Option<Vec<String>>,
+    #[serde(default)]
+    pub cmd: Option<Vec<String>>,
+    #[serde(default)]
+    pub ports: Option<Vec<String>>,
     #[serde(default)]
     pub config: Option<String>,
     #[serde(default)]
@@ -82,7 +91,16 @@ pub struct DeployResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PendingDeployment {
     pub id: String,
-    pub compose: String,
+    #[serde(default)]
+    pub compose: Option<String>,
+    #[serde(default)]
+    pub image: Option<String>,
+    #[serde(default)]
+    pub env: Option<String>,
+    #[serde(default)]
+    pub cmd: Option<String>,
+    #[serde(default)]
+    pub ports: Option<String>,
     #[serde(default)]
     pub config: Option<String>,
     #[serde(default)]

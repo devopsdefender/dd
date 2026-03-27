@@ -13,6 +13,18 @@ pub async fn deploy(
     State(state): State<AppState>,
     Json(req): Json<DeployRequest>,
 ) -> Result<(StatusCode, Json<DeployResponse>), AppError> {
+    // Validate: exactly one of compose or image must be set
+    if req.compose.is_none() && req.image.is_none() {
+        return Err(AppError::InvalidInput(
+            "exactly one of 'compose' or 'image' must be provided".into(),
+        ));
+    }
+    if req.compose.is_some() && req.image.is_some() {
+        return Err(AppError::InvalidInput(
+            "cannot set both 'compose' and 'image'".into(),
+        ));
+    }
+
     // Find an available agent
     let agent = agent_store::find_available_agent(
         &state.db,
@@ -35,6 +47,11 @@ pub async fn deploy(
         ));
     }
 
+    // Serialize list fields as JSON for storage
+    let env_json = req.env.map(|v| serde_json::to_string(&v).unwrap_or_default());
+    let cmd_json = req.cmd.map(|v| serde_json::to_string(&v).unwrap_or_default());
+    let ports_json = req.ports.map(|v| serde_json::to_string(&v).unwrap_or_default());
+
     // Create deployment record as pending -- agent picks it up via heartbeat
     let deployment_id = uuid::Uuid::new_v4();
     let now = chrono::Utc::now().to_rfc3339();
@@ -44,6 +61,10 @@ pub async fn deploy(
         app_name: req.app_name,
         app_version: req.app_version,
         compose: req.compose,
+        image: req.image,
+        env: env_json,
+        cmd: cmd_json,
+        ports: ports_json,
         config: req.config,
         status: "pending".into(),
         error_message: None,
@@ -157,6 +178,10 @@ pub async fn rollback_deployment(
         app_name: prev_dep.app_name,
         app_version: prev_dep.app_version,
         compose: prev_dep.compose,
+        image: prev_dep.image,
+        env: prev_dep.env,
+        cmd: prev_dep.cmd,
+        ports: prev_dep.ports,
         config: prev_dep.config,
         status: "pending".into(),
         error_message: None,
@@ -239,7 +264,7 @@ mod tests {
         let app = build_router(state);
 
         let deploy_req = DeployRequest {
-            compose: "version: '3'".into(),
+            compose: Some("version: '3'".into()), image: None, env: None, cmd: None, ports: None,
             config: None,
             app_name: None,
             app_version: None,
@@ -267,7 +292,7 @@ mod tests {
         let app = build_router(state.clone());
 
         let deploy_req = DeployRequest {
-            compose: "version: '3'\nservices:\n  web:\n    image: nginx".into(),
+            compose: Some("version: '3'\nservices:\n  web:\n    image: nginx".into()), image: None, env: None, cmd: None, ports: None,
             config: None,
             app_name: Some("test-app".into()),
             app_version: Some("1.0".into()),
@@ -314,7 +339,7 @@ mod tests {
             .header("content-type", "application/json")
             .body(Body::from(
                 serde_json::to_string(&DeployRequest {
-                    compose: "version: '3'\nservices:\n  app1:\n    image: nginx".into(),
+                    compose: Some("version: '3'\nservices:\n  app1:\n    image: nginx".into()), image: None, env: None, cmd: None, ports: None,
                     config: None,
                     app_name: Some("app1".into()),
                     app_version: None,
@@ -337,7 +362,7 @@ mod tests {
             .header("content-type", "application/json")
             .body(Body::from(
                 serde_json::to_string(&DeployRequest {
-                    compose: "version: '3'\nservices:\n  app2:\n    image: redis".into(),
+                    compose: Some("version: '3'\nservices:\n  app2:\n    image: redis".into()), image: None, env: None, cmd: None, ports: None,
                     config: None,
                     app_name: Some("app2".into()),
                     app_version: None,
@@ -369,7 +394,7 @@ mod tests {
             agent_id: TEST_AGENT_ID.into(),
             app_name: Some("test-app".into()),
             app_version: Some("1.0".into()),
-            compose: "version: '3'".into(),
+            compose: Some("version: '3'".into()), image: None, env: None, cmd: None, ports: None,
             config: None,
             status: "pending".into(),
             error_message: None,
@@ -431,7 +456,7 @@ mod tests {
             agent_id: TEST_AGENT_ID.into(),
             app_name: None,
             app_version: None,
-            compose: "version: '3'".into(),
+            compose: Some("version: '3'".into()), image: None, env: None, cmd: None, ports: None,
             config: None,
             status: "deploying".into(),
             error_message: None,
@@ -469,7 +494,7 @@ mod tests {
             agent_id: TEST_AGENT_ID.into(),
             app_name: None,
             app_version: None,
-            compose: "version: '3'".into(),
+            compose: Some("version: '3'".into()), image: None, env: None, cmd: None, ports: None,
             config: None,
             status: "running".into(),
             error_message: None,
