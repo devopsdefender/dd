@@ -40,7 +40,7 @@
 
     - name: Resolve runtime defaults
       ansible.builtin.set_fact:
-        resolved_zone: "{{ agent_zone if (agent_zone | length > 0) else (lookup('env', 'GCP_ZONE') | default('us-central1-a', true)) }}"
+        resolved_zone: "{{ agent_zone if (agent_zone | length > 0) else (lookup('env', 'GCP_ZONE') | default('us-central1-c', true)) }}"
         resolved_region: "{{ agent_region }}"
         resolved_env_name: "{{ lookup('env', 'DD_ENV') | default('staging', true) }}"
         resolved_network_name: "{{ lookup('env', 'DD_NETWORK_NAME') | default('', true) }}"

@@ -29,7 +29,7 @@
         resolved_env_name: "{{ (lookup('env', 'DD_ENV') | default('staging', true)) | lower }}"
         resolved_domain: "{{ lookup('env', 'DD_DOMAIN') | default('devopsdefender.com', true) }}"
         resolved_network_name: "{{ lookup('env', 'DD_NETWORK_NAME') | default('', true) }}"
-        resolved_cp_zone: "{{ cp_zone if (cp_zone | length > 0) else ((lookup('env', 'GCP_ZONE') | default(lookup('env', 'AGENT_DATACENTER_AZ'), true)) | default('us-central1-a', true)) }}"
+        resolved_cp_zone: "{{ cp_zone if (cp_zone | length > 0) else ((lookup('env', 'GCP_ZONE') | default(lookup('env', 'AGENT_DATACENTER_AZ'), true)) | default('us-central1-c', true)) }}"
 
     - name: Resolve control-plane size
       ansible.builtin.set_fact:

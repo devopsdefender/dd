@@ -11,7 +11,7 @@
     num_llm_agents: 0
     orchestration_provider: gcp
     agent_datacenter: ""
-    agent_datacenter_az: us-central1-a
+    agent_datacenter_az: us-central1-c
     agent_datacenter_region: ""
     agent_verify_wait_attempts: 90
     agent_verify_wait_seconds: 10
