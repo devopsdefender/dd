@@ -79,6 +79,8 @@
           - -e
           - cp_zone={{ agent_datacenter_az }}
           - -e
+          - "source_image_family={{ source_image_family | default('dd-agent-main') }}"
+          - -e
           - output_json_path={{ cp_boot_file.path }}
       args:
         chdir: "{{ repo_root }}"
