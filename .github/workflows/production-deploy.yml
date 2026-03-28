@@ -79,7 +79,8 @@ jobs:
         run: |
           ansible-playbook infra/ansible/playbooks/gcp-deploy.yml \
             -e num_tiny_agents=0 -e num_standard_agents=0 -e num_llm_agents=0 \
-            -e dd_env=production
+            -e dd_env=production \
+            -e source_image_family=dd-agent-prod
 
       - name: Smoke check
         run: |
