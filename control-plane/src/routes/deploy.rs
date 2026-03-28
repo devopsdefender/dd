@@ -48,9 +48,15 @@ pub async fn deploy(
     }
 
     // Serialize list fields as JSON for storage
-    let env_json = req.env.map(|v| serde_json::to_string(&v).unwrap_or_default());
-    let cmd_json = req.cmd.map(|v| serde_json::to_string(&v).unwrap_or_default());
-    let ports_json = req.ports.map(|v| serde_json::to_string(&v).unwrap_or_default());
+    let env_json = req
+        .env
+        .map(|v| serde_json::to_string(&v).unwrap_or_default());
+    let cmd_json = req
+        .cmd
+        .map(|v| serde_json::to_string(&v).unwrap_or_default());
+    let ports_json = req
+        .ports
+        .map(|v| serde_json::to_string(&v).unwrap_or_default());
 
     // Create deployment record as pending -- agent picks it up via heartbeat
     let deployment_id = uuid::Uuid::new_v4();
@@ -264,7 +270,11 @@ mod tests {
         let app = build_router(state);
 
         let deploy_req = DeployRequest {
-            compose: Some("version: '3'".into()), image: None, env: None, cmd: None, ports: None,
+            compose: Some("version: '3'".into()),
+            image: None,
+            env: None,
+            cmd: None,
+            ports: None,
             config: None,
             app_name: None,
             app_version: None,
@@ -292,7 +302,11 @@ mod tests {
         let app = build_router(state.clone());
 
         let deploy_req = DeployRequest {
-            compose: Some("version: '3'\nservices:\n  web:\n    image: nginx".into()), image: None, env: None, cmd: None, ports: None,
+            compose: Some("version: '3'\nservices:\n  web:\n    image: nginx".into()),
+            image: None,
+            env: None,
+            cmd: None,
+            ports: None,
             config: None,
             app_name: Some("test-app".into()),
             app_version: Some("1.0".into()),
@@ -339,7 +353,11 @@ mod tests {
             .header("content-type", "application/json")
             .body(Body::from(
                 serde_json::to_string(&DeployRequest {
-                    compose: Some("version: '3'\nservices:\n  app1:\n    image: nginx".into()), image: None, env: None, cmd: None, ports: None,
+                    compose: Some("version: '3'\nservices:\n  app1:\n    image: nginx".into()),
+                    image: None,
+                    env: None,
+                    cmd: None,
+                    ports: None,
                     config: None,
                     app_name: Some("app1".into()),
                     app_version: None,
@@ -362,7 +380,11 @@ mod tests {
             .header("content-type", "application/json")
             .body(Body::from(
                 serde_json::to_string(&DeployRequest {
-                    compose: Some("version: '3'\nservices:\n  app2:\n    image: redis".into()), image: None, env: None, cmd: None, ports: None,
+                    compose: Some("version: '3'\nservices:\n  app2:\n    image: redis".into()),
+                    image: None,
+                    env: None,
+                    cmd: None,
+                    ports: None,
                     config: None,
                     app_name: Some("app2".into()),
                     app_version: None,
@@ -394,7 +416,11 @@ mod tests {
             agent_id: TEST_AGENT_ID.into(),
             app_name: Some("test-app".into()),
             app_version: Some("1.0".into()),
-            compose: Some("version: '3'".into()), image: None, env: None, cmd: None, ports: None,
+            compose: Some("version: '3'".into()),
+            image: None,
+            env: None,
+            cmd: None,
+            ports: None,
             config: None,
             status: "pending".into(),
             error_message: None,
@@ -456,7 +482,11 @@ mod tests {
             agent_id: TEST_AGENT_ID.into(),
             app_name: None,
             app_version: None,
-            compose: Some("version: '3'".into()), image: None, env: None, cmd: None, ports: None,
+            compose: Some("version: '3'".into()),
+            image: None,
+            env: None,
+            cmd: None,
+            ports: None,
             config: None,
             status: "deploying".into(),
             error_message: None,
@@ -494,7 +524,11 @@ mod tests {
             agent_id: TEST_AGENT_ID.into(),
             app_name: None,
             app_version: None,
-            compose: Some("version: '3'".into()), image: None, env: None, cmd: None, ports: None,
+            compose: Some("version: '3'".into()),
+            image: None,
+            env: None,
+            cmd: None,
+            ports: None,
             config: None,
             status: "running".into(),
             error_message: None,

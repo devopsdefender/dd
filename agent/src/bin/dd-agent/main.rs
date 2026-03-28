@@ -293,9 +293,8 @@ async fn process_deployment(
         Some(img) => img.clone(),
         None => {
             eprintln!("dd-agent: deployment {} has no image, skipping", dep.id);
-            let _ =
-                report_deployment_status(http, cp_url, &dep.id, "failed", Some("no image set"))
-                    .await;
+            let _ = report_deployment_status(http, cp_url, &dep.id, "failed", Some("no image set"))
+                .await;
             return;
         }
     };
@@ -372,7 +371,11 @@ async fn process_deployment(
 
     match runtime.create_and_start(&req).await {
         Ok(container_id) => {
-            eprintln!("dd-agent: deployment {} running as {}", dep.id, &container_id[..12]);
+            eprintln!(
+                "dd-agent: deployment {} running as {}",
+                dep.id,
+                &container_id[..12]
+            );
             let _ = report_deployment_status(http, cp_url, &dep.id, "running", None).await;
 
             active_deployments.lock().await.insert(
@@ -412,7 +415,10 @@ async fn check_active_deployments(
     for (dep_id, container_id) in entries {
         if let Ok(containers) = runtime.list_containers(None).await {
             if !containers.contains(&container_id) {
-                eprintln!("dd-agent: deployment {} container gone, marking failed", dep_id);
+                eprintln!(
+                    "dd-agent: deployment {} container gone, marking failed",
+                    dep_id
+                );
                 let _ = report_deployment_status(
                     http,
                     cp_url,
