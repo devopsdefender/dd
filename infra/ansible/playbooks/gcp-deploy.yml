@@ -44,14 +44,13 @@
         total_additional_agents: "{{ (num_tiny_agents | int) + (num_standard_agents | int) + (num_llm_agents | int) }}"
         total_agents: "{{ (num_tiny_agents | int) + (num_standard_agents | int) + (num_llm_agents | int) }}"
 
-    - name: Validate agent count and ITA API key requirements
+    - name: Validate ITA API key if agents requested
       ansible.builtin.assert:
         that:
-          - total_agents | int > 0
           - (total_additional_agents | int == 0) or (ita_api_key | length > 0)
         fail_msg: >-
-          Invalid fleet request: total_agents must be > 0 and ITA_API_KEY (or INTEL_API_KEY)
-          is required when launching additional agents.
+          ITA_API_KEY (or INTEL_API_KEY) is required when launching agents.
+      when: total_additional_agents | int > 0
 
     - name: Print deploy parameters
       ansible.builtin.debug:
