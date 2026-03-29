@@ -116,14 +116,14 @@ jobs:
           echo "deployment_id=$dep_id" >> "$GITHUB_OUTPUT"
 
           # Wait for the agent to pull and start the container
-          for i in $(seq 1 30); do
+          for i in $(seq 1 12); do
             status=$(curl -fsSL "$api/api/v1/deployments/$dep_id" | jq -r .status)
-            echo "  attempt ${i}/30: status=${status}"
+            echo "  attempt ${i}/12: status=${status}"
             [ "$status" = "running" ] && echo "Integration test passed!" && exit 0
             [ "$status" = "failed" ] && echo "::error::Hello world deploy failed" && exit 1
-            sleep 10
+            sleep 5
           done
-          echo "::error::Hello world deploy timed out"
+          echo "::error::Hello world deploy timed out (60s)"
           exit 1
 
       - name: Cleanup test deployment
