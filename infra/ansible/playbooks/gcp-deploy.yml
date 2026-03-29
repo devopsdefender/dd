@@ -324,7 +324,10 @@
           {{
             final_agents_list
             | selectattr('registration_state', 'equalto', 'ready')
-            | selectattr('attestation_verified', 'equalto', true)
+            | selectattr('mrtd', 'defined')
+            | rejectattr('mrtd', 'none')
+            | selectattr('node_size', 'defined')
+            | rejectattr('node_size', 'none')
             | map(attribute='node_size')
             | map('string')
             | map('lower')
