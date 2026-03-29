@@ -1,0 +1,15 @@
+name: Website Preview
+
+on:
+  pull_request:
+    paths: ["website/**", "README.md"]
+
+jobs:
+  preview:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/upload-artifact@v4
+        with:
+          name: website-preview
+          path: website/
