@@ -1,9 +1,11 @@
 pub mod accounts;
 pub mod admin;
 pub mod agents;
+pub mod apps;
 pub mod auth;
 pub mod deploy;
 pub mod health;
+pub mod providers;
 pub mod stats;
 pub mod ui;
 
@@ -66,5 +68,28 @@ pub fn build_router(state: AppState) -> Router {
         // Auth
         .route("/api/v1/auth/login", post(auth::login))
         .route("/api/v1/auth/me", get(auth::me))
+        // App catalog
+        .route("/api/v1/apps", get(apps::list_apps))
+        .route("/api/v1/apps", post(apps::create_app))
+        .route("/api/v1/apps/{id}", get(apps::get_app))
+        .route("/api/v1/apps/{id}", delete(apps::delete_app))
+        .route("/api/v1/apps/{id}/versions", get(apps::list_versions))
+        .route("/api/v1/apps/{id}/versions", post(apps::create_version))
+        .route("/api/v1/apps/{id}/deployers", get(apps::list_deployers))
+        .route("/api/v1/apps/{id}/deployers", post(apps::grant_deploy))
+        .route(
+            "/api/v1/apps/{app_id}/deployers/{account_id}",
+            delete(apps::revoke_deploy),
+        )
+        // Providers
+        .route("/api/v1/providers", get(providers::list_providers))
+        .route("/api/v1/providers", post(providers::register_provider))
+        .route("/api/v1/providers/{id}", delete(providers::revoke_provider))
+        .route(
+            "/api/v1/providers/{id}/skus",
+            get(providers::list_provider_skus),
+        )
+        .route("/api/v1/providers/{id}/skus", post(providers::register_sku))
+        .route("/api/v1/skus", get(providers::list_all_skus))
         .with_state(state)
 }
