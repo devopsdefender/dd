@@ -165,12 +165,15 @@ pub fn find_available_agent(
     datacenter: Option<&str>,
 ) -> AppResult<Option<AgentRow>> {
     let conn = db.lock().unwrap();
+    // Only consider agents with a heartbeat in the last 2 minutes
+    let cutoff = (chrono::Utc::now() - chrono::Duration::seconds(120)).to_rfc3339();
     let mut query = String::from(
         "SELECT id, vm_name, status, registration_state, hostname, tunnel_id, \
          mrtd, tcb_status, node_size, datacenter, github_owner, created_at, last_heartbeat_at \
-         FROM agents WHERE registration_state = 'ready'",
+         FROM agents WHERE registration_state = 'ready' \
+         AND last_heartbeat_at IS NOT NULL AND last_heartbeat_at > ?1",
     );
-    let mut bind_values: Vec<String> = Vec::new();
+    let mut bind_values: Vec<String> = vec![cutoff];
 
     if let Some(ns) = node_size {
         bind_values.push(ns.to_string());
@@ -180,7 +183,7 @@ pub fn find_available_agent(
         bind_values.push(dc.to_string());
         query.push_str(&format!(" AND datacenter = ?{}", bind_values.len()));
     }
-    query.push_str(" LIMIT 1");
+    query.push_str(" ORDER BY last_heartbeat_at DESC LIMIT 1");
 
     let mut stmt = conn.prepare(&query).map_err(|_| AppError::Internal)?;
 
@@ -235,7 +238,7 @@ mod tests {
             datacenter: None,
             github_owner: None,
             created_at: Utc::now().to_rfc3339(),
-            last_heartbeat_at: None,
+            last_heartbeat_at: Some(chrono::Utc::now().to_rfc3339()),
         }
     }
 

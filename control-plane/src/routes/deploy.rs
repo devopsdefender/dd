@@ -259,7 +259,7 @@ mod tests {
             datacenter: None,
             github_owner: None,
             created_at: chrono::Utc::now().to_rfc3339(),
-            last_heartbeat_at: None,
+            last_heartbeat_at: Some(chrono::Utc::now().to_rfc3339()),
         };
         let _ = agent_store::insert_agent(&state.db, &agent);
     }
