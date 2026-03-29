@@ -76,6 +76,13 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/apps/{id}", delete(apps::delete_app))
         .route("/api/v1/apps/{id}/versions", get(apps::list_versions))
         .route("/api/v1/apps/{id}/versions", post(apps::create_version))
+        // App deploy grants
+        .route("/api/v1/apps/{id}/deployers", get(apps::list_deployers))
+        .route("/api/v1/apps/{id}/deployers", post(apps::grant_deploy))
+        .route(
+            "/api/v1/apps/{app_id}/deployers/{account_id}",
+            delete(apps::revoke_deploy),
+        )
         // Providers
         .route("/api/v1/providers", get(providers::list_providers))
         .route("/api/v1/providers", post(providers::register_provider))

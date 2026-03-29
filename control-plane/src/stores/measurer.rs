@@ -384,6 +384,7 @@ mod tests {
             id: "a1".into(),
             name: "test-app".into(),
             description: None,
+            owner_id: None,
             created_at: Utc::now().to_rfc3339(),
         };
         app::insert_app(&db, &a).unwrap();

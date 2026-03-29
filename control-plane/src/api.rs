@@ -75,6 +75,8 @@ pub struct DeployRequest {
     pub datacenter: Option<String>,
     #[serde(default)]
     pub dry_run: Option<bool>,
+    #[serde(default)]
+    pub account_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

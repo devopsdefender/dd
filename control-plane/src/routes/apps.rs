@@ -16,6 +16,14 @@ pub struct CreateAppRequest {
     pub name: String,
     #[serde(default)]
     pub description: Option<String>,
+    #[serde(default)]
+    pub owner_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GrantDeployRequest {
+    pub account_id: String,
+    pub granted_by: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -50,6 +58,7 @@ pub async fn create_app(
         id: uuid::Uuid::new_v4().to_string(),
         name: req.name,
         description: req.description,
+        owner_id: req.owner_id,
         created_at: chrono::Utc::now().to_rfc3339(),
     };
     app::insert_app(&state.db, &row)?;
@@ -111,6 +120,58 @@ pub async fn create_version(
     };
     app::insert_app_version(&state.db, &row)?;
     Ok((StatusCode::CREATED, Json(row)))
+}
+
+// ---------------------------------------------------------------------------
+// Deploy Grants
+// ---------------------------------------------------------------------------
+
+/// POST /api/v1/apps/{id}/deployers
+pub async fn grant_deploy(
+    State(state): State<AppState>,
+    Path(app_id): Path<String>,
+    Json(req): Json<GrantDeployRequest>,
+) -> Result<(StatusCode, Json<app::DeployGrantRow>), AppError> {
+    let app_row = app::get_app(&state.db, &app_id)?.ok_or(AppError::NotFound)?;
+
+    // Only owner can grant deploy rights
+    match &app_row.owner_id {
+        Some(oid) if oid != &req.granted_by => return Err(AppError::Forbidden),
+        None => return Err(AppError::InvalidInput("app has no owner".into())),
+        _ => {}
+    }
+
+    let row = app::DeployGrantRow {
+        id: uuid::Uuid::new_v4().to_string(),
+        app_id,
+        account_id: req.account_id,
+        granted_by: req.granted_by,
+        created_at: chrono::Utc::now().to_rfc3339(),
+    };
+    app::insert_deploy_grant(&state.db, &row)?;
+    Ok((StatusCode::CREATED, Json(row)))
+}
+
+/// GET /api/v1/apps/{id}/deployers
+pub async fn list_deployers(
+    State(state): State<AppState>,
+    Path(app_id): Path<String>,
+) -> Result<Json<Vec<app::DeployGrantRow>>, AppError> {
+    app::get_app(&state.db, &app_id)?.ok_or(AppError::NotFound)?;
+    let grants = app::list_deploy_grants(&state.db, &app_id)?;
+    Ok(Json(grants))
+}
+
+/// DELETE /api/v1/apps/{id}/deployers/{account_id}
+pub async fn revoke_deploy(
+    State(state): State<AppState>,
+    Path((app_id, account_id)): Path<(String, String)>,
+) -> Result<StatusCode, AppError> {
+    if app::delete_deploy_grant(&state.db, &app_id, &account_id)? {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(AppError::NotFound)
+    }
 }
 
 #[cfg(test)]

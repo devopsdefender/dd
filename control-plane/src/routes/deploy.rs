@@ -38,9 +38,25 @@ pub async fn deploy(
 
     let agent_id: uuid::Uuid = agent.id.parse().map_err(|_| AppError::Internal)?;
 
-    // Check measurement enforcement if app_name + app_version are set
+    // Check measurement enforcement and ownership if app_name + app_version are set
     if let (Some(ref app_name), Some(ref app_version)) = (&req.app_name, &req.app_version) {
         if let Some(app_row) = app_store::get_app_by_name(&state.db, app_name)? {
+            // Ownership check: owner-only by default
+            if app_row.owner_id.is_some() {
+                match &req.account_id {
+                    Some(account_id) => {
+                        if !app_store::can_deploy(&state.db, &app_row.id, account_id)? {
+                            return Err(AppError::Forbidden);
+                        }
+                    }
+                    None => {
+                        // App has an owner but deployer didn't identify themselves
+                        return Err(AppError::Unauthorized);
+                    }
+                }
+            }
+
+            // Measurement enforcement
             if let Some(version_row) =
                 app_store::find_app_version(&state.db, app_name, app_version)?
             {
@@ -285,6 +301,7 @@ mod tests {
             node_size: None,
             datacenter: None,
             github_owner: None,
+            attestation_token: None,
             created_at: chrono::Utc::now().to_rfc3339(),
             last_heartbeat_at: Some(chrono::Utc::now().to_rfc3339()),
         };
@@ -309,6 +326,7 @@ mod tests {
             node_size: None,
             datacenter: None,
             dry_run: None,
+            account_id: None,
         };
 
         let req = Request::builder()
@@ -341,6 +359,7 @@ mod tests {
             node_size: None,
             datacenter: None,
             dry_run: None,
+            account_id: None,
         };
 
         let req = Request::builder()
@@ -392,6 +411,7 @@ mod tests {
                     node_size: None,
                     datacenter: None,
                     dry_run: None,
+                    account_id: None,
                 })
                 .unwrap(),
             ))
@@ -419,6 +439,7 @@ mod tests {
                     node_size: None,
                     datacenter: None,
                     dry_run: None,
+                    account_id: None,
                 })
                 .unwrap(),
             ))
@@ -592,6 +613,7 @@ mod tests {
             id: "app-1".into(),
             name: "gated-app".into(),
             description: None,
+            owner_id: None,
             created_at: chrono::Utc::now().to_rfc3339(),
         };
         crate::stores::app::insert_app(&state.db, &app_row).unwrap();
@@ -621,6 +643,7 @@ mod tests {
             node_size: None,
             datacenter: None,
             dry_run: None,
+            account_id: None,
         };
         let req = Request::builder()
             .uri("/api/v1/deploy")
