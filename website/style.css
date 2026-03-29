@@ -507,6 +507,25 @@ code {
   justify-content: center;
 }
 
+.step-icon {
+  flex-shrink: 0;
+  width: 48px;
+  height: 48px;
+  background: var(--color-primary-50);
+  border-radius: var(--radius-md);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* ============================================
+   Use Cases
+   ============================================ */
+.use-cases {
+  padding: 100px 0;
+  background: var(--color-bg);
+}
+
 .step-content h3 {
   font-size: 1.1rem;
   margin-bottom: 4px;
