@@ -51,7 +51,7 @@ pub async fn agent_register(
         datacenter: req.datacenter,
         github_owner: req.github_owner,
         created_at: chrono::Utc::now().to_rfc3339(),
-        last_heartbeat_at: None,
+        last_heartbeat_at: Some(chrono::Utc::now().to_rfc3339()),
     };
     agent_store::insert_agent(&state.db, &agent)?;
 
