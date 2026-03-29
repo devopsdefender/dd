@@ -16,14 +16,15 @@ Together: TDX proves the hardware is legit, GitHub OIDC proves the deployer is a
 
 ## Repository Structure
 
-This is a monorepo with five independent components, each with its own git history and CI/CD:
+This is a monorepo with the following components:
 
 ```
 dd/
 ├── agent/          # Rust binary that runs on TDX VMs, manages workloads
 ├── control-plane/  # Rust Axum API server, orchestrates agents and deployments
-├── images/         # Packer definitions for building agent VM images
-├── private-llm/    # Example app: self-hosted LLM stack (Ollama + chat UI)
+├── images/         # Packer definitions for building GCP agent VM images
+├── infra/          # Ansible playbooks for GCP deployments
+├── openapi/        # OpenAPI spec for control-plane API (used by agent code generation)
 └── website/        # Static landing page at devopsdefender.com
 ```
 
@@ -65,7 +66,7 @@ Central management API for agent registration, deployment orchestration, health 
 
 **Binaries:** `dd-cp` (server), `dd-admin` (CLI utility for password hashing)
 **Entry point:** `src/bin/dd-cp/main.rs`
-**Database:** SQLite via sqlx with compile-time query checking
+**Database:** SQLite via rusqlite
 
 **Architecture layers:**
 - `src/routes/` — Axum HTTP handlers (health, agents, deploy, accounts, auth, admin, stats, ui)
@@ -106,19 +107,14 @@ Central management API for agent registration, deployment orchestration, health 
 
 **Deployment:** Multi-stage Dockerfile (Rust builder → debian bookworm-slim runtime with cloudflared).
 
-**Infrastructure** (`infra/`): Ansible playbooks for GCP and baremetal deployments. Key playbooks:
-- `gcp-control-plane-new.yml` — launch TDX-enabled GCP VM for control plane
-- `gcp-vm-fleet-new.yml` — launch agent fleet
-- `gcp-image-bake.yml` — build VM images
-- `baremetal-deploy.yml` — bare metal deployment
+**Infrastructure:** See top-level `infra/` directory.
 
 ### images/ (Packer)
 
-Builds VM images for agent nodes with all dependencies pre-installed.
+Builds GCP VM images for agent nodes with all dependencies pre-installed.
 
-**Two image types:**
-- `packer/baremetal-agent-image.pkr.hcl` — QEMU/KVM image (Ubuntu 24.04, qcow2 output)
-- `packer/gcp-agent-image.pkr.hcl` — GCP Compute Engine image
+**Image type:**
+- `packer/gcp-agent-image.pkr.hcl` — GCP Compute Engine image (Ubuntu 24.04)
 
 **Provisioning script** (`packer/provision-agent-image.sh`) installs:
 - dd-agent and dd-cp binaries
@@ -126,21 +122,22 @@ Builds VM images for agent nodes with all dependencies pre-installed.
 - cloudflared (Cloudflare Tunnel client)
 - Creates systemd services: `devopsdefender-agent.service` (enabled) and `devopsdefender-control-plane.service` (disabled)
 
-### private-llm/ (Docker Compose)
+### infra/ (Ansible)
 
-Example application: a self-hosted LLM chat interface deployed to DevOps Defender.
+GCP infrastructure automation for deploying control-plane and agent fleets.
 
-**Services:**
-- **Ollama** — LLM inference engine
-- **Caddy** — reverse proxy routing `/api/*` to Ollama, serving static chat UI
+**Key playbooks** (`ansible/playbooks/`):
+- `gcp-control-plane-new.yml` — launch TDX-enabled GCP VM for control plane
+- `gcp-vm-fleet-new.yml` — launch agent fleet
+- `gcp-deploy.yml` — full deploy orchestration
+- `gcp-image-bake.yml` — build VM images via Packer
+- `gcp-cleanup-managed-vms.yml` — cleanup old VMs
 
-**Two compose variants:**
-- `docker-compose.yml` — CPU mode, uses `smollm2:135m` model
-- `docker-compose.h100.yml` — GPU mode (NVIDIA H100), uses `qwen2.5:32b` model
+**Templates** (`ansible/playbooks/templates/`): Jinja2 templates for agent and control-plane startup scripts and JSON configs.
 
-**UI:** Single-page vanilla JS chat app (`ui/index.html`) with streaming responses, dark theme.
-**Test:** `test.py` — smoke test that validates model availability and inference.
-**Deployment:** GitHub Actions workflow using OIDC authentication (no long-lived secrets).
+### openapi/
+
+- `control-plane.yaml` — OpenAPI 3.0.0 spec for the control-plane API. Used by the agent's `build.rs` to generate Rust request/response types.
 
 ### website/ (Static HTML)
 
@@ -197,7 +194,7 @@ cargo clippy --all-targets
 
 CI enforces: `RUSTFLAGS="-Dwarnings"` (warnings are errors).
 
-Both projects use Rust 2021 edition. The control-plane uses sqlx with compile-time checked queries against SQLite.
+Both projects use Rust 2021 edition. The control-plane uses rusqlite for SQLite access.
 
 ### Running Locally
 
@@ -210,9 +207,6 @@ DD_AGENT_SKIP_ATTESTATION=true DD_CP_URL=http://localhost:8080 cargo run --bin d
 
 # Generate admin password hash
 cargo run --bin dd-admin -- hash-password
-
-# Private LLM
-cd private-llm && docker compose up
 ```
 
 ## Key Concepts
@@ -229,9 +223,9 @@ cd private-llm && docker compose up
 
 All infrastructure is managed through GitHub Actions. **Never SSH into hosts, run Ansible locally, or attempt manual fixes on VMs.** If staging or production is down, trigger the appropriate GitHub Actions workflow.
 
-**Staging** (`staging-deploy.yml`) — auto-deploys on push to `main`. Pipeline: build → bake GCP agent image → cleanup old VMs → deploy via Ansible → smoke check `app-staging.devopsdefender.com/health`.
+**Staging** (`staging-deploy.yml`) — auto-deploys on push to `main` or `staging`. Pipeline: build → bake GCP agent image → cleanup old VMs → deploy via Ansible → smoke check `app-staging.devopsdefender.com/health`.
 
-**Production** (`production-deploy.yml`) — manual trigger only (`workflow_dispatch`). Inputs: `num_tiny_agents`, `num_standard_agents`, `num_llm_agents`. Same pipeline as staging.
+**Production** (`production-deploy.yml`) — auto-deploys on push to `main`, also supports manual trigger (`workflow_dispatch`). Same pipeline as staging, uses `dd-agent-prod` image family.
 
 **Health check URLs:**
 - Staging: `https://app-staging.devopsdefender.com/health`
@@ -240,18 +234,15 @@ All infrastructure is managed through GitHub Actions. **Never SSH into hosts, ru
 **To deploy or fix an environment**, use `gh workflow run` or the GitHub Actions UI:
 ```bash
 # Trigger staging deploy
-gh workflow run staging-deploy.yml --repo devopsdefender/control-plane
+gh workflow run staging-deploy.yml --repo devopsdefender/dd
 
 # Trigger production deploy
-gh workflow run production-deploy.yml --repo devopsdefender/control-plane \
-  -f num_tiny_agents=0 -f num_standard_agents=0 -f num_llm_agents=1
+gh workflow run production-deploy.yml --repo devopsdefender/dd
 ```
 
 ## CI/CD Pipelines
 
 Each component has its own GitHub Actions workflows:
-- **agent**: `ci.yml` (check/test/fmt/clippy), `release.yml` (build binary + GitHub release)
-- **control-plane**: `ci.yml`, `staging-deploy.yml`, `production-deploy.yml`, `release.yml`
-- **images**: `baremetal-image.yml` (Packer build on self-hosted runner)
-- **private-llm**: `deploy.yml` (OIDC-authenticated deployment to DD platform)
-- **website**: `pages.yml` (GitHub Pages deployment)
+- **monorepo**: `ci.yml` (check/test/fmt/clippy for both agent and control-plane), `staging-deploy.yml`, `production-deploy.yml`, `release.yml`
+- **images**: used by staging/production deploy pipelines (Packer bake step)
+- **website**: `website.yml` (GitHub Pages deployment)
