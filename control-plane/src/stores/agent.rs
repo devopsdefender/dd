@@ -21,6 +21,7 @@ pub struct AgentRow {
     pub github_owner: Option<String>,
     pub created_at: String,
     pub last_heartbeat_at: Option<String>,
+    pub last_attested_at: Option<String>,
 }
 
 fn row_to_agent(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentRow> {
@@ -38,6 +39,7 @@ fn row_to_agent(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentRow> {
         github_owner: row.get("github_owner")?,
         created_at: row.get("created_at")?,
         last_heartbeat_at: row.get("last_heartbeat_at")?,
+        last_attested_at: row.get("last_attested_at")?,
     })
 }
 
@@ -46,8 +48,9 @@ pub fn insert_agent(db: &Db, agent: &AgentRow) -> AppResult<()> {
     let conn = db.lock().unwrap();
     conn.execute(
         "INSERT INTO agents (id, vm_name, status, registration_state, hostname, tunnel_id, \
-         mrtd, tcb_status, node_size, datacenter, github_owner, created_at, last_heartbeat_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+         mrtd, tcb_status, node_size, datacenter, github_owner, created_at, last_heartbeat_at, \
+         last_attested_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
         params![
             agent.id,
             agent.vm_name,
@@ -62,6 +65,7 @@ pub fn insert_agent(db: &Db, agent: &AgentRow) -> AppResult<()> {
             agent.github_owner,
             agent.created_at,
             agent.last_heartbeat_at,
+            agent.last_attested_at,
         ],
     )
     .map_err(|_| AppError::Internal)?;
@@ -75,7 +79,8 @@ pub fn get_agent(db: &Db, id: &str) -> AppResult<Option<AgentRow>> {
     let mut stmt = conn
         .prepare(
             "SELECT id, vm_name, status, registration_state, hostname, tunnel_id, \
-             mrtd, tcb_status, node_size, datacenter, github_owner, created_at, last_heartbeat_at \
+             mrtd, tcb_status, node_size, datacenter, github_owner, created_at, last_heartbeat_at, \
+             last_attested_at \
              FROM agents WHERE id = ?1",
         )
         .map_err(|_| AppError::Internal)?;
@@ -94,7 +99,8 @@ pub fn list_agents(db: &Db) -> AppResult<Vec<AgentRow>> {
     let mut stmt = conn
         .prepare(
             "SELECT id, vm_name, status, registration_state, hostname, tunnel_id, \
-             mrtd, tcb_status, node_size, datacenter, github_owner, created_at, last_heartbeat_at \
+             mrtd, tcb_status, node_size, datacenter, github_owner, created_at, last_heartbeat_at, \
+             last_attested_at \
              FROM agents ORDER BY created_at DESC",
         )
         .map_err(|_| AppError::Internal)?;
@@ -169,7 +175,8 @@ pub fn find_available_agent(
     let cutoff = (chrono::Utc::now() - chrono::Duration::seconds(120)).to_rfc3339();
     let mut query = String::from(
         "SELECT id, vm_name, status, registration_state, hostname, tunnel_id, \
-         mrtd, tcb_status, node_size, datacenter, github_owner, created_at, last_heartbeat_at \
+         mrtd, tcb_status, node_size, datacenter, github_owner, created_at, last_heartbeat_at, \
+         last_attested_at \
          FROM agents WHERE registration_state = 'ready' \
          AND last_heartbeat_at IS NOT NULL AND last_heartbeat_at > ?1",
     );
@@ -198,6 +205,67 @@ pub fn find_available_agent(
         .map_err(|_| AppError::Internal)?;
 
     Ok(result)
+}
+
+/// List agents whose last heartbeat is older than the given cutoff timestamp.
+pub fn list_stale_agents(db: &Db, cutoff: &str) -> AppResult<Vec<AgentRow>> {
+    let conn = db.lock().unwrap();
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, vm_name, status, registration_state, hostname, tunnel_id, \
+             mrtd, tcb_status, node_size, datacenter, github_owner, created_at, last_heartbeat_at, \
+             last_attested_at \
+             FROM agents WHERE registration_state = 'ready' \
+             AND (last_heartbeat_at IS NULL OR last_heartbeat_at < ?1)",
+        )
+        .map_err(|_| AppError::Internal)?;
+
+    let rows = stmt
+        .query_map(params![cutoff], row_to_agent)
+        .map_err(|_| AppError::Internal)?;
+
+    let mut agents = Vec::new();
+    for row in rows {
+        agents.push(row.map_err(|_| AppError::Internal)?);
+    }
+    Ok(agents)
+}
+
+/// Update the MRTD (TDX measurement) for an agent.
+pub fn update_mrtd(db: &Db, id: &str, mrtd: &str) -> AppResult<bool> {
+    let conn = db.lock().unwrap();
+    let count = conn
+        .execute(
+            "UPDATE agents SET mrtd = ?1 WHERE id = ?2",
+            params![mrtd, id],
+        )
+        .map_err(|_| AppError::Internal)?;
+    Ok(count > 0)
+}
+
+/// Update the TCB status for an agent.
+pub fn update_tcb_status(db: &Db, id: &str, tcb_status: &str) -> AppResult<bool> {
+    let conn = db.lock().unwrap();
+    let count = conn
+        .execute(
+            "UPDATE agents SET tcb_status = ?1 WHERE id = ?2",
+            params![tcb_status, id],
+        )
+        .map_err(|_| AppError::Internal)?;
+    Ok(count > 0)
+}
+
+/// Update the last_attested_at timestamp for an agent.
+pub fn update_last_attested_at(db: &Db, id: &str) -> AppResult<bool> {
+    let now = Utc::now().to_rfc3339();
+    let conn = db.lock().unwrap();
+    let count = conn
+        .execute(
+            "UPDATE agents SET last_attested_at = ?1 WHERE id = ?2",
+            params![now, id],
+        )
+        .map_err(|_| AppError::Internal)?;
+    Ok(count > 0)
 }
 
 // We need this trait extension for optional query results
@@ -239,6 +307,7 @@ mod tests {
             github_owner: None,
             created_at: Utc::now().to_rfc3339(),
             last_heartbeat_at: Some(chrono::Utc::now().to_rfc3339()),
+            last_attested_at: Some(chrono::Utc::now().to_rfc3339()),
         }
     }
 

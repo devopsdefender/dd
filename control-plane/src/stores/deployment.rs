@@ -216,6 +216,7 @@ mod tests {
             github_owner: None,
             created_at: chrono::Utc::now().to_rfc3339(),
             last_heartbeat_at: None,
+            last_attested_at: None,
         };
         // Ignore error if agent already exists
         let _ = agent_store::insert_agent(db, &agent);

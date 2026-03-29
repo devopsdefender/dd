@@ -5,6 +5,7 @@ use dd_control_plane::services::attestation::{AttestationService, RuntimeEnv};
 use dd_control_plane::services::github_oidc::GithubOidcService;
 use dd_control_plane::services::tunnel::TunnelService;
 use dd_control_plane::state::AppState;
+use dd_control_plane::stores::agent as agent_store;
 
 #[tokio::main]
 async fn main() {
@@ -40,8 +41,12 @@ async fn main() {
         state.github_oidc = GithubOidcService::from_env();
     }
 
-    // Capture tunnel service and hostname before moving state into the router.
+    // Capture tunnel service, DB, and hostname before moving state into the router.
     let tunnel_svc = state.tunnel.clone();
+    let shutdown_tunnel_svc = state.tunnel.clone();
+    let cleanup_tunnel_svc = state.tunnel.clone();
+    let cleanup_db = state.db.clone();
+    let stale_timeout = state.stale_agent_timeout_seconds;
     let cp_public_hostname = std::env::var("DD_CP_PUBLIC_HOSTNAME").unwrap_or_default();
     let cp_port: u16 = config
         .bind_addr
@@ -62,10 +67,11 @@ async fn main() {
 
     // Spawn CF tunnel setup in the background (after the listener is bound).
     if !cp_public_hostname.is_empty() {
+        let hostname = cp_public_hostname.clone();
         tokio::spawn(async move {
-            eprintln!("  creating CF tunnel for {cp_public_hostname}...");
+            eprintln!("  creating CF tunnel for {hostname}...");
             match tunnel_svc
-                .create_and_run_cp_tunnel(&cp_public_hostname, cp_port)
+                .create_and_run_cp_tunnel(&hostname, cp_port)
                 .await
             {
                 Ok(info) => eprintln!(
@@ -77,5 +83,79 @@ async fn main() {
         });
     }
 
-    axum::serve(listener, app).await.expect("server error");
+    // Spawn background stale-agent cleanup loop.
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            let cutoff =
+                (chrono::Utc::now() - chrono::Duration::seconds(stale_timeout as i64)).to_rfc3339();
+            match agent_store::list_stale_agents(&cleanup_db, &cutoff) {
+                Ok(stale_agents) => {
+                    for agent in stale_agents {
+                        eprintln!(
+                            "dd-cp: cleaning up stale agent {} ({})",
+                            agent.id, agent.vm_name
+                        );
+                        let tunnel_name = format!("dd-agent-{}", agent.id);
+                        if let Err(e) = cleanup_tunnel_svc.delete_tunnel_by_name(&tunnel_name).await
+                        {
+                            eprintln!(
+                                "dd-cp: warning: tunnel cleanup for stale agent {} failed: {e}",
+                                agent.id
+                            );
+                        }
+                        if let Some(ref hostname) = agent.hostname {
+                            if let Err(e) = cleanup_tunnel_svc.delete_dns_record(hostname).await {
+                                eprintln!(
+                                    "dd-cp: warning: DNS cleanup for stale agent {} failed: {e}",
+                                    agent.id
+                                );
+                            }
+                        }
+                        if let Err(e) = agent_store::delete_agent(&cleanup_db, &agent.id) {
+                            eprintln!(
+                                "dd-cp: warning: DB cleanup for stale agent {} failed: {e}",
+                                agent.id
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("dd-cp: stale agent check failed: {e}");
+                }
+            }
+        }
+    });
+
+    // Graceful shutdown: clean CP tunnel + DNS on SIGTERM/SIGINT.
+    let shutdown_hostname = cp_public_hostname.clone();
+    let shutdown = async {
+        tokio::signal::ctrl_c().await.ok();
+        eprintln!("dd-cp: shutdown signal received");
+    };
+
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown)
+        .await
+        .expect("server error");
+
+    // Post-shutdown: clean up the CP's own Cloudflare tunnel and DNS record.
+    if !shutdown_hostname.is_empty() {
+        let tunnel_name = format!("dd-cp-{}", shutdown_hostname.replace('.', "-"));
+        eprintln!("dd-cp: cleaning up CP tunnel {tunnel_name}...");
+        if let Err(e) = shutdown_tunnel_svc
+            .delete_tunnel_by_name(&tunnel_name)
+            .await
+        {
+            eprintln!("dd-cp: CP tunnel cleanup failed: {e}");
+        }
+        if let Err(e) = shutdown_tunnel_svc
+            .delete_dns_record(&shutdown_hostname)
+            .await
+        {
+            eprintln!("dd-cp: CP DNS cleanup failed: {e}");
+        }
+        eprintln!("dd-cp: shutdown complete");
+    }
 }

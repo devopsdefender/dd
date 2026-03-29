@@ -165,7 +165,11 @@ impl TunnelService {
     }
 
     /// Delete a tunnel by name (lookup + clean connections + delete). Best-effort.
-    async fn delete_tunnel_by_name(&self, name: &str) -> AppResult<()> {
+    pub async fn delete_tunnel_by_name(&self, name: &str) -> AppResult<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+
         let api_token = self
             .api_token
             .as_ref()
@@ -381,6 +385,45 @@ impl TunnelService {
         Ok(())
     }
 
+    /// Delete a CNAME DNS record for a hostname. Best-effort: returns Ok(()) if not found.
+    pub async fn delete_dns_record(&self, hostname: &str) -> AppResult<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+
+        let api_token = self
+            .api_token
+            .as_ref()
+            .ok_or_else(|| AppError::Config("DD_CP_CF_API_TOKEN not set".into()))?;
+        let zone_id = self
+            .zone_id
+            .as_ref()
+            .ok_or_else(|| AppError::Config("DD_CP_CF_ZONE_ID not set".into()))?;
+
+        let client = reqwest::Client::new();
+        let record_id = self
+            .find_dns_record_id(&client, api_token, zone_id, hostname)
+            .await?;
+
+        if let Some(record_id) = record_id {
+            let resp = client
+                .delete(format!(
+                    "https://api.cloudflare.com/client/v4/zones/{zone_id}/dns_records/{record_id}"
+                ))
+                .header("Authorization", format!("Bearer {api_token}"))
+                .send()
+                .await
+                .map_err(|e| AppError::External(format!("CF DNS delete failed: {e}")))?;
+
+            if !resp.status().is_success() {
+                let body = resp.text().await.unwrap_or_default();
+                return Err(AppError::External(format!("CF DNS delete failed: {body}")));
+            }
+        }
+
+        Ok(())
+    }
+
     /// Look up an existing CNAME DNS record by hostname, returning its record ID if found.
     async fn find_dns_record_id(
         &self,
@@ -502,6 +545,20 @@ mod tests {
     async fn disabled_service_delete_is_noop() {
         let svc = TunnelService::disabled_for_tests();
         let result = svc.delete_tunnel("fake-tunnel-id").await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn disabled_service_delete_by_name_is_noop() {
+        let svc = TunnelService::disabled_for_tests();
+        let result = svc.delete_tunnel_by_name("fake-tunnel").await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn disabled_service_delete_dns_is_noop() {
+        let svc = TunnelService::disabled_for_tests();
+        let result = svc.delete_dns_record("test.devopsdefender.com").await;
         assert!(result.is_ok());
     }
 }
