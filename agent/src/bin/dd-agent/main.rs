@@ -38,6 +38,7 @@ async fn main() {
 struct DeploymentState {
     id: String,
     container_id: String,
+    container_name: String,
 }
 
 type ActiveDeployments = Arc<Mutex<HashMap<String, DeploymentState>>>;
@@ -299,14 +300,12 @@ async fn process_deployment(
         }
     };
 
-    let short_id = &dep.id[..8.min(dep.id.len())];
-    let container_name = format!("dd-{short_id}");
+    let app_name = dep.app_name.as_deref().unwrap_or("unnamed");
+    let container_name = format!("dd-{app_name}");
 
     eprintln!(
         "dd-agent: deploying {} (app: {}, image: {})",
-        dep.id,
-        dep.app_name.as_deref().unwrap_or("unnamed"),
-        image
+        dep.id, app_name, image
     );
 
     let runtime = match oci::DockerOciRuntime::new() {
@@ -317,6 +316,25 @@ async fn process_deployment(
             return;
         }
     };
+
+    // Stop and remove any existing container with the same name (redeploy)
+    let _ = runtime.stop_container(&container_name).await;
+    let _ = runtime.remove_container(&container_name).await;
+
+    // Also clean up the previous active deployment for this app
+    {
+        let mut deployments = active_deployments.lock().await;
+        let old_ids: Vec<String> = deployments
+            .values()
+            .filter(|d| d.container_name == container_name && d.id != dep.id)
+            .map(|d| d.id.clone())
+            .collect();
+        for old_id in &old_ids {
+            let _ =
+                report_deployment_status(http, cp_url, old_id, "stopped", Some("replaced")).await;
+            deployments.remove(old_id);
+        }
+    }
 
     // Pull image
     eprintln!("dd-agent: pulling {image}");
@@ -363,7 +381,7 @@ async fn process_deployment(
 
     let req = oci::LaunchRequest {
         image,
-        name: Some(container_name),
+        name: Some(container_name.clone()),
         env,
         ports,
         cmd,
@@ -383,6 +401,7 @@ async fn process_deployment(
                 DeploymentState {
                     id: dep.id,
                     container_id,
+                    container_name,
                 },
             );
         }

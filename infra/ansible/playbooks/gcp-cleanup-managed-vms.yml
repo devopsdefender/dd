@@ -242,3 +242,56 @@
         label: "{{ item }}"
       register: delete_cmd
       when: managed_instances | length > 0
+
+    # ── Cleanup stale images (keep only the latest per family) ──────────
+    - name: List managed images
+      ansible.builtin.command:
+        argv:
+          - gcloud
+          - compute
+          - images
+          - list
+          - --project
+          - "{{ lookup('env', 'GCP_PROJECT_ID') }}"
+          - --filter
+          - "labels.devopsdefender=managed"
+          - --sort-by
+          - "~creationTimestamp"
+          - --format
+          - "value(name,family)"
+      register: managed_images_raw
+      changed_when: false
+
+    - name: Identify stale images (keep latest per family)
+      ansible.builtin.set_fact:
+        stale_images: >-
+          {%- set seen_families = [] -%}
+          {%- set stale = [] -%}
+          {%- for line in managed_images_raw.stdout_lines -%}
+            {%- set parts = line.split() -%}
+            {%- if parts | length >= 2 -%}
+              {%- set name = parts[0] -%}
+              {%- set family = parts[1] -%}
+              {%- if family in seen_families -%}
+                {%- set _ = stale.append(name) -%}
+              {%- else -%}
+                {%- set _ = seen_families.append(family) -%}
+              {%- endif -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {{ stale }}
+
+    - name: Delete stale images
+      ansible.builtin.command:
+        argv:
+          - gcloud
+          - compute
+          - images
+          - delete
+          - "{{ item }}"
+          - --project
+          - "{{ lookup('env', 'GCP_PROJECT_ID') }}"
+          - --quiet
+      loop: "{{ stale_images }}"
+      when: stale_images | length > 0
+      failed_when: false
