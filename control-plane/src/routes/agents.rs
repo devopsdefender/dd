@@ -4,7 +4,8 @@ use axum::Json;
 
 use crate::api::{
     AgentChallengeResponse, AgentCheckIngestRequest, AgentCheckIngestResponse,
-    AgentRegisterRequest, AgentRegisterResponse, HeartbeatResponse, PendingDeployment,
+    AgentRegisterRequest, AgentRegisterResponse, HeartbeatRequest, HeartbeatResponse,
+    PendingDeployment,
 };
 use crate::common::error::AppError;
 use crate::state::AppState;
@@ -52,6 +53,7 @@ pub async fn agent_register(
         github_owner: req.github_owner,
         created_at: chrono::Utc::now().to_rfc3339(),
         last_heartbeat_at: Some(chrono::Utc::now().to_rfc3339()),
+        last_attested_at: Some(chrono::Utc::now().to_rfc3339()),
     };
     agent_store::insert_agent(&state.db, &agent)?;
 
@@ -87,12 +89,27 @@ pub async fn delete_agent(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, AppError> {
-    let deleted = agent_store::delete_agent(&state.db, &id)?;
-    if deleted {
-        Ok(StatusCode::NO_CONTENT)
-    } else {
-        Err(AppError::NotFound)
+    // Fetch agent to get tunnel/DNS info before deleting
+    let agent = agent_store::get_agent(&state.db, &id)?;
+    let agent = match agent {
+        Some(a) => a,
+        None => return Err(AppError::NotFound),
+    };
+
+    // Best-effort CF cleanup: clean tunnel connections + delete tunnel + delete DNS
+    let tunnel_name = format!("dd-agent-{}", agent.id);
+    if let Err(e) = state.tunnel.delete_tunnel_by_name(&tunnel_name).await {
+        eprintln!("dd-cp: warning: tunnel cleanup for agent {id} failed: {e}");
     }
+    if let Some(ref hostname) = agent.hostname {
+        if let Err(e) = state.tunnel.delete_dns_record(hostname).await {
+            eprintln!("dd-cp: warning: DNS cleanup for agent {id} failed: {e}");
+        }
+    }
+
+    // Delete from database
+    agent_store::delete_agent(&state.db, &id)?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// POST /api/v1/agents/{id}/reset
@@ -113,11 +130,72 @@ pub async fn reset_agent(
 pub async fn agent_heartbeat(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    body: Option<Json<HeartbeatRequest>>,
 ) -> Result<Json<HeartbeatResponse>, AppError> {
     let updated = agent_store::update_heartbeat(&state.db, &id)?;
     if !updated {
         return Err(AppError::NotFound);
     }
+
+    // Handle re-attestation response if the agent included an attestation token
+    let req = body.map(|b| b.0).unwrap_or_default();
+    if let Some(ref token) = req.attestation_token {
+        match state.attestation.verify_registration_token(token).await {
+            Ok(attestation) => {
+                agent_store::update_last_attested_at(&state.db, &id)?;
+                // Update MRTD/TCB status if they changed
+                if let Some(ref mrtd) = attestation.mrtd {
+                    let _ = agent_store::update_mrtd(&state.db, &id, mrtd);
+                }
+                if let Some(ref tcb) = attestation.tcb_status {
+                    let _ = agent_store::update_tcb_status(&state.db, &id, tcb);
+                }
+                eprintln!("dd-cp: agent {id} re-attestation succeeded");
+            }
+            Err(e) => {
+                eprintln!("dd-cp: agent {id} re-attestation failed: {e}, revoking");
+                // Clean up CF resources and mark agent as failed
+                let agent = agent_store::get_agent(&state.db, &id)?;
+                if let Some(agent) = agent {
+                    let tunnel_name = format!("dd-agent-{}", agent.id);
+                    let _ = state.tunnel.delete_tunnel_by_name(&tunnel_name).await;
+                    if let Some(ref hostname) = agent.hostname {
+                        let _ = state.tunnel.delete_dns_record(hostname).await;
+                    }
+                }
+                agent_store::update_registration_state(&state.db, &id, "attestation_failed")?;
+                return Ok(Json(HeartbeatResponse {
+                    ok: false,
+                    pending_deployments: vec![],
+                    reattest: false,
+                    nonce: None,
+                }));
+            }
+        }
+    }
+
+    // Check if re-attestation is needed
+    let agent = agent_store::get_agent(&state.db, &id)?.ok_or(AppError::NotFound)?;
+    let needs_reattest = match agent.last_attested_at {
+        Some(ref ts) => {
+            if let Ok(attested) = chrono::DateTime::parse_from_rfc3339(ts) {
+                let elapsed = chrono::Utc::now()
+                    .signed_duration_since(attested)
+                    .num_seconds();
+                elapsed > state.attestation_recheck_seconds as i64
+            } else {
+                true
+            }
+        }
+        None => true,
+    };
+
+    let (reattest, nonce) = if needs_reattest {
+        let nonce = state.nonce.issue().await;
+        (true, Some(nonce))
+    } else {
+        (false, None)
+    };
 
     let pending = deployment_store::list_pending_deployments(&state.db, &id)?;
 
@@ -144,6 +222,8 @@ pub async fn agent_heartbeat(
     Ok(Json(HeartbeatResponse {
         ok: true,
         pending_deployments,
+        reattest,
+        nonce,
     }))
 }
 

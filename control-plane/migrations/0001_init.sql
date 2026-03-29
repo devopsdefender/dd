@@ -13,7 +13,8 @@ CREATE TABLE IF NOT EXISTS agents (
     datacenter TEXT,
     github_owner TEXT,
     created_at TEXT NOT NULL,
-    last_heartbeat_at TEXT
+    last_heartbeat_at TEXT,
+    last_attested_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS agent_control_credentials (
