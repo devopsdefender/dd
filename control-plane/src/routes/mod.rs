@@ -93,7 +93,7 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route(
             "/api/v1/admin/migration/deploy-cp",
-            post(migration::bootstrap_deploy_cp),
+            post(migration::deploy_cp),
         )
         .route(
             "/api/v1/admin/migration/proxy/start",

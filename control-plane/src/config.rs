@@ -1,27 +1,5 @@
 use std::collections::HashMap;
 
-/// The operational mode of the control plane.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CpMode {
-    /// Bootstrap mode: a lightweight CP that runs on bare infrastructure,
-    /// registers agents, and can deploy the portable CP as a workload.
-    /// Does not create its own CF tunnel by default.
-    Bootstrap,
-    /// Portable mode: the full CP running as a container workload on an agent.
-    /// Supports state export/import for migration between nodes.
-    Portable,
-}
-
-impl CpMode {
-    fn from_str(s: &str) -> Self {
-        match s.to_lowercase().as_str() {
-            "bootstrap" => Self::Bootstrap,
-            "portable" => Self::Portable,
-            _ => Self::Portable,
-        }
-    }
-}
-
 /// Control plane configuration, loaded from environment variables.
 #[derive(Debug, Clone)]
 pub struct CpConfig {
@@ -31,8 +9,6 @@ pub struct CpConfig {
     pub tcb_enforcement_mode: String,
     pub rtmr_enforcement_mode: String,
     pub nonce_enforcement_mode: String,
-    /// Bootstrap or portable mode.
-    pub cp_mode: CpMode,
     /// Path to a state bundle JSON file to import on startup.
     /// When set, the CP will restore state from this file before serving.
     pub import_state_path: Option<String>,
@@ -72,16 +48,8 @@ impl CpConfig {
                 .get("DD_CP_NONCE_ENFORCEMENT_MODE")
                 .cloned()
                 .unwrap_or_else(|| "required".to_string()),
-            cp_mode: map
-                .get("DD_CP_MODE")
-                .map(|s| CpMode::from_str(s))
-                .unwrap_or(CpMode::Portable),
             import_state_path: map.get("DD_CP_IMPORT_STATE").cloned(),
         }
-    }
-
-    pub fn is_bootstrap(&self) -> bool {
-        self.cp_mode == CpMode::Bootstrap
     }
 }
 
@@ -99,17 +67,7 @@ mod tests {
         assert_eq!(cfg.tcb_enforcement_mode, "strict");
         assert_eq!(cfg.rtmr_enforcement_mode, "strict");
         assert_eq!(cfg.nonce_enforcement_mode, "required");
-        assert_eq!(cfg.cp_mode, CpMode::Portable);
         assert!(cfg.import_state_path.is_none());
-    }
-
-    #[test]
-    fn bootstrap_mode_from_env() {
-        let mut map = HashMap::new();
-        map.insert("DD_CP_MODE".into(), "bootstrap".into());
-        let cfg = CpConfig::from_map(&map);
-        assert_eq!(cfg.cp_mode, CpMode::Bootstrap);
-        assert!(cfg.is_bootstrap());
     }
 
     #[test]

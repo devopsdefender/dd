@@ -14,14 +14,13 @@ async fn main() {
     eprintln!("DevOps Defender Control Plane starting...");
     eprintln!("  bind_addr: {}", config.bind_addr);
     eprintln!("  database:  {}", config.database_url);
-    eprintln!("  mode:      {:?}", config.cp_mode);
 
     // Connect to database and run migrations
     let db = db::connect_and_migrate(&config.database_url).expect("failed to connect to database");
 
     eprintln!("  database connected, migrations applied");
 
-    // Import seed config if provided (new portable CP bootstrapping from a bootstrap CP)
+    // Import seed config if provided (deployed by another CP via deploy-cp)
     import_seed_if_configured(&db);
 
     // Import full state bundle if provided (instant cutover migration)
@@ -71,26 +70,20 @@ async fn main() {
         move |req: axum::http::Request<axum::body::Body>, next: axum::middleware::Next| {
             let proxy = proxy_target.clone();
             async move {
-                // Check if we should proxy this request
                 let target = proxy.read().unwrap().clone();
                 if let Some(target_url) = target {
-                    // Don't proxy migration control endpoints (admin still talks to old CP)
+                    // Don't proxy migration control endpoints
                     let path = req.uri().path();
                     if path.starts_with("/api/v1/admin/migration/") || path == "/health" {
                         return next.run(req).await;
                     }
 
-                    // Forward to the new CP
                     match proxy_request(&target_url, req).await {
                         Ok(resp) => resp,
-                        Err(_) => {
-                            // If proxy fails, fall through to local handling
-                            // (can't retry the consumed request, return 502)
-                            axum::http::Response::builder()
-                                .status(502)
-                                .body(axum::body::Body::from("proxy target unreachable"))
-                                .unwrap()
-                        }
+                        Err(_) => axum::http::Response::builder()
+                            .status(502)
+                            .body(axum::body::Body::from("proxy target unreachable"))
+                            .unwrap(),
                     }
                 } else {
                     next.run(req).await
@@ -107,11 +100,7 @@ async fn main() {
     eprintln!("  listening on {}", listener.local_addr().unwrap());
 
     // Spawn CF tunnel setup in the background (after the listener is bound).
-    // In bootstrap mode, skip tunnel unless explicitly configured.
-    let should_create_tunnel = !cp_public_hostname.is_empty()
-        && (!config.is_bootstrap() || std::env::var("DD_CP_FORCE_TUNNEL").is_ok());
-
-    if should_create_tunnel {
+    if !cp_public_hostname.is_empty() {
         tokio::spawn(async move {
             eprintln!("  creating CF tunnel for {cp_public_hostname}...");
             match tunnel_svc
@@ -133,7 +122,7 @@ async fn main() {
 }
 
 /// Import seed config from the DD_CP_IMPORT_SEED_INLINE env var.
-/// This is set by the bootstrap CP when deploying the portable CP.
+/// This is set when a CP deploys another CP via the deploy-cp endpoint.
 fn import_seed_if_configured(db: &dd_control_plane::db::Db) {
     if let Ok(seed_json) = std::env::var("DD_CP_IMPORT_SEED_INLINE") {
         eprintln!("  importing seed config from DD_CP_IMPORT_SEED_INLINE...");

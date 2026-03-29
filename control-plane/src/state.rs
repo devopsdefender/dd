@@ -28,8 +28,6 @@ pub struct AppState {
     pub attestation_recheck_seconds: u64,
     pub agent_health_path: String,
     pub agent_attestation_path: String,
-    /// "bootstrap" or "portable".
-    pub cp_mode: String,
     /// When set, the CP proxies all requests to this URL for zero-downtime migration.
     pub proxy_target: Arc<RwLock<Option<String>>>,
     /// Number of agents the old CP had, for migration readiness tracking.
@@ -74,7 +72,6 @@ impl AppState {
             attestation_recheck_seconds: env_u64("DD_CP_ATTESTATION_RECHECK_SECONDS", 3600),
             agent_health_path: env("DD_CP_AGENT_HEALTH_PATH", "/health"),
             agent_attestation_path: env("DD_CP_AGENT_ATTESTATION_PATH", "/attestation"),
-            cp_mode: env("DD_CP_MODE", "portable"),
             proxy_target: Arc::new(RwLock::new(None)),
             expected_agent_count: Arc::new(RwLock::new(None)),
         }
@@ -101,7 +98,6 @@ impl AppState {
             attestation_recheck_seconds: 3600,
             agent_health_path: "/health".into(),
             agent_attestation_path: "/attestation".into(),
-            cp_mode: "portable".into(),
             proxy_target: Arc::new(RwLock::new(None)),
             expected_agent_count: Arc::new(RwLock::new(None)),
         }

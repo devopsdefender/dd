@@ -201,7 +201,6 @@ pub struct AuthMeResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MigrationStatusResponse {
-    pub cp_mode: String,
     pub can_export: bool,
     pub can_import: bool,
     pub agent_count: usize,
@@ -216,13 +215,13 @@ pub struct MigrationImportResponse {
     pub summary: crate::services::migration::SeedConfigSummary,
 }
 
-/// Request to deploy the portable CP on an agent (bootstrap mode only).
+/// Request to deploy a new CP instance on an agent.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct BootstrapDeployCpRequest {
+pub struct DeployCpRequest {
     /// The OCI image for the control-plane container.
     pub image: String,
-    /// Target agent ID to deploy the portable CP on.
-    /// If not set, the bootstrap CP picks an available agent.
+    /// Target agent ID to deploy the CP on.
+    /// If not set, picks an available agent.
     #[serde(default)]
     pub agent_id: Option<String>,
     /// Optional node_size filter when auto-selecting an agent.
@@ -234,7 +233,7 @@ pub struct BootstrapDeployCpRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct BootstrapDeployCpResponse {
+pub struct DeployCpResponse {
     pub deployment_id: Uuid,
     pub agent_id: Uuid,
     pub status: DeploymentStatus,

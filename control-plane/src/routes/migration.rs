@@ -3,9 +3,8 @@ use axum::http::StatusCode;
 use axum::Json;
 
 use crate::api::{
-    AgentReattachRequest, BootstrapDeployCpRequest, BootstrapDeployCpResponse,
-    MigrationImportResponse, MigrationReadinessResponse, MigrationStatusResponse,
-    ProxyStartRequest,
+    AgentReattachRequest, DeployCpRequest, DeployCpResponse, MigrationImportResponse,
+    MigrationReadinessResponse, MigrationStatusResponse, ProxyStartRequest,
 };
 use crate::common::error::AppError;
 use crate::services::migration::{SeedConfig, StateBundle};
@@ -24,7 +23,6 @@ pub async fn migration_status(
     let proxy = state.proxy_target.read().unwrap().clone();
 
     Ok(Json(MigrationStatusResponse {
-        cp_mode: state.cp_mode.clone(),
         can_export: true,
         can_import: true,
         agent_count: agents.len(),
@@ -42,7 +40,6 @@ pub async fn migration_readiness(
     let current_agents = agent_store::list_agents(&state.db)?;
     let registered = current_agents.len();
 
-    // If we don't know the expected count yet, report not ready
     if expected == 0 {
         return Ok(Json(MigrationReadinessResponse {
             ready: false,
@@ -56,7 +53,7 @@ pub async fn migration_readiness(
         ready: registered >= expected,
         agents_registered: registered,
         agents_expected: expected,
-        agents_missing: vec![], // Can't list specifics without old CP data
+        agents_missing: vec![],
     }))
 }
 
@@ -102,7 +99,6 @@ pub async fn import_full(
     Json(bundle): Json<StateBundle>,
 ) -> Result<Json<MigrationImportResponse>, AppError> {
     let seed_summary = {
-        // Extract just the seed table counts for the summary
         let mut table_counts = std::collections::HashMap::new();
         for (table, rows) in &bundle.database {
             if let Some(arr) = rows.as_array() {
@@ -135,11 +131,8 @@ pub async fn proxy_start(
     State(state): State<AppState>,
     Json(req): Json<ProxyStartRequest>,
 ) -> Result<StatusCode, AppError> {
-    // Record agent count so the new CP can track readiness
     let agents = agent_store::list_agents(&state.db)?;
     *state.expected_agent_count.write().unwrap() = Some(agents.len());
-
-    // Activate proxy
     *state.proxy_target.write().unwrap() = Some(req.target_url.clone());
 
     eprintln!(
@@ -170,7 +163,6 @@ pub async fn agent_reattach(
 ) -> Result<(StatusCode, Json<serde_json::Value>), AppError> {
     let agent_id = uuid::Uuid::new_v4();
 
-    // Create tunnel for the reattaching agent
     let tunnel_info = state
         .tunnel
         .create_tunnel_for_agent(agent_id, &req.vm_name)
@@ -197,7 +189,6 @@ pub async fn agent_reattach(
     };
     agent_store::insert_agent(&state.db, &agent)?;
 
-    // Restore running deployment records
     for dep in &req.running_deployments {
         let now = chrono::Utc::now().to_rfc3339();
         let row = deployment_store::DeploymentRow {
@@ -217,7 +208,6 @@ pub async fn agent_reattach(
             created_at: now.clone(),
             updated_at: now,
         };
-        // Ignore duplicate errors — deployment might already exist from seed import
         let _ = deployment_store::insert_deployment(&state.db, &row);
     }
 
@@ -238,23 +228,16 @@ pub async fn agent_reattach(
     ))
 }
 
-// ── Bootstrap: deploy portable CP ───────────────────────────────────────────
+// ── Deploy CP on an agent ───────────────────────────────────────────────────
 
 /// POST /api/v1/admin/migration/deploy-cp
-/// Bootstrap-only: deploy the portable CP as a container workload on an agent.
+/// Deploy a new CP instance as a container workload on an agent.
 /// Exports the seed config and passes secrets as container env vars.
 /// Agents will naturally re-register with the new CP.
-pub async fn bootstrap_deploy_cp(
+pub async fn deploy_cp(
     State(state): State<AppState>,
-    Json(req): Json<BootstrapDeployCpRequest>,
-) -> Result<(StatusCode, Json<BootstrapDeployCpResponse>), AppError> {
-    if state.cp_mode != "bootstrap" {
-        return Err(AppError::InvalidInput(
-            "deploy-cp is only available in bootstrap mode".into(),
-        ));
-    }
-
-    // Find or validate the target agent
+    Json(req): Json<DeployCpRequest>,
+) -> Result<(StatusCode, Json<DeployCpResponse>), AppError> {
     let agent = if let Some(ref agent_id) = req.agent_id {
         agent_store::get_agent(&state.db, agent_id)?.ok_or(AppError::NotFound)?
     } else {
@@ -273,13 +256,9 @@ pub async fn bootstrap_deploy_cp(
     let seed_json = serde_json::to_string(&seed)
         .map_err(|e| AppError::External(format!("serialize seed: {e}")))?;
 
-    // Build env vars: secrets + mode + seed config inline
-    let mut env_vars = vec![
-        "DD_CP_MODE=portable".to_string(),
-        "DD_CP_BIND_ADDR=0.0.0.0:8080".to_string(),
-    ];
+    // Build env vars: secrets + seed config inline
+    let mut env_vars = vec!["DD_CP_BIND_ADDR=0.0.0.0:8080".to_string()];
 
-    // Collect current secrets from env
     for &key in crate::services::migration::SECRET_ENV_VARS {
         if let Ok(val) = std::env::var(key) {
             env_vars.push(format!("{key}={val}"));
@@ -314,7 +293,7 @@ pub async fn bootstrap_deploy_cp(
 
     Ok((
         StatusCode::CREATED,
-        Json(BootstrapDeployCpResponse {
+        Json(DeployCpResponse {
             deployment_id,
             agent_id,
             status: DeploymentStatus::Pending,
@@ -365,7 +344,6 @@ mod tests {
     async fn export_seed_excludes_agents() {
         let state = test_state();
 
-        // Insert an agent and a setting
         let agent = agent_store::AgentRow {
             id: "test-agent-1".into(),
             vm_name: "vm-export-test".into(),
@@ -400,11 +378,8 @@ mod tests {
             .unwrap();
         let seed: SeedConfig = serde_json::from_slice(&body).unwrap();
 
-        // Settings should be included
         let settings = seed.tables.get("settings").unwrap().as_array().unwrap();
         assert_eq!(settings.len(), 1);
-
-        // Agents should NOT be in seed config
         assert!(!seed.tables.contains_key("agents"));
     }
 
@@ -435,13 +410,11 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::CREATED);
 
-        // Verify agent was created
         let agents = agent_store::list_agents(&state.db).unwrap();
         assert_eq!(agents.len(), 1);
         assert_eq!(agents[0].vm_name, "vm-returning");
         assert_eq!(agents[0].status, "deployed");
 
-        // Verify deployment was recorded
         let deps = deployment_store::list_deployments(&state.db, Some(&agents[0].id)).unwrap();
         assert_eq!(deps.len(), 1);
         assert_eq!(deps[0].id, "dep-123");
@@ -452,10 +425,8 @@ mod tests {
     async fn readiness_tracks_expected_count() {
         let state = test_state();
 
-        // Set expected count
         *state.expected_agent_count.write().unwrap() = Some(3);
 
-        // Add 2 agents (not yet at 3)
         for i in 0..2 {
             let agent = agent_store::AgentRow {
                 id: format!("agent-{i}"),
