@@ -112,7 +112,7 @@
 
     - name: Resolve control-plane config env inputs
       ansible.builtin.set_fact:
-        admin_password_env: "{{ lookup('env', 'CP_ADMIN_PASSWORD') | default(lookup('env', 'ADMIN_PASSWORD'), true) }}"
+        admin_password_env: "{{ lookup('env', 'DD_CP_ADMIN_PASSWORD') | default(lookup('env', 'CP_ADMIN_PASSWORD') | default(lookup('env', 'ADMIN_PASSWORD'), true), true) }}"
         dd_agent_ita_api_key_env: "{{ lookup('env', 'DD_AGENT_ITA_API_KEY') | default(lookup('env', 'ITA_API_KEY') | default(lookup('env', 'INTEL_API_KEY'), true), true) }}"
 
     - name: Build control-plane raw_kv payload (env vars forwarded to dd-cp)

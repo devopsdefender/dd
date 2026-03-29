@@ -89,4 +89,5 @@ jobs:
             curl -fsS "${url}/health" >/dev/null 2>&1 && echo "Healthy!" && exit 0
             echo "  attempt ${i}/30..." && sleep 10
           done
-          echo "::warning::Not healthy within 5 minutes"
+          echo "::error::Not healthy within 5 minutes"
+          exit 1
