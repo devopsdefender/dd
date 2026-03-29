@@ -227,6 +227,98 @@ pub fn has_valid_measurement(db: &Db, app_id: &str, version_id: &str) -> AppResu
     Ok(count > 0)
 }
 
+// ---------------------------------------------------------------------------
+// Provider SKUs
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkuRow {
+    pub id: String,
+    pub provider_id: String,
+    pub name: String,
+    pub vcpu: i64,
+    pub ram_gb: i64,
+    pub gpu: Option<String>,
+    pub region: Option<String>,
+    pub available: i64,
+    pub status: String,
+    pub created_at: String,
+}
+
+fn row_to_sku(row: &rusqlite::Row<'_>) -> rusqlite::Result<SkuRow> {
+    Ok(SkuRow {
+        id: row.get("id")?,
+        provider_id: row.get("provider_id")?,
+        name: row.get("name")?,
+        vcpu: row.get("vcpu")?,
+        ram_gb: row.get("ram_gb")?,
+        gpu: row.get("gpu")?,
+        region: row.get("region")?,
+        available: row.get("available")?,
+        status: row.get("status")?,
+        created_at: row.get("created_at")?,
+    })
+}
+
+pub fn insert_sku(db: &Db, sku: &SkuRow) -> AppResult<()> {
+    let conn = db.lock().unwrap();
+    conn.execute(
+        "INSERT INTO provider_skus \
+         (id, provider_id, name, vcpu, ram_gb, gpu, region, available, status, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        params![
+            sku.id,
+            sku.provider_id,
+            sku.name,
+            sku.vcpu,
+            sku.ram_gb,
+            sku.gpu,
+            sku.region,
+            sku.available,
+            sku.status,
+            sku.created_at,
+        ],
+    )
+    .map_err(|_| AppError::Internal)?;
+    Ok(())
+}
+
+pub fn list_skus_for_provider(db: &Db, provider_id: &str) -> AppResult<Vec<SkuRow>> {
+    let conn = db.lock().unwrap();
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, provider_id, name, vcpu, ram_gb, gpu, region, available, status, created_at \
+             FROM provider_skus WHERE provider_id = ?1 ORDER BY created_at DESC",
+        )
+        .map_err(|_| AppError::Internal)?;
+    let rows = stmt
+        .query_map(params![provider_id], row_to_sku)
+        .map_err(|_| AppError::Internal)?;
+    let mut skus = Vec::new();
+    for row in rows {
+        skus.push(row.map_err(|_| AppError::Internal)?);
+    }
+    Ok(skus)
+}
+
+pub fn list_all_skus(db: &Db) -> AppResult<Vec<SkuRow>> {
+    let conn = db.lock().unwrap();
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, provider_id, name, vcpu, ram_gb, gpu, region, available, status, created_at \
+             FROM provider_skus WHERE status = 'active' ORDER BY name",
+        )
+        .map_err(|_| AppError::Internal)?;
+    let rows = stmt
+        .query_map([], row_to_sku)
+        .map_err(|_| AppError::Internal)?;
+    let mut skus = Vec::new();
+    for row in rows {
+        skus.push(row.map_err(|_| AppError::Internal)?);
+    }
+    Ok(skus)
+}
+
 trait OptionalExt<T> {
     fn optional(self) -> Result<Option<T>, rusqlite::Error>;
 }

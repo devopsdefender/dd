@@ -1,3 +1,4 @@
 [workspace]
 members = ["agent", "control-plane"]
+exclude = ["apps/provider", "apps/capacity-service"]
 resolver = "2"

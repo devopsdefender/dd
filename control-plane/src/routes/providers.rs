@@ -12,7 +12,7 @@ use crate::stores::{app, measurer};
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RegisterMeasurerRequest {
+pub struct RegisterProviderRequest {
     pub name: String,
     pub public_key: String,
     #[serde(default)]
@@ -38,21 +38,21 @@ pub struct SubmitMeasurementRequest {
 }
 
 // ---------------------------------------------------------------------------
-// Measurer CRUD
+// Provider CRUD
 // ---------------------------------------------------------------------------
 
-/// GET /api/v1/measurers
-pub async fn list_measurers(
+/// GET /api/v1/providers
+pub async fn list_providers(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<measurer::MeasurerRow>>, AppError> {
-    let measurers = measurer::list_measurers(&state.db)?;
-    Ok(Json(measurers))
+    let providers = measurer::list_measurers(&state.db)?;
+    Ok(Json(providers))
 }
 
-/// POST /api/v1/measurers
-pub async fn register_measurer(
+/// POST /api/v1/providers
+pub async fn register_provider(
     State(state): State<AppState>,
-    Json(req): Json<RegisterMeasurerRequest>,
+    Json(req): Json<RegisterProviderRequest>,
 ) -> Result<(StatusCode, Json<measurer::MeasurerRow>), AppError> {
     if req.name.is_empty() || req.public_key.is_empty() {
         return Err(AppError::InvalidInput(
@@ -74,8 +74,8 @@ pub async fn register_measurer(
     Ok((StatusCode::CREATED, Json(row)))
 }
 
-/// DELETE /api/v1/measurers/{id}
-pub async fn revoke_measurer(
+/// DELETE /api/v1/providers/{id}
+pub async fn revoke_provider(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, AppError> {
@@ -84,6 +84,65 @@ pub async fn revoke_measurer(
     } else {
         Err(AppError::NotFound)
     }
+}
+
+// ---------------------------------------------------------------------------
+// SKUs
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegisterSkuRequest {
+    pub name: String,
+    pub vcpu: i64,
+    pub ram_gb: i64,
+    #[serde(default)]
+    pub gpu: Option<String>,
+    #[serde(default)]
+    pub region: Option<String>,
+    #[serde(default)]
+    pub available: Option<i64>,
+}
+
+/// POST /api/v1/providers/{id}/skus
+pub async fn register_sku(
+    State(state): State<AppState>,
+    Path(provider_id): Path<String>,
+    Json(req): Json<RegisterSkuRequest>,
+) -> Result<(StatusCode, Json<measurer::SkuRow>), AppError> {
+    // Verify provider exists
+    measurer::get_measurer(&state.db, &provider_id)?.ok_or(AppError::NotFound)?;
+
+    let row = measurer::SkuRow {
+        id: uuid::Uuid::new_v4().to_string(),
+        provider_id,
+        name: req.name,
+        vcpu: req.vcpu,
+        ram_gb: req.ram_gb,
+        gpu: req.gpu,
+        region: req.region,
+        available: req.available.unwrap_or(0),
+        status: "active".into(),
+        created_at: chrono::Utc::now().to_rfc3339(),
+    };
+    measurer::insert_sku(&state.db, &row)?;
+    Ok((StatusCode::CREATED, Json(row)))
+}
+
+/// GET /api/v1/providers/{id}/skus
+pub async fn list_provider_skus(
+    State(state): State<AppState>,
+    Path(provider_id): Path<String>,
+) -> Result<Json<Vec<measurer::SkuRow>>, AppError> {
+    let skus = measurer::list_skus_for_provider(&state.db, &provider_id)?;
+    Ok(Json(skus))
+}
+
+/// GET /api/v1/skus — list all available SKUs across all providers
+pub async fn list_all_skus(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<measurer::SkuRow>>, AppError> {
+    let skus = measurer::list_all_skus(&state.db)?;
+    Ok(Json(skus))
 }
 
 // ---------------------------------------------------------------------------
@@ -202,12 +261,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn register_and_list_measurers() {
+    async fn register_and_list_providers() {
         let state = test_state();
         let app = build_router(state);
 
         let req = Request::builder()
-            .uri("/api/v1/measurers")
+            .uri("/api/v1/providers")
             .method("POST")
             .header("content-type", "application/json")
             .body(Body::from(
@@ -224,7 +283,7 @@ mod tests {
 
         // List
         let req = Request::builder()
-            .uri("/api/v1/measurers")
+            .uri("/api/v1/providers")
             .body(Body::empty())
             .unwrap();
         let resp = app.clone().oneshot(req).await.unwrap();
@@ -232,13 +291,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn revoke_measurer() {
+    async fn revoke_provider() {
         let state = test_state();
         let app = build_router(state);
 
         // Create
         let req = Request::builder()
-            .uri("/api/v1/measurers")
+            .uri("/api/v1/providers")
             .method("POST")
             .header("content-type", "application/json")
             .body(Body::from(
@@ -251,7 +310,7 @@ mod tests {
 
         // Revoke
         let req = Request::builder()
-            .uri(format!("/api/v1/measurers/{}", created.id))
+            .uri(format!("/api/v1/providers/{}", created.id))
             .method("DELETE")
             .body(Body::empty())
             .unwrap();
@@ -288,9 +347,9 @@ mod tests {
         let created_version: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let version_id = created_version["id"].as_str().unwrap();
 
-        // Create measurer
+        // Create provider
         let req = Request::builder()
-            .uri("/api/v1/measurers")
+            .uri("/api/v1/providers")
             .method("POST")
             .header("content-type", "application/json")
             .body(Body::from(

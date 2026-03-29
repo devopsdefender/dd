@@ -5,7 +5,7 @@ pub mod apps;
 pub mod auth;
 pub mod deploy;
 pub mod health;
-pub mod measurers;
+pub mod providers;
 pub mod stats;
 pub mod ui;
 
@@ -75,27 +75,37 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/apps/{id}", delete(apps::delete_app))
         .route("/api/v1/apps/{id}/versions", get(apps::list_versions))
         .route("/api/v1/apps/{id}/versions", post(apps::create_version))
-        // Measurers
-        .route("/api/v1/measurers", get(measurers::list_measurers))
-        .route("/api/v1/measurers", post(measurers::register_measurer))
-        .route("/api/v1/measurers/{id}", delete(measurers::revoke_measurer))
+        // Providers
+        .route("/api/v1/providers", get(providers::list_providers))
+        .route("/api/v1/providers", post(providers::register_provider))
+        .route("/api/v1/providers/{id}", delete(providers::revoke_provider))
+        // Provider SKUs
+        .route(
+            "/api/v1/providers/{id}/skus",
+            get(providers::list_provider_skus),
+        )
+        .route(
+            "/api/v1/providers/{id}/skus",
+            post(providers::register_sku),
+        )
+        .route("/api/v1/skus", get(providers::list_all_skus))
         // Measurements (app)
         .route(
             "/api/v1/apps/{app_id}/versions/{version_id}/measure",
-            post(measurers::submit_app_measurement),
+            post(providers::submit_app_measurement),
         )
         .route(
             "/api/v1/apps/{app_id}/versions/{version_id}/measurements",
-            get(measurers::list_app_measurements),
+            get(providers::list_app_measurements),
         )
         // Measurements (node)
         .route(
             "/api/v1/agents/{id}/measure",
-            post(measurers::submit_node_measurement),
+            post(providers::submit_node_measurement),
         )
         .route(
             "/api/v1/agents/{id}/measurements",
-            get(measurers::list_node_measurements),
+            get(providers::list_node_measurements),
         )
         .with_state(state)
 }
