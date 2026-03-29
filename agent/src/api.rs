@@ -45,3 +45,33 @@ pub struct UpdateDeploymentStatusRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
 }
+
+/// Sent to a new CP when heartbeat returns 404 (CP doesn't know this agent).
+/// Includes currently running deployments so the CP can track them.
+#[derive(Debug, Clone, Serialize)]
+pub struct AgentReattachRequest {
+    pub vm_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub node_size: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub datacenter: Option<String>,
+    pub running_deployments: Vec<RunningDeploymentReport>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RunningDeploymentReport {
+    pub deployment_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub app_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
+    pub status: String,
+}
+
+/// Response from the reattach endpoint — same shape as register response.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct AgentReattachResponse {
+    pub agent_id: String,
+    pub tunnel_token: String,
+    pub hostname: String,
+}

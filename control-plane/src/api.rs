@@ -196,6 +196,91 @@ pub struct AuthMeResponse {
 }
 
 // ---------------------------------------------------------------------------
+// Migration
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MigrationStatusResponse {
+    pub cp_mode: String,
+    pub can_export: bool,
+    pub can_import: bool,
+    pub agent_count: usize,
+    pub deployment_count: usize,
+    /// If proxying is active, the target URL.
+    pub proxy_target: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MigrationImportResponse {
+    pub imported: bool,
+    pub summary: crate::services::migration::SeedConfigSummary,
+}
+
+/// Request to deploy the portable CP on an agent (bootstrap mode only).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BootstrapDeployCpRequest {
+    /// The OCI image for the control-plane container.
+    pub image: String,
+    /// Target agent ID to deploy the portable CP on.
+    /// If not set, the bootstrap CP picks an available agent.
+    #[serde(default)]
+    pub agent_id: Option<String>,
+    /// Optional node_size filter when auto-selecting an agent.
+    #[serde(default)]
+    pub node_size: Option<String>,
+    /// Optional datacenter filter when auto-selecting an agent.
+    #[serde(default)]
+    pub datacenter: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BootstrapDeployCpResponse {
+    pub deployment_id: Uuid,
+    pub agent_id: Uuid,
+    pub status: DeploymentStatus,
+    pub seed_config_included: bool,
+}
+
+/// Readiness report: how many agents have re-registered with the new CP.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MigrationReadinessResponse {
+    pub ready: bool,
+    pub agents_registered: usize,
+    pub agents_expected: usize,
+    pub agents_missing: Vec<String>,
+}
+
+/// Request to start proxying all traffic to a new CP during migration.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ProxyStartRequest {
+    /// URL of the new CP to proxy traffic to (e.g. "http://10.0.0.5:8080").
+    pub target_url: String,
+}
+
+/// Agent re-registration request — sent when an agent heartbeats a new CP
+/// that doesn't know about it yet.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AgentReattachRequest {
+    pub vm_name: String,
+    #[serde(default)]
+    pub node_size: Option<String>,
+    #[serde(default)]
+    pub datacenter: Option<String>,
+    /// Deployments currently running on this agent.
+    #[serde(default)]
+    pub running_deployments: Vec<RunningDeploymentReport>,
+}
+
+/// A deployment the agent is currently running (reported during reattach).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RunningDeploymentReport {
+    pub deployment_id: String,
+    pub app_name: Option<String>,
+    pub image: Option<String>,
+    pub status: String,
+}
+
+// ---------------------------------------------------------------------------
 // Error response
 // ---------------------------------------------------------------------------
 

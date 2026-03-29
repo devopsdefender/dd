@@ -8,8 +8,8 @@ use tokio::sync::Mutex;
 
 use config::{AgentMode, AgentRuntimeConfig};
 use dd_agent::api::{
-    AgentChallengeResponse, AgentRegisterResponse, HeartbeatResponse, PendingDeployment,
-    UpdateDeploymentStatusRequest,
+    AgentChallengeResponse, AgentReattachRequest, AgentReattachResponse, AgentRegisterResponse,
+    HeartbeatResponse, PendingDeployment, RunningDeploymentReport, UpdateDeploymentStatusRequest,
 };
 
 // ── Entry point ────────────────────────────────────────────────────────────
@@ -84,7 +84,7 @@ async fn run_agent_mode(cfg: AgentRuntimeConfig) {
 
     let active_deployments: ActiveDeployments = Arc::new(Mutex::new(HashMap::new()));
     let agent_id = registration.agent_id.clone();
-    heartbeat_loop(&http, &cp_url, &agent_id, active_deployments).await;
+    heartbeat_loop(&http, &cp_url, &agent_id, active_deployments, &cfg).await;
 }
 
 // ── Registration with retry ──────────────────────────────────────────────
@@ -221,14 +221,16 @@ async fn heartbeat_loop(
     cp_url: &str,
     agent_id: &str,
     active_deployments: ActiveDeployments,
+    cfg: &AgentRuntimeConfig,
 ) {
-    let url = format!("{cp_url}/api/v1/agents/{agent_id}/heartbeat");
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+    let mut current_agent_id = agent_id.to_string();
 
     loop {
         tokio::select! {
             _ = interval.tick() => {
-                match send_heartbeat(http, &url).await {
+                let hb_url = format!("{cp_url}/api/v1/agents/{current_agent_id}/heartbeat");
+                match send_heartbeat(http, &hb_url).await {
                     Ok(resp) => {
                         if !resp.pending_deployments.is_empty() {
                             eprintln!(
@@ -247,6 +249,27 @@ async fn heartbeat_loop(
                         }
 
                         check_active_deployments(http, cp_url, active_deployments.clone()).await;
+                    }
+                    Err(ref e) if e.contains("status 404") => {
+                        // CP doesn't know us — it may have migrated.
+                        // Reattach with our current state so the new CP picks us up.
+                        eprintln!("dd-agent: heartbeat 404 — CP may have migrated, reattaching...");
+                        match reattach(http, cp_url, cfg, &active_deployments).await {
+                            Ok(resp) => {
+                                current_agent_id = resp.agent_id.clone();
+                                eprintln!(
+                                    "dd-agent: reattached as {} at {}",
+                                    resp.agent_id, resp.hostname
+                                );
+                                // Restart cloudflared with new tunnel token
+                                if let Err(e) = start_cloudflared(&resp.tunnel_token).await {
+                                    eprintln!("dd-agent: cloudflared restart failed: {e}");
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("dd-agent: reattach failed: {e}");
+                            }
+                        }
                     }
                     Err(e) => {
                         eprintln!("dd-agent: heartbeat failed: {e}");
@@ -513,6 +536,54 @@ async fn shutdown_deployments(
     }
 
     active_deployments.lock().await.clear();
+}
+
+// ── Reattach (CP migration recovery) ────────────────────────────────────────
+
+async fn reattach(
+    http: &reqwest::Client,
+    cp_url: &str,
+    cfg: &AgentRuntimeConfig,
+    active_deployments: &ActiveDeployments,
+) -> Result<AgentReattachResponse, String> {
+    let url = format!("{cp_url}/api/v1/agents/reattach");
+
+    // Build list of currently running deployments
+    let deployments = active_deployments.lock().await;
+    let running: Vec<RunningDeploymentReport> = deployments
+        .values()
+        .map(|d| RunningDeploymentReport {
+            deployment_id: d.id.clone(),
+            app_name: None,
+            image: None,
+            status: "running".into(),
+        })
+        .collect();
+    drop(deployments);
+
+    let body = AgentReattachRequest {
+        vm_name: hostname(),
+        node_size: cfg.node_size.clone(),
+        datacenter: cfg.datacenter.clone(),
+        running_deployments: running,
+    };
+
+    let resp = http
+        .post(&url)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("POST {url}: {e}"))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body_text = resp.text().await.unwrap_or_default();
+        return Err(format!("POST {url}: status {status}: {body_text}"));
+    }
+
+    resp.json::<AgentReattachResponse>()
+        .await
+        .map_err(|e| format!("parse reattach response: {e}"))
 }
 
 // ── Control-plane mode ─────────────────────────────────────────────────────
