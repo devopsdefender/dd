@@ -428,9 +428,10 @@
     <span class="badge">Open Source Confidential Computing</span>
     <h1>Zero trust from auth<br>to compute to network</h1>
     <p class="lead">
-      Deploy unmodified Docker containers to Intel TDX enclaves. GitHub OIDC eliminates
-      stored credentials. Cloudflare Tunnels remove open ports. Hardware attestation
-      proves workload integrity before any secret is released.
+      Deploy unmodified Docker containers to Intel TDX enclaves. Your cloud provider
+      has root &mdash; TDX ensures they still can't read your memory. GitHub OIDC
+      eliminates stored credentials. Cloudflare Tunnels remove open ports. Hardware
+      attestation proves it all cryptographically.
     </p>
     <div class="hero-actions">
       <a href="#quickstart" class="btn btn-primary">Get Started</a>
@@ -477,9 +478,10 @@
       </div>
       <div class="card">
         <h3>Zero Trust Computation</h3>
-        <p>Every workload runs inside an Intel TDX enclave with encrypted memory.
-        Before secrets are released, a cryptographic attestation quote proves the exact
-        firmware, kernel, and application code running &mdash; verified by Intel Trust Authority.</p>
+        <p>Your cloud provider has root on the host. With TDX, it doesn't matter.
+        Each workload runs in a hardware-encrypted enclave that even the datacenter operator
+        cannot read &mdash; not GCP, not OVH, not anyone with physical access to the rack.
+        Attestation proves it cryptographically before any secret is released.</p>
         <span class="tag">Intel TDX Enclaves</span>
       </div>
     </div>
