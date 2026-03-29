@@ -91,3 +91,46 @@ jobs:
           done
           echo "::error::Not healthy within 5 minutes"
           exit 1
+
+      - name: Integration test -- deploy hello world
+        id: integration
+        run: |
+          set -euo pipefail
+          api="https://app.${{ vars.DD_CF_DOMAIN || 'devopsdefender.com' }}"
+
+          # Deploy nginx as a hello-world test app
+          http_code=$(curl -s -o /tmp/deploy-resp.json -w '%{http_code}' \
+            "$api/api/v1/deploy" \
+            -H "Content-Type: application/json" \
+            -d '{"image": "nginx:alpine", "app_name": "hello-world-test", "ports": ["8080:80"]}')
+
+          if [ "$http_code" = "404" ]; then
+            echo "No agents available -- skipping integration test"
+            echo "skipped=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          elif [ "$http_code" != "201" ]; then
+            echo "::error::Deploy returned HTTP $http_code"
+            cat /tmp/deploy-resp.json
+            exit 1
+          fi
+
+          cat /tmp/deploy-resp.json | jq .
+          dep_id=$(jq -r .deployment_id /tmp/deploy-resp.json)
+          echo "deployment_id=$dep_id" >> "$GITHUB_OUTPUT"
+
+          # Wait for the agent to pull and start the container
+          for i in $(seq 1 12); do
+            status=$(curl -fsSL "$api/api/v1/deployments/$dep_id" | jq -r .status)
+            echo "  attempt ${i}/12: status=${status}"
+            [ "$status" = "running" ] && echo "Integration test passed!" && exit 0
+            [ "$status" = "failed" ] && echo "::error::Hello world deploy failed" && exit 1
+            sleep 5
+          done
+          echo "::error::Hello world deploy timed out (60s)"
+          exit 1
+
+      - name: Cleanup test deployment
+        if: always() && steps.integration.outputs.deployment_id
+        run: |
+          api="https://app.${{ vars.DD_CF_DOMAIN || 'devopsdefender.com' }}"
+          curl -s -X POST "$api/api/v1/deployments/${{ steps.integration.outputs.deployment_id }}/stop" || true
