@@ -72,6 +72,9 @@ impl TunnelService {
 
         let client = reqwest::Client::new();
 
+        // Delete any existing tunnel with this name (idempotent redeploy)
+        self.delete_tunnel_by_name(&tunnel_name).await.ok();
+
         // Create the tunnel
         let create_resp = client
             .post(format!(
@@ -161,6 +164,59 @@ impl TunnelService {
         Ok(())
     }
 
+    /// Delete a tunnel by name (lookup + clean connections + delete). Best-effort.
+    async fn delete_tunnel_by_name(&self, name: &str) -> AppResult<()> {
+        let api_token = self
+            .api_token
+            .as_ref()
+            .ok_or_else(|| AppError::Config("DD_CP_CF_API_TOKEN not set".into()))?;
+        let account_id = self
+            .account_id
+            .as_ref()
+            .ok_or_else(|| AppError::Config("DD_CP_CF_ACCOUNT_ID not set".into()))?;
+
+        let client = reqwest::Client::new();
+
+        // Find tunnel by name
+        let resp = client
+            .get(format!(
+                "https://api.cloudflare.com/client/v4/accounts/{account_id}/cfd_tunnel?name={name}"
+            ))
+            .header("Authorization", format!("Bearer {api_token}"))
+            .send()
+            .await
+            .map_err(|e| AppError::External(format!("CF tunnel lookup: {e}")))?;
+
+        let body: serde_json::Value = resp.json().await.unwrap_or_default();
+        let tunnels = body["result"].as_array();
+
+        if let Some(tunnels) = tunnels {
+            for tunnel in tunnels {
+                if let Some(id) = tunnel["id"].as_str() {
+                    // Clean connections first
+                    let _ = client
+                        .delete(format!(
+                            "https://api.cloudflare.com/client/v4/accounts/{account_id}/cfd_tunnel/{id}/connections"
+                        ))
+                        .header("Authorization", format!("Bearer {api_token}"))
+                        .send()
+                        .await;
+
+                    // Delete the tunnel
+                    let _ = client
+                        .delete(format!(
+                            "https://api.cloudflare.com/client/v4/accounts/{account_id}/cfd_tunnel/{id}"
+                        ))
+                        .header("Authorization", format!("Bearer {api_token}"))
+                        .send()
+                        .await;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Create a Cloudflare tunnel for the control plane itself, configure
     /// ingress to route to a local port, create the DNS CNAME, and spawn
     /// `cloudflared` to connect the tunnel.
@@ -190,6 +246,9 @@ impl TunnelService {
         let tunnel_secret = Uuid::new_v4().to_string().replace('-', "");
 
         let client = reqwest::Client::new();
+
+        // 0. Delete any existing tunnel with this name (idempotent redeploy).
+        self.delete_tunnel_by_name(&tunnel_name).await.ok();
 
         // 1. Create the tunnel.
         let create_resp = client
