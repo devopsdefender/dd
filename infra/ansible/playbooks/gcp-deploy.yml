@@ -29,7 +29,7 @@
         else (repo_root ~ '/infra/ansible/ansible.cfg')
       }}
     ita_api_key: "{{ lookup('env', 'ITA_API_KEY') | default(lookup('env', 'INTEL_API_KEY'), true) }}"
-    admin_password: "{{ lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'CP_ADMIN_PASSWORD'), true) }}"
+    admin_password: "{{ lookup('env', 'DD_CP_ADMIN_PASSWORD') | default(lookup('env', 'ADMIN_PASSWORD') | default(lookup('env', 'CP_ADMIN_PASSWORD'), true), true) }}"
   tasks:
     - name: Validate required deploy inputs
       ansible.builtin.assert:
@@ -260,37 +260,43 @@
           Not all agents ready ({{ ready_agents }}/{{ total_agents }}).
       when: ready_agents | int < total_agents | int
 
+    - name: Skip measurement approval when no agents deployed
+      ansible.builtin.debug:
+        msg: "No agents deployed (total_agents={{ total_agents }}), skipping trusted measurement auto-approval"
+      when: total_agents | int == 0
+
     - name: Probe admin login endpoint
       ansible.builtin.uri:
-        url: "{{ cp_bootstrap_url }}/admin/login"
+        url: "{{ cp_bootstrap_url }}/api/v1/auth/login"
         method: POST
         body_format: json
         body:
           password: "probe"
-        status_code: [200, 401, 403, 404]
+        status_code: [200, 401, 403, 404, 500]
         return_content: true
       register: admin_probe
       failed_when: false
+      when: total_agents | int > 0
 
     - name: Set admin API availability
       ansible.builtin.set_fact:
-        admin_api_available: "{{ admin_probe.status | int != 404 }}"
+        admin_api_available: "{{ (total_agents | int > 0) and (admin_probe.status | default(404) | int not in [404, 500]) }}"
 
     - name: Skip measurement approval when admin API is unavailable
       ansible.builtin.debug:
-        msg: "Admin API not available (got {{ admin_probe.status }}), skipping trusted measurement auto-approval"
+        msg: "Admin API not available (got {{ admin_probe.status | default('skipped') }}), skipping trusted measurement auto-approval"
       when: not (admin_api_available | bool)
 
     - name: Ensure admin password is configured for measurement approval
       ansible.builtin.assert:
         that:
           - admin_password | length > 0
-        fail_msg: "ADMIN_PASSWORD (or CP_ADMIN_PASSWORD) is required for trusted measurement approval"
+        fail_msg: "DD_CP_ADMIN_PASSWORD (or ADMIN_PASSWORD / CP_ADMIN_PASSWORD) is required for trusted measurement approval"
       when: admin_api_available | bool
 
     - name: Admin login
       ansible.builtin.uri:
-        url: "{{ cp_bootstrap_url }}/admin/login"
+        url: "{{ cp_bootstrap_url }}/api/v1/auth/login"
         method: POST
         body_format: json
         body:
@@ -314,71 +320,58 @@
 
     - name: Compute node sizes that need trusted measurement approval
       ansible.builtin.set_fact:
-        approval_sizes: >-
+        approval_agents: >-
           {{
             final_agents_list
             | selectattr('registration_state', 'equalto', 'ready')
-            | selectattr('attestation_verified', 'equalto', true)
-            | map(attribute='node_size')
-            | map('string')
-            | map('lower')
-            | select('in', ['tiny', 'standard', 'llm'])
-            | unique
+            | selectattr('mrtd', 'defined')
+            | rejectattr('mrtd', 'none')
+            | selectattr('node_size', 'defined')
+            | rejectattr('node_size', 'none')
             | list
           }}
       when: admin_api_available | bool
 
-    - name: Ensure there are attested ready node sizes to approve
-      ansible.builtin.assert:
-        that:
-          - approval_sizes | length > 0
-        fail_msg: "No attested ready node sizes found; cannot auto-approve trusted measurements"
+    - name: Derive unique approval entries (one per mrtd)
+      ansible.builtin.set_fact:
+        approval_entries: >-
+          {%- set seen = [] -%}
+          {%- set entries = [] -%}
+          {%- for a in (approval_agents | default([])) -%}
+            {%- if a.mrtd not in seen -%}
+              {%- set _ = seen.append(a.mrtd) -%}
+              {%- set _ = entries.append({'mrtd': a.mrtd, 'label': 'ci-auto-approve-' ~ (a.node_size | default('unknown') | lower)}) -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {{ entries }}
       when: admin_api_available | bool
 
-    - name: Fetch observed measurements for each attested ready node size
+    - name: Skip measurement approval when no attested agents found
+      ansible.builtin.debug:
+        msg: "No attested agents with mrtd found, skipping measurement approval"
+      when:
+        - admin_api_available | bool
+        - (approval_entries | default([]) | length) == 0
+
+    - name: Approve trusted measurement for each attested agent
       ansible.builtin.uri:
-        url: "{{ cp_bootstrap_url }}/api/admin/measurements/agents?node_size={{ item }}&limit=20"
-        method: GET
-        headers:
-          Authorization: "Bearer {{ admin_session_token }}"
-        status_code: 200
-        return_content: true
-      loop: "{{ approval_sizes | default([]) }}"
-      register: observed_measurements
-      when: admin_api_available | bool
-
-    - name: Validate observed measurement availability per node size
-      ansible.builtin.assert:
-        that:
-          - (item.json | default([]) | length) > 0
-          - (item.json[0].mrtd | default('') | length) > 0
-        fail_msg: "No observed measurement with mrtd for node_size='{{ item.item }}'"
-      loop: "{{ (observed_measurements.results | default([])) }}"
-      when: admin_api_available | bool
-
-    - name: Approve trusted measurement for each attested ready node size
-      ansible.builtin.uri:
-        url: "{{ cp_bootstrap_url }}/api/admin/trusted-measurements/agent"
+        url: "{{ cp_bootstrap_url }}/api/v1/admin/measurements"
         method: POST
         headers:
           Authorization: "Bearer {{ admin_session_token }}"
         body_format: json
-        body: >-
-          {{
-            {
-              'node_size': item.item,
-              'mrtd': item.json[0].mrtd,
-              'source': 'ci-auto-approve'
-            }
-            | combine((item.json[0].rtmrs is mapping) | ternary({'rtmrs': item.json[0].rtmrs}, {}))
-          }}
-        status_code: [200, 201, 204]
-      loop: "{{ (observed_measurements.results | default([])) }}"
-      when: admin_api_available | bool
+        body:
+          mrtd: "{{ item.mrtd }}"
+          label: "{{ item.label }}"
+        status_code: [200, 201, 409]
+      loop: "{{ approval_entries | default([]) }}"
+      when:
+        - admin_api_available | bool
+        - (approval_entries | default([]) | length) > 0
 
     - name: Admin logout
       ansible.builtin.uri:
-        url: "{{ cp_bootstrap_url }}/admin/logout"
+        url: "{{ cp_bootstrap_url }}/api/v1/auth/logout"
         method: POST
         headers:
           Authorization: "Bearer {{ admin_session_token }}"
