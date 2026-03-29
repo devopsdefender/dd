@@ -1,838 +1,724 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>DevOps Defender - Confidential Computing for CI/CD</title>
-  <meta name="description" content="Deploy Docker apps to hardware-verified Intel TDX enclaves. Secure your CI/CD pipeline with confidential computing, remote attestation, and GitHub OIDC.">
-  <link rel="stylesheet" href="style.css">
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>DevOps Defender — Confidential Computing for CI/CD</title>
+  <meta name="description" content="Deploy unmodified Docker apps to hardware-verified Intel TDX enclaves. Zero secrets, remote attestation, GitHub OIDC.">
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🛡</text></svg>">
+  <style>
+    /* ---- reset ---- */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    /* ---- palette (pretext-inspired warm minimalism) ---- */
+    :root {
+      --bg:        #fbf7f0;
+      --bg-grad:   #f5f1ea;
+      --surface:   #fffdf8;
+      --border:    #d8cec3;
+      --text:      #201b18;
+      --text-sec:  #6d645d;
+      --accent:    #955f3b;
+      --accent-h:  #7a4c2e;
+      --mono-bg:   #f0ebe4;
+      --tag-bg:    #eae4db;
+    }
+
+    /* ---- base ---- */
+    html { scroll-behavior: smooth; }
+    body {
+      font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
+      font-size: 17px;
+      line-height: 1.65;
+      color: var(--text);
+      background: linear-gradient(180deg, var(--bg) 0%, var(--bg-grad) 100%);
+      min-height: 100vh;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    /* ---- layout ---- */
+    .wrap {
+      width: min(940px, calc(100vw - 32px));
+      margin: 0 auto;
+    }
+
+    /* ---- typography ---- */
+    h1, h2, h3 { font-family: Georgia, "Times New Roman", serif; font-weight: 400; }
+    h1 { font-size: 2.8rem; line-height: 1.15; letter-spacing: -0.02em; }
+    h2 { font-size: 1.8rem; line-height: 1.25; letter-spacing: -0.01em; margin-bottom: 0.5em; }
+    h3 { font-size: 1.15rem; line-height: 1.35; margin-bottom: 0.35em; }
+    p  { color: var(--text-sec); }
+    a  { color: var(--accent); text-decoration: none; }
+    a:hover { color: var(--accent-h); text-decoration: underline; }
+    code, pre {
+      font-family: "SF Mono", "Fira Code", "Fira Mono", Menlo, Consolas, monospace;
+      font-size: 0.88em;
+    }
+    pre {
+      background: var(--mono-bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 1.1em 1.3em;
+      overflow-x: auto;
+      line-height: 1.55;
+      color: var(--text);
+    }
+    code { background: var(--mono-bg); padding: 0.15em 0.4em; border-radius: 3px; }
+    pre code { background: none; padding: 0; }
+
+    /* ---- nav ---- */
+    nav {
+      padding: 1.2em 0;
+      border-bottom: 1px solid var(--border);
+      margin-bottom: 4em;
+    }
+    nav .inner {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .logo {
+      font-family: Georgia, serif;
+      font-size: 1.15rem;
+      color: var(--text);
+      font-weight: 400;
+      letter-spacing: -0.01em;
+    }
+    .logo span { color: var(--accent); }
+    nav ul { list-style: none; display: flex; gap: 1.8em; }
+    nav a { color: var(--text-sec); font-size: 0.92rem; }
+    nav a:hover { color: var(--accent); text-decoration: none; }
+
+    /* ---- hero ---- */
+    .hero {
+      padding-bottom: 4em;
+      border-bottom: 1px solid var(--border);
+      margin-bottom: 4em;
+    }
+    .hero .badge {
+      display: inline-block;
+      font-size: 0.82rem;
+      color: var(--accent);
+      background: var(--tag-bg);
+      padding: 0.3em 0.9em;
+      border-radius: 20px;
+      margin-bottom: 1.5em;
+      letter-spacing: 0.02em;
+    }
+    .hero p.lead {
+      font-size: 1.18rem;
+      line-height: 1.6;
+      max-width: 620px;
+      margin-top: 1em;
+      color: var(--text-sec);
+    }
+    .hero-actions {
+      display: flex;
+      gap: 1em;
+      margin-top: 2em;
+      flex-wrap: wrap;
+    }
+    .btn {
+      display: inline-block;
+      font-size: 0.92rem;
+      padding: 0.65em 1.5em;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+      background: var(--surface);
+      color: var(--text);
+      cursor: pointer;
+      transition: all 0.15s ease;
+    }
+    .btn:hover {
+      border-color: color-mix(in srgb, var(--accent) 50%, var(--border));
+      transform: translateY(-1px);
+      box-shadow: 0 2px 8px rgba(0,0,0,0.06);
+      text-decoration: none;
+    }
+    .btn-primary {
+      background: var(--accent);
+      color: #fff;
+      border-color: var(--accent);
+    }
+    .btn-primary:hover {
+      background: var(--accent-h);
+      border-color: var(--accent-h);
+      color: #fff;
+    }
+
+    /* ---- stats row ---- */
+    .stats {
+      display: flex;
+      gap: 2.5em;
+      margin-top: 2.5em;
+      flex-wrap: wrap;
+    }
+    .stat-item strong {
+      display: block;
+      font-family: Georgia, serif;
+      font-size: 1.1rem;
+      font-weight: 400;
+      color: var(--text);
+    }
+    .stat-item span {
+      font-size: 0.82rem;
+      color: var(--text-sec);
+    }
+
+    /* ---- section ---- */
+    section {
+      padding-bottom: 4em;
+      margin-bottom: 4em;
+      border-bottom: 1px solid var(--border);
+    }
+    section:last-of-type { border-bottom: none; }
+    .section-label {
+      font-size: 0.78rem;
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      color: var(--accent);
+      margin-bottom: 0.8em;
+    }
+    .section-desc {
+      max-width: 600px;
+      margin-bottom: 2.5em;
+    }
+
+    /* ---- card grid ---- */
+    .grid { display: grid; gap: 16px; }
+    .grid-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .grid-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 1.5em;
+      transition: all 0.15s ease;
+    }
+    .card:hover {
+      transform: translateY(-1px);
+      border-color: color-mix(in srgb, var(--accent) 40%, var(--border));
+      box-shadow: 0 2px 12px rgba(0,0,0,0.05);
+    }
+    .card h3 { color: var(--text); }
+    .card p { font-size: 0.92rem; }
+    .card .tag {
+      display: inline-block;
+      font-size: 0.75rem;
+      background: var(--tag-bg);
+      color: var(--text-sec);
+      padding: 0.2em 0.6em;
+      border-radius: 3px;
+      margin-top: 0.8em;
+    }
+
+    /* ---- how it works ---- */
+    .steps {
+      counter-reset: step;
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 16px;
+    }
+    .step {
+      counter-increment: step;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 1.5em;
+      position: relative;
+      transition: all 0.15s ease;
+    }
+    .step:hover {
+      transform: translateY(-1px);
+      box-shadow: 0 2px 12px rgba(0,0,0,0.05);
+    }
+    .step::before {
+      content: counter(step);
+      font-family: Georgia, serif;
+      font-size: 2rem;
+      color: var(--border);
+      line-height: 1;
+      display: block;
+      margin-bottom: 0.5em;
+    }
+    .step h3 { font-size: 1rem; }
+    .step p { font-size: 0.85rem; }
+
+    /* ---- architecture ---- */
+    .arch-diagram {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 2.5em;
+      font-size: 0.88rem;
+    }
+    .arch-layers { display: flex; flex-direction: column; gap: 1.2em; }
+    .arch-layer {
+      display: flex;
+      align-items: center;
+      gap: 1em;
+    }
+    .arch-label {
+      flex-shrink: 0;
+      width: 120px;
+      font-family: "SF Mono", Menlo, Consolas, monospace;
+      font-size: 0.78rem;
+      color: var(--accent);
+      text-align: right;
+    }
+    .arch-boxes {
+      display: flex;
+      gap: 0.6em;
+      flex-wrap: wrap;
+      flex: 1;
+    }
+    .arch-box {
+      background: var(--mono-bg);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 0.45em 0.9em;
+      font-family: "SF Mono", Menlo, Consolas, monospace;
+      font-size: 0.8rem;
+      color: var(--text);
+    }
+    .arch-connector {
+      text-align: center;
+      color: var(--border);
+      font-size: 1.2rem;
+      padding: 0.2em 0;
+      padding-left: 120px;
+    }
+
+    /* ---- two-col section ---- */
+    .split {
+      display: grid;
+      grid-template-columns: 1fr 1.2fr;
+      gap: 3em;
+      align-items: start;
+    }
+    .split-text h2 { margin-bottom: 0.3em; }
+    .split-text p { margin-bottom: 1em; }
+    .split-text ol {
+      list-style: none;
+      counter-reset: oidc;
+      padding: 0;
+    }
+    .split-text ol li {
+      counter-increment: oidc;
+      padding-left: 1.8em;
+      position: relative;
+      margin-bottom: 0.8em;
+      color: var(--text-sec);
+      font-size: 0.95rem;
+    }
+    .split-text ol li::before {
+      content: counter(oidc) ".";
+      position: absolute;
+      left: 0;
+      color: var(--accent);
+      font-family: Georgia, serif;
+      font-weight: 400;
+    }
+
+    /* ---- quickstart ---- */
+    .qs-steps { display: flex; flex-direction: column; gap: 2em; }
+    .qs-step h3 { margin-bottom: 0.6em; }
+    .qs-step h3 span {
+      color: var(--accent);
+      font-family: Georgia, serif;
+      margin-right: 0.4em;
+    }
+
+    /* ---- security grid ---- */
+    .sec-grid {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 16px;
+    }
+    .sec-item {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 1.3em 1.5em;
+      transition: all 0.15s ease;
+    }
+    .sec-item:hover {
+      transform: translateY(-1px);
+      box-shadow: 0 2px 12px rgba(0,0,0,0.05);
+    }
+    .sec-item h3 { font-size: 1rem; margin-bottom: 0.25em; }
+    .sec-item p { font-size: 0.88rem; }
+
+    /* ---- cta ---- */
+    .cta-section {
+      text-align: center;
+      padding: 3em 0 2em;
+    }
+    .cta-section h2 { margin-bottom: 0.4em; }
+    .cta-section p { margin: 0 auto 1.5em; max-width: 480px; }
+
+    /* ---- footer ---- */
+    footer {
+      border-top: 1px solid var(--border);
+      padding: 2.5em 0;
+      margin-top: 2em;
+    }
+    .footer-inner {
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+      flex-wrap: wrap;
+      gap: 1em;
+    }
+    .footer-copy {
+      font-size: 0.82rem;
+      color: var(--text-sec);
+    }
+    .footer-links {
+      display: flex;
+      gap: 1.5em;
+      list-style: none;
+    }
+    .footer-links a {
+      font-size: 0.82rem;
+      color: var(--text-sec);
+    }
+    .footer-links a:hover { color: var(--accent); }
+
+    /* ---- responsive ---- */
+    @media (max-width: 760px) {
+      h1 { font-size: 2rem; }
+      h2 { font-size: 1.4rem; }
+      nav ul { display: none; }
+      .grid-2, .grid-3, .sec-grid { grid-template-columns: 1fr; }
+      .steps { grid-template-columns: 1fr 1fr; }
+      .split { grid-template-columns: 1fr; gap: 2em; }
+      .stats { gap: 1.5em; }
+      .arch-label { width: 80px; font-size: 0.72rem; }
+      .arch-connector { padding-left: 80px; }
+    }
+    @media (max-width: 480px) {
+      .steps { grid-template-columns: 1fr; }
+    }
+  </style>
 </head>
 <body>
 
-  <!-- Navigation -->
-  <nav class="navbar" id="navbar">
-    <div class="container nav-container">
-      <a href="https://devopsdefender.com" class="nav-logo">
-        <span class="logo-icon">
-          <svg width="32" height="32" viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg">
-            <path d="M16 2L4 8v8c0 7.732 5.12 14.953 12 16.84C22.88 30.953 28 23.732 28 16V8L16 2z" fill="#4f46e5"/>
-            <path d="M16 6L8 10v6c0 5.155 3.413 9.969 8 11.227C20.587 25.969 24 21.155 24 16v-6L16 6z" fill="#0d9488"/>
-            <path d="M14 16l-2-2-1.5 1.5L14 19l6-6-1.5-1.5L14 16z" fill="white"/>
-          </svg>
-        </span>
-        <span class="logo-text">DevOps Defender</span>
-      </a>
-      <button class="nav-toggle" id="nav-toggle" aria-label="Toggle navigation">
-        <span></span>
-        <span></span>
-        <span></span>
-      </button>
-      <ul class="nav-links" id="nav-links">
-        <li><a href="#how-it-works">How It Works</a></li>
-        <li><a href="#architecture">Architecture</a></li>
-        <li><a href="#tee">TEE Security</a></li>
-        <li><a href="#github-oidc">GitHub OIDC</a></li>
-        <li><a href="#quickstart">Quick Start</a></li>
-        <li><a href="https://github.com/devopsdefender/control-plane" class="nav-cta">GitHub</a></li>
-      </ul>
-    </div>
-  </nav>
+<!-- nav -->
+<nav>
+  <div class="wrap inner">
+    <div class="logo">DevOps <span>Defender</span></div>
+    <ul>
+      <li><a href="#how-it-works">How It Works</a></li>
+      <li><a href="#architecture">Architecture</a></li>
+      <li><a href="#security">Security</a></li>
+      <li><a href="#github-oidc">GitHub OIDC</a></li>
+      <li><a href="#quickstart">Quick Start</a></li>
+      <li><a href="https://github.com/devopsdefender/dd">GitHub</a></li>
+    </ul>
+  </div>
+</nav>
 
-  <!-- Hero Section -->
-  <header class="hero" id="hero">
-    <div class="hero-bg"></div>
-    <div class="container hero-content">
-      <div class="hero-badge">Open Source Confidential Computing Platform</div>
-      <h1>Secure Your CI/CD Pipeline with <span class="hero-highlight">Confidential Computing</span></h1>
-      <p class="hero-subtitle">
-        Deploy unmodified Docker applications to hardware-verified Intel TDX enclaves.
-        Every workload runs in a Trusted Execution Environment with remote attestation,
-        memory encryption, and cryptographic proof of integrity.
-      </p>
-      <div class="hero-actions">
-        <a href="#quickstart" class="btn btn-primary btn-lg">Get Started</a>
-        <a href="https://github.com/devopsdefender/control-plane" class="btn btn-outline btn-lg">View on GitHub</a>
+<main class="wrap">
+
+  <!-- hero -->
+  <div class="hero">
+    <span class="badge">Open Source Confidential Computing</span>
+    <h1>Deploy to hardware-verified<br>enclaves, no code changes</h1>
+    <p class="lead">
+      Run unmodified Docker containers inside Intel TDX trusted execution environments.
+      Every workload gets memory encryption, remote attestation, and cryptographic
+      proof of integrity &mdash; with zero stored secrets.
+    </p>
+    <div class="hero-actions">
+      <a href="#quickstart" class="btn btn-primary">Get Started</a>
+      <a href="https://github.com/devopsdefender/dd" class="btn">View on GitHub</a>
+    </div>
+    <div class="stats">
+      <div class="stat-item">
+        <strong>Intel TDX</strong>
+        <span>Hardware isolation</span>
       </div>
-      <div class="hero-stats">
-        <div class="hero-stat">
-          <span class="hero-stat-value">TDX</span>
-          <span class="hero-stat-label">Intel Trust Domain Extensions</span>
-        </div>
-        <div class="hero-stat-divider"></div>
-        <div class="hero-stat">
-          <span class="hero-stat-value">Zero Trust</span>
-          <span class="hero-stat-label">Hardware-Rooted Attestation</span>
-        </div>
-        <div class="hero-stat-divider"></div>
-        <div class="hero-stat">
-          <span class="hero-stat-value">No Secrets</span>
-          <span class="hero-stat-label">GitHub OIDC Authentication</span>
-        </div>
+      <div class="stat-item">
+        <strong>Zero Trust</strong>
+        <span>Attestation before access</span>
+      </div>
+      <div class="stat-item">
+        <strong>No Secrets</strong>
+        <span>GitHub OIDC end-to-end</span>
+      </div>
+      <div class="stat-item">
+        <strong>Unmodified Docker</strong>
+        <span>No SDK, no wrapper</span>
       </div>
     </div>
-  </header>
+  </div>
 
-  <!-- Value Proposition -->
-  <section class="value-props">
-    <div class="container">
-      <div class="value-grid">
-        <div class="value-card">
-          <div class="value-icon">
-            <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="#4f46e5" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect>
-              <path d="M7 11V7a5 5 0 0 1 10 0v4"></path>
-            </svg>
-          </div>
-          <h3>Hardware Isolation</h3>
-          <p>Every workload runs inside an Intel TDX virtual machine with encrypted memory that even the hypervisor cannot read.</p>
-        </div>
-        <div class="value-card">
-          <div class="value-icon">
-            <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="#4f46e5" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path>
-              <path d="M9 12l2 2 4-4"></path>
-            </svg>
-          </div>
-          <h3>Remote Attestation</h3>
-          <p>Cryptographic proof from Intel hardware that your code is running unmodified in a genuine TDX enclave before any secrets are released.</p>
-        </div>
-        <div class="value-card">
-          <div class="value-icon">
-            <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="#4f46e5" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <polyline points="16 18 22 12 16 6"></polyline>
-              <polyline points="8 6 2 12 8 18"></polyline>
-            </svg>
-          </div>
-          <h3>Unmodified Docker</h3>
-          <p>Bring your existing Docker images. No SDK, no code changes, no special toolchains. If it runs in Docker, it runs in a TDX enclave.</p>
-        </div>
+  <!-- value props -->
+  <section>
+    <p class="section-label">Why DevOps Defender</p>
+    <div class="grid grid-3">
+      <div class="card">
+        <h3>Hardware Isolation</h3>
+        <p>Each workload runs in a CPU-enforced enclave. The hypervisor, host OS, and
+        even physical access cannot read encrypted memory.</p>
+        <span class="tag">Intel TDX</span>
+      </div>
+      <div class="card">
+        <h3>Remote Attestation</h3>
+        <p>Before any secret is released, a cryptographic quote proves the exact code,
+        firmware, and configuration running inside the enclave.</p>
+        <span class="tag">Intel Trust Authority</span>
+      </div>
+      <div class="card">
+        <h3>Unmodified Docker</h3>
+        <p>Bring your existing container images. No special SDK, no code changes, no
+        recompilation. If it runs in Docker, it runs here.</p>
+        <span class="tag">OCI Compatible</span>
       </div>
     </div>
   </section>
 
-  <!-- How It Works -->
-  <section class="how-it-works" id="how-it-works">
-    <div class="container">
-      <div class="section-header">
-        <h2>How It Works</h2>
-        <p>From code commit to verified enclave deployment in four steps.</p>
+  <!-- how it works -->
+  <section id="how-it-works">
+    <p class="section-label">How It Works</p>
+    <h2>Four steps from code to enclave</h2>
+    <p class="section-desc">
+      DevOps Defender handles attestation, networking, and orchestration so you can
+      focus on your application.
+    </p>
+    <div class="steps">
+      <div class="step">
+        <h3>Register App</h3>
+        <p>Create an application entry via the API. Define the container image,
+        health check, and resource requirements.</p>
       </div>
-
-      <div class="flow-diagram">
-        <div class="flow-step">
-          <div class="flow-step-number">1</div>
-          <div class="flow-step-icon">
-            <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="#4f46e5" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
-              <polyline points="14 2 14 8 20 8"></polyline>
-              <line x1="12" y1="18" x2="12" y2="12"></line>
-              <line x1="9" y1="15" x2="15" y2="15"></line>
-            </svg>
-          </div>
-          <h3>Register Application</h3>
-          <p>Define your app with its Docker image reference, expected measurements, and the GitHub organization authorized to deploy it.</p>
-        </div>
-
-        <div class="flow-connector">
-          <svg width="40" height="24" viewBox="0 0 40 24" fill="none">
-            <path d="M0 12h32M28 6l8 6-8 6" stroke="#4f46e5" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-          </svg>
-        </div>
-
-        <div class="flow-step">
-          <div class="flow-step-number">2</div>
-          <div class="flow-step-icon">
-            <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="#0d9488" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-              <polyline points="16 16 12 12 8 16"></polyline>
-              <line x1="12" y1="12" x2="12" y2="21"></line>
-              <path d="M20.39 18.39A5 5 0 0 0 18 9h-1.26A8 8 0 1 0 3 16.3"></path>
-              <polyline points="16 16 12 12 8 16"></polyline>
-            </svg>
-          </div>
-          <h3>Publish Version</h3>
-          <p>Push your container image to a registry. DevOps Defender records the content digest as the expected image measurement for attestation.</p>
-        </div>
-
-        <div class="flow-connector">
-          <svg width="40" height="24" viewBox="0 0 40 24" fill="none">
-            <path d="M0 12h32M28 6l8 6-8 6" stroke="#0d9488" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-          </svg>
-        </div>
-
-        <div class="flow-step">
-          <div class="flow-step-number">3</div>
-          <div class="flow-step-icon">
-            <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="#4f46e5" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path>
-              <path d="M12 8v4M12 16h.01"></path>
-            </svg>
-          </div>
-          <h3>Measure Enclave</h3>
-          <p>The TDX hardware generates a cryptographic attestation quote binding the VM identity, firmware, kernel, and rootfs into a verifiable measurement chain.</p>
-        </div>
-
-        <div class="flow-connector">
-          <svg width="40" height="24" viewBox="0 0 40 24" fill="none">
-            <path d="M0 12h32M28 6l8 6-8 6" stroke="#4f46e5" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-          </svg>
-        </div>
-
-        <div class="flow-step">
-          <div class="flow-step-number">4</div>
-          <div class="flow-step-icon">
-            <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="#0d9488" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-              <rect x="2" y="3" width="20" height="14" rx="2" ry="2"></rect>
-              <line x1="8" y1="21" x2="16" y2="21"></line>
-              <line x1="12" y1="17" x2="12" y2="21"></line>
-              <path d="M7 8l3 3-3 3M12 14h4"></path>
-            </svg>
-          </div>
-          <h3>Deploy to TDX</h3>
-          <p>Your Docker container launches inside the verified TDX enclave. The control plane monitors health via heartbeats and enforces attestation continuously.</p>
-        </div>
+      <div class="step">
+        <h3>Publish Version</h3>
+        <p>Push a new app version from GitHub Actions. The OIDC token proves
+        ownership &mdash; no API key needed.</p>
+      </div>
+      <div class="step">
+        <h3>Measure Enclave</h3>
+        <p>The control plane records TDX measurements (MRTD, RTMR) for the
+        target VM. Only trusted measurements are accepted.</p>
+      </div>
+      <div class="step">
+        <h3>Deploy</h3>
+        <p>An available TDX agent picks up the deployment, pulls the image,
+        starts the container, and opens a Cloudflare tunnel.</p>
       </div>
     </div>
   </section>
 
-  <!-- Architecture -->
-  <section class="architecture" id="architecture">
-    <div class="container">
-      <div class="section-header">
-        <h2>Architecture</h2>
-        <p>A one-way trust model where every component runs inside a Trusted Execution Environment.</p>
-      </div>
-
-      <div class="arch-diagram">
-        <div class="arch-layer arch-layer-client">
-          <div class="arch-label">Client Layer</div>
-          <div class="arch-nodes">
-            <div class="arch-node">
-              <div class="arch-node-icon">
-                <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                  <circle cx="12" cy="12" r="10"></circle>
-                  <circle cx="12" cy="12" r="4"></circle>
-                  <line x1="21.17" y1="8" x2="12" y2="8"></line>
-                  <line x1="3.95" y1="6.06" x2="8.54" y2="14"></line>
-                  <line x1="10.88" y1="21.94" x2="15.46" y2="14"></line>
-                </svg>
-              </div>
-              <span>GitHub Actions</span>
-              <span class="arch-node-detail">OIDC Token Issuer</span>
-            </div>
-            <div class="arch-node">
-              <div class="arch-node-icon">
-                <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                  <rect x="2" y="3" width="20" height="14" rx="2" ry="2"></rect>
-                  <line x1="8" y1="21" x2="16" y2="21"></line>
-                  <line x1="12" y1="17" x2="12" y2="21"></line>
-                </svg>
-              </div>
-              <span>CLI / SDK</span>
-              <span class="arch-node-detail">Deploy Commands</span>
-            </div>
+  <!-- architecture -->
+  <section id="architecture">
+    <p class="section-label">Architecture</p>
+    <h2>Layered, auditable, minimal</h2>
+    <p class="section-desc">
+      Two Rust binaries &mdash; a control plane and a node agent &mdash; connected
+      through attested channels with no shared secrets.
+    </p>
+    <div class="arch-diagram">
+      <div class="arch-layers">
+        <div class="arch-layer">
+          <div class="arch-label">client</div>
+          <div class="arch-boxes">
+            <div class="arch-box">GitHub Actions</div>
+            <div class="arch-box">API Client</div>
+            <div class="arch-box">Admin CLI</div>
           </div>
         </div>
-
-        <div class="arch-arrow">
-          <svg width="24" height="40" viewBox="0 0 24 40" fill="none">
-            <path d="M12 0v32M6 26l6 8 6-8" stroke="#4f46e5" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-          </svg>
-          <span class="arch-arrow-label">HTTPS / OIDC JWT</span>
-        </div>
-
-        <div class="arch-layer arch-layer-edge">
-          <div class="arch-label">Edge Layer</div>
-          <div class="arch-nodes">
-            <div class="arch-node arch-node-highlight">
-              <div class="arch-node-icon">
-                <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                  <path d="M18 10h-1.26A8 8 0 1 0 9 20h9a5 5 0 0 0 0-10z"></path>
-                </svg>
-              </div>
-              <span>Cloudflare Tunnel</span>
-              <span class="arch-node-detail">TLS Termination / DDoS Protection</span>
-            </div>
+        <div class="arch-connector">&darr;</div>
+        <div class="arch-layer">
+          <div class="arch-label">edge</div>
+          <div class="arch-boxes">
+            <div class="arch-box">Cloudflare Tunnel</div>
+            <div class="arch-box">TLS Termination</div>
           </div>
         </div>
-
-        <div class="arch-arrow">
-          <svg width="24" height="40" viewBox="0 0 24 40" fill="none">
-            <path d="M12 0v32M6 26l6 8 6-8" stroke="#0d9488" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-          </svg>
-          <span class="arch-arrow-label">Cloudflare Tunnel (encrypted)</span>
-        </div>
-
-        <div class="arch-layer arch-layer-cp">
-          <div class="arch-label">Control Plane</div>
-          <div class="arch-nodes">
-            <div class="arch-node arch-node-tdx">
-              <div class="arch-tdx-badge">TDX Enclave</div>
-              <div class="arch-node-icon">
-                <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                  <rect x="4" y="4" width="16" height="16" rx="2" ry="2"></rect>
-                  <rect x="9" y="9" width="6" height="6"></rect>
-                  <line x1="9" y1="1" x2="9" y2="4"></line>
-                  <line x1="15" y1="1" x2="15" y2="4"></line>
-                  <line x1="9" y1="20" x2="9" y2="23"></line>
-                  <line x1="15" y1="20" x2="15" y2="23"></line>
-                  <line x1="20" y1="9" x2="23" y2="9"></line>
-                  <line x1="20" y1="14" x2="23" y2="14"></line>
-                  <line x1="1" y1="9" x2="4" y2="9"></line>
-                  <line x1="1" y1="14" x2="4" y2="14"></line>
-                </svg>
-              </div>
-              <span>Control Plane API</span>
-              <span class="arch-node-detail">Agent Registry / Attestation Verifier / Deploy Orchestrator</span>
-            </div>
+        <div class="arch-connector">&darr;</div>
+        <div class="arch-layer">
+          <div class="arch-label">control</div>
+          <div class="arch-boxes">
+            <div class="arch-box">dd-cp</div>
+            <div class="arch-box">SQLite</div>
+            <div class="arch-box">Attestation Verifier</div>
+            <div class="arch-box">Tunnel Manager</div>
           </div>
         </div>
-
-        <div class="arch-arrow">
-          <svg width="24" height="40" viewBox="0 0 24 40" fill="none">
-            <path d="M12 0v32M6 26l6 8 6-8" stroke="#4f46e5" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-          </svg>
-          <span class="arch-arrow-label">Mutual Attestation / Heartbeat</span>
-        </div>
-
-        <div class="arch-layer arch-layer-agents">
-          <div class="arch-label">Agent Layer</div>
-          <div class="arch-nodes">
-            <div class="arch-node arch-node-tdx">
-              <div class="arch-tdx-badge">TDX Enclave</div>
-              <div class="arch-node-icon">
-                <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                  <rect x="4" y="4" width="16" height="16" rx="2" ry="2"></rect>
-                  <rect x="9" y="9" width="6" height="6"></rect>
-                  <line x1="9" y1="1" x2="9" y2="4"></line>
-                  <line x1="15" y1="1" x2="15" y2="4"></line>
-                  <line x1="9" y1="20" x2="9" y2="23"></line>
-                  <line x1="15" y1="20" x2="15" y2="23"></line>
-                  <line x1="20" y1="9" x2="23" y2="9"></line>
-                  <line x1="20" y1="14" x2="23" y2="14"></line>
-                  <line x1="1" y1="9" x2="4" y2="9"></line>
-                  <line x1="1" y1="14" x2="4" y2="14"></line>
-                </svg>
-              </div>
-              <span>Agent + Workload</span>
-              <span class="arch-node-detail">Your Docker Container</span>
-            </div>
-            <div class="arch-node arch-node-tdx">
-              <div class="arch-tdx-badge">TDX Enclave</div>
-              <div class="arch-node-icon">
-                <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                  <rect x="4" y="4" width="16" height="16" rx="2" ry="2"></rect>
-                  <rect x="9" y="9" width="6" height="6"></rect>
-                  <line x1="9" y1="1" x2="9" y2="4"></line>
-                  <line x1="15" y1="1" x2="15" y2="4"></line>
-                  <line x1="9" y1="20" x2="9" y2="23"></line>
-                  <line x1="15" y1="20" x2="15" y2="23"></line>
-                  <line x1="20" y1="9" x2="23" y2="9"></line>
-                  <line x1="20" y1="14" x2="23" y2="14"></line>
-                  <line x1="1" y1="9" x2="4" y2="9"></line>
-                  <line x1="1" y1="14" x2="4" y2="14"></line>
-                </svg>
-              </div>
-              <span>Agent + Workload</span>
-              <span class="arch-node-detail">Your Docker Container</span>
-            </div>
-            <div class="arch-node arch-node-tdx">
-              <div class="arch-tdx-badge">TDX Enclave</div>
-              <div class="arch-node-icon">
-                <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                  <rect x="4" y="4" width="16" height="16" rx="2" ry="2"></rect>
-                  <rect x="9" y="9" width="6" height="6"></rect>
-                  <line x1="9" y1="1" x2="9" y2="4"></line>
-                  <line x1="15" y1="1" x2="15" y2="4"></line>
-                  <line x1="9" y1="20" x2="9" y2="23"></line>
-                  <line x1="15" y1="20" x2="15" y2="23"></line>
-                  <line x1="20" y1="9" x2="23" y2="9"></line>
-                  <line x1="20" y1="14" x2="23" y2="14"></line>
-                  <line x1="1" y1="9" x2="4" y2="9"></line>
-                  <line x1="1" y1="14" x2="4" y2="14"></line>
-                </svg>
-              </div>
-              <span>Agent + Workload</span>
-              <span class="arch-node-detail">Your Docker Container</span>
-            </div>
-          </div>
-        </div>
-      </div>
-
-      <div class="trust-model">
-        <h3>One-Way Trust Model</h3>
-        <p>Trust flows from hardware to software. Each layer verifies the one below it, never the reverse.</p>
-        <table class="trust-table">
-          <thead>
-            <tr>
-              <th>Trust Anchor</th>
-              <th>What It Proves</th>
-              <th>Mechanism</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr>
-              <td>Intel CPU</td>
-              <td>Hardware is genuine TDX-capable silicon</td>
-              <td>Intel Attestation Service certificate chain</td>
-            </tr>
-            <tr>
-              <td>TDX Module</td>
-              <td>VM memory is encrypted and isolated</td>
-              <td>SEAM module measurement in MRTD</td>
-            </tr>
-            <tr>
-              <td>Firmware / Kernel</td>
-              <td>Boot chain is unmodified</td>
-              <td>RTMR[0] and RTMR[1] measurements</td>
-            </tr>
-            <tr>
-              <td>dm-verity rootfs</td>
-              <td>Filesystem integrity is intact</td>
-              <td>RTMR[2] contains verity root hash</td>
-            </tr>
-            <tr>
-              <td>Application</td>
-              <td>Correct container image is running</td>
-              <td>RTMR[3] extends with image digest</td>
-            </tr>
-          </tbody>
-        </table>
-      </div>
-    </div>
-  </section>
-
-  <!-- TEE Deep Dive -->
-  <section class="tee-section" id="tee">
-    <div class="container">
-      <div class="section-header">
-        <h2>Trusted Execution Environments</h2>
-        <p>Intel TDX provides hardware-enforced isolation for entire virtual machines, not just application enclaves.</p>
-      </div>
-
-      <div class="tee-grid">
-        <div class="tee-card">
-          <div class="tee-card-header">
-            <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="#4f46e5" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-              <rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect>
-              <path d="M7 11V7a5 5 0 0 1 10 0v4"></path>
-              <circle cx="12" cy="16" r="1"></circle>
-            </svg>
-            <h3>Hardware Memory Encryption</h3>
-          </div>
-          <p>Intel TDX encrypts all VM memory with AES-256-XTS using per-TD keys managed entirely in hardware. The hypervisor, other VMs, and even physical memory probes cannot access your data.</p>
-          <ul class="tee-features">
-            <li>Per-VM encryption keys generated by CPU microcode</li>
-            <li>Keys never exposed to software, including firmware</li>
-            <li>Integrity protection against memory replay attacks</li>
-            <li>Full VM isolation, not just process-level</li>
-          </ul>
-        </div>
-
-        <div class="tee-card">
-          <div class="tee-card-header">
-            <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="#0d9488" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path>
-              <path d="M9 12l2 2 4-4"></path>
-            </svg>
-            <h3>Remote Attestation</h3>
-          </div>
-          <p>Before releasing any secrets, verify the enclave is genuine. The TDX quote contains cryptographic measurements of the entire software stack, signed by Intel-provisioned keys.</p>
-          <ul class="tee-features">
-            <li>MRTD: Measures the initial TD configuration and firmware</li>
-            <li>RTMR[0-1]: Firmware and kernel boot chain</li>
-            <li>RTMR[2]: dm-verity root filesystem hash</li>
-            <li>RTMR[3]: Application-level measurements</li>
-          </ul>
-        </div>
-
-        <div class="tee-card">
-          <div class="tee-card-header">
-            <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="#4f46e5" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-              <polyline points="16 18 22 12 16 6"></polyline>
-              <polyline points="8 6 2 12 8 18"></polyline>
-              <line x1="14" y1="4" x2="10" y2="20"></line>
-            </svg>
-            <h3>Unmodified Docker Apps</h3>
-          </div>
-          <p>Unlike SGX enclaves that require a specialized SDK, TDX protects entire VMs. Your Docker containers run without any code changes inside a confidential virtual machine.</p>
-          <ul class="tee-features">
-            <li>Standard OCI container images, any base image</li>
-            <li>No SDK or library dependencies required</li>
-            <li>Full Linux environment inside the enclave</li>
-            <li>Podman container runtime for rootless execution</li>
-          </ul>
-        </div>
-
-        <div class="tee-card">
-          <div class="tee-card-header">
-            <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="#0d9488" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"></path>
-              <polyline points="3.27 6.96 12 12.01 20.73 6.96"></polyline>
-              <line x1="12" y1="22.08" x2="12" y2="12"></line>
-            </svg>
-            <h3>Measured Boot Chain</h3>
-          </div>
-          <p>Every component in the boot sequence is measured into TDX runtime measurement registers before execution, creating an unforgeable chain of trust from CPU silicon to your application.</p>
-          <ul class="tee-features">
-            <li>OVMF firmware measured by TDX module into MRTD</li>
-            <li>Kernel and initramfs measured into RTMR[0]</li>
-            <li>dm-verity rootfs integrity measured into RTMR[2]</li>
-            <li>Application identity extended into RTMR[3]</li>
-          </ul>
-        </div>
-      </div>
-    </div>
-  </section>
-
-  <!-- Security Section -->
-  <section class="security-section" id="security">
-    <div class="container">
-      <div class="section-header">
-        <h2>Defense in Depth</h2>
-        <p>Multiple independent security layers ensure that a compromise of any single component does not breach the system.</p>
-      </div>
-
-      <div class="security-grid">
-        <div class="security-item">
-          <div class="security-icon">
-            <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="#4f46e5" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <circle cx="12" cy="12" r="10"></circle>
-              <path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"></path>
-              <line x1="12" y1="17" x2="12.01" y2="17"></line>
-            </svg>
-          </div>
-          <div class="security-content">
-            <h4>Nonce Challenge Protocol</h4>
-            <p>Every attestation request includes a unique server-generated nonce bound to the TDX quote's report data field. This prevents replay attacks and ensures freshness of every attestation.</p>
-          </div>
-        </div>
-
-        <div class="security-item">
-          <div class="security-icon">
-            <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="#0d9488" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path>
-            </svg>
-          </div>
-          <div class="security-content">
-            <h4>dm-verity Root Filesystem</h4>
-            <p>The agent VM boots with a read-only root filesystem protected by dm-verity. Any modification to the filesystem causes I/O errors, making persistent rootkits impossible.</p>
-          </div>
-        </div>
-
-        <div class="security-item">
-          <div class="security-icon">
-            <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="#4f46e5" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <rect x="4" y="4" width="16" height="16" rx="2" ry="2"></rect>
-              <rect x="9" y="9" width="6" height="6"></rect>
-            </svg>
-          </div>
-          <div class="security-content">
-            <h4>TCB Enforcement</h4>
-            <p>The Trusted Computing Base is pinned to specific versions. The control plane rejects agents whose firmware, kernel, or TDX module versions do not match the expected TCB.</p>
-          </div>
-        </div>
-
-        <div class="security-item">
-          <div class="security-icon">
-            <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="#0d9488" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path>
-              <circle cx="12" cy="12" r="3"></circle>
-            </svg>
-          </div>
-          <div class="security-content">
-            <h4>Continuous Monitoring</h4>
-            <p>Agents send periodic heartbeats with fresh attestation evidence. If an agent fails to attest or measurements drift, it is immediately quarantined from the fleet.</p>
-          </div>
-        </div>
-
-        <div class="security-item">
-          <div class="security-icon">
-            <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="#4f46e5" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M18 10h-1.26A8 8 0 1 0 9 20h9a5 5 0 0 0 0-10z"></path>
-            </svg>
-          </div>
-          <div class="security-content">
-            <h4>Cloudflare Tunnel Isolation</h4>
-            <p>Each agent receives a scoped Cloudflare tunnel token during registration. Traffic never traverses the open internet; all communication is encrypted end-to-end through Cloudflare's network.</p>
-          </div>
-        </div>
-
-        <div class="security-item">
-          <div class="security-icon">
-            <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="#0d9488" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <polyline points="20 6 9 17 4 12"></polyline>
-            </svg>
-          </div>
-          <div class="security-content">
-            <h4>Ownership via Label Matching</h4>
-            <p>Agents are labeled with their GitHub organization. Deploy requests are authorized by matching the OIDC token's repository owner claim against the agent's ownership label. No shared secrets, no API keys.</p>
+        <div class="arch-connector">&darr;</div>
+        <div class="arch-layer">
+          <div class="arch-label">agents</div>
+          <div class="arch-boxes">
+            <div class="arch-box">dd-agent &middot; TDX VM</div>
+            <div class="arch-box">dd-agent &middot; TDX VM</div>
+            <div class="arch-box">dd-agent &middot; TDX VM</div>
           </div>
         </div>
       </div>
     </div>
   </section>
 
-  <!-- GitHub OIDC Deploy -->
-  <section class="oidc-section" id="github-oidc">
-    <div class="container">
-      <div class="section-header">
-        <h2>Deploy with GitHub OIDC</h2>
-        <p>No API keys. No shared secrets. Deploy directly from GitHub Actions using OpenID Connect tokens.</p>
+  <!-- security -->
+  <section id="security">
+    <p class="section-label">Defense in Depth</p>
+    <h2>Six layers of verification</h2>
+    <p class="section-desc">
+      Security isn't one feature &mdash; it's the interaction between
+      hardware, firmware, kernel, and application-level checks.
+    </p>
+    <div class="sec-grid">
+      <div class="sec-item">
+        <h3>Nonce Challenge Protocol</h3>
+        <p>Every registration begins with a fresh nonce embedded in the TDX quote,
+        preventing replay attacks.</p>
       </div>
-
-      <div class="oidc-layout">
-        <div class="oidc-explanation">
-          <div class="oidc-step">
-            <div class="oidc-step-num">1</div>
-            <div class="oidc-step-content">
-              <h4>GitHub Issues a JWT</h4>
-              <p>Your GitHub Actions workflow requests an OIDC token from GitHub's token endpoint. This JWT contains claims about the repository, organization, branch, and workflow that triggered the deployment.</p>
-            </div>
-          </div>
-          <div class="oidc-step">
-            <div class="oidc-step-num">2</div>
-            <div class="oidc-step-content">
-              <h4>Control Plane Verifies the Token</h4>
-              <p>DevOps Defender validates the JWT signature against GitHub's JWKS endpoint, checks the audience claim, and extracts the <code>repository_owner</code> to determine which organization is deploying.</p>
-            </div>
-          </div>
-          <div class="oidc-step">
-            <div class="oidc-step-num">3</div>
-            <div class="oidc-step-content">
-              <h4>Ownership Match Authorizes Deploy</h4>
-              <p>The control plane matches the JWT's <code>repository_owner</code> against agents labeled with <code>github:org/&lt;name&gt;</code>. Only agents owned by the deploying organization receive the workload.</p>
-            </div>
-          </div>
-          <div class="oidc-step">
-            <div class="oidc-step-num">4</div>
-            <div class="oidc-step-content">
-              <h4>Workload Deploys to Attested Agents</h4>
-              <p>The container image is pulled and launched inside the TDX enclave. No secrets were exchanged, stored, or rotated. The entire auth flow is stateless and ephemeral.</p>
-            </div>
-          </div>
-        </div>
-
-        <div class="oidc-code">
-          <div class="code-header">
-            <span class="code-filename">.github/workflows/deploy.yml</span>
-            <span class="code-lang">YAML</span>
-          </div>
-          <pre><code><span class="code-key">name:</span> Deploy to DevOps Defender
-<span class="code-key">on:</span>
-  <span class="code-key">push:</span>
-    <span class="code-key">branches:</span> [main]
-
-<span class="code-key">permissions:</span>
-  <span class="code-key">id-token:</span> write
-  <span class="code-key">contents:</span> read
-
-<span class="code-key">jobs:</span>
-  <span class="code-key">deploy:</span>
-    <span class="code-key">runs-on:</span> ubuntu-latest
-    <span class="code-key">steps:</span>
-      - <span class="code-key">uses:</span> actions/checkout@v4
-
-      - <span class="code-key">name:</span> Deploy to TDX enclave
-        <span class="code-key">uses:</span> devopsdefender/deploy-action@v1
-        <span class="code-key">with:</span>
-          <span class="code-key">control-plane:</span> https://devopsdefender.com
-          <span class="code-key">app-name:</span> my-application
-          <span class="code-key">image:</span> ghcr.io/myorg/myapp:${{ github.sha }}</code></pre>
-        </div>
+      <div class="sec-item">
+        <h3>TDX Measurements</h3>
+        <p>MRTD and RTMR[0&ndash;3] registers capture the full boot chain &mdash;
+        firmware, kernel, root filesystem, and application layer.</p>
+      </div>
+      <div class="sec-item">
+        <h3>dm-verity Root FS</h3>
+        <p>The agent VM root filesystem is integrity-protected. Any block-level
+        tampering is detected at read time.</p>
+      </div>
+      <div class="sec-item">
+        <h3>TCB Enforcement</h3>
+        <p>Trusted Computing Base status is verified against Intel advisories.
+        Out-of-date firmware is rejected.</p>
+      </div>
+      <div class="sec-item">
+        <h3>Cloudflare Tunnel Isolation</h3>
+        <p>Agents make outbound-only connections. No inbound ports, no public IPs,
+        no attack surface on the network layer.</p>
+      </div>
+      <div class="sec-item">
+        <h3>Continuous Health Monitoring</h3>
+        <p>Agents heartbeat every 30 seconds. Missed heartbeats trigger re-attestation
+        before any new workload is scheduled.</p>
       </div>
     </div>
   </section>
 
-  <!-- Quick Start -->
-  <section class="quickstart" id="quickstart">
-    <div class="container">
-      <div class="section-header">
-        <h2>Quick Start</h2>
-        <p>Get your first workload running in a TDX enclave in minutes.</p>
+  <!-- github oidc -->
+  <section id="github-oidc">
+    <p class="section-label">GitHub OIDC</p>
+    <div class="split">
+      <div class="split-text">
+        <h2>Deploy without secrets</h2>
+        <p>
+          GitHub Actions issues short-lived OIDC tokens. The control plane verifies
+          them directly &mdash; no API keys, no shared passwords, no credential rotation.
+        </p>
+        <ol>
+          <li>GitHub Actions mints a JWT bound to the repository and workflow</li>
+          <li>The control plane verifies the token against GitHub's JWKS endpoint</li>
+          <li>Repository ownership is matched to the registered application</li>
+          <li>Deployment is created and assigned to an attested TDX agent</li>
+        </ol>
       </div>
+      <div>
+<pre><code># .github/workflows/deploy.yml
+name: Deploy to TDX
+on:
+  push:
+    branches: [main]
 
-      <div class="quickstart-steps">
-        <div class="qs-step">
-          <div class="qs-step-header">
-            <span class="qs-step-num">Step 1</span>
-            <h3>Register Your Application</h3>
-          </div>
-          <div class="qs-step-body">
-            <p>Register your app with the control plane. This defines the container image, expected measurements, and which GitHub organization is authorized to deploy.</p>
-            <div class="code-block">
-              <div class="code-header">
-                <span class="code-filename">Terminal</span>
-              </div>
-              <pre><code><span class="code-comment"># Register a new application</span>
-curl -X POST https://devopsdefender.com/api/v1/apps \
+permissions:
+  id-token: write
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get OIDC Token
+        id: oidc
+        run: |
+          TOKEN=$(curl -s -H \
+            "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=devopsdefender" \
+            | jq -r '.value')
+          echo "token=$TOKEN" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy
+        run: |
+          curl -X POST \
+            https://app.devopsdefender.com/api/v1/deploy \
+            -H "Authorization: Bearer ${{ steps.oidc.outputs.token }}" \
+            -H "Content-Type: application/json" \
+            -d '{"app_name": "my-app", "version": "latest"}'</code></pre>
+      </div>
+    </div>
+  </section>
+
+  <!-- quickstart -->
+  <section id="quickstart">
+    <p class="section-label">Quick Start</p>
+    <h2>Up and running in three steps</h2>
+    <div class="qs-steps">
+      <div class="qs-step">
+        <h3><span>1.</span> Create an account and register your app</h3>
+<pre><code>curl -X POST https://app.devopsdefender.com/api/v1/accounts \
+  -H "Content-Type: application/json" \
+  -d '{"name": "my-org", "type": "deployer"}'
+
+curl -X POST https://app.devopsdefender.com/api/v1/apps \
+  -H "Authorization: Bearer dd_live_..." \
   -H "Content-Type: application/json" \
   -d '{
-    "name": "my-application",
-    "image": "ghcr.io/myorg/myapp:latest",
-    "owner": "github:org/myorg"
+    "name": "my-app",
+    "image": "ghcr.io/my-org/my-app:latest",
+    "github_repo": "my-org/my-app",
+    "health_check_path": "/health"
   }'</code></pre>
-            </div>
-          </div>
-        </div>
+      </div>
+      <div class="qs-step">
+        <h3><span>2.</span> Add the GitHub Action to your repository</h3>
+        <p>Copy the workflow above into <code>.github/workflows/deploy.yml</code> and push to <code>main</code>.</p>
+      </div>
+      <div class="qs-step">
+        <h3><span>3.</span> Verify the deployment</h3>
+<pre><code># Check deployment status
+curl https://app.devopsdefender.com/api/v1/deployments \
+  -H "Authorization: Bearer dd_live_..."
 
-        <div class="qs-step">
-          <div class="qs-step-header">
-            <span class="qs-step-num">Step 2</span>
-            <h3>Add the GitHub Action</h3>
-          </div>
-          <div class="qs-step-body">
-            <p>Add the DevOps Defender deploy action to your workflow. The action handles OIDC token acquisition and deployment automatically.</p>
-            <div class="code-block">
-              <div class="code-header">
-                <span class="code-filename">.github/workflows/deploy.yml</span>
-              </div>
-              <pre><code><span class="code-key">permissions:</span>
-  <span class="code-key">id-token:</span> write
-
-<span class="code-key">steps:</span>
-  - <span class="code-key">name:</span> Deploy
-    <span class="code-key">uses:</span> devopsdefender/deploy-action@v1
-    <span class="code-key">with:</span>
-      <span class="code-key">control-plane:</span> https://devopsdefender.com
-      <span class="code-key">app-name:</span> my-application
-      <span class="code-key">image:</span> ghcr.io/myorg/myapp:${{ github.sha }}</code></pre>
-            </div>
-          </div>
-        </div>
-
-        <div class="qs-step">
-          <div class="qs-step-header">
-            <span class="qs-step-num">Step 3</span>
-            <h3>Verify and Monitor</h3>
-          </div>
-          <div class="qs-step-body">
-            <p>Check that your agent registered successfully and the workload is running inside a verified TDX enclave.</p>
-            <div class="code-block">
-              <div class="code-header">
-                <span class="code-filename">Terminal</span>
-              </div>
-              <pre><code><span class="code-comment"># List registered agents</span>
-curl https://devopsdefender.com/api/v1/agents | jq
-
-<span class="code-comment"># Check agent attestation status</span>
-curl https://devopsdefender.com/api/v1/agents/{id} | jq '.registration_state'
-
-<span class="code-comment"># View agent logs</span>
-curl https://devopsdefender.com/api/v1/agents/{id}/logs</code></pre>
-            </div>
-          </div>
-        </div>
+# Verify attestation
+curl https://app.devopsdefender.com/api/v1/agents \
+  -H "Authorization: Bearer dd_live_..." \
+  | jq '.[].attestation'</code></pre>
       </div>
     </div>
   </section>
 
-  <!-- CTA Section -->
-  <section class="cta-section">
-    <div class="container">
-      <div class="cta-content">
-        <h2>Ready to deploy with confidence?</h2>
-        <p>DevOps Defender is open source. Inspect the code, audit the measurements, and verify the attestation yourself.</p>
-        <div class="cta-actions">
-          <a href="https://github.com/devopsdefender/control-plane" class="btn btn-primary btn-lg">View on GitHub</a>
-          <a href="#quickstart" class="btn btn-outline-light btn-lg">Get Started</a>
-        </div>
-      </div>
+  <!-- cta -->
+  <div class="cta-section">
+    <h2>Ready to deploy with confidence?</h2>
+    <p>DevOps Defender is open source. Read the code, run it locally, deploy to production.</p>
+    <div class="hero-actions" style="justify-content: center;">
+      <a href="https://github.com/devopsdefender/dd" class="btn btn-primary">View on GitHub</a>
+      <a href="#quickstart" class="btn">Get Started</a>
     </div>
-  </section>
+  </div>
 
-  <!-- Footer -->
-  <footer class="footer">
-    <div class="container">
-      <div class="footer-grid">
-        <div class="footer-brand">
-          <a href="https://devopsdefender.com" class="footer-logo">
-            <span class="logo-icon">
-              <svg width="24" height="24" viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg">
-                <path d="M16 2L4 8v8c0 7.732 5.12 14.953 12 16.84C22.88 30.953 28 23.732 28 16V8L16 2z" fill="#4f46e5"/>
-                <path d="M16 6L8 10v6c0 5.155 3.413 9.969 8 11.227C20.587 25.969 24 21.155 24 16v-6L16 6z" fill="#0d9488"/>
-                <path d="M14 16l-2-2-1.5 1.5L14 19l6-6-1.5-1.5L14 16z" fill="white"/>
-              </svg>
-            </span>
-            <span class="logo-text">DevOps Defender</span>
-          </a>
-          <p>Confidential computing for CI/CD pipelines. Deploy Docker apps to hardware-verified Intel TDX enclaves.</p>
-        </div>
+</main>
 
-        <div class="footer-links-group">
-          <h4>Product</h4>
-          <ul>
-            <li><a href="#how-it-works">How It Works</a></li>
-            <li><a href="#architecture">Architecture</a></li>
-            <li><a href="#tee">TEE Security</a></li>
-            <li><a href="#security">Defense in Depth</a></li>
-          </ul>
-        </div>
+<footer>
+  <div class="wrap footer-inner">
+    <span class="footer-copy">&copy; 2025 DevOps Defender</span>
+    <ul class="footer-links">
+      <li><a href="#how-it-works">How It Works</a></li>
+      <li><a href="#architecture">Architecture</a></li>
+      <li><a href="#security">Security</a></li>
+      <li><a href="https://github.com/devopsdefender/dd">GitHub</a></li>
+      <li><a href="https://github.com/devopsdefender/dd/blob/main/LICENSE">License</a></li>
+    </ul>
+  </div>
+</footer>
 
-        <div class="footer-links-group">
-          <h4>Developers</h4>
-          <ul>
-            <li><a href="#quickstart">Quick Start</a></li>
-            <li><a href="#github-oidc">GitHub OIDC</a></li>
-            <li><a href="https://github.com/devopsdefender/control-plane">Control Plane</a></li>
-            <li><a href="https://github.com/devopsdefender/control-plane/issues">Issues</a></li>
-          </ul>
-        </div>
-
-        <div class="footer-links-group">
-          <h4>Resources</h4>
-          <ul>
-            <li><a href="https://github.com/devopsdefender/control-plane/blob/main/README.md">Documentation</a></li>
-            <li><a href="https://github.com/devopsdefender/control-plane/blob/main/LICENSE">License</a></li>
-            <li><a href="https://github.com/devopsdefender/control-plane/blob/main/SECURITY.md">Security Policy</a></li>
-            <li><a href="https://github.com/devopsdefender">GitHub Organization</a></li>
-          </ul>
-        </div>
-      </div>
-
-      <div class="footer-bottom">
-        <p>Copyright 2024-2026 DevOps Defender contributors. Open source under the Apache 2.0 License.</p>
-      </div>
-    </div>
-  </footer>
-
-  <script>
-    // Mobile nav toggle
-    const toggle = document.getElementById('nav-toggle');
-    const links = document.getElementById('nav-links');
-    toggle.addEventListener('click', () => {
-      links.classList.toggle('nav-open');
-      toggle.classList.toggle('active');
-    });
-
-    // Close mobile nav on link click
-    document.querySelectorAll('.nav-links a').forEach(link => {
-      link.addEventListener('click', () => {
-        links.classList.remove('nav-open');
-        toggle.classList.remove('active');
-      });
-    });
-
-    // Navbar scroll effect
-    const navbar = document.getElementById('navbar');
-    window.addEventListener('scroll', () => {
-      if (window.scrollY > 50) {
-        navbar.classList.add('scrolled');
-      } else {
-        navbar.classList.remove('scrolled');
-      }
-    });
-
-    // Smooth scroll for anchor links
-    document.querySelectorAll('a[href^="#"]').forEach(anchor => {
-      anchor.addEventListener('click', function (e) {
-        e.preventDefault();
-        const target = document.querySelector(this.getAttribute('href'));
-        if (target) {
-          target.scrollIntoView({ behavior: 'smooth', block: 'start' });
-        }
-      });
-    });
-  </script>
 </body>
 </html>
