@@ -109,10 +109,23 @@ pub struct PendingDeployment {
     pub app_version: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct HeartbeatRequest {
+    /// Attestation token provided in response to a re-attestation challenge.
+    #[serde(default)]
+    pub attestation_token: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct HeartbeatResponse {
     pub ok: bool,
     pub pending_deployments: Vec<PendingDeployment>,
+    /// When true, the agent must include an attestation_token in its next heartbeat.
+    #[serde(default)]
+    pub reattest: bool,
+    /// Nonce to embed in the attestation quote when reattest is true.
+    #[serde(default)]
+    pub nonce: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
