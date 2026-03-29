@@ -62,9 +62,12 @@ dd/
 ├── control-plane/  # API server -- orchestrates deployments and health checks
 ├── images/         # VM image definitions
 ├── infra/          # Infrastructure automation
-├── openapi/        # API spec
-└── website/        # This landing page
+└── openapi/        # API spec
 ```
+
+## Website
+
+The landing page at [devopsdefender.com](https://devopsdefender.com) lives on the [`gh-pages`](https://github.com/devopsdefender/dd/tree/gh-pages) branch. PRs targeting `gh-pages` get a preview URL commented automatically.
 
 ## Under the Hood
 
