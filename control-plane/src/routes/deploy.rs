@@ -5,7 +5,10 @@ use axum::Json;
 use crate::api::{DeployRequest, DeployResponse, UpdateDeploymentStatusRequest};
 use crate::common::error::AppError;
 use crate::state::AppState;
-use crate::stores::{agent as agent_store, deployment as deployment_store};
+use crate::stores::{
+    agent as agent_store, app as app_store, deployment as deployment_store,
+    measurer as measurer_store,
+};
 use crate::types::DeploymentStatus;
 
 /// POST /api/v1/deploy
@@ -34,6 +37,30 @@ pub async fn deploy(
     .ok_or(AppError::NotFound)?;
 
     let agent_id: uuid::Uuid = agent.id.parse().map_err(|_| AppError::Internal)?;
+
+    // Check measurement enforcement if app_name + app_version are set
+    if let (Some(ref app_name), Some(ref app_version)) = (&req.app_name, &req.app_version) {
+        if let Some(app_row) = app_store::get_app_by_name(&state.db, app_name)? {
+            if let Some(version_row) =
+                app_store::find_app_version(&state.db, app_name, app_version)?
+            {
+                let has_measurement =
+                    measurer_store::has_valid_measurement(&state.db, &app_row.id, &version_row.id)?;
+                match state.measurement_enforcement.as_str() {
+                    "strict" if !has_measurement => {
+                        return Err(AppError::Forbidden);
+                    }
+                    "warn" if !has_measurement => {
+                        eprintln!(
+                            "dd-cp: WARNING: deploying {} v{} without measurement",
+                            app_name, app_version
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
 
     let dry_run = req.dry_run.unwrap_or(false);
     if dry_run {
@@ -552,5 +579,96 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(updated.status, "stopped");
+    }
+
+    #[tokio::test]
+    async fn strict_enforcement_blocks_unmeasured_deploy() {
+        let mut state = test_state();
+        state.measurement_enforcement = "strict".into();
+        ensure_agent(&state);
+
+        // Create app + version in catalog
+        let app_row = crate::stores::app::AppRow {
+            id: "app-1".into(),
+            name: "gated-app".into(),
+            description: None,
+            created_at: chrono::Utc::now().to_rfc3339(),
+        };
+        crate::stores::app::insert_app(&state.db, &app_row).unwrap();
+        let ver_row = crate::stores::app::AppVersionRow {
+            id: "ver-1".into(),
+            app_id: "app-1".into(),
+            version: "1.0.0".into(),
+            compose: None,
+            config: None,
+            created_at: chrono::Utc::now().to_rfc3339(),
+        };
+        crate::stores::app::insert_app_version(&state.db, &ver_row).unwrap();
+
+        let app = build_router(state.clone());
+
+        // Deploy with matching app_name + app_version → should be FORBIDDEN (no measurement)
+        let deploy_req = DeployRequest {
+            compose: None,
+            image: Some("ghcr.io/test/gated-app:1.0.0".into()),
+            env: None,
+            cmd: None,
+            ports: None,
+            config: None,
+            app_name: Some("gated-app".into()),
+            app_version: Some("1.0.0".into()),
+            agent_name: None,
+            node_size: None,
+            datacenter: None,
+            dry_run: None,
+        };
+        let req = Request::builder()
+            .uri("/api/v1/deploy")
+            .method("POST")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&deploy_req).unwrap()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        // Now add a measurer + measurement
+        let measurer_row = crate::stores::measurer::MeasurerRow {
+            id: "m1".into(),
+            name: "test-measurer".into(),
+            public_key: "key".into(),
+            agent_id: None,
+            mrtd: None,
+            measurement_types: "app".into(),
+            status: "active".into(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+        };
+        crate::stores::measurer::insert_measurer(&state.db, &measurer_row).unwrap();
+        let measurement = crate::stores::measurer::MeasurementRow {
+            id: "meas-1".into(),
+            measurer_id: "m1".into(),
+            measurement_type: "app".into(),
+            app_id: Some("app-1".into()),
+            version_id: Some("ver-1".into()),
+            image_digest: Some("sha256:abc".into()),
+            agent_id: None,
+            node_mrtd: None,
+            measurement_hash: "hash".into(),
+            signature: "sig".into(),
+            report: "{}".into(),
+            status: "valid".into(),
+            measured_at: chrono::Utc::now().to_rfc3339(),
+        };
+        crate::stores::measurer::insert_measurement(&state.db, &measurement).unwrap();
+
+        // Deploy again → should succeed now
+        let app2 = build_router(state.clone());
+        let req = Request::builder()
+            .uri("/api/v1/deploy")
+            .method("POST")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&deploy_req).unwrap()))
+            .unwrap();
+        let resp = app2.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
     }
 }

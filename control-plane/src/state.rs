@@ -26,6 +26,7 @@ pub struct AppState {
     pub attestation_recheck_seconds: u64,
     pub agent_health_path: String,
     pub agent_attestation_path: String,
+    pub measurement_enforcement: String,
 }
 
 impl AppState {
@@ -66,6 +67,7 @@ impl AppState {
             attestation_recheck_seconds: env_u64("DD_CP_ATTESTATION_RECHECK_SECONDS", 3600),
             agent_health_path: env("DD_CP_AGENT_HEALTH_PATH", "/health"),
             agent_attestation_path: env("DD_CP_AGENT_ATTESTATION_PATH", "/attestation"),
+            measurement_enforcement: env("DD_CP_MEASUREMENT_ENFORCEMENT_MODE", "disabled"),
         }
     }
 
@@ -90,6 +92,7 @@ impl AppState {
             attestation_recheck_seconds: 3600,
             agent_health_path: "/health".into(),
             agent_attestation_path: "/attestation".into(),
+            measurement_enforcement: "disabled".into(),
         }
     }
 }
