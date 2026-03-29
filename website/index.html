@@ -410,6 +410,7 @@
   <div class="wrap inner">
     <div class="logo">DevOps <span>Defender</span></div>
     <ul>
+      <li><a href="#zero-trust">Zero Trust</a></li>
       <li><a href="#how-it-works">How It Works</a></li>
       <li><a href="#architecture">Architecture</a></li>
       <li><a href="#security">Security</a></li>
@@ -425,11 +426,11 @@
   <!-- hero -->
   <div class="hero">
     <span class="badge">Open Source Confidential Computing</span>
-    <h1>Deploy to hardware-verified<br>enclaves, no code changes</h1>
+    <h1>Zero trust from auth<br>to compute to network</h1>
     <p class="lead">
-      Run unmodified Docker containers inside Intel TDX trusted execution environments.
-      Every workload gets memory encryption, remote attestation, and cryptographic
-      proof of integrity &mdash; with zero stored secrets.
+      Deploy unmodified Docker containers to Intel TDX enclaves. GitHub OIDC eliminates
+      stored credentials. Cloudflare Tunnels remove open ports. Hardware attestation
+      proves workload integrity before any secret is released.
     </p>
     <div class="hero-actions">
       <a href="#quickstart" class="btn btn-primary">Get Started</a>
@@ -437,45 +438,49 @@
     </div>
     <div class="stats">
       <div class="stat-item">
-        <strong>Intel TDX</strong>
-        <span>Hardware isolation</span>
+        <strong>Zero Trust Auth</strong>
+        <span>GitHub OIDC &mdash; no stored secrets</span>
       </div>
       <div class="stat-item">
-        <strong>Zero Trust</strong>
-        <span>Attestation before access</span>
+        <strong>Zero Trust Network</strong>
+        <span>Cloudflare Tunnels &mdash; no open ports</span>
       </div>
       <div class="stat-item">
-        <strong>No Secrets</strong>
-        <span>GitHub OIDC end-to-end</span>
-      </div>
-      <div class="stat-item">
-        <strong>Unmodified Docker</strong>
-        <span>No SDK, no wrapper</span>
+        <strong>Zero Trust Compute</strong>
+        <span>Intel TDX &mdash; hardware-attested enclaves</span>
       </div>
     </div>
   </div>
 
-  <!-- value props -->
-  <section>
-    <p class="section-label">Why DevOps Defender</p>
+  <!-- zero trust pillars -->
+  <section id="zero-trust">
+    <p class="section-label">Zero Trust, Three Layers</p>
+    <h2>Every layer verified, nothing assumed</h2>
+    <p class="section-desc">
+      Traditional platforms trust the network, trust the host, and trust long-lived API keys.
+      DevOps Defender eliminates all three assumptions.
+    </p>
     <div class="grid grid-3">
       <div class="card">
-        <h3>Hardware Isolation</h3>
-        <p>Each workload runs in a CPU-enforced enclave. The hypervisor, host OS, and
-        even physical access cannot read encrypted memory.</p>
-        <span class="tag">Intel TDX</span>
+        <h3>Zero Trust Authentication</h3>
+        <p>GitHub OIDC issues short-lived, scoped JWTs for every deployment. No API keys
+        to rotate, no shared secrets to leak, no credential stores to breach. Identity
+        is verified per-request against GitHub's JWKS endpoint.</p>
+        <span class="tag">GitHub OIDC</span>
       </div>
       <div class="card">
-        <h3>Remote Attestation</h3>
-        <p>Before any secret is released, a cryptographic quote proves the exact code,
-        firmware, and configuration running inside the enclave.</p>
-        <span class="tag">Intel Trust Authority</span>
+        <h3>Zero Trust Networking</h3>
+        <p>Agents connect outbound through Cloudflare Tunnels. No listening ports, no
+        public IPs, no firewall rules to misconfigure. TLS terminates at
+        Cloudflare's edge &mdash; the network path is invisible to attackers.</p>
+        <span class="tag">Cloudflare Tunnels</span>
       </div>
       <div class="card">
-        <h3>Unmodified Docker</h3>
-        <p>Bring your existing container images. No special SDK, no code changes, no
-        recompilation. If it runs in Docker, it runs here.</p>
-        <span class="tag">OCI Compatible</span>
+        <h3>Zero Trust Computation</h3>
+        <p>Every workload runs inside an Intel TDX enclave with encrypted memory.
+        Before secrets are released, a cryptographic attestation quote proves the exact
+        firmware, kernel, and application code running &mdash; verified by Intel Trust Authority.</p>
+        <span class="tag">Intel TDX Enclaves</span>
       </div>
     </div>
   </section>
