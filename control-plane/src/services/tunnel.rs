@@ -112,6 +112,10 @@ impl TunnelService {
 
         let hostname = format!("{vm_name}.{}", self.domain);
 
+        // Configure tunnel ingress to route to agent's default port
+        self.configure_tunnel_ingress(&tunnel_id, &hostname, "http://localhost:8080")
+            .await?;
+
         // Create DNS record
         self.create_dns_record(&tunnel_id, &hostname).await?;
 
