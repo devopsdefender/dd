@@ -32,7 +32,7 @@ The cheapest way to run apps and open-source AI models with real security. Your 
 
 Deploy a hello-world app in three steps. No API keys, no config files, no secrets.
 
-A complete working example lives in [`examples/hello-world/`](examples/hello-world/).
+This exact flow runs as an integration test on every staging and production deploy (see [staging](/.github/workflows/staging-deploy.yml) and [production](/.github/workflows/production-deploy.yml) pipelines).
 
 ### 1. Write your app
 
