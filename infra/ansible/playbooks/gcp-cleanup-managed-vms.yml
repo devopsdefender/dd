@@ -141,6 +141,20 @@
         - cf_cleanup_enabled | bool
         - managed_agent_names | length > 0
 
+    - name: Clean connections for managed agent tunnels
+      ansible.builtin.uri:
+        url: "https://api.cloudflare.com/client/v4/accounts/{{ cf_account_id }}/cfd_tunnel/{{ item }}/connections"
+        method: DELETE
+        headers:
+          Authorization: "Bearer {{ cf_api_token }}"
+        status_code: [200, 404]
+        return_content: true
+      loop: "{{ cf_tunnel_ids | default([]) }}"
+      when:
+        - cf_cleanup_enabled | bool
+        - (cf_tunnel_ids | default([]) | length) > 0
+      failed_when: false
+
     - name: Delete Cloudflare tunnels for managed agents
       ansible.builtin.uri:
         url: "https://api.cloudflare.com/client/v4/accounts/{{ cf_account_id }}/cfd_tunnel/{{ item }}"
@@ -197,6 +211,20 @@
       when:
         - cf_cleanup_enabled | bool
         - managed_cp_names | length > 0
+
+    - name: Clean connections for managed CP tunnels
+      ansible.builtin.uri:
+        url: "https://api.cloudflare.com/client/v4/accounts/{{ cf_account_id }}/cfd_tunnel/{{ item }}/connections"
+        method: DELETE
+        headers:
+          Authorization: "Bearer {{ cf_api_token }}"
+        status_code: [200, 404]
+        return_content: true
+      loop: "{{ cf_cp_tunnel_ids | default([]) }}"
+      when:
+        - cf_cleanup_enabled | bool
+        - (cf_cp_tunnel_ids | default([]) | length) > 0
+      failed_when: false
 
     - name: Delete Cloudflare tunnels for managed CPs
       ansible.builtin.uri:
