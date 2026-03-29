@@ -21,5 +21,8 @@ pub fn connect_and_migrate(url: &str) -> Result<Db, rusqlite::Error> {
     conn.execute_batch(include_str!("../migrations/0001_init.sql"))?;
     conn.execute_batch(include_str!("../migrations/0002_measurer_trust.sql"))?;
     conn.execute_batch(include_str!("../migrations/0003_provider_skus.sql"))?;
+    conn.execute_batch(include_str!(
+        "../migrations/0004_agent_attestation_token.sql"
+    ))?;
     Ok(Arc::new(Mutex::new(conn)))
 }

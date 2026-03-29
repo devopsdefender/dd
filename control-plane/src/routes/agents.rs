@@ -37,7 +37,7 @@ pub async fn agent_register(
         .create_tunnel_for_agent(agent_id, &req.vm_name)
         .await?;
 
-    // Store agent
+    // Store agent (include raw attestation token so deployers can verify independently)
     let agent = agent_store::AgentRow {
         id: agent_id.to_string(),
         vm_name: req.vm_name.clone(),
@@ -50,6 +50,7 @@ pub async fn agent_register(
         node_size: req.node_size,
         datacenter: req.datacenter,
         github_owner: req.github_owner,
+        attestation_token: Some(req.intel_ta_token.clone()),
         created_at: chrono::Utc::now().to_rfc3339(),
         last_heartbeat_at: Some(chrono::Utc::now().to_rfc3339()),
     };
@@ -107,6 +108,20 @@ pub async fn reset_agent(
     agent_store::update_agent_status(&state.db, &id, "undeployed")?;
     agent_store::update_registration_state(&state.db, &id, "pending")?;
     Ok(StatusCode::OK)
+}
+
+/// GET /api/v1/agents/{id}/quote — raw attestation token for independent verification
+pub async fn get_agent_quote(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let agent = agent_store::get_agent(&state.db, &id)?.ok_or(AppError::NotFound)?;
+    Ok(Json(serde_json::json!({
+        "agent_id": agent.id,
+        "attestation_token": agent.attestation_token,
+        "mrtd": agent.mrtd,
+        "tcb_status": agent.tcb_status,
+    })))
 }
 
 /// POST /api/v1/agents/{id}/heartbeat

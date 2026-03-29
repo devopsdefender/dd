@@ -19,6 +19,7 @@ pub struct AgentRow {
     pub node_size: Option<String>,
     pub datacenter: Option<String>,
     pub github_owner: Option<String>,
+    pub attestation_token: Option<String>,
     pub created_at: String,
     pub last_heartbeat_at: Option<String>,
 }
@@ -36,6 +37,7 @@ fn row_to_agent(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentRow> {
         node_size: row.get("node_size")?,
         datacenter: row.get("datacenter")?,
         github_owner: row.get("github_owner")?,
+        attestation_token: row.get("attestation_token")?,
         created_at: row.get("created_at")?,
         last_heartbeat_at: row.get("last_heartbeat_at")?,
     })
@@ -46,8 +48,8 @@ pub fn insert_agent(db: &Db, agent: &AgentRow) -> AppResult<()> {
     let conn = db.lock().unwrap();
     conn.execute(
         "INSERT INTO agents (id, vm_name, status, registration_state, hostname, tunnel_id, \
-         mrtd, tcb_status, node_size, datacenter, github_owner, created_at, last_heartbeat_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+         mrtd, tcb_status, node_size, datacenter, github_owner, attestation_token, created_at, last_heartbeat_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
         params![
             agent.id,
             agent.vm_name,
@@ -60,6 +62,7 @@ pub fn insert_agent(db: &Db, agent: &AgentRow) -> AppResult<()> {
             agent.node_size,
             agent.datacenter,
             agent.github_owner,
+            agent.attestation_token,
             agent.created_at,
             agent.last_heartbeat_at,
         ],
@@ -75,7 +78,7 @@ pub fn get_agent(db: &Db, id: &str) -> AppResult<Option<AgentRow>> {
     let mut stmt = conn
         .prepare(
             "SELECT id, vm_name, status, registration_state, hostname, tunnel_id, \
-             mrtd, tcb_status, node_size, datacenter, github_owner, created_at, last_heartbeat_at \
+             mrtd, tcb_status, node_size, datacenter, github_owner, attestation_token, created_at, last_heartbeat_at \
              FROM agents WHERE id = ?1",
         )
         .map_err(|_| AppError::Internal)?;
@@ -94,7 +97,7 @@ pub fn list_agents(db: &Db) -> AppResult<Vec<AgentRow>> {
     let mut stmt = conn
         .prepare(
             "SELECT id, vm_name, status, registration_state, hostname, tunnel_id, \
-             mrtd, tcb_status, node_size, datacenter, github_owner, created_at, last_heartbeat_at \
+             mrtd, tcb_status, node_size, datacenter, github_owner, attestation_token, created_at, last_heartbeat_at \
              FROM agents ORDER BY created_at DESC",
         )
         .map_err(|_| AppError::Internal)?;
@@ -169,7 +172,7 @@ pub fn find_available_agent(
     let cutoff = (chrono::Utc::now() - chrono::Duration::seconds(120)).to_rfc3339();
     let mut query = String::from(
         "SELECT id, vm_name, status, registration_state, hostname, tunnel_id, \
-         mrtd, tcb_status, node_size, datacenter, github_owner, created_at, last_heartbeat_at \
+         mrtd, tcb_status, node_size, datacenter, github_owner, attestation_token, created_at, last_heartbeat_at \
          FROM agents WHERE registration_state = 'ready' \
          AND last_heartbeat_at IS NOT NULL AND last_heartbeat_at > ?1",
     );
@@ -237,6 +240,7 @@ mod tests {
             node_size: None,
             datacenter: None,
             github_owner: None,
+            attestation_token: None,
             created_at: Utc::now().to_rfc3339(),
             last_heartbeat_at: Some(chrono::Utc::now().to_rfc3339()),
         }

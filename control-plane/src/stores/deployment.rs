@@ -214,6 +214,7 @@ mod tests {
             node_size: None,
             datacenter: None,
             github_owner: None,
+            attestation_token: None,
             created_at: chrono::Utc::now().to_rfc3339(),
             last_heartbeat_at: None,
         };

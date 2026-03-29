@@ -29,6 +29,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/agents/{id}", get(agents::get_agent))
         .route("/api/v1/agents/{id}", delete(agents::delete_agent))
         .route("/api/v1/agents/{id}/reset", post(agents::reset_agent))
+        .route("/api/v1/agents/{id}/quote", get(agents::get_agent_quote))
         // Agent heartbeat & checks
         .route(
             "/api/v1/agents/{id}/heartbeat",
@@ -84,10 +85,7 @@ pub fn build_router(state: AppState) -> Router {
             "/api/v1/providers/{id}/skus",
             get(providers::list_provider_skus),
         )
-        .route(
-            "/api/v1/providers/{id}/skus",
-            post(providers::register_sku),
-        )
+        .route("/api/v1/providers/{id}/skus", post(providers::register_sku))
         .route("/api/v1/skus", get(providers::list_all_skus))
         // Measurements (app)
         .route(
