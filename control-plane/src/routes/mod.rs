@@ -1,6 +1,7 @@
 pub mod accounts;
 pub mod admin;
 pub mod agents;
+pub mod apps;
 pub mod auth;
 pub mod deploy;
 pub mod health;
@@ -22,6 +23,8 @@ pub fn build_router(state: AppState) -> Router {
         // Agent challenge & registration
         .route("/api/v1/agents/challenge", get(agents::agent_challenge))
         .route("/api/v1/agents/register", post(agents::agent_register))
+        // Apps
+        .route("/api/v1/apps", get(apps::list_apps))
         // Agent CRUD
         .route("/api/v1/agents", get(agents::list_agents))
         .route("/api/v1/agents/{id}", get(agents::get_agent))
