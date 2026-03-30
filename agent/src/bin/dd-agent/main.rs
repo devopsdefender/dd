@@ -258,6 +258,7 @@ async fn heartbeat_loop(
             _ = tokio::signal::ctrl_c() => {
                 eprintln!("dd-agent: received shutdown signal, cleaning up...");
                 shutdown_deployments(http, cp_url, active_deployments.clone()).await;
+                deregister_agent(http, cp_url, agent_id).await;
                 eprintln!("dd-agent: shutdown complete");
                 return;
             }
@@ -528,6 +529,22 @@ async fn shutdown_deployments(
     }
 
     active_deployments.lock().await.clear();
+}
+
+/// Deregister this agent from the control plane on shutdown.
+async fn deregister_agent(http: &reqwest::Client, cp_url: &str, agent_id: &str) {
+    let url = format!("{cp_url}/api/v1/agents/{agent_id}");
+    match http.delete(&url).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            eprintln!("dd-agent: deregistered from control plane");
+        }
+        Ok(resp) => {
+            eprintln!("dd-agent: deregister returned {}", resp.status());
+        }
+        Err(e) => {
+            eprintln!("dd-agent: deregister failed: {e}");
+        }
+    }
 }
 
 // ── Control-plane mode ─────────────────────────────────────────────────────
