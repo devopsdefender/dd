@@ -156,23 +156,32 @@ Landing page for devopsdefender.com, deployed via GitHub Pages.
 ### Working on Changes
 
 1. **Always work on a feature branch.** Create a branch from `main` (e.g., `feat/my-change`, `fix/bug-description`).
-2. **Push your feature branch** and open a PR targeting `main`.
-3. **Wait for board approval** before merging. Never merge your own PR without an approving review.
+2. **Run checks before committing:** `cargo fmt --check`, `cargo clippy --all-targets`, `cargo test` (with `RUSTFLAGS="-Dwarnings"`). Fix any issues before pushing.
+3. **Push your feature branch** and open a PR targeting `main`.
+4. **Wait for board approval** before merging. Never merge your own PR without an approving review.
+
+### Pull Request Standards
+
+PRs must be written for a human reviewer, not a machine. Follow these rules:
+
+- **Title:** Describe the user-visible change, not the implementation. "Agent hostnames stop resolving after redeploy" not "add hostname check to stale cleanup loop".
+- **Body:** Problem → root cause → fix → how to verify. No jargon. A board member who doesn't write Rust should understand the PR.
+- **One logical change per PR.** Don't mix unrelated fixes. If a PR has both a bug fix and a feature, split them.
+- **Squash into one commit** unless commits represent genuinely separate logical steps (e.g., refactor then feature).
+- **Always lint and test before pushing.** CI will catch it, but don't waste reviewer time on clippy failures.
 
 ### Testing in Staging
 
-- The **`staging` branch** auto-deploys to the staging environment (`app-staging.devopsdefender.com`).
-- You can freely push to `staging` to test changes without approval.
-- To test: merge or push your feature branch into `staging`. This triggers the staging deploy pipeline.
-- The `staging` branch can be force-pushed or reset as needed — it is not protected.
+- **PRs targeting `main`** automatically deploy to staging (`app-staging.devopsdefender.com`).
+- Every PR gets a full staging integration test (build, deploy, smoke check, hello-world deploy) before review.
+- You can also trigger a staging deploy manually via `gh workflow run staging-deploy.yml`.
 
 ### Summary
 
 | Branch    | Protection | Deploys to  | Approval Required |
 |-----------|-----------|-------------|-------------------|
-| `main`    | Yes       | Production-ready | Yes — board review required |
-| `staging` | No        | Staging     | No — free to test |
-| Feature   | No        | —           | No — work freely  |
+| `main`    | Yes       | Production  | Yes — board review required |
+| Feature   | No        | Staging (via PR) | No — work freely  |
 
 ## Build & Development
 
@@ -223,7 +232,7 @@ cargo run --bin dd-admin -- hash-password
 
 All infrastructure is managed through GitHub Actions. **Never SSH into hosts, run Ansible locally, or attempt manual fixes on VMs.** If staging or production is down, trigger the appropriate GitHub Actions workflow.
 
-**Staging** (`staging-deploy.yml`) — auto-deploys on push to `main` or `staging`. Pipeline: build → bake GCP agent image → cleanup old VMs → deploy via Ansible → smoke check `app-staging.devopsdefender.com/health`.
+**Staging** (`staging-deploy.yml`) — runs on PRs targeting `main` (and manual dispatch). Pipeline: build → bake GCP agent image → cleanup old VMs → deploy via Ansible → smoke check `app-staging.devopsdefender.com/health` → hello-world integration test.
 
 **Production** (`production-deploy.yml`) — auto-deploys on push to `main`, also supports manual trigger (`workflow_dispatch`). Same pipeline as staging, uses `dd-agent-prod` image family.
 

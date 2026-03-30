@@ -394,6 +394,21 @@ async fn process_deployment(
                 dep.id,
                 &container_id[..12]
             );
+
+            // Wait briefly and dump initial container logs for debugging.
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            match runtime.logs(&container_id, 20).await {
+                Ok(lines) => {
+                    for line in &lines {
+                        eprintln!("dd-agent: [{}] {}", &container_id[..12], line.trim());
+                    }
+                }
+                Err(e) => eprintln!(
+                    "dd-agent: failed to fetch logs for {}: {e}",
+                    &container_id[..12]
+                ),
+            }
+
             let _ = report_deployment_status(http, cp_url, &dep.id, "running", None).await;
 
             active_deployments.lock().await.insert(

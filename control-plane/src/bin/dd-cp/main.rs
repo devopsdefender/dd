@@ -105,8 +105,28 @@ async fn main() {
                                 agent.id
                             );
                         }
+                        // Only delete the DNS record if no other active agent
+                        // shares the same hostname. When a VM is replaced, the
+                        // new agent inherits the hostname and we must not nuke
+                        // its DNS record while cleaning up the old one.
                         if let Some(ref hostname) = agent.hostname {
-                            if let Err(e) = cleanup_tunnel_svc.delete_dns_record(hostname).await {
+                            let hostname_in_use = agent_store::list_agents(&cleanup_db)
+                                .map(|agents| {
+                                    agents.iter().any(|a| {
+                                        a.id != agent.id
+                                            && a.hostname.as_deref() == Some(hostname.as_str())
+                                    })
+                                })
+                                .unwrap_or(false);
+
+                            if hostname_in_use {
+                                eprintln!(
+                                    "dd-cp: skipping DNS cleanup for {} -- hostname {} still in use by another agent",
+                                    agent.id, hostname
+                                );
+                            } else if let Err(e) =
+                                cleanup_tunnel_svc.delete_dns_record(hostname).await
+                            {
                                 eprintln!(
                                     "dd-cp: warning: DNS cleanup for stale agent {} failed: {e}",
                                     agent.id
