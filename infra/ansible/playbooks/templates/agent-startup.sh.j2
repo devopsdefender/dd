@@ -8,4 +8,6 @@ chmod 0600 /etc/devopsdefender/agent.json
 systemctl daemon-reload || true
 systemctl disable --now devopsdefender-control-plane.service || true
 systemctl enable devopsdefender-agent.service || true
+HOSTNAME=$(curl -sf -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/name || hostname)
+hostnamectl set-hostname "$HOSTNAME"
 systemctl restart devopsdefender-agent.service || true
