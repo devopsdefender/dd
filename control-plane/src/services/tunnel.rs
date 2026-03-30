@@ -116,11 +116,15 @@ impl TunnelService {
         let hostname = format!("{vm_name}.{}", self.domain);
 
         // Configure tunnel ingress to route to agent's default port
+        eprintln!("dd-cp: tunnel {tunnel_name}: configuring ingress for {hostname}");
         self.configure_tunnel_ingress(&tunnel_id, &hostname, "http://localhost:8080")
             .await?;
+        eprintln!("dd-cp: tunnel {tunnel_name}: ingress configured");
 
         // Create DNS record
+        eprintln!("dd-cp: tunnel {tunnel_name}: creating DNS CNAME for {hostname}");
         self.create_dns_record(&tunnel_id, &hostname).await?;
+        eprintln!("dd-cp: tunnel {tunnel_name}: DNS CNAME created");
 
         Ok(TunnelInfo {
             tunnel_id,
@@ -333,12 +337,15 @@ impl TunnelService {
         let tunnel_content = format!("{tunnel_id}.cfargotunnel.com");
         let client = reqwest::Client::new();
 
+        eprintln!("dd-cp: DNS: creating CNAME {hostname} -> {tunnel_content} (zone_id={zone_id})");
+
         // Check if a CNAME record already exists for this hostname.
         let existing_id = self
             .find_dns_record_id(&client, api_token, zone_id, hostname)
             .await?;
 
-        if let Some(record_id) = existing_id {
+        if let Some(ref record_id) = existing_id {
+            eprintln!("dd-cp: DNS: found existing record {record_id}, updating");
             // Update the existing record to point to the new tunnel.
             let resp = client
                 .put(format!(
@@ -355,11 +362,14 @@ impl TunnelService {
                 .await
                 .map_err(|e| AppError::External(format!("CF DNS update failed: {e}")))?;
 
-            if !resp.status().is_success() {
-                let body = resp.text().await.unwrap_or_default();
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            eprintln!("dd-cp: DNS: update response {status}: {body}");
+            if !status.is_success() {
                 return Err(AppError::External(format!("CF DNS update failed: {body}")));
             }
         } else {
+            eprintln!("dd-cp: DNS: no existing record, creating new CNAME");
             // Create a new record.
             let resp = client
                 .post(format!(
@@ -376,8 +386,10 @@ impl TunnelService {
                 .await
                 .map_err(|e| AppError::External(format!("CF DNS create failed: {e}")))?;
 
-            if !resp.status().is_success() {
-                let body = resp.text().await.unwrap_or_default();
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            eprintln!("dd-cp: DNS: create response {status}: {body}");
+            if !status.is_success() {
                 return Err(AppError::External(format!("CF DNS create failed: {body}")));
             }
         }
@@ -432,16 +444,20 @@ impl TunnelService {
         zone_id: &str,
         hostname: &str,
     ) -> AppResult<Option<String>> {
+        let url = format!(
+            "https://api.cloudflare.com/client/v4/zones/{zone_id}/dns_records?type=CNAME&name={hostname}"
+        );
         let resp = client
-            .get(format!(
-                "https://api.cloudflare.com/client/v4/zones/{zone_id}/dns_records?type=CNAME&name={hostname}"
-            ))
+            .get(&url)
             .header("Authorization", format!("Bearer {api_token}"))
             .send()
             .await
             .map_err(|e| AppError::External(format!("CF DNS lookup failed: {e}")))?;
 
-        if !resp.status().is_success() {
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            eprintln!("dd-cp: DNS lookup failed (HTTP {status}): {body}");
             // Non-fatal: if lookup fails, fall through to create.
             return Ok(None);
         }
@@ -451,11 +467,18 @@ impl TunnelService {
             .await
             .map_err(|e| AppError::External(format!("CF DNS lookup parse: {e}")))?;
 
-        Ok(body["result"]
+        let result = body["result"]
             .as_array()
             .and_then(|arr| arr.first())
             .and_then(|rec| rec["id"].as_str())
-            .map(|s| s.to_string()))
+            .map(|s| s.to_string());
+
+        eprintln!(
+            "dd-cp: DNS lookup for {hostname}: found={}",
+            result.is_some()
+        );
+
+        Ok(result)
     }
 
     /// Configure tunnel ingress rules via the Cloudflare API.

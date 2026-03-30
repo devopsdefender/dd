@@ -1,8 +1,8 @@
 name: Staging Deploy
 
 on:
-  push:
-    branches: [main, staging]
+  pull_request:
+    branches: [main]
     paths:
       - "agent/**"
       - "control-plane/**"
