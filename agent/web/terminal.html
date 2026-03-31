@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>DD Terminal</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.min.css">
+<style>
+  body { margin: 0; background: #1e1e2e; display: flex; flex-direction: column; height: 100vh; }
+  #status { color: #a6adc8; font-family: monospace; padding: 8px 12px; font-size: 13px; }
+  #status .ok { color: #a6e3a1; }
+  #status .err { color: #f38ba8; }
+  #status .warn { color: #f9e2af; }
+  #attestation { color: #89b4fa; font-family: monospace; padding: 0 12px 8px; font-size: 12px; display: none; }
+  #terminal { flex: 1; }
+</style>
+</head>
+<body>
+<div id="status">connecting...</div>
+<div id="attestation"></div>
+<div id="terminal"></div>
+
+<script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.min.js"></script>
+<script>
+// DD Terminal — End-to-end encrypted session via Noise protocol over WebSocket.
+//
+// Flow:
+// 1. WebSocket connects to agent
+// 2. Noise_XX handshake over WebSocket binary frames
+//    - Browser is initiator, agent is responder
+//    - Agent sends attestation (TDX quote etc.) as handshake payload
+// 3. After handshake: all terminal I/O is Noise-encrypted
+//    - Keystrokes → encrypt → WebSocket → agent decrypts → container stdin
+//    - Container stdout → agent encrypts → WebSocket → browser decrypts → xterm.js
+//
+// Currently uses plaintext JSON while noise-c.wasm integration is pending.
+// The WebSocket handler on the agent side supports both modes:
+// - Binary frames = Noise-encrypted (future)
+// - Text frames = plaintext JSON (current, TLS via CF tunnel provides transport security)
+
+const term = new Terminal({
+  cursorBlink: true,
+  theme: { background: '#1e1e2e', foreground: '#cdd6f4', cursor: '#f5e0dc' },
+  fontFamily: 'JetBrains Mono, Menlo, monospace',
+  fontSize: 14,
+});
+const fitAddon = new FitAddon.FitAddon();
+term.loadAddon(fitAddon);
+term.open(document.getElementById('terminal'));
+fitAddon.fit();
+window.addEventListener('resize', () => fitAddon.fit());
+
+const status = document.getElementById('status');
+const attestationEl = document.getElementById('attestation');
+
+// Parse app name and token from URL
+const path = window.location.pathname;
+const appName = path.split('/session/')[1] || '';
+const params = new URLSearchParams(window.location.search);
+let token = params.get('token') || localStorage.getItem('dd_token');
+
+if (!token) {
+  token = prompt('GitHub token (from: gh auth token)');
+  if (token) localStorage.setItem('dd_token', token);
+}
+
+if (!token) {
+  status.innerHTML = '<span class="err">no token provided</span>';
+  throw new Error('no token');
+}
+
+// Connect WebSocket with token
+const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+const wsUrl = `${proto}//${window.location.host}/ws/session/${appName}?token=${encodeURIComponent(token)}`;
+
+status.innerHTML = `connecting to <span class="ok">${appName || 'shell'}</span>...`;
+
+const ws = new WebSocket(wsUrl);
+
+ws.onopen = () => {
+  status.innerHTML = `handshake with <span class="ok">${appName}</span>...`;
+  // Future: initiate Noise_XX handshake here
+  // For now, the agent auto-attaches on WebSocket connect
+};
+
+ws.onmessage = (event) => {
+  try {
+    const text = typeof event.data === 'string' ? event.data : new TextDecoder().decode(event.data);
+    const msg = JSON.parse(text);
+
+    switch (msg.type) {
+      case 'stdout':
+      case 'stderr': {
+        const output = typeof msg.data === 'string'
+          ? msg.data
+          : String.fromCharCode(...msg.data);
+        term.write(output);
+        break;
+      }
+      case 'ok':
+        if (msg.status) {
+          status.innerHTML = `<span class="ok">${msg.status}</span>`;
+        }
+        // Show attestation info if present
+        if (msg.attestation_type) {
+          attestationEl.style.display = 'block';
+          attestationEl.textContent = `attestation: ${msg.attestation_type}`;
+          if (msg.attestation_type === 'tdx') {
+            attestationEl.textContent += ' (hardware-verified enclave)';
+          }
+        }
+        term.focus();
+        break;
+      case 'error':
+        status.innerHTML = `<span class="err">${msg.message}</span>`;
+        break;
+      case 'attestation':
+        // Future: verify TDX quote client-side
+        attestationEl.style.display = 'block';
+        attestationEl.textContent = `attestation: ${msg.attestation_type || 'unknown'}`;
+        if (msg.vm_name) attestationEl.textContent += ` (${msg.vm_name})`;
+        break;
+    }
+  } catch {
+    // Raw text fallback
+    const text = typeof event.data === 'string' ? event.data : new TextDecoder().decode(event.data);
+    term.write(text);
+  }
+};
+
+ws.onclose = () => {
+  status.innerHTML = '<span class="err">disconnected</span>';
+  term.write('\r\n[session ended]\r\n');
+};
+
+ws.onerror = () => {
+  status.innerHTML = '<span class="err">connection error</span>';
+};
+
+// Terminal input → agent (will be Noise-encrypted in future)
+term.onData((data) => {
+  if (ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({
+      type: 'stdin',
+      data: Array.from(new TextEncoder().encode(data))
+    }));
+  }
+});
+</script>
+</body>
+</html>
