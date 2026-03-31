@@ -1,0 +1,14 @@
+[Unit]
+Description=DevOps Defender Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/dd-agent
+EnvironmentFile=-/etc/dd/agent.env
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
