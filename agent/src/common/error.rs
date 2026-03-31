@@ -62,6 +62,23 @@ impl AppError {
     }
 }
 
+impl axum::response::IntoResponse for AppError {
+    fn into_response(self) -> axum::response::Response {
+        let status = match &self {
+            AppError::InvalidInput(_) => axum::http::StatusCode::BAD_REQUEST,
+            AppError::Unauthorized => axum::http::StatusCode::UNAUTHORIZED,
+            AppError::Forbidden => axum::http::StatusCode::FORBIDDEN,
+            AppError::NotFound => axum::http::StatusCode::NOT_FOUND,
+            AppError::Conflict(_) => axum::http::StatusCode::CONFLICT,
+            AppError::Config(_) => axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            AppError::External(_) => axum::http::StatusCode::BAD_GATEWAY,
+            AppError::Internal => axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        let body = axum::Json(self.to_error_body());
+        (status, body).into_response()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

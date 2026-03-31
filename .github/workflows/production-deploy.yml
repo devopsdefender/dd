@@ -5,8 +5,6 @@ on:
     branches: [main]
     paths:
       - "agent/**"
-      - "control-plane/**"
-      - "images/**"
       - "infra/**"
       - ".github/workflows/production-deploy.yml"
   workflow_dispatch:
@@ -17,120 +15,169 @@ concurrency:
 
 env:
   RUSTFLAGS: "-Dwarnings"
+  GCP_ZONE: us-central1-c
+  DD_ENV: production
+  DD_DOMAIN: ${{ vars.DD_CF_DOMAIN || 'devopsdefender.com' }}
+
+permissions:
+  contents: write
 
 jobs:
-  deploy:
+  build:
     runs-on: ubuntu-latest
     environment: production
+    outputs:
+      binary_url: ${{ steps.upload.outputs.url }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-
       - name: Build release binaries
         run: cargo build --workspace --release
+      - name: Upload as release asset
+        id: upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sha12="$(echo "${{ github.sha }}" | cut -c1-12)"
+          tag="prod-${sha12}"
+          gh release list --limit 20 | grep "^prod-" | awk '{print $1}' | while read -r old; do
+            gh release delete "$old" --yes --cleanup-tag 2>/dev/null || true
+          done
+          gh release create "$tag" \
+            --title "prod-${sha12}" \
+            --notes "Production build from ${{ github.sha }}" \
+            --prerelease \
+            target/release/dd-agent
+          url=$(gh release view "$tag" --json assets --jq '.assets[] | select(.name=="dd-agent") | .url')
+          echo "url=${url}" >> "$GITHUB_OUTPUT"
 
+  cleanup:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
       - uses: google-github-actions/auth@v2
         with:
           credentials_json: ${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}
-
       - uses: google-github-actions/setup-gcloud@v2
-      - uses: hashicorp/setup-packer@v3
-      - run: pip install ansible
 
-      - name: Bake GCP agent image
+      - name: Delete managed VMs
         env:
           GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
         run: |
-          set -euo pipefail
-          sha12="$(echo "${{ github.sha }}" | cut -c1-12)"
-          ansible-playbook infra/ansible/playbooks/gcp-image-bake.yml \
-            -e source_image_project=ubuntu-os-cloud \
-            -e source_image_family=ubuntu-2404-lts-amd64 \
-            -e "target_image_name=dd-agent-prod-${sha12}" \
-            -e target_image_family=dd-agent-prod \
-            -e "dd_agent_binary_path=${GITHUB_WORKSPACE}/target/release/dd-agent" \
-            -e "dd_cp_binary_path=${GITHUB_WORKSPACE}/target/release/dd-cp" \
-            -e "packer_template_path=${GITHUB_WORKSPACE}/images/packer/gcp-agent-image.pkr.hcl" \
-            -e "source_sha=${{ github.sha }}"
+          gcloud compute instances list \
+            --project="$GCP_PROJECT_ID" \
+            --filter="labels.devopsdefender=managed AND labels.dd_env=production" \
+            --format="value(name,zone.basename())" | while read -r name zone; do
+            [ -z "$name" ] && continue
+            echo "Deleting VM: $name ($zone)"
+            gcloud compute instances delete "$name" --project="$GCP_PROJECT_ID" --zone="$zone" --quiet || true
+          done
 
-      - name: Cleanup old production VMs
+      - name: Delete CF tunnels for production
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.DD_CP_CF_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.DD_CP_CF_ACCOUNT_ID }}
+        run: |
+          tunnels=$(curl -sf "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/cfd_tunnel?is_deleted=false" \
+            -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" | jq -r '.result[] | select(.name | startswith("dd-devopsdefender-")) | .id') || true
+          for id in $tunnels; do
+            echo "Deleting tunnel: $id"
+            curl -sf -X DELETE "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/cfd_tunnel/${id}/connections" \
+              -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" || true
+            curl -sf -X DELETE "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/cfd_tunnel/${id}" \
+              -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" || true
+          done
+
+  deploy:
+    needs: [build, cleanup]
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Create TDX VM
         env:
           GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.DD_CP_CF_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.DD_CP_CF_ACCOUNT_ID }}
           CLOUDFLARE_ZONE_ID: ${{ secrets.DD_CP_CF_ZONE_ID }}
-          DD_DOMAIN: ${{ vars.DD_CF_DOMAIN || 'devopsdefender.com' }}
-        run: |
-          ansible-playbook infra/ansible/playbooks/gcp-cleanup-managed-vms.yml \
-            -e dd_env_name=production
-
-      - name: Deploy
-        env:
-          GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
-          DD_CP_ADMIN_PASSWORD: ${{ secrets.DD_CP_ADMIN_PASSWORD }}
-          CLOUDFLARE_API_TOKEN: ${{ secrets.DD_CP_CF_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.DD_CP_CF_ACCOUNT_ID }}
-          CLOUDFLARE_ZONE_ID: ${{ secrets.DD_CP_CF_ZONE_ID }}
-          INTEL_API_KEY: ${{ secrets.INTEL_API_KEY }}
-          DD_DOMAIN: ${{ vars.DD_CF_DOMAIN || 'devopsdefender.com' }}
-          DD_GIT_SHA: ${{ github.sha }}
-          DD_ENV: production
-        run: |
-          ansible-playbook infra/ansible/playbooks/gcp-deploy.yml \
-            -e num_tiny_agents=0 -e num_standard_agents=0 -e num_llm_agents=0 \
-            -e dd_env=production \
-            -e source_image_family=dd-agent-prod
-
-      - name: Smoke check
-        run: |
-          url="https://app.${{ vars.DD_CF_DOMAIN || 'devopsdefender.com' }}"
-          for i in $(seq 1 30); do
-            curl -fsS "${url}/health" >/dev/null 2>&1 && echo "Healthy!" && exit 0
-            echo "  attempt ${i}/30..." && sleep 10
-          done
-          echo "::error::Not healthy within 5 minutes"
-          exit 1
-
-      - name: Integration test -- deploy hello world
-        id: integration
+          BINARY_URL: ${{ needs.build.outputs.binary_url }}
         run: |
           set -euo pipefail
-          api="https://app.${{ vars.DD_CF_DOMAIN || 'devopsdefender.com' }}"
+          VM_NAME="dd-prod-$(date +%s)"
+          HOSTNAME="app.${DD_DOMAIN}"
 
-          # Deploy nginx as a hello-world test app
-          http_code=$(curl -s -o /tmp/deploy-resp.json -w '%{http_code}' \
-            "$api/api/v1/deploy" \
-            -H "Content-Type: application/json" \
-            -d '{"image": "nginx:alpine", "app_name": "hello-world-test", "ports": ["8080:80"]}')
+          cat > /tmp/startup.sh <<STARTUP
+          #!/bin/bash
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
 
-          if [ "$http_code" = "404" ]; then
-            echo "No agents available -- skipping integration test"
-            echo "skipped=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          elif [ "$http_code" != "201" ]; then
-            echo "::error::Deploy returned HTTP $http_code"
-            cat /tmp/deploy-resp.json
-            exit 1
-          fi
+          # Install cloudflared
+          curl -fsSL -o /usr/local/bin/cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          chmod +x /usr/local/bin/cloudflared
 
-          cat /tmp/deploy-resp.json | jq .
-          dep_id=$(jq -r .deployment_id /tmp/deploy-resp.json)
-          echo "deployment_id=$dep_id" >> "$GITHUB_OUTPUT"
+          # Download dd-agent from GitHub release
+          curl -fsSL -o /usr/local/bin/dd-agent "${BINARY_URL}" -H "Accept: application/octet-stream"
+          chmod +x /usr/local/bin/dd-agent
 
-          # Wait for the agent to pull and start the container
-          for i in $(seq 1 12); do
-            status=$(curl -fsSL "$api/api/v1/deployments/$dep_id" | jq -r .status)
-            echo "  attempt ${i}/12: status=${status}"
-            [ "$status" = "running" ] && echo "Integration test passed!" && exit 0
-            [ "$status" = "failed" ] && echo "::error::Hello world deploy failed" && exit 1
-            sleep 5
+          export DD_OWNER=devopsdefender
+          export DD_CF_API_TOKEN=${CLOUDFLARE_API_TOKEN}
+          export DD_CF_ACCOUNT_ID=${CLOUDFLARE_ACCOUNT_ID}
+          export DD_CF_ZONE_ID=${CLOUDFLARE_ZONE_ID}
+          export DD_CF_DOMAIN=${DD_DOMAIN}
+          export DD_HOSTNAME=${HOSTNAME}
+
+          nohup /usr/local/bin/dd-agent > /var/log/dd-agent.log 2>&1 &
+          STARTUP
+
+          gcloud compute instances create "$VM_NAME" \
+            --project="$GCP_PROJECT_ID" \
+            --zone="$GCP_ZONE" \
+            --machine-type=c3-standard-4 \
+            --confidential-compute-type=TDX \
+            --maintenance-policy=TERMINATE \
+            --boot-disk-size=256GB \
+            --image-family=ubuntu-2404-lts-amd64 \
+            --image-project=ubuntu-os-cloud \
+            --metadata-from-file=startup-script=/tmp/startup.sh \
+            --labels=devopsdefender=managed,dd_env=production \
+            --scopes=storage-ro \
+            --tags=dd-agent
+
+          EXTERNAL_IP=$(gcloud compute instances describe "$VM_NAME" \
+            --project="$GCP_PROJECT_ID" --zone="$GCP_ZONE" \
+            --format="value(networkInterfaces[0].accessConfigs[0].natIP)")
+          echo "VM: $VM_NAME IP: $EXTERNAL_IP"
+          echo "bootstrap_ip=$EXTERNAL_IP" >> "$GITHUB_ENV"
+
+      - name: Wait for agent health
+        run: |
+          for i in $(seq 1 60); do
+            curl -fsS "http://${bootstrap_ip}:8080/health" >/dev/null 2>&1 && echo "Agent healthy!" && exit 0
+            echo "  attempt ${i}/60..." && sleep 5
           done
-          echo "::error::Hello world deploy timed out (60s)"
+          echo "::error::Agent not healthy within 5 minutes"
           exit 1
 
-      - name: Cleanup test deployment
-        if: always() && steps.integration.outputs.deployment_id
+      - name: Smoke check via CF tunnel
         run: |
-          api="https://app.${{ vars.DD_CF_DOMAIN || 'devopsdefender.com' }}"
-          curl -s -X POST "$api/api/v1/deployments/${{ steps.integration.outputs.deployment_id }}/stop" || true
+          url="https://app.${DD_DOMAIN}"
+          for i in $(seq 1 24); do
+            curl -fsS "${url}/health" >/dev/null 2>&1 && echo "Tunnel healthy!" && exit 0
+            echo "  attempt ${i}/24..." && sleep 5
+          done
+          echo "::error::Tunnel not reachable within 2 minutes"
+          exit 1
+
+      - name: Integration test
+        run: |
+          url="https://app.${DD_DOMAIN}"
+          health=$(curl -fsS "${url}/health")
+          echo "Health: $health"
+          echo "$health" | jq -e '.ok == true' > /dev/null
+          echo "$health" | jq -e '.agent_id' > /dev/null
+          echo "Production deploy verified!"

@@ -117,3 +117,70 @@
       loop: "{{ stale_images }}"
       when: stale_images | length > 0
       failed_when: false
+
+    # ── Cleanup orphaned Packer resources ─────────────────────────────────
+    - name: List orphaned Packer VMs
+      ansible.builtin.command:
+        argv:
+          - gcloud
+          - compute
+          - instances
+          - list
+          - --project
+          - "{{ lookup('env', 'GCP_PROJECT_ID') }}"
+          - --filter
+          - "name~^packer-"
+          - --format
+          - "value(name,zone.basename())"
+      register: packer_vms_raw
+      changed_when: false
+
+    - name: Delete orphaned Packer VMs
+      ansible.builtin.command:
+        argv:
+          - gcloud
+          - compute
+          - instances
+          - delete
+          - "{{ item.split()[0] }}"
+          - --project
+          - "{{ lookup('env', 'GCP_PROJECT_ID') }}"
+          - --zone
+          - "{{ item.split()[1] }}"
+          - --quiet
+      loop: "{{ packer_vms_raw.stdout_lines | reject('equalto', '') | list }}"
+      when: packer_vms_raw.stdout_lines | reject('equalto', '') | list | length > 0
+      failed_when: false
+
+    - name: List orphaned Packer disks
+      ansible.builtin.command:
+        argv:
+          - gcloud
+          - compute
+          - disks
+          - list
+          - --project
+          - "{{ lookup('env', 'GCP_PROJECT_ID') }}"
+          - --filter
+          - "name~^packer-"
+          - --format
+          - "value(name,zone.basename())"
+      register: packer_disks_raw
+      changed_when: false
+
+    - name: Delete orphaned Packer disks
+      ansible.builtin.command:
+        argv:
+          - gcloud
+          - compute
+          - disks
+          - delete
+          - "{{ item.split()[0] }}"
+          - --project
+          - "{{ lookup('env', 'GCP_PROJECT_ID') }}"
+          - --zone
+          - "{{ item.split()[1] }}"
+          - --quiet
+      loop: "{{ packer_disks_raw.stdout_lines | reject('equalto', '') | list }}"
+      when: packer_disks_raw.stdout_lines | reject('equalto', '') | list | length > 0
+      failed_when: false

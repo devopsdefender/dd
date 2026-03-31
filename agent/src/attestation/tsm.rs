@@ -205,6 +205,38 @@ fn copy_fixed_64(src: &[u8]) -> [u8; 64] {
     dst
 }
 
+// ── AttestationBackend implementation ──────────────────────────────────────
+
+/// TDX attestation backend using configfs-tsm.
+pub struct TdxBackend;
+
+impl super::AttestationBackend for TdxBackend {
+    fn attestation_type(&self) -> &str {
+        "tdx"
+    }
+
+    fn generate_quote_b64(&self) -> Option<String> {
+        generate_tdx_quote_base64().ok()
+    }
+
+    fn health_metadata(&self) -> serde_json::Value {
+        let quote = self.generate_quote_b64();
+        let parsed: Option<ParsedQuote> =
+            quote.as_ref().and_then(|q| parse_tdx_quote_base64(q).ok());
+
+        let mrtd = parsed.as_ref().map(|p| p.mrtd_hex());
+        let rtmr0 = parsed.as_ref().map(|p| hex(&p.rtmrs[0]));
+        let rtmr1 = parsed.as_ref().map(|p| hex(&p.rtmrs[1]));
+
+        serde_json::json!({
+            "attestation_type": "tdx",
+            "mrtd": mrtd,
+            "rtmr0": rtmr0,
+            "rtmr1": rtmr1,
+        })
+    }
+}
+
 // ── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

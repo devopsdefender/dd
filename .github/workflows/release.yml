@@ -26,5 +26,5 @@ jobs:
             --title "${{ github.ref_name }}" \
             --generate-notes \
             target/release/dd-agent \
-            target/release/dd-cp \
-            target/release/dd-admin
+            target/release/dd \
+            target/release/dd-register
