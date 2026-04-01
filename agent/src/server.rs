@@ -671,8 +671,277 @@ async fn handle_ws_noise_cmd(socket: WebSocket, state: AgentState) {
 
 // ── HTTP Router ──────────────────────────────────────────────────────────
 
+#[derive(Debug, serde::Deserialize)]
+struct DashQuery {
+    token: Option<String>,
+}
+
+async fn dashboard(
+    State(state): State<AgentState>,
+    query: axum::extract::Query<DashQuery>,
+) -> Result<Html<String>, AppError> {
+    if !state.owner.is_empty() {
+        let token = query.token.as_deref().ok_or(AppError::Unauthorized)?;
+        verify_github_token(token, &state.owner).await?;
+    }
+
+    let metrics = collect_metrics().await;
+    let deps = state.deployments.lock().await;
+    let mut rows = String::new();
+    for d in deps.values() {
+        let status_color = match d.status.as_str() {
+            "running" => "#a6e3a1",
+            "deploying" => "#f9e2af",
+            "failed" | "exited" => "#f38ba8",
+            _ => "#a6adc8",
+        };
+        let terminal_link = if d.status == "running" {
+            format!(r#"<a href="/session/{}">terminal</a>"#, d.app_name)
+        } else {
+            String::new()
+        };
+        rows.push_str(&format!(
+            r#"<tr>
+                <td>{}</td>
+                <td><span style="color:{status_color}">{}</span></td>
+                <td>{}</td>
+                <td>{}</td>
+                <td>{terminal_link}</td>
+            </tr>"#,
+            d.app_name,
+            d.status,
+            d.image,
+            d.started_at.split('T').next().unwrap_or(&d.started_at),
+        ));
+    }
+
+    let uptime = state.started_at.elapsed().as_secs();
+    let uptime_str = if uptime > 3600 {
+        format!("{}h {}m", uptime / 3600, (uptime % 3600) / 60)
+    } else if uptime > 60 {
+        format!("{}m {}s", uptime / 60, uptime % 60)
+    } else {
+        format!("{uptime}s")
+    };
+
+    Ok(Html(format!(
+        r#"<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>DD — {vm_name}</title>
+<style>
+  body {{ margin: 0; background: #1e1e2e; color: #cdd6f4; font-family: 'JetBrains Mono', monospace; padding: 24px; }}
+  h1 {{ color: #89b4fa; margin: 0 0 4px; font-size: 20px; }}
+  .subtitle {{ color: #585b70; font-size: 12px; margin-bottom: 16px; }}
+  .meta {{ color: #a6adc8; font-size: 13px; margin-bottom: 20px; }}
+  .meta .ok {{ color: #a6e3a1; }}
+  .metrics {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin-bottom: 24px; }}
+  .metric {{ background: #313244; border-radius: 8px; padding: 12px 16px; }}
+  .metric .label {{ color: #a6adc8; font-size: 11px; text-transform: uppercase; }}
+  .metric .value {{ color: #cdd6f4; font-size: 18px; font-weight: bold; margin-top: 4px; }}
+  .metric .bar {{ background: #45475a; border-radius: 4px; height: 4px; margin-top: 8px; }}
+  .metric .bar-fill {{ background: #89b4fa; border-radius: 4px; height: 4px; }}
+  .section {{ color: #a6adc8; font-size: 12px; text-transform: uppercase; margin: 20px 0 8px; }}
+  table {{ border-collapse: collapse; width: 100%; }}
+  th {{ text-align: left; color: #a6adc8; font-weight: normal; font-size: 12px; text-transform: uppercase; padding: 8px 12px; border-bottom: 1px solid #313244; }}
+  td {{ padding: 8px 12px; border-bottom: 1px solid #313244; font-size: 14px; }}
+  a {{ color: #89b4fa; text-decoration: none; }}
+  a:hover {{ text-decoration: underline; }}
+  .empty {{ color: #585b70; padding: 24px; text-align: center; }}
+</style>
+</head>
+<body>
+<h1>DevOps Defender</h1>
+<div class="subtitle">{agent_id}</div>
+<div class="meta">
+  {vm_name} &middot; <span class="ok">healthy</span> &middot; {att} &middot; owner: {owner} &middot; uptime {uptime}
+</div>
+
+<div class="metrics">
+  <div class="metric">
+    <div class="label">CPU</div>
+    <div class="value">{cpu_pct}%</div>
+    <div class="bar"><div class="bar-fill" style="width:{cpu_pct}%"></div></div>
+  </div>
+  <div class="metric">
+    <div class="label">Memory</div>
+    <div class="value">{mem_used} / {mem_total}</div>
+    <div class="bar"><div class="bar-fill" style="width:{mem_pct}%"></div></div>
+  </div>
+  <div class="metric">
+    <div class="label">Disk</div>
+    <div class="value">{disk_used} / {disk_total}</div>
+    <div class="bar"><div class="bar-fill" style="width:{disk_pct}%"></div></div>
+  </div>
+  <div class="metric">
+    <div class="label">Load</div>
+    <div class="value">{load_1m}</div>
+    <div class="bar"><div class="bar-fill" style="width:{load_pct}%"></div></div>
+  </div>
+</div>
+
+<div class="section">Jobs ({count})</div>
+{table}
+</body>
+</html>"#,
+        vm_name = state.vm_name,
+        agent_id = state.agent_id,
+        att = state.attestation_type,
+        owner = state.owner,
+        uptime = uptime_str,
+        count = deps.len(),
+        cpu_pct = metrics.cpu_pct,
+        mem_used = metrics.mem_used,
+        mem_total = metrics.mem_total,
+        mem_pct = metrics.mem_pct,
+        disk_used = metrics.disk_used,
+        disk_total = metrics.disk_total,
+        disk_pct = metrics.disk_pct,
+        load_1m = metrics.load_1m,
+        load_pct = metrics.load_pct,
+        table = if deps.is_empty() {
+            r#"<div class="empty">no jobs running &mdash; deploy something with <code>dd deploy</code></div>"#.to_string()
+        } else {
+            format!(
+                r#"<table>
+<tr><th>app</th><th>status</th><th>image</th><th>started</th><th></th></tr>
+{rows}
+</table>"#
+            )
+        },
+    )))
+}
+
+// ── System Metrics ───────────────────────────────────────────────────────
+
+struct SystemMetrics {
+    cpu_pct: u64,
+    mem_used: String,
+    mem_total: String,
+    mem_pct: u64,
+    disk_used: String,
+    disk_total: String,
+    disk_pct: u64,
+    load_1m: String,
+    load_pct: u64,
+}
+
+fn format_bytes(bytes: u64) -> String {
+    if bytes >= 1_073_741_824 {
+        format!("{:.1}G", bytes as f64 / 1_073_741_824.0)
+    } else if bytes >= 1_048_576 {
+        format!("{:.0}M", bytes as f64 / 1_048_576.0)
+    } else {
+        format!("{:.0}K", bytes as f64 / 1024.0)
+    }
+}
+
+async fn collect_metrics() -> SystemMetrics {
+    let mut metrics = SystemMetrics {
+        cpu_pct: 0,
+        mem_used: "?".into(),
+        mem_total: "?".into(),
+        mem_pct: 0,
+        disk_used: "?".into(),
+        disk_total: "?".into(),
+        disk_pct: 0,
+        load_1m: "?".into(),
+        load_pct: 0,
+    };
+
+    // Memory from /proc/meminfo
+    if let Ok(meminfo) = tokio::fs::read_to_string("/proc/meminfo").await {
+        let mut total_kb = 0u64;
+        let mut available_kb = 0u64;
+        for line in meminfo.lines() {
+            if let Some(val) = line.strip_prefix("MemTotal:") {
+                total_kb = val
+                    .split_whitespace()
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
+            }
+            if let Some(val) = line.strip_prefix("MemAvailable:") {
+                available_kb = val
+                    .split_whitespace()
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
+            }
+        }
+        if total_kb > 0 {
+            let used_kb = total_kb.saturating_sub(available_kb);
+            metrics.mem_total = format_bytes(total_kb * 1024);
+            metrics.mem_used = format_bytes(used_kb * 1024);
+            metrics.mem_pct = (used_kb * 100) / total_kb;
+        }
+    }
+
+    // Load average from /proc/loadavg
+    if let Ok(loadavg) = tokio::fs::read_to_string("/proc/loadavg").await {
+        if let Some(load_1m) = loadavg.split_whitespace().next() {
+            metrics.load_1m = load_1m.to_string();
+            let load: f64 = load_1m.parse().unwrap_or(0.0);
+            // Normalize to percentage of CPU count
+            let cpus = num_cpus().await;
+            metrics.load_pct = ((load / cpus as f64) * 100.0).min(100.0) as u64;
+        }
+    }
+
+    // CPU usage from /proc/stat (simple: 100 - idle%)
+    if let Ok(stat) = tokio::fs::read_to_string("/proc/stat").await {
+        if let Some(cpu_line) = stat.lines().next() {
+            let vals: Vec<u64> = cpu_line
+                .split_whitespace()
+                .skip(1)
+                .filter_map(|v| v.parse().ok())
+                .collect();
+            if vals.len() >= 4 {
+                let total: u64 = vals.iter().sum();
+                let idle = vals[3];
+                if total > 0 {
+                    metrics.cpu_pct = 100u64.saturating_sub((idle * 100) / total);
+                }
+            }
+        }
+    }
+
+    // Disk from /proc/mounts + statvfs equivalent
+    if let Ok(output) = tokio::process::Command::new("df")
+        .arg("-B1")
+        .arg("/")
+        .output()
+        .await
+    {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if let Some(line) = stdout.lines().nth(1) {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 4 {
+                let total: u64 = parts[1].parse().unwrap_or(0);
+                let used: u64 = parts[2].parse().unwrap_or(0);
+                if total > 0 {
+                    metrics.disk_total = format_bytes(total);
+                    metrics.disk_used = format_bytes(used);
+                    metrics.disk_pct = (used * 100) / total;
+                }
+            }
+        }
+    }
+
+    metrics
+}
+
+async fn num_cpus() -> usize {
+    tokio::fs::read_to_string("/proc/cpuinfo")
+        .await
+        .map(|s| s.matches("processor").count())
+        .unwrap_or(1)
+}
+
 pub fn build_router(state: AgentState) -> Router {
     Router::new()
+        .route("/", get(dashboard))
         .route("/health", get(health))
         .route("/deployments", get(list_deployments))
         .route("/deployments/{id}", get(get_deployment))
