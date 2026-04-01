@@ -76,7 +76,16 @@ async fn run_agent_mode(cfg: AgentRuntimeConfig) {
         let cf = dd_agent::tunnel::CfConfig::from_env().unwrap();
         eprintln!("dd-agent: self-registering via CF API");
         let http = reqwest::Client::new();
-        match dd_agent::tunnel::create_agent_tunnel(&http, &cf, &agent_id, &vm_name).await {
+        let hostname_override = std::env::var("DD_HOSTNAME").ok().filter(|s| !s.is_empty());
+        match dd_agent::tunnel::create_agent_tunnel(
+            &http,
+            &cf,
+            &agent_id,
+            &vm_name,
+            hostname_override.as_deref(),
+        )
+        .await
+        {
             Ok(info) => {
                 eprintln!("dd-agent: tunnel created — hostname={}", info.hostname);
                 if let Err(e) = start_cloudflared(&info.tunnel_token).await {

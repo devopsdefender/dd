@@ -42,18 +42,22 @@ const CF_API: &str = "https://api.cloudflare.com/client/v4";
 
 /// Create a CF tunnel for an agent, configure ingress, create DNS CNAME.
 /// Tunnel name uses agent_id (UUID) to guarantee uniqueness.
-/// DD_HOSTNAME controls the public DNS name users see.
+/// `hostname_override` sets the public DNS name — pass `None` for UUID-based.
+/// Callers must pass the override explicitly; this function never reads DD_HOSTNAME
+/// from the environment (to avoid the register's hostname leaking to remote agents).
 pub async fn create_agent_tunnel(
     client: &reqwest::Client,
     cf: &CfConfig,
     agent_id: &str,
-    vm_name: &str,
+    _vm_name: &str,
+    hostname_override: Option<&str>,
 ) -> Result<TunnelInfo, String> {
-    let hostname_override = std::env::var("DD_HOSTNAME").ok().filter(|s| !s.is_empty());
     let env_label = std::env::var("DD_ENV").unwrap_or_else(|_| "dev".into());
     let tunnel_name = format!("dd-{env_label}-{agent_id}");
     let tunnel_secret = uuid::Uuid::new_v4().to_string().replace('-', "");
-    let hostname = hostname_override.unwrap_or_else(|| format!("{vm_name}.{}", cf.domain));
+    let hostname = hostname_override
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| format!("{tunnel_name}.{}", cf.domain));
 
     // Delete existing tunnel with this name (idempotent redeploy)
     let _ = delete_tunnel_by_name(client, cf, &tunnel_name).await;

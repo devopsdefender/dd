@@ -60,14 +60,21 @@ async fn main() {
     eprintln!("dd-register: self-registering tunnel for {hostname}");
 
     let http_client = reqwest::Client::new();
-    let tunnel_info =
-        match tunnel::create_agent_tunnel(&http_client, &cf, &register_id, "register").await {
-            Ok(info) => info,
-            Err(e) => {
-                eprintln!("dd-register: self-registration failed: {e}");
-                std::process::exit(1);
-            }
-        };
+    let tunnel_info = match tunnel::create_agent_tunnel(
+        &http_client,
+        &cf,
+        &register_id,
+        "register",
+        Some(&hostname),
+    )
+    .await
+    {
+        Ok(info) => info,
+        Err(e) => {
+            eprintln!("dd-register: self-registration failed: {e}");
+            std::process::exit(1);
+        }
+    };
 
     eprintln!("dd-register: tunnel created — {}", tunnel_info.hostname);
 
@@ -297,14 +304,14 @@ async fn handle_registration(socket: WebSocket, cf: CfConfig, registry: AgentReg
     // Create tunnel for the agent
     let client = reqwest::Client::new();
     let agent_id = uuid::Uuid::new_v4().to_string();
-    let tunnel_info = match tunnel::create_agent_tunnel(&client, &cf, &agent_id, &reg.vm_name).await
-    {
-        Ok(info) => info,
-        Err(e) => {
-            eprintln!("dd-register: tunnel failed: {e}");
-            return;
-        }
-    };
+    let tunnel_info =
+        match tunnel::create_agent_tunnel(&client, &cf, &agent_id, &reg.vm_name, None).await {
+            Ok(info) => info,
+            Err(e) => {
+                eprintln!("dd-register: tunnel failed: {e}");
+                return;
+            }
+        };
 
     eprintln!(
         "dd-register: {} registered at {}",

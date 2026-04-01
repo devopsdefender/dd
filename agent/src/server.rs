@@ -1985,7 +1985,8 @@ async fn handle_ws_register(socket: WebSocket, state: AgentState) {
     let client = reqwest::Client::new();
     let agent_id = uuid::Uuid::new_v4().to_string();
     let tunnel_info =
-        match crate::tunnel::create_agent_tunnel(&client, &cf, &agent_id, &reg.vm_name).await {
+        match crate::tunnel::create_agent_tunnel(&client, &cf, &agent_id, &reg.vm_name, None).await
+        {
             Ok(info) => info,
             Err(e) => {
                 eprintln!("dd-register: tunnel failed: {e}");
