@@ -142,6 +142,9 @@ jobs:
           export DD_CF_ZONE_ID=${CLOUDFLARE_ZONE_ID}
           export DD_CF_DOMAIN=${DD_DOMAIN}
           export DD_HOSTNAME=${HOSTNAME}
+          export DD_GITHUB_CLIENT_ID=${DD_GITHUB_CLIENT_ID}
+          export DD_GITHUB_CLIENT_SECRET=${DD_GITHUB_CLIENT_SECRET}
+          export DD_GITHUB_CALLBACK_URL=${DD_GITHUB_CALLBACK_URL}
 
           # Boot a demo shell workload
           export DD_BOOT_CMD=bash
