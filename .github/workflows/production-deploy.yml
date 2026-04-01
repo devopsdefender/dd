@@ -105,6 +105,9 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.DD_CP_CF_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.DD_CP_CF_ACCOUNT_ID }}
           CLOUDFLARE_ZONE_ID: ${{ secrets.DD_CP_CF_ZONE_ID }}
+          DD_GITHUB_CLIENT_ID: ${{ vars.DD_GITHUB_CLIENT_ID }}
+          DD_GITHUB_CALLBACK_URL: ${{ vars.DD_GITHUB_CALLBACK_URL }}
+          DD_GITHUB_CLIENT_SECRET: ${{ secrets.DD_GITHUB_CLIENT_SECRET }}
           BINARY_URL: ${{ needs.build.outputs.binary_url }}
         run: |
           set -euo pipefail
@@ -130,6 +133,9 @@ jobs:
           export DD_CF_ZONE_ID=${CLOUDFLARE_ZONE_ID}
           export DD_CF_DOMAIN=${DD_DOMAIN}
           export DD_HOSTNAME=${HOSTNAME}
+          export DD_GITHUB_CLIENT_ID=${DD_GITHUB_CLIENT_ID}
+          export DD_GITHUB_CLIENT_SECRET=${DD_GITHUB_CLIENT_SECRET}
+          export DD_GITHUB_CALLBACK_URL=${DD_GITHUB_CALLBACK_URL}
 
           nohup /usr/local/bin/dd-agent > /var/log/dd-agent.log 2>&1 &
           STARTUP
