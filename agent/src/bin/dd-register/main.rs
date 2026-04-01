@@ -1,16 +1,32 @@
-//! Registration service — accepts Noise-over-WebSocket connections from agents,
-//! verifies attestation, provisions CF tunnels, delivers tokens.
+//! DD Register — fleet entry point.
 //!
-//! Single HTTP server with one WebSocket endpoint. No database, no state.
+//! Runs on the bootstrap VM. Self-registers a CF tunnel, serves the fleet
+//! dashboard, and handles agent registrations. Agents connect via Noise
+//! WebSocket to get their own tunnel tokens.
 
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::WebSocketUpgrade;
+use axum::response::Html;
 use axum::routing::get;
 use axum::Router;
 use futures_util::{SinkExt, StreamExt};
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 use dd_agent::noise::{self, AttestationPayload, BootstrapConfig};
 use dd_agent::tunnel::{self, CfConfig};
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct AgentRecord {
+    agent_id: String,
+    hostname: String,
+    vm_name: String,
+    attestation_type: String,
+    registered_at: String,
+}
+
+type AgentRegistry = Arc<Mutex<HashMap<String, AgentRecord>>>;
 
 #[derive(Debug, serde::Deserialize)]
 struct RegisterRequest {
@@ -23,7 +39,7 @@ async fn main() {
     let port: u16 = std::env::var("DD_REGISTER_PORT")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(9090);
+        .unwrap_or(8080);
 
     let cf = match CfConfig::from_env() {
         Ok(c) => c,
@@ -34,19 +50,78 @@ async fn main() {
         }
     };
 
+    // Self-register: create our own CF tunnel
+    let hostname = std::env::var("DD_HOSTNAME").unwrap_or_else(|_| {
+        eprintln!("dd-register: DD_HOSTNAME not set");
+        std::process::exit(1);
+    });
+
+    let register_id = uuid::Uuid::new_v4().to_string();
+    eprintln!("dd-register: self-registering tunnel for {hostname}");
+
+    let http_client = reqwest::Client::new();
+    let tunnel_info =
+        match tunnel::create_agent_tunnel(&http_client, &cf, &register_id, "register").await {
+            Ok(info) => info,
+            Err(e) => {
+                eprintln!("dd-register: self-registration failed: {e}");
+                std::process::exit(1);
+            }
+        };
+
+    eprintln!("dd-register: tunnel created — {}", tunnel_info.hostname);
+
+    // Spawn cloudflared
+    let token = tunnel_info.tunnel_token.clone();
+    tokio::spawn(async move {
+        eprintln!("dd-register: starting cloudflared");
+        let mut child = tokio::process::Command::new("cloudflared")
+            .args(["tunnel", "--no-autoupdate", "run", "--token", &token])
+            .spawn()
+            .expect("failed to spawn cloudflared");
+        let _ = child.wait().await;
+        eprintln!("dd-register: cloudflared exited");
+    });
+
+    let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+    let env_label = std::env::var("DD_ENV").unwrap_or_else(|_| "dev".into());
+
+    let dashboard_registry = registry.clone();
+    let dashboard_cf = cf.clone();
+    let dashboard_env = env_label.clone();
+    let dashboard_hostname = hostname.clone();
+
+    let register_cf = cf.clone();
+    let register_registry = registry.clone();
+
     let app = Router::new()
-        .route("/health", get(|| async { "ok" }))
+        .route(
+            "/",
+            get(move || {
+                let reg = dashboard_registry.clone();
+                let cf = dashboard_cf.clone();
+                let env = dashboard_env.clone();
+                let host = dashboard_hostname.clone();
+                async move { fleet_dashboard(reg, cf, env, host).await }
+            }),
+        )
+        .route(
+            "/health",
+            get(|| async { axum::Json(serde_json::json!({"ok": true, "service": "dd-register"})) }),
+        )
         .route(
             "/register",
             get(move |ws: WebSocketUpgrade| {
-                let cf = cf.clone();
-                async move { ws.on_upgrade(move |socket| handle_registration(socket, cf)) }
+                let cf = register_cf.clone();
+                let reg = register_registry.clone();
+                async move { ws.on_upgrade(move |socket| handle_registration(socket, cf, reg)) }
             }),
         );
 
     let addr = format!("0.0.0.0:{port}");
     eprintln!("dd-register: listening on {addr}");
-    eprintln!("dd-register: agents connect to ws://host:{port}/register");
+    eprintln!("dd-register: dashboard at https://{hostname}/");
+    eprintln!("dd-register: agents register at wss://{hostname}/register");
 
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
@@ -54,7 +129,88 @@ async fn main() {
     axum::serve(listener, app).await.expect("server error");
 }
 
-async fn handle_registration(socket: WebSocket, cf: CfConfig) {
+// ── Fleet Dashboard ──────────────────────────────────────────────────────
+
+async fn fleet_dashboard(
+    registry: AgentRegistry,
+    _cf: CfConfig,
+    env: String,
+    hostname: String,
+) -> Html<String> {
+    let agents = registry.lock().await;
+
+    let mut rows = String::new();
+    for agent in agents.values() {
+        rows.push_str(&format!(
+            r#"<tr>
+                <td><a href="https://{hostname}">{hostname}</a></td>
+                <td>{vm_name}</td>
+                <td><span style="color:#a6e3a1">registered</span></td>
+                <td>{att}</td>
+                <td>{registered}</td>
+            </tr>"#,
+            hostname = agent.hostname,
+            vm_name = agent.vm_name,
+            att = agent.attestation_type,
+            registered = agent
+                .registered_at
+                .split('T')
+                .next()
+                .unwrap_or(&agent.registered_at),
+        ));
+    }
+
+    Html(format!(
+        r#"<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>DD Fleet — {env}</title>
+<style>
+  body {{ margin: 0; background: #1e1e2e; color: #cdd6f4; font-family: 'JetBrains Mono', monospace; padding: 24px; }}
+  h1 {{ color: #89b4fa; margin: 0 0 4px; font-size: 20px; }}
+  .subtitle {{ color: #585b70; font-size: 12px; margin-bottom: 16px; }}
+  .meta {{ color: #a6adc8; font-size: 13px; margin-bottom: 24px; }}
+  .meta .ok {{ color: #a6e3a1; }}
+  .section {{ color: #a6adc8; font-size: 12px; text-transform: uppercase; margin: 20px 0 8px; }}
+  table {{ border-collapse: collapse; width: 100%; }}
+  th {{ text-align: left; color: #a6adc8; font-weight: normal; font-size: 12px; text-transform: uppercase; padding: 8px 12px; border-bottom: 1px solid #313244; }}
+  td {{ padding: 8px 12px; border-bottom: 1px solid #313244; font-size: 14px; }}
+  a {{ color: #89b4fa; text-decoration: none; }}
+  a:hover {{ text-decoration: underline; }}
+  .empty {{ color: #585b70; padding: 24px; text-align: center; }}
+</style>
+</head>
+<body>
+<h1>DevOps Defender</h1>
+<div class="subtitle">{env} fleet</div>
+<div class="meta">
+  <span class="ok">healthy</span> &middot; {hostname} &middot; {count} agent(s) registered
+</div>
+
+<div class="section">Agents ({count})</div>
+{table}
+</body>
+</html>"#,
+        env = env,
+        hostname = hostname,
+        count = agents.len(),
+        table = if agents.is_empty() {
+            r#"<div class="empty">no agents registered &mdash; start a dd-agent with DD_REGISTER_URL pointing here</div>"#.to_string()
+        } else {
+            format!(
+                r#"<table>
+<tr><th>hostname</th><th>vm</th><th>status</th><th>attestation</th><th>registered</th></tr>
+{rows}
+</table>"#
+            )
+        },
+    ))
+}
+
+// ── Agent Registration ───────────────────────────────────────────────────
+
+async fn handle_registration(socket: WebSocket, cf: CfConfig, registry: AgentRegistry) {
     let (mut ws_tx, mut ws_rx) = socket.split();
 
     let keypair = match noise::generate_keypair() {
@@ -78,19 +234,15 @@ async fn handle_registration(socket: WebSocket, cf: CfConfig) {
 
     let mut buf = vec![0u8; 65535];
 
-    // XX handshake over WebSocket binary frames
-
-    // msg1 from agent
+    // XX handshake
     let msg1 = match ws_rx.next().await {
         Some(Ok(Message::Binary(data))) => data.to_vec(),
         _ => return,
     };
     if noise.read_message(&msg1, &mut buf).is_err() {
-        eprintln!("dd-register: handshake msg1 failed");
         return;
     }
 
-    // msg2 (no payload from register side)
     let mut msg2_buf = vec![0u8; 65535];
     let msg2_len = match noise.write_message(&[], &mut msg2_buf) {
         Ok(n) => n,
@@ -104,29 +256,22 @@ async fn handle_registration(socket: WebSocket, cf: CfConfig) {
         return;
     }
 
-    // msg3 from agent (with attestation payload)
     let msg3 = match ws_rx.next().await {
         Some(Ok(Message::Binary(data))) => data.to_vec(),
         _ => return,
     };
     let payload_len = match noise.read_message(&msg3, &mut buf) {
         Ok(n) => n,
-        Err(_) => {
-            eprintln!("dd-register: handshake msg3 failed");
-            return;
-        }
+        Err(_) => return,
     };
 
     let attestation: AttestationPayload = match serde_json::from_slice(&buf[..payload_len]) {
         Ok(a) => a,
-        Err(_) => {
-            eprintln!("dd-register: parse attestation failed");
-            return;
-        }
+        Err(_) => return,
     };
 
     eprintln!(
-        "dd-register: agent {} attestation: {}",
+        "dd-register: agent {} ({})",
         attestation.vm_name, attestation.attestation_type
     );
 
@@ -135,7 +280,7 @@ async fn handle_registration(socket: WebSocket, cf: CfConfig) {
         Err(_) => return,
     };
 
-    // Read encrypted registration request
+    // Read registration request
     let enc_req = match ws_rx.next().await {
         Some(Ok(Message::Binary(data))) => data.to_vec(),
         _ => return,
@@ -144,42 +289,45 @@ async fn handle_registration(socket: WebSocket, cf: CfConfig) {
         Ok(n) => n,
         Err(_) => return,
     };
-
     let reg: RegisterRequest = match serde_json::from_slice(&buf[..req_len]) {
         Ok(r) => r,
-        Err(_) => {
-            eprintln!("dd-register: parse request failed");
-            return;
-        }
+        Err(_) => return,
     };
 
-    eprintln!(
-        "dd-register: creating tunnel for owner={} vm={}",
-        reg.owner, reg.vm_name
-    );
-
-    // Create CF tunnel
+    // Create tunnel for the agent
     let client = reqwest::Client::new();
     let agent_id = uuid::Uuid::new_v4().to_string();
     let tunnel_info = match tunnel::create_agent_tunnel(&client, &cf, &agent_id, &reg.vm_name).await
     {
         Ok(info) => info,
         Err(e) => {
-            eprintln!("dd-register: tunnel creation failed: {e}");
+            eprintln!("dd-register: tunnel failed: {e}");
             return;
         }
     };
 
     eprintln!(
-        "dd-register: tunnel created — hostname={}",
-        tunnel_info.hostname
+        "dd-register: {} registered at {}",
+        reg.vm_name, tunnel_info.hostname
     );
 
-    // Send encrypted bootstrap config
+    // Record in registry
+    registry.lock().await.insert(
+        agent_id.clone(),
+        AgentRecord {
+            agent_id,
+            hostname: tunnel_info.hostname.clone(),
+            vm_name: reg.vm_name.clone(),
+            attestation_type: attestation.attestation_type,
+            registered_at: chrono::Utc::now().to_rfc3339(),
+        },
+    );
+
+    // Send bootstrap config
     let config = BootstrapConfig {
         owner: reg.owner,
         tunnel_token: tunnel_info.tunnel_token,
-        hostname: tunnel_info.hostname.clone(),
+        hostname: tunnel_info.hostname,
     };
     let config_json = serde_json::to_vec(&config).unwrap();
     let mut enc_resp = vec![0u8; 65535];
@@ -188,9 +336,4 @@ async fn handle_registration(socket: WebSocket, cf: CfConfig) {
             .send(Message::Binary(enc_resp[..len].to_vec().into()))
             .await;
     }
-
-    eprintln!(
-        "dd-register: agent {} registered at {}",
-        attestation.vm_name, tunnel_info.hostname
-    );
 }
