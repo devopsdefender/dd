@@ -49,6 +49,13 @@ async fn run_agent_mode(cfg: AgentRuntimeConfig) {
         eprintln!("dd-agent: DD_OWNER not set");
         std::process::exit(1);
     });
+    let oauth = match dd_agent::server::GithubOAuthConfig::from_env() {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("dd-agent: configuration error: {error}");
+            std::process::exit(1);
+        }
+    };
 
     // Ensure workloads directory exists
     let _ = tokio::fs::create_dir_all("/var/lib/dd/workloads/logs").await;
@@ -95,6 +102,9 @@ async fn run_agent_mode(cfg: AgentRuntimeConfig) {
 
     let deployments: Deployments = Arc::new(Mutex::new(HashMap::new()));
     let process_handles: dd_agent::server::ProcessHandles = Arc::new(Mutex::new(HashMap::new()));
+    let browser_sessions: dd_agent::server::BrowserSessions = Arc::new(Mutex::new(HashMap::new()));
+    let pending_oauth_states: dd_agent::server::PendingOauthStates =
+        Arc::new(Mutex::new(HashMap::new()));
 
     // Auto-deploy boot workload if configured
     // DD_BOOT_CMD="bash" — run a direct command (no OCI pull)
@@ -182,6 +192,9 @@ async fn run_agent_mode(cfg: AgentRuntimeConfig) {
         deployments: deployments.clone(),
         process_handles,
         started_at: std::time::Instant::now(),
+        oauth,
+        browser_sessions,
+        pending_oauth_states,
     };
 
     // HTTP server (read-only: health, list deployments, logs)
