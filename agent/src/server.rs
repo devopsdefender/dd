@@ -1,13 +1,15 @@
 use axum::extract::ws::{Message, WebSocket};
-use axum::extract::{Path, State, WebSocketUpgrade};
-use axum::http::HeaderMap;
-use axum::response::{Html, IntoResponse};
+use axum::extract::{OriginalUri, Path, State, WebSocketUpgrade};
+use axum::http::header::{COOKIE, SET_COOKIE};
+use axum::http::{HeaderMap, HeaderValue, Uri};
+use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::Mutex;
 
@@ -54,6 +56,8 @@ pub struct HealthResponse {
 }
 
 pub type Deployments = Arc<Mutex<HashMap<String, DeploymentInfo>>>;
+pub type BrowserSessions = Arc<Mutex<HashMap<String, BrowserSession>>>;
+pub type PendingOauthStates = Arc<Mutex<HashMap<String, PendingOauthState>>>;
 
 /// Per-process I/O handles for interactive sessions.
 pub struct ProcessIO {
@@ -62,6 +66,48 @@ pub struct ProcessIO {
 }
 
 pub type ProcessHandles = Arc<Mutex<HashMap<String, ProcessIO>>>;
+
+#[derive(Debug, Clone)]
+pub struct GithubOAuthConfig {
+    pub client_id: String,
+    pub client_secret: String,
+    pub callback_url: String,
+    pub secure_cookies: bool,
+}
+
+impl GithubOAuthConfig {
+    pub fn from_env() -> Result<Option<Self>, String> {
+        let client_id = std::env::var("DD_GITHUB_CLIENT_ID").ok();
+        let client_secret = std::env::var("DD_GITHUB_CLIENT_SECRET").ok();
+        let callback_url = std::env::var("DD_GITHUB_CALLBACK_URL").ok();
+
+        match (client_id, client_secret, callback_url) {
+            (None, None, None) => Ok(None),
+            (Some(client_id), Some(client_secret), Some(callback_url)) => Ok(Some(Self {
+                client_id,
+                client_secret,
+                secure_cookies: callback_url.starts_with("https://"),
+                callback_url,
+            })),
+            _ => Err(
+                "DD_GITHUB_CLIENT_ID, DD_GITHUB_CLIENT_SECRET, and DD_GITHUB_CALLBACK_URL must all be set"
+                    .into(),
+            ),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct BrowserSession {
+    pub token: String,
+    pub expires_at: Instant,
+}
+
+#[derive(Debug, Clone)]
+pub struct PendingOauthState {
+    pub next_path: String,
+    pub expires_at: Instant,
+}
 
 #[derive(Clone)]
 pub struct AgentState {
@@ -72,9 +118,16 @@ pub struct AgentState {
     pub deployments: Deployments,
     pub process_handles: ProcessHandles,
     pub started_at: std::time::Instant,
+    pub oauth: Option<GithubOAuthConfig>,
+    pub browser_sessions: BrowserSessions,
+    pub pending_oauth_states: PendingOauthStates,
 }
 
 // ── Auth ──────────────────────────────────────────────────────────────────
+
+const SESSION_COOKIE: &str = "dd_session";
+const SESSION_TTL: Duration = Duration::from_secs(8 * 60 * 60);
+const OAUTH_STATE_TTL: Duration = Duration::from_secs(10 * 60);
 
 fn extract_auth(headers: &HeaderMap) -> Option<String> {
     let value = headers.get("authorization")?.to_str().ok()?;
@@ -84,12 +137,112 @@ fn extract_auth(headers: &HeaderMap) -> Option<String> {
     Some(token.to_string())
 }
 
-async fn verify_owner(state: &AgentState, headers: &HeaderMap) -> Result<(), AppError> {
-    if state.owner.is_empty() {
-        return Ok(());
+fn extract_cookie(headers: &HeaderMap, name: &str) -> Option<String> {
+    let cookies = headers.get(COOKIE)?.to_str().ok()?;
+    for cookie in cookies.split(';') {
+        let mut parts = cookie.trim().splitn(2, '=');
+        let key = parts.next()?.trim();
+        let value = parts.next()?.trim();
+        if key == name {
+            return Some(value.to_string());
+        }
     }
-    let token = extract_auth(headers).ok_or(AppError::Unauthorized)?;
-    verify_github_token(&token, &state.owner).await
+    None
+}
+
+fn sanitize_next_path(next: Option<&str>) -> String {
+    match next {
+        Some(path) if path.starts_with('/') && !path.starts_with("//") => path.to_string(),
+        _ => "/".to_string(),
+    }
+}
+
+fn github_oauth_redirect(next: &Uri) -> Redirect {
+    let mut url = reqwest::Url::parse("http://localhost/auth/github/start").unwrap();
+    let next_path = next
+        .path_and_query()
+        .map(|value| value.as_str())
+        .unwrap_or("/");
+    url.query_pairs_mut().append_pair("next", next_path);
+    let location = format!("{}?{}", url.path(), url.query().unwrap_or_default());
+    Redirect::to(&location)
+}
+
+fn build_session_cookie(state: &AgentState, session_id: &str, max_age: u64) -> String {
+    let mut cookie =
+        format!("{SESSION_COOKIE}={session_id}; Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age}");
+    if state
+        .oauth
+        .as_ref()
+        .map(|oauth| oauth.secure_cookies)
+        .unwrap_or(false)
+    {
+        cookie.push_str("; Secure");
+    }
+    cookie
+}
+
+fn response_with_cookie(response: impl IntoResponse, cookie: String) -> Response {
+    let mut response = response.into_response();
+    if let Ok(value) = HeaderValue::from_str(&cookie) {
+        response.headers_mut().append(SET_COOKIE, value);
+    }
+    response
+}
+
+async fn session_token_from_cookie(state: &AgentState, headers: &HeaderMap) -> Option<String> {
+    let session_id = extract_cookie(headers, SESSION_COOKIE)?;
+    let mut sessions = state.browser_sessions.lock().await;
+    let now = Instant::now();
+    sessions.retain(|_, session| session.expires_at > now);
+    sessions
+        .get(&session_id)
+        .map(|session| session.token.clone())
+}
+
+async fn resolve_github_token(
+    state: &AgentState,
+    headers: &HeaderMap,
+    query_token: Option<&str>,
+) -> Result<Option<String>, AppError> {
+    if state.owner.is_empty() {
+        return Ok(None);
+    }
+
+    if let Some(token) = query_token.filter(|token| !token.is_empty()) {
+        verify_github_token(token, &state.owner).await?;
+        return Ok(Some(token.to_string()));
+    }
+
+    if let Some(token) = extract_auth(headers) {
+        verify_github_token(&token, &state.owner).await?;
+        return Ok(Some(token));
+    }
+
+    if let Some(token) = session_token_from_cookie(state, headers).await {
+        return Ok(Some(token));
+    }
+
+    Err(AppError::Unauthorized)
+}
+
+async fn require_browser_token(
+    state: &AgentState,
+    headers: &HeaderMap,
+    query_token: Option<&str>,
+    current_uri: &Uri,
+) -> Result<Option<String>, Response> {
+    match resolve_github_token(state, headers, query_token).await {
+        Ok(token) => Ok(token),
+        Err(AppError::Unauthorized) if state.oauth.is_some() => {
+            Err(github_oauth_redirect(current_uri).into_response())
+        }
+        Err(err) => Err(err.into_response()),
+    }
+}
+
+async fn verify_owner(state: &AgentState, headers: &HeaderMap) -> Result<(), AppError> {
+    resolve_github_token(state, headers, None).await.map(|_| ())
 }
 
 // ── HTTP Handlers (read-only) ────────────────────────────────────────────
@@ -105,6 +258,26 @@ async fn health(State(state): State<AgentState>) -> Json<HealthResponse> {
         deployment_count,
         uptime_seconds: state.started_at.elapsed().as_secs(),
     })
+}
+
+async fn logged_out_page() -> Html<&'static str> {
+    Html(
+        r#"<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DD — Signed Out</title>
+</head>
+<body>
+<main>
+  <h1>Signed out</h1>
+  <p>Your browser session has been cleared.</p>
+  <p><a href="/">Return to dashboard</a></p>
+</main>
+</body>
+</html>"#,
+    )
 }
 
 async fn list_deployments(
@@ -161,9 +334,22 @@ async fn deployment_logs(
 
 // ── Web terminal ─────────────────────────────────────────────────────────
 
-async fn session_page(Path(app_name): Path<String>) -> Html<String> {
+async fn session_page(
+    State(state): State<AgentState>,
+    Path(app_name): Path<String>,
+    query: axum::extract::Query<SessionQuery>,
+    headers: HeaderMap,
+    OriginalUri(uri): OriginalUri,
+) -> Result<Response, AppError> {
+    if !state.owner.is_empty() {
+        match require_browser_token(&state, &headers, query.token.as_deref(), &uri).await {
+            Ok(_) => {}
+            Err(response) => return Ok(response),
+        }
+    }
+
     let html = include_str!("../web/terminal.html");
-    Html(html.replace("DD Terminal", &format!("DD — {app_name}")))
+    Ok(Html(html.replace("DD Terminal", &format!("DD — {app_name}"))).into_response())
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -175,14 +361,145 @@ async fn ws_session(
     State(state): State<AgentState>,
     Path(app_name): Path<String>,
     query: axum::extract::Query<SessionQuery>,
+    headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Result<impl IntoResponse, AppError> {
-    // Verify GitHub token if owner is set
-    if !state.owner.is_empty() {
-        let token = query.token.as_deref().ok_or(AppError::Unauthorized)?;
-        verify_github_token(token, &state.owner).await?;
-    }
+    resolve_github_token(&state, &headers, query.token.as_deref()).await?;
     Ok(ws.on_upgrade(move |socket| handle_ws_session(socket, state, app_name)))
+}
+
+#[derive(Debug, Deserialize)]
+struct AuthStartQuery {
+    next: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubCallbackQuery {
+    code: Option<String>,
+    state: Option<String>,
+    error: Option<String>,
+    error_description: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubTokenResponse {
+    access_token: Option<String>,
+}
+
+async fn github_auth_start(
+    State(state): State<AgentState>,
+    query: axum::extract::Query<AuthStartQuery>,
+) -> Result<Redirect, AppError> {
+    let oauth = state
+        .oauth
+        .as_ref()
+        .ok_or_else(|| AppError::Config("GitHub OAuth is not configured".into()))?;
+    let next_path = sanitize_next_path(query.next.as_deref());
+    let state_id = uuid::Uuid::new_v4().simple().to_string();
+
+    state.pending_oauth_states.lock().await.insert(
+        state_id.clone(),
+        PendingOauthState {
+            next_path,
+            expires_at: Instant::now() + OAUTH_STATE_TTL,
+        },
+    );
+
+    let mut url = reqwest::Url::parse("https://github.com/login/oauth/authorize").unwrap();
+    url.query_pairs_mut()
+        .append_pair("client_id", &oauth.client_id)
+        .append_pair("redirect_uri", &oauth.callback_url)
+        .append_pair("scope", "read:user read:org")
+        .append_pair("state", &state_id);
+    Ok(Redirect::to(url.as_str()))
+}
+
+async fn github_auth_callback(
+    State(state): State<AgentState>,
+    query: axum::extract::Query<GithubCallbackQuery>,
+) -> Result<Response, AppError> {
+    if let Some(error) = query.error.as_deref() {
+        let description = query.error_description.as_deref().unwrap_or(error);
+        return Err(AppError::External(description.into()));
+    }
+
+    let oauth = state
+        .oauth
+        .as_ref()
+        .ok_or_else(|| AppError::Config("GitHub OAuth is not configured".into()))?;
+    let code = query
+        .code
+        .as_deref()
+        .ok_or_else(|| AppError::InvalidInput("missing GitHub OAuth code".into()))?;
+    let state_id = query
+        .state
+        .as_deref()
+        .ok_or_else(|| AppError::InvalidInput("missing GitHub OAuth state".into()))?;
+
+    let next_path = {
+        let mut states = state.pending_oauth_states.lock().await;
+        let now = Instant::now();
+        states.retain(|_, pending| pending.expires_at > now);
+        states
+            .remove(state_id)
+            .map(|pending| pending.next_path)
+            .ok_or(AppError::Unauthorized)?
+    };
+
+    let http = reqwest::Client::new();
+    let token_resp = http
+        .post("https://github.com/login/oauth/access_token")
+        .header("Accept", "application/json")
+        .header("User-Agent", "dd-agent")
+        .form(&[
+            ("client_id", oauth.client_id.as_str()),
+            ("client_secret", oauth.client_secret.as_str()),
+            ("code", code),
+            ("redirect_uri", oauth.callback_url.as_str()),
+            ("state", state_id),
+        ])
+        .send()
+        .await
+        .map_err(|e| AppError::External(format!("GitHub OAuth exchange failed: {e}")))?;
+
+    if !token_resp.status().is_success() {
+        return Err(AppError::Unauthorized);
+    }
+
+    let token_body: GithubTokenResponse = token_resp
+        .json()
+        .await
+        .map_err(|e| AppError::External(format!("invalid GitHub OAuth response: {e}")))?;
+    let token = token_body.access_token.ok_or(AppError::Unauthorized)?;
+
+    if !state.owner.is_empty() {
+        verify_github_token(&token, &state.owner).await?;
+    }
+
+    let session_id = uuid::Uuid::new_v4().simple().to_string();
+    state.browser_sessions.lock().await.insert(
+        session_id.clone(),
+        BrowserSession {
+            token,
+            expires_at: Instant::now() + SESSION_TTL,
+        },
+    );
+
+    Ok(response_with_cookie(
+        Redirect::to(&next_path),
+        build_session_cookie(&state, &session_id, SESSION_TTL.as_secs()),
+    ))
+}
+
+async fn github_auth_logout(State(state): State<AgentState>, headers: HeaderMap) -> Response {
+    if let Some(session_id) = extract_cookie(&headers, SESSION_COOKIE) {
+        state.browser_sessions.lock().await.remove(&session_id);
+    }
+
+    response_with_cookie(
+        Redirect::to("/logged-out"),
+        build_session_cookie(&state, "", 0),
+    )
 }
 
 async fn verify_github_token(token: &str, owner: &str) -> Result<(), AppError> {
@@ -679,10 +996,14 @@ struct DashQuery {
 async fn dashboard(
     State(state): State<AgentState>,
     query: axum::extract::Query<DashQuery>,
-) -> Result<Html<String>, AppError> {
+    headers: HeaderMap,
+    OriginalUri(uri): OriginalUri,
+) -> Result<Response, AppError> {
     if !state.owner.is_empty() {
-        let token = query.token.as_deref().ok_or(AppError::Unauthorized)?;
-        verify_github_token(token, &state.owner).await?;
+        match require_browser_token(&state, &headers, query.token.as_deref(), &uri).await {
+            Ok(_) => {}
+            Err(response) => return Ok(response),
+        }
     }
 
     let metrics = collect_metrics().await;
@@ -892,6 +1213,7 @@ async fn dashboard(
   <header>
     <h1>DevOps Defender</h1>
     <p class="muted">{agent_id}</p>
+    <p><a href="/auth/logout">Log out</a></p>
     <ul>
       <li>vm: <strong>{vm_name}</strong></li>
       <li>health: <strong>healthy</strong></li>
@@ -954,7 +1276,8 @@ async fn dashboard(
 </table></div>"#
             )
         },
-    )))
+    ))
+    .into_response())
 }
 
 // ── System Metrics ───────────────────────────────────────────────────────
@@ -1086,6 +1409,10 @@ async fn num_cpus() -> usize {
 pub fn build_router(state: AgentState) -> Router {
     Router::new()
         .route("/", get(dashboard))
+        .route("/logged-out", get(logged_out_page))
+        .route("/auth/github/start", get(github_auth_start))
+        .route("/auth/github/callback", get(github_auth_callback))
+        .route("/auth/logout", get(github_auth_logout))
         .route("/health", get(health))
         .route("/deployments", get(list_deployments))
         .route("/deployments/{id}", get(get_deployment))

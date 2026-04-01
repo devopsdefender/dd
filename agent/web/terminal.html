@@ -135,6 +135,7 @@
       <span class="muted" id="detail">Enter a GitHub token to attach to this container.</span>
     </div>
     <p class="muted" id="attestation"></p>
+    <p><a href="/auth/logout">Log out</a></p>
   </header>
 
   <section>
@@ -236,12 +237,11 @@ function focusTerminal() {
   fitTerminal();
 }
 
-let token = params.get('token') || localStorage.getItem('dd_token') || '';
+let token = params.get('token') || '';
 let ws = null;
 
 if (token) {
   tokenInput.value = token;
-  localStorage.setItem('dd_token', token);
 }
 
 updateHomeLink(token);
@@ -256,14 +256,7 @@ function sendInput(data) {
 }
 
 function connect(nextToken) {
-  if (!nextToken) {
-    setStatus('err', 'Token required', 'Enter a GitHub token to attach to this container.');
-    tokenInput.focus();
-    return;
-  }
-
-  token = nextToken;
-  localStorage.setItem('dd_token', token);
+  token = nextToken || '';
   updateHomeLink(token);
 
   if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
@@ -274,7 +267,8 @@ function connect(nextToken) {
   setAttestation('');
 
   const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const wsUrl = `${proto}//${window.location.host}/ws/session/${encodeURIComponent(appName)}?token=${encodeURIComponent(token)}`;
+  let wsUrl = `${proto}//${window.location.host}/ws/session/${encodeURIComponent(appName)}`;
+  if (token) wsUrl += `?token=${encodeURIComponent(token)}`;
   ws = new WebSocket(wsUrl);
 
   ws.onopen = () => {
@@ -326,7 +320,13 @@ function connect(nextToken) {
   };
 
   ws.onerror = () => {
-    setStatus('err', 'Connection error', 'Check the token and whether the container is still running.');
+    setStatus(
+      'err',
+      'Connection error',
+      token
+        ? 'Check the token and whether the container is still running.'
+        : 'Log in again or enter a GitHub token if cookie auth is unavailable.'
+    );
   };
 }
 
@@ -361,11 +361,11 @@ clearButton.addEventListener('click', () => {
 });
 
 if (token) {
-  setStatus('warn', 'Connecting', `Opening ${appName || 'shell'} session...`);
-  connect(token);
+  tokenInput.value = token;
 } else {
-  setStatus('idle', 'Waiting', 'Enter a GitHub token to attach to this container.');
+  setStatus('warn', 'Connecting', `Opening ${appName || 'shell'} session...`);
 }
+connect(tokenInput.value.trim());
 </script>
 </body>
 </html>
