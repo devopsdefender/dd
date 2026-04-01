@@ -211,9 +211,18 @@ jobs:
           done
 
           # 3. Protected session page redirects into GitHub login
-          headers=$(curl -fsSI "${url}/session/demo")
-          echo "$headers" | grep -iq '^location: /auth/github/start?next=%2Fsession%2Fdemo' && \
-            echo "✓ Web terminal page requires GitHub login"
+          auth_ok=0
+          for i in $(seq 1 12); do
+            headers=$(curl -sSI "${url}/session/demo" || true)
+            if echo "$headers" | grep -iq '^location: /auth/github/start?next=%2Fsession%2Fdemo'; then
+              echo "✓ Web terminal page requires GitHub login"
+              auth_ok=1
+              break
+            fi
+            echo "  waiting for auth redirect... attempt ${i}/12"
+            sleep 5
+          done
+          [ "$auth_ok" -eq 1 ] || { echo "::error::Protected session page did not redirect to GitHub login"; exit 1; }
 
           # 4. Deployments endpoint works
           deps=$(curl -fsS "${url}/deployments" -H "Authorization: Bearer dummy" 2>/dev/null || echo "[]")
