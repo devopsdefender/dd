@@ -151,6 +151,17 @@ jobs:
           export DD_BOOT_APP=demo
 
           nohup /usr/local/bin/dd-agent > /var/log/dd-agent.log 2>&1 &
+
+          # Start scraper process (discovers agents from CF, reports to register)
+          sleep 5
+          DD_AGENT_MODE=scraper \
+          DD_CF_API_TOKEN=${CLOUDFLARE_API_TOKEN} \
+          DD_CF_ACCOUNT_ID=${CLOUDFLARE_ACCOUNT_ID} \
+          DD_CF_ZONE_ID=${CLOUDFLARE_ZONE_ID} \
+          DD_CF_DOMAIN=${DD_DOMAIN} \
+          DD_ENV=staging \
+          DD_REGISTER_URL=ws://localhost:8080/scraper \
+          nohup /usr/local/bin/dd-agent > /var/log/dd-scraper.log 2>&1 &
           STARTUP
 
           gcloud compute instances create "$VM_NAME" \

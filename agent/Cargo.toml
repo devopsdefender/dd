@@ -12,10 +12,6 @@ name = "dd-agent"
 path = "src/bin/dd-agent/main.rs"
 
 [[bin]]
-name = "dd"
-path = "src/bin/dd/main.rs"
-
-[[bin]]
 name = "dd-register"
 path = "src/bin/dd-register/main.rs"
 
@@ -23,7 +19,6 @@ path = "src/bin/dd-register/main.rs"
 axum = { version = "0.8", features = ["ws"] }
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
-clap = { version = "4", features = ["derive"] }
 futures-util = "0.3"
 jsonwebtoken = "9"
 oci-unpack = "0.1.1"

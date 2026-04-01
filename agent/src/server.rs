@@ -3,7 +3,7 @@ use axum::extract::{OriginalUri, Path, State, WebSocketUpgrade};
 use axum::http::header::{COOKIE, SET_COOKIE};
 use axum::http::{HeaderMap, HeaderValue, Uri};
 use axum::response::{Html, IntoResponse, Redirect, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -54,6 +54,11 @@ pub struct HealthResponse {
     pub attestation_type: String,
     pub deployment_count: usize,
     pub uptime_seconds: u64,
+    pub cpu_percent: u64,
+    pub memory_used_mb: u64,
+    pub memory_total_mb: u64,
+    pub disk_used_gb: u64,
+    pub disk_total_gb: u64,
 }
 
 pub type Deployments = Arc<Mutex<HashMap<String, DeploymentInfo>>>;
@@ -118,6 +123,12 @@ pub struct RegisteredAgent {
     pub vm_name: String,
     pub attestation_type: String,
     pub registered_at: String,
+    pub last_seen: chrono::DateTime<chrono::Utc>,
+    pub status: String,
+    pub deployment_count: usize,
+    pub cpu_percent: u64,
+    pub memory_used_mb: u64,
+    pub memory_total_mb: u64,
 }
 
 pub type AgentRegistry = Arc<Mutex<HashMap<String, RegisteredAgent>>>;
@@ -266,6 +277,7 @@ async fn verify_owner(state: &AgentState, headers: &HeaderMap) -> Result<(), App
 
 async fn health(State(state): State<AgentState>) -> Json<HealthResponse> {
     let deployment_count = state.deployments.lock().await.len();
+    let metrics = collect_metrics().await;
     Json(HealthResponse {
         ok: true,
         agent_id: state.agent_id.clone(),
@@ -274,7 +286,30 @@ async fn health(State(state): State<AgentState>) -> Json<HealthResponse> {
         attestation_type: state.attestation_type.clone(),
         deployment_count,
         uptime_seconds: state.started_at.elapsed().as_secs(),
+        cpu_percent: metrics.cpu_pct,
+        memory_used_mb: parse_size_mb(&metrics.mem_used),
+        memory_total_mb: parse_size_mb(&metrics.mem_total),
+        disk_used_gb: parse_size_gb(&metrics.disk_used),
+        disk_total_gb: parse_size_gb(&metrics.disk_total),
     })
+}
+
+fn parse_size_mb(s: &str) -> u64 {
+    if let Some(g) = s.strip_suffix('G') {
+        (g.parse::<f64>().unwrap_or(0.0) * 1024.0) as u64
+    } else if let Some(m) = s.strip_suffix('M') {
+        m.parse::<f64>().unwrap_or(0.0) as u64
+    } else {
+        0
+    }
+}
+
+fn parse_size_gb(s: &str) -> u64 {
+    if let Some(g) = s.strip_suffix('G') {
+        g.parse::<f64>().unwrap_or(0.0) as u64
+    } else {
+        0
+    }
 }
 
 async fn logged_out_page() -> Html<&'static str> {
@@ -1445,24 +1480,48 @@ async fn fleet_dashboard_html(state: &AgentState) -> Html<String> {
     let agents = state.agent_registry.lock().await;
     let env = std::env::var("DD_ENV").unwrap_or_else(|_| "dev".into());
 
+    let now = chrono::Utc::now();
     let mut rows = String::new();
     for a in agents.values() {
+        let status_color = match a.status.as_str() {
+            "healthy" => "#a6e3a1",
+            "stale" => "#fab387",
+            "dead" => "#f38ba8",
+            _ => "#a6adc8",
+        };
+        let age_secs = now.signed_duration_since(a.last_seen).num_seconds();
+        let last_seen = if age_secs < 60 {
+            format!("{age_secs}s ago")
+        } else if age_secs < 3600 {
+            format!("{}m ago", age_secs / 60)
+        } else {
+            format!("{}h ago", age_secs / 3600)
+        };
+        let mem_str = if a.memory_total_mb > 0 {
+            format!("{}M / {}M", a.memory_used_mb, a.memory_total_mb)
+        } else {
+            "-".into()
+        };
         rows.push_str(&format!(
             r#"<tr>
-                <td><a href="https://{}">{}</a></td>
-                <td>{}</td>
-                <td><span style="color:#a6e3a1">registered</span></td>
-                <td>{}</td>
-                <td>{}</td>
+                <td><a href="https://{hostname}">{hostname}</a></td>
+                <td>{vm}</td>
+                <td><span style="color:{status_color}">{status}</span></td>
+                <td>{attestation}</td>
+                <td>{deploys}</td>
+                <td>{cpu}%</td>
+                <td>{mem}</td>
+                <td>{last_seen}</td>
             </tr>"#,
-            a.hostname,
-            a.hostname,
-            a.vm_name,
-            a.attestation_type,
-            a.registered_at
-                .split('T')
-                .next()
-                .unwrap_or(&a.registered_at),
+            hostname = a.hostname,
+            vm = a.vm_name,
+            status_color = status_color,
+            status = a.status,
+            attestation = a.attestation_type,
+            deploys = a.deployment_count,
+            cpu = a.cpu_percent,
+            mem = mem_str,
+            last_seen = last_seen,
         ));
     }
 
@@ -1505,10 +1564,269 @@ async fn fleet_dashboard_html(state: &AgentState) -> Html<String> {
             r#"<div class="empty">no agents registered</div>"#.to_string()
         } else {
             format!(
-                r#"<table><tr><th>hostname</th><th>vm</th><th>status</th><th>attestation</th><th>registered</th></tr>{rows}</table>"#
+                r#"<table><tr><th>hostname</th><th>vm</th><th>status</th><th>attestation</th><th>deploys</th><th>cpu</th><th>memory</th><th>last seen</th></tr>{rows}</table>"#
             )
         },
     ))
+}
+
+// ── Scraper + Deregister endpoints (register mode) ──────────────────────
+
+#[derive(Deserialize)]
+struct DeregisterRequest {
+    agent_id: String,
+}
+
+async fn post_deregister(
+    State(state): State<AgentState>,
+    Json(req): Json<DeregisterRequest>,
+) -> Response {
+    let agent = state.agent_registry.lock().await.remove(&req.agent_id);
+    if let Some(agent) = agent {
+        if let Some(cf) = &state.cf_config {
+            let client = reqwest::Client::new();
+            if let Err(e) =
+                crate::tunnel::remove_agent(&client, cf, &agent.agent_id, &agent.hostname).await
+            {
+                eprintln!("dd-register: deregister tunnel cleanup failed: {e}");
+            } else {
+                eprintln!("dd-register: deregistered {} ({})", agent.agent_id, agent.hostname);
+            }
+        }
+        (axum::http::StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response()
+    } else {
+        (
+            axum::http::StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "agent not found"})),
+        )
+            .into_response()
+    }
+}
+
+// ── Scraper WebSocket — accepts fleet health reports ────────────────────
+
+#[derive(Deserialize)]
+struct AgentHealthReport {
+    hostname: String,
+    healthy: bool,
+    #[serde(default)]
+    agent_id: Option<String>,
+    #[serde(default)]
+    vm_name: Option<String>,
+    #[serde(default)]
+    attestation_type: Option<String>,
+    #[serde(default)]
+    deployment_count: Option<usize>,
+    #[serde(default)]
+    cpu_percent: Option<u64>,
+    #[serde(default)]
+    memory_used_mb: Option<u64>,
+    #[serde(default)]
+    memory_total_mb: Option<u64>,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct FleetReport {
+    agents: Vec<AgentHealthReport>,
+    #[serde(default)]
+    orphan_tunnels: Vec<String>,
+}
+
+async fn ws_scraper(State(state): State<AgentState>, ws: WebSocketUpgrade) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| handle_ws_scraper(socket, state))
+}
+
+async fn handle_ws_scraper(socket: WebSocket, state: AgentState) {
+    let (mut ws_tx, mut ws_rx) = socket.split();
+
+    // Noise XX handshake (scraper is initiator, register is responder)
+    let keypair = match crate::noise::generate_keypair() {
+        Ok(k) => k,
+        Err(_) => return,
+    };
+
+    let mut noise = match snow::Builder::new(crate::noise::NOISE_PATTERN.parse().unwrap())
+        .local_private_key(&keypair.private)
+        .and_then(|b| b.build_responder())
+    {
+        Ok(n) => n,
+        Err(_) => return,
+    };
+
+    let mut buf = vec![0u8; 65535];
+
+    // XX handshake
+    let msg1 = match ws_rx.next().await {
+        Some(Ok(Message::Binary(d))) => d.to_vec(),
+        _ => return,
+    };
+    if noise.read_message(&msg1, &mut buf).is_err() {
+        return;
+    }
+
+    let mut msg2 = vec![0u8; 65535];
+    let len = match noise.write_message(&[], &mut msg2) {
+        Ok(n) => n,
+        Err(_) => return,
+    };
+    if ws_tx
+        .send(Message::Binary(msg2[..len].to_vec().into()))
+        .await
+        .is_err()
+    {
+        return;
+    }
+
+    let msg3 = match ws_rx.next().await {
+        Some(Ok(Message::Binary(d))) => d.to_vec(),
+        _ => return,
+    };
+    let payload_len = match noise.read_message(&msg3, &mut buf) {
+        Ok(n) => n,
+        Err(_) => return,
+    };
+
+    // Verify scraper attestation
+    let attestation: crate::noise::AttestationPayload =
+        match serde_json::from_slice(&buf[..payload_len]) {
+            Ok(a) => a,
+            Err(_) => return,
+        };
+    eprintln!(
+        "dd-register: scraper connected (attestation: {})",
+        attestation.attestation_type
+    );
+
+    let mut transport = match noise.into_transport_mode() {
+        Ok(t) => t,
+        Err(_) => return,
+    };
+
+    // Receive fleet reports in a loop
+    while let Some(Ok(Message::Binary(data))) = ws_rx.next().await {
+        let data = data.to_vec();
+        let dec_len = match transport.read_message(&data, &mut buf) {
+            Ok(n) => n,
+            Err(_) => break,
+        };
+
+        let report: FleetReport = match serde_json::from_slice(&buf[..dec_len]) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("dd-register: bad fleet report: {e}");
+                continue;
+            }
+        };
+
+        let now = chrono::Utc::now();
+        let mut registry = state.agent_registry.lock().await;
+        let mut healthy_count = 0usize;
+        let mut stale_count = 0usize;
+
+        for agent_report in &report.agents {
+            if agent_report.healthy {
+                healthy_count += 1;
+                // Update or insert healthy agent
+                if let Some(existing) = registry.values_mut().find(|a| a.hostname == agent_report.hostname) {
+                    existing.last_seen = now;
+                    existing.status = "healthy".into();
+                    if let Some(dc) = agent_report.deployment_count {
+                        existing.deployment_count = dc;
+                    }
+                    if let Some(cpu) = agent_report.cpu_percent {
+                        existing.cpu_percent = cpu;
+                    }
+                    if let Some(mem_used) = agent_report.memory_used_mb {
+                        existing.memory_used_mb = mem_used;
+                    }
+                    if let Some(mem_total) = agent_report.memory_total_mb {
+                        existing.memory_total_mb = mem_total;
+                    }
+                } else if let Some(ref aid) = agent_report.agent_id {
+                    // Discovered via CF tunnel but not in registry — insert
+                    registry.insert(aid.clone(), RegisteredAgent {
+                        agent_id: aid.clone(),
+                        hostname: agent_report.hostname.clone(),
+                        vm_name: agent_report.vm_name.clone().unwrap_or_default(),
+                        attestation_type: agent_report.attestation_type.clone().unwrap_or_else(|| "unknown".into()),
+                        registered_at: now.to_rfc3339(),
+                        last_seen: now,
+                        status: "healthy".into(),
+                        deployment_count: agent_report.deployment_count.unwrap_or(0),
+                        cpu_percent: agent_report.cpu_percent.unwrap_or(0),
+                        memory_used_mb: agent_report.memory_used_mb.unwrap_or(0),
+                        memory_total_mb: agent_report.memory_total_mb.unwrap_or(0),
+                    });
+                    eprintln!("dd-register: scraper discovered new agent {aid} at {}", agent_report.hostname);
+                }
+            } else {
+                stale_count += 1;
+                // Mark unreachable agent as stale
+                if let Some(existing) = registry.values_mut().find(|a| a.hostname == agent_report.hostname) {
+                    if existing.status == "healthy" {
+                        existing.status = "stale".into();
+                        eprintln!(
+                            "dd-register: scraper: {} stale ({})",
+                            existing.hostname,
+                            agent_report.error.as_deref().unwrap_or("unreachable")
+                        );
+                    } else if existing.status == "stale" {
+                        // Already stale from a previous report — mark dead
+                        existing.status = "dead".into();
+                        eprintln!("dd-register: scraper: {} dead", existing.hostname);
+                    }
+                }
+            }
+        }
+
+        // Clean up dead agents
+        let dead: Vec<(String, String)> = registry
+            .values()
+            .filter(|a| a.status == "dead")
+            .map(|a| (a.agent_id.clone(), a.hostname.clone()))
+            .collect();
+        drop(registry);
+
+        for (agent_id, hostname) in &dead {
+            if let Some(cf) = &state.cf_config {
+                let client = reqwest::Client::new();
+                if let Err(e) = crate::tunnel::remove_agent(&client, cf, agent_id, hostname).await {
+                    eprintln!("dd-register: scraper cleanup failed for {hostname}: {e}");
+                } else {
+                    eprintln!("dd-register: scraper cleaned up {hostname}");
+                }
+            }
+            state.agent_registry.lock().await.remove(agent_id);
+        }
+
+        // Clean up orphan tunnels (tunnels with no registered agent)
+        for tunnel_name in &report.orphan_tunnels {
+            if let Some(cf) = &state.cf_config {
+                let client = reqwest::Client::new();
+                if let Err(e) = crate::tunnel::delete_tunnel_by_name(&client, cf, tunnel_name).await {
+                    eprintln!("dd-register: scraper orphan cleanup failed for {tunnel_name}: {e}");
+                } else {
+                    eprintln!("dd-register: scraper cleaned orphan tunnel {tunnel_name}");
+                }
+            }
+        }
+
+        eprintln!(
+            "dd-register: scraper report: {} healthy, {} stale/unreachable, {} orphan tunnels, {} dead cleaned",
+            healthy_count, stale_count, report.orphan_tunnels.len(), dead.len()
+        );
+
+        // Send ack
+        let ack = serde_json::json!({"ok": true}).to_string();
+        let mut enc = vec![0u8; 65535];
+        if let Ok(len) = transport.write_message(ack.as_bytes(), &mut enc) {
+            let _ = ws_tx.send(Message::Binary(enc[..len].to_vec().into())).await;
+        }
+    }
+
+    eprintln!("dd-register: scraper disconnected");
 }
 
 async fn ws_register(State(state): State<AgentState>, ws: WebSocketUpgrade) -> impl IntoResponse {
@@ -1620,6 +1938,7 @@ async fn handle_ws_register(socket: WebSocket, state: AgentState) {
     );
 
     // Record
+    let now = chrono::Utc::now();
     state.agent_registry.lock().await.insert(
         agent_id.clone(),
         RegisteredAgent {
@@ -1627,7 +1946,13 @@ async fn handle_ws_register(socket: WebSocket, state: AgentState) {
             hostname: tunnel_info.hostname.clone(),
             vm_name: reg.vm_name,
             attestation_type: attestation.attestation_type,
-            registered_at: chrono::Utc::now().to_rfc3339(),
+            registered_at: now.to_rfc3339(),
+            last_seen: now,
+            status: "healthy".into(),
+            deployment_count: 0,
+            cpu_percent: 0,
+            memory_used_mb: 0,
+            memory_total_mb: 0,
         },
     );
 
@@ -1652,7 +1977,9 @@ pub fn build_router(state: AgentState) -> Router {
     if state.register_mode {
         router = router
             .route("/", get(fleet_dashboard))
-            .route("/register", get(ws_register));
+            .route("/register", get(ws_register))
+            .route("/scraper", get(ws_scraper))
+            .route("/deregister", post(post_deregister));
     } else {
         router = router.route("/", get(dashboard));
     }
@@ -1670,7 +1997,28 @@ pub fn build_router(state: AgentState) -> Router {
         .route("/ws/session/{app_name}", get(ws_session))
         .route("/noise/session/{app_name}", get(ws_noise_session))
         .route("/noise/cmd", get(ws_noise_cmd))
+        .route("/deploy", post(post_deploy))
         .with_state(state)
+}
+
+// ── POST /deploy — localhost-only deploy endpoint ───────────────────────
+
+async fn post_deploy(
+    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    State(state): State<AgentState>,
+    Json(req): Json<DeployRequest>,
+) -> Response {
+    // Only allow deploys from localhost
+    if !addr.ip().is_loopback() {
+        return (
+            axum::http::StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": "deploy only allowed from localhost"})),
+        )
+            .into_response();
+    }
+
+    let (id, status) = execute_deploy(&state.deployments, req).await;
+    Json(serde_json::json!({"id": id, "status": status})).into_response()
 }
 
 // ── Deploy/Stop logic (called by Noise command channel) ──────────────────

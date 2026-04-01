@@ -109,6 +109,7 @@ jobs:
           DD_GITHUB_CALLBACK_URL: ${{ vars.DD_GITHUB_CALLBACK_URL }}
           DD_GITHUB_CLIENT_SECRET: ${{ secrets.DD_GITHUB_CLIENT_SECRET }}
           BINARY_URL: ${{ needs.build.outputs.binary_url }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
         run: |
           set -euo pipefail
           VM_NAME="dd-prod-$(date +%s)"
@@ -128,6 +129,7 @@ jobs:
           chmod +x /usr/local/bin/dd-agent
 
           export DD_OWNER=devopsdefender
+          export DD_AGENT_MODE=register
           export DD_ENV=production
           export DD_CF_API_TOKEN=${CLOUDFLARE_API_TOKEN}
           export DD_CF_ACCOUNT_ID=${CLOUDFLARE_ACCOUNT_ID}
@@ -138,7 +140,22 @@ jobs:
           export DD_GITHUB_CLIENT_SECRET=${DD_GITHUB_CLIENT_SECRET}
           export DD_GITHUB_CALLBACK_URL=${DD_GITHUB_CALLBACK_URL}
 
+          # Boot a demo shell workload
+          export DD_BOOT_CMD=bash
+          export DD_BOOT_APP=demo
+
           nohup /usr/local/bin/dd-agent > /var/log/dd-agent.log 2>&1 &
+
+          # Start scraper process (discovers agents from CF, reports to register)
+          sleep 5
+          DD_AGENT_MODE=scraper \
+          DD_CF_API_TOKEN=${CLOUDFLARE_API_TOKEN} \
+          DD_CF_ACCOUNT_ID=${CLOUDFLARE_ACCOUNT_ID} \
+          DD_CF_ZONE_ID=${CLOUDFLARE_ZONE_ID} \
+          DD_CF_DOMAIN=${DD_DOMAIN} \
+          DD_ENV=production \
+          DD_REGISTER_URL=ws://localhost:8080/scraper \
+          nohup /usr/local/bin/dd-agent > /var/log/dd-scraper.log 2>&1 &
           STARTUP
 
           gcloud compute instances create "$VM_NAME" \
@@ -182,9 +199,45 @@ jobs:
 
       - name: Integration test
         run: |
+          set -euo pipefail
           url="https://app.${DD_DOMAIN}"
+
+          # 1. Health check
           health=$(curl -fsS "${url}/health")
           echo "Health: $health"
           echo "$health" | jq -e '.ok == true' > /dev/null
           echo "$health" | jq -e '.agent_id' > /dev/null
-          echo "Production deploy verified!"
+          echo "✓ Agent healthy"
+
+          # 2. Wait for boot workload to deploy
+          for i in $(seq 1 30); do
+            count=$(echo "$(curl -fsS "${url}/health")" | jq -r '.deployment_count')
+            [ "$count" -gt 0 ] && echo "✓ Boot workload running (deployments: $count)" && break
+            echo "  waiting for boot workload... attempt ${i}/30"
+            sleep 5
+          done
+
+          # 3. Protected session page redirects into GitHub login
+          auth_ok=0
+          for i in $(seq 1 12); do
+            headers=$(curl -sSI "${url}/session/demo" || true)
+            if echo "$headers" | grep -iq '^location: /auth/github/start?next=%2Fsession%2Fdemo'; then
+              echo "✓ Web terminal page requires GitHub login"
+              auth_ok=1
+              break
+            fi
+            echo "  waiting for auth redirect... attempt ${i}/12"
+            sleep 5
+          done
+          [ "$auth_ok" -eq 1 ] || { echo "::error::Protected session page did not redirect to GitHub login"; exit 1; }
+
+          # 4. Deployments endpoint works
+          deps=$(curl -fsS "${url}/deployments" -H "Authorization: Bearer dummy" 2>/dev/null || echo "[]")
+          echo "Deployments: $deps"
+
+          echo ""
+          echo "═══════════════════════════════════════"
+          echo "  Production integration test passed!"
+          echo "  Agent: ${url}"
+          echo "  Terminal: ${url}/session/demo"
+          echo "═══════════════════════════════════════"
