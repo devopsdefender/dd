@@ -98,23 +98,19 @@ pub async fn pull_image(image: &str, app_name: &str) -> Result<ImageConfig, Stri
     Ok(config)
 }
 
-/// Spawn a workload process from a pulled image using chroot.
-/// Mounts /proc, /sys, /dev into the rootfs for a functional environment.
+/// Spawn a workload process from a pulled OCI image.
+/// No chroot — the VM is the isolation boundary. Just run the binary directly.
 pub async fn spawn_workload(
     app_name: &str,
     config: &ImageConfig,
     extra_env: Vec<String>,
     tty: bool,
 ) -> Result<Child, String> {
-    // oci-unpack extracts layers directly into the target dir (no rootfs/ subdir)
-    let rootfs = PathBuf::from(WORKLOADS_DIR).join(app_name);
+    let workdir = PathBuf::from(WORKLOADS_DIR).join(app_name);
 
-    if !rootfs.join("bin").exists() && !rootfs.join("usr").exists() {
-        return Err(format!("rootfs not found at {}", rootfs.display()));
+    if !workdir.exists() {
+        return Err(format!("workload dir not found: {}", workdir.display()));
     }
-
-    // Mount essential filesystems into the chroot
-    setup_chroot_mounts(&rootfs).await?;
 
     // Entrypoint + cmd
     let mut args: Vec<String> = config.entrypoint.clone();
@@ -126,7 +122,20 @@ pub async fn spawn_workload(
 
     let program = args.remove(0);
 
-    // Environment
+    // Resolve the program path — look in the extracted image first, then system PATH
+    let resolved_program = if program.starts_with('/') {
+        // Absolute path — look inside extracted image
+        let in_image = workdir.join(program.trim_start_matches('/'));
+        if in_image.exists() {
+            in_image.to_string_lossy().to_string()
+        } else {
+            program.clone() // Fall back to system
+        }
+    } else {
+        program.clone()
+    };
+
+    // Environment from image config + extras
     let mut env_map: HashMap<String, String> = HashMap::new();
     for kv in &config.env {
         if let Some((k, v)) = kv.split_once('=') {
@@ -138,9 +147,14 @@ pub async fn spawn_workload(
             env_map.insert(k.to_string(), v.to_string());
         }
     }
-    env_map
-        .entry("PATH".into())
-        .or_insert_with(|| "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".into());
+
+    // Prepend extracted image dirs to PATH so image binaries are found
+    let image_path = format!(
+        "{0}/usr/local/sbin:{0}/usr/local/bin:{0}/usr/sbin:{0}/usr/bin:{0}/sbin:{0}/bin",
+        workdir.display()
+    );
+    let system_path = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+    env_map.insert("PATH".into(), format!("{image_path}:{system_path}"));
     env_map
         .entry("HOME".into())
         .or_insert_with(|| "/root".into());
@@ -148,24 +162,32 @@ pub async fn spawn_workload(
         .entry("TERM".into())
         .or_insert_with(|| "xterm-256color".into());
 
-    // Ensure log directory exists
     let _ = tokio::fs::create_dir_all("/var/lib/dd/workloads/logs").await;
-
-    // Build the chroot command
-    let chroot_cmd = format!("chroot {} {} {}", rootfs.display(), program, args.join(" "));
 
     let mut cmd = if tty {
         let mut c = Command::new("script");
         c.arg("-qfc");
-        c.arg(&chroot_cmd);
+        c.arg(format!("{} {}", resolved_program, args.join(" ")));
         c.arg("/dev/null");
         c
     } else {
-        let mut c = Command::new("sh");
-        c.arg("-c");
-        c.arg(&chroot_cmd);
+        let mut c = Command::new(&resolved_program);
+        c.args(&args);
         c
     };
+
+    // Set working directory to the image's configured workdir (inside extracted image)
+    let cwd = if !config.working_dir.is_empty() && config.working_dir != "/" {
+        let img_cwd = workdir.join(config.working_dir.trim_start_matches('/'));
+        if img_cwd.exists() {
+            img_cwd
+        } else {
+            workdir.clone()
+        }
+    } else {
+        workdir.clone()
+    };
+    cmd.current_dir(&cwd);
 
     cmd.env_clear();
     for (k, v) in &env_map {
@@ -226,66 +248,6 @@ pub async fn spawn_command(program: &str, args: &[&str], tty: bool) -> Result<Ch
         child.id().unwrap_or(0)
     );
     Ok(child)
-}
-
-/// Mount /proc, /sys, /dev into a chroot rootfs.
-async fn setup_chroot_mounts(rootfs: &Path) -> Result<(), String> {
-    let mounts = [
-        ("proc", "proc", "/proc"),
-        ("sysfs", "sysfs", "/sys"),
-        ("devtmpfs", "devtmpfs", "/dev"),
-        ("devpts", "devpts", "/dev/pts"),
-        ("tmpfs", "tmpfs", "/tmp"),
-        ("tmpfs", "tmpfs", "/run"),
-    ];
-
-    for (fstype, src, target) in &mounts {
-        let mount_point = rootfs.join(target.trim_start_matches('/'));
-        let _ = tokio::fs::create_dir_all(&mount_point).await;
-
-        // Skip if already mounted
-        let status = Command::new("mountpoint")
-            .arg("-q")
-            .arg(&mount_point)
-            .status()
-            .await;
-        if matches!(status, Ok(s) if s.success()) {
-            continue;
-        }
-
-        let result = Command::new("mount")
-            .arg("-t")
-            .arg(fstype)
-            .arg(src)
-            .arg(&mount_point)
-            .status()
-            .await
-            .map_err(|e| format!("mount {target}: {e}"))?;
-
-        if !result.success() {
-            eprintln!("dd-agent: warning: failed to mount {target} in chroot (non-fatal)");
-        }
-    }
-
-    // Bind mount /shared into the chroot
-    let shared_mount = rootfs.join("shared");
-    let _ = tokio::fs::create_dir_all(&shared_mount).await;
-    let _ = tokio::fs::create_dir_all("/var/lib/dd/shared").await;
-    let _ = Command::new("mount")
-        .arg("--bind")
-        .arg("/var/lib/dd/shared")
-        .arg(&shared_mount)
-        .status()
-        .await;
-
-    // Copy resolv.conf for DNS
-    let resolv_src = Path::new("/etc/resolv.conf");
-    let resolv_dst = rootfs.join("etc/resolv.conf");
-    if resolv_src.exists() {
-        let _ = tokio::fs::copy(resolv_src, resolv_dst).await;
-    }
-
-    Ok(())
 }
 
 /// Kill a process by PID.
