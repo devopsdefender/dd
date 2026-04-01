@@ -115,7 +115,6 @@ jobs:
           DD_GITHUB_CALLBACK_URL: ${{ vars.DD_GITHUB_CALLBACK_URL }}
           DD_GITHUB_CLIENT_SECRET: ${{ secrets.DD_GITHUB_CLIENT_SECRET }}
           BINARY_URL: ${{ needs.build.outputs.binary_url }}
-          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
         run: |
           set -euo pipefail
           VM_NAME="dd-staging-$(date +%s)"
@@ -151,6 +150,17 @@ jobs:
           export DD_BOOT_APP=demo
 
           nohup /usr/local/bin/dd-agent > /var/log/dd-agent.log 2>&1 &
+
+          # Start scraper process (discovers agents from CF, reports to register)
+          sleep 5
+          DD_AGENT_MODE=scraper \
+          DD_CF_API_TOKEN=${CLOUDFLARE_API_TOKEN} \
+          DD_CF_ACCOUNT_ID=${CLOUDFLARE_ACCOUNT_ID} \
+          DD_CF_ZONE_ID=${CLOUDFLARE_ZONE_ID} \
+          DD_CF_DOMAIN=${DD_DOMAIN} \
+          DD_ENV=staging \
+          DD_REGISTER_URL=ws://localhost:8080/scraper \
+          nohup /usr/local/bin/dd-agent > /var/log/dd-scraper.log 2>&1 &
           STARTUP
 
           gcloud compute instances create "$VM_NAME" \

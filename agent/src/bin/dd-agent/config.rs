@@ -8,6 +8,7 @@ use std::path::PathBuf;
 pub enum AgentMode {
     Agent,
     Register,
+    Scraper,
     ControlPlane,
     Measure,
 }
@@ -17,6 +18,7 @@ impl AgentMode {
         match s.to_lowercase().replace('_', "-").as_str() {
             "agent" => Some(Self::Agent),
             "register" => Some(Self::Register),
+            "scraper" => Some(Self::Scraper),
             "control-plane" | "controlplane" | "cp" => Some(Self::ControlPlane),
             "measure" => Some(Self::Measure),
             _ => None,
