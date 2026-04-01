@@ -41,15 +41,17 @@ pub struct TunnelInfo {
 const CF_API: &str = "https://api.cloudflare.com/client/v4";
 
 /// Create a CF tunnel for an agent, configure ingress, create DNS CNAME.
-/// If `hostname_override` is set, use it instead of `{vm_name}.{domain}`.
+/// Tunnel name uses agent_id (UUID) to guarantee uniqueness.
+/// DD_HOSTNAME controls the public DNS name users see.
 pub async fn create_agent_tunnel(
     client: &reqwest::Client,
     cf: &CfConfig,
-    owner: &str,
+    agent_id: &str,
     vm_name: &str,
 ) -> Result<TunnelInfo, String> {
     let hostname_override = std::env::var("DD_HOSTNAME").ok().filter(|s| !s.is_empty());
-    let tunnel_name = format!("dd-{owner}-{vm_name}");
+    let env_label = std::env::var("DD_ENV").unwrap_or_else(|_| "dev".into());
+    let tunnel_name = format!("dd-{env_label}-{agent_id}");
     let tunnel_secret = uuid::Uuid::new_v4().to_string().replace('-', "");
     let hostname = hostname_override.unwrap_or_else(|| format!("{vm_name}.{}", cf.domain));
 
@@ -175,13 +177,13 @@ pub async fn delete_dns_record(
 pub async fn remove_agent(
     client: &reqwest::Client,
     cf: &CfConfig,
-    owner: &str,
-    vm_name: &str,
+    agent_id: &str,
+    hostname: &str,
 ) -> Result<(), String> {
-    let tunnel_name = format!("dd-{owner}-{vm_name}");
-    let hostname = format!("{vm_name}.{}", cf.domain);
+    let env_label = std::env::var("DD_ENV").unwrap_or_else(|_| "dev".into());
+    let tunnel_name = format!("dd-{env_label}-{agent_id}");
     delete_tunnel_by_name(client, cf, &tunnel_name).await?;
-    delete_dns_record(client, cf, &hostname).await?;
+    delete_dns_record(client, cf, hostname).await?;
     Ok(())
 }
 
