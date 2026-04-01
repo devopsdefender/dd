@@ -99,17 +99,22 @@ pub async fn pull_image(image: &str, app_name: &str) -> Result<ImageConfig, Stri
 }
 
 /// Spawn a workload process from a pulled image using chroot.
+/// Mounts /proc, /sys, /dev into the rootfs for a functional environment.
 pub async fn spawn_workload(
     app_name: &str,
     config: &ImageConfig,
     extra_env: Vec<String>,
     tty: bool,
 ) -> Result<Child, String> {
-    let rootfs = PathBuf::from(WORKLOADS_DIR).join(app_name).join("rootfs");
+    // oci-unpack extracts layers directly into the target dir (no rootfs/ subdir)
+    let rootfs = PathBuf::from(WORKLOADS_DIR).join(app_name);
 
-    if !rootfs.exists() {
-        return Err(format!("rootfs not found: {}", rootfs.display()));
+    if !rootfs.join("bin").exists() && !rootfs.join("usr").exists() {
+        return Err(format!("rootfs not found at {}", rootfs.display()));
     }
+
+    // Mount essential filesystems into the chroot
+    setup_chroot_mounts(&rootfs).await?;
 
     // Entrypoint + cmd
     let mut args: Vec<String> = config.entrypoint.clone();
@@ -136,37 +141,35 @@ pub async fn spawn_workload(
     env_map
         .entry("PATH".into())
         .or_insert_with(|| "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".into());
+    env_map
+        .entry("HOME".into())
+        .or_insert_with(|| "/root".into());
+    env_map
+        .entry("TERM".into())
+        .or_insert_with(|| "xterm-256color".into());
 
     // Ensure log directory exists
     let _ = tokio::fs::create_dir_all("/var/lib/dd/workloads/logs").await;
 
+    // Build the chroot command
+    let chroot_cmd = format!("chroot {} {} {}", rootfs.display(), program, args.join(" "));
+
     let mut cmd = if tty {
-        // Use script(1) to allocate a PTY for interactive workloads
         let mut c = Command::new("script");
-        c.arg("-qfc"); // quiet, flush, command
-        c.arg(format!(
-            "chroot {} {} {}",
-            rootfs.display(),
-            program,
-            args.join(" ")
-        ));
-        c.arg("/dev/null"); // typescript output (discard)
+        c.arg("-qfc");
+        c.arg(&chroot_cmd);
+        c.arg("/dev/null");
         c
     } else {
-        let mut c = Command::new("chroot");
-        c.arg(rootfs.as_os_str());
-        c.arg(&program);
-        c.args(&args);
+        let mut c = Command::new("sh");
+        c.arg("-c");
+        c.arg(&chroot_cmd);
         c
     };
 
     cmd.env_clear();
     for (k, v) in &env_map {
         cmd.env(k, v);
-    }
-    // script needs TERM set
-    if tty {
-        cmd.env("TERM", "xterm-256color");
     }
 
     cmd.stdin(if tty {
@@ -223,6 +226,66 @@ pub async fn spawn_command(program: &str, args: &[&str], tty: bool) -> Result<Ch
         child.id().unwrap_or(0)
     );
     Ok(child)
+}
+
+/// Mount /proc, /sys, /dev into a chroot rootfs.
+async fn setup_chroot_mounts(rootfs: &Path) -> Result<(), String> {
+    let mounts = [
+        ("proc", "proc", "/proc"),
+        ("sysfs", "sysfs", "/sys"),
+        ("devtmpfs", "devtmpfs", "/dev"),
+        ("devpts", "devpts", "/dev/pts"),
+        ("tmpfs", "tmpfs", "/tmp"),
+        ("tmpfs", "tmpfs", "/run"),
+    ];
+
+    for (fstype, src, target) in &mounts {
+        let mount_point = rootfs.join(target.trim_start_matches('/'));
+        let _ = tokio::fs::create_dir_all(&mount_point).await;
+
+        // Skip if already mounted
+        let status = Command::new("mountpoint")
+            .arg("-q")
+            .arg(&mount_point)
+            .status()
+            .await;
+        if matches!(status, Ok(s) if s.success()) {
+            continue;
+        }
+
+        let result = Command::new("mount")
+            .arg("-t")
+            .arg(fstype)
+            .arg(src)
+            .arg(&mount_point)
+            .status()
+            .await
+            .map_err(|e| format!("mount {target}: {e}"))?;
+
+        if !result.success() {
+            eprintln!("dd-agent: warning: failed to mount {target} in chroot (non-fatal)");
+        }
+    }
+
+    // Bind mount /shared into the chroot
+    let shared_mount = rootfs.join("shared");
+    let _ = tokio::fs::create_dir_all(&shared_mount).await;
+    let _ = tokio::fs::create_dir_all("/var/lib/dd/shared").await;
+    let _ = Command::new("mount")
+        .arg("--bind")
+        .arg("/var/lib/dd/shared")
+        .arg(&shared_mount)
+        .status()
+        .await;
+
+    // Copy resolv.conf for DNS
+    let resolv_src = Path::new("/etc/resolv.conf");
+    let resolv_dst = rootfs.join("etc/resolv.conf");
+    if resolv_src.exists() {
+        let _ = tokio::fs::copy(resolv_src, resolv_dst).await;
+    }
+
+    Ok(())
 }
 
 /// Kill a process by PID.
