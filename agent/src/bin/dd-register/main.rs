@@ -160,14 +160,15 @@ async fn handle_registration(socket: WebSocket, cf: CfConfig) {
 
     // Create CF tunnel
     let client = reqwest::Client::new();
-    let tunnel_info =
-        match tunnel::create_agent_tunnel(&client, &cf, &reg.owner, &reg.vm_name).await {
-            Ok(info) => info,
-            Err(e) => {
-                eprintln!("dd-register: tunnel creation failed: {e}");
-                return;
-            }
-        };
+    let agent_id = uuid::Uuid::new_v4().to_string();
+    let tunnel_info = match tunnel::create_agent_tunnel(&client, &cf, &agent_id, &reg.vm_name).await
+    {
+        Ok(info) => info,
+        Err(e) => {
+            eprintln!("dd-register: tunnel creation failed: {e}");
+            return;
+        }
+    };
 
     eprintln!(
         "dd-register: tunnel created — hostname={}",

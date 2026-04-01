@@ -87,7 +87,7 @@ jobs:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.DD_CP_CF_ACCOUNT_ID }}
         run: |
           tunnels=$(curl -sf "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/cfd_tunnel?is_deleted=false" \
-            -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" | jq -r '.result[] | select(.name | startswith("dd-devopsdefender-dd-staging-")) | .id') || true
+            -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" | jq -r '.result[] | select(.name | startswith("dd-staging-")) | .id') || true
           for id in $tunnels; do
             echo "Deleting tunnel: $id"
             curl -sf -X DELETE "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/cfd_tunnel/${id}/connections" \
@@ -136,6 +136,7 @@ jobs:
           chmod +x /usr/local/bin/dd-agent
 
           export DD_OWNER=devopsdefender
+          export DD_ENV=staging
           export DD_CF_API_TOKEN=${CLOUDFLARE_API_TOKEN}
           export DD_CF_ACCOUNT_ID=${CLOUDFLARE_ACCOUNT_ID}
           export DD_CF_ZONE_ID=${CLOUDFLARE_ZONE_ID}
