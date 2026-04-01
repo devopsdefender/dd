@@ -646,8 +646,8 @@ async fn register_via_noise(
     let keypair = dd_agent::noise::generate_keypair()?;
     let attestation = build_attestation(vm_name, backend);
 
-    // Connect via WebSocket
-    let ws_url = format!("ws://{register_url}/register");
+    // Connect via WebSocket — DD_REGISTER_URL is already a full URL like wss://host/register
+    let ws_url = register_url.to_string();
     let (ws_stream, _) = tokio_tungstenite::connect_async(&ws_url)
         .await
         .map_err(|e| format!("ws connect to {ws_url}: {e}"))?;
