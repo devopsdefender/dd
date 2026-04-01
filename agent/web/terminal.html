@@ -2,150 +2,370 @@
 <html>
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>DD Terminal</title>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.min.css">
 <style>
-  body { margin: 0; background: #1e1e2e; display: flex; flex-direction: column; height: 100vh; }
-  #status { color: #a6adc8; font-family: monospace; padding: 8px 12px; font-size: 13px; }
-  #status .ok { color: #a6e3a1; }
-  #status .err { color: #f38ba8; }
-  #status .warn { color: #f9e2af; }
-  #attestation { color: #89b4fa; font-family: monospace; padding: 0 12px 8px; font-size: 12px; display: none; }
-  #terminal { flex: 1; }
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background: #fff;
+    color: #111827;
+    font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  }
+
+  main {
+    min-height: 100dvh;
+    width: min(960px, 100%);
+    margin: 0 auto;
+    padding: 12px;
+    display: grid;
+    grid-template-rows: auto auto 1fr auto;
+    gap: 12px;
+  }
+
+  header {
+    display: grid;
+    gap: 6px;
+  }
+
+  h1 {
+    margin: 0;
+    font-size: 24px;
+    line-height: 1.05;
+    word-break: break-word;
+  }
+
+  p, a, input, button {
+    font-size: 0.95rem;
+  }
+
+  .row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+
+  a {
+    color: #1d4ed8;
+    text-decoration-thickness: 1px;
+  }
+
+  .muted {
+    color: #4b5563;
+  }
+
+  form {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    gap: 8px;
+  }
+
+  input,
+  button {
+    font: inherit;
+  }
+
+  input {
+    width: 100%;
+    min-width: 0;
+    height: 42px;
+    padding: 0 12px;
+    border: 1px solid #d1d5db;
+    background: #fff;
+    color: inherit;
+  }
+
+  button {
+    height: 42px;
+    padding: 0 14px;
+    border: 1px solid #d1d5db;
+    background: #fff;
+    color: inherit;
+  }
+
+  button.primary,
+  button:focus-visible {
+    background: #1d4ed8;
+    border-color: #1d4ed8;
+    color: #fff;
+  }
+
+  .terminal {
+    border: 1px solid #d1d5db;
+    overflow: hidden;
+  }
+
+  .terminal-frame {
+    min-height: min(68dvh, 720px);
+    padding: 10px;
+    background: #111827;
+  }
+
+  #terminal {
+    height: min(68dvh, 700px);
+  }
+
+  .controls {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+
+  .controls button {
+    min-width: 72px;
+  }
+
+  @media (min-width: 720px) {
+    main { padding: 20px; }
+    .terminal-frame { min-height: 72dvh; }
+    #terminal { height: 72dvh; }
+  }
 </style>
 </head>
 <body>
-<div id="status">connecting...</div>
-<div id="attestation"></div>
-<div id="terminal"></div>
+<main>
+  <header>
+    <a id="homeLink" href="/">Back to admin</a>
+    <h1 id="appName">Session</h1>
+    <div class="row">
+      <strong id="status">Waiting</strong>
+      <span class="muted" id="detail">Enter a GitHub token to attach to this container.</span>
+    </div>
+    <p class="muted" id="attestation"></p>
+  </header>
+
+  <section>
+    <form id="tokenForm">
+      <input id="tokenInput" type="password" placeholder="GitHub token" autocomplete="off" autocapitalize="none" spellcheck="false">
+      <button type="submit" class="primary" id="connectButton">Connect</button>
+    </form>
+  </section>
+
+  <section class="terminal">
+    <div class="terminal-frame" id="terminalFrame">
+      <div id="terminal"></div>
+    </div>
+  </section>
+
+  <nav class="controls">
+    <button type="button" class="primary" id="keyboardButton">Keyboard</button>
+    <button type="button" data-send="\u0003">Ctrl+C</button>
+    <button type="button" data-send="\t">Tab</button>
+    <button type="button" data-send="\u001b">Esc</button>
+    <button type="button" id="clearButton">Clear</button>
+  </nav>
+</main>
 
 <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.min.js"></script>
 <script>
-// DD Terminal — End-to-end encrypted session via Noise protocol over WebSocket.
-//
-// Flow:
-// 1. WebSocket connects to agent
-// 2. Noise_XX handshake over WebSocket binary frames
-//    - Browser is initiator, agent is responder
-//    - Agent sends attestation (TDX quote etc.) as handshake payload
-// 3. After handshake: all terminal I/O is Noise-encrypted
-//    - Keystrokes → encrypt → WebSocket → agent decrypts → container stdin
-//    - Container stdout → agent encrypts → WebSocket → browser decrypts → xterm.js
-//
-// Currently uses plaintext JSON while noise-c.wasm integration is pending.
-// The WebSocket handler on the agent side supports both modes:
-// - Binary frames = Noise-encrypted (future)
-// - Text frames = plaintext JSON (current, TLS via CF tunnel provides transport security)
+const path = window.location.pathname;
+const appName = decodeURIComponent(path.split('/session/')[1] || '');
+const params = new URLSearchParams(window.location.search);
+
+const homeLink = document.getElementById('homeLink');
+const appNameEl = document.getElementById('appName');
+const statusEl = document.getElementById('status');
+const detailEl = document.getElementById('detail');
+const attestationEl = document.getElementById('attestation');
+const tokenForm = document.getElementById('tokenForm');
+const tokenInput = document.getElementById('tokenInput');
+const keyboardButton = document.getElementById('keyboardButton');
+const clearButton = document.getElementById('clearButton');
+const terminalFrame = document.getElementById('terminalFrame');
+
+appNameEl.textContent = appName || 'Shell';
 
 const term = new Terminal({
   cursorBlink: true,
-  theme: { background: '#1e1e2e', foreground: '#cdd6f4', cursor: '#f5e0dc' },
-  fontFamily: 'JetBrains Mono, Menlo, monospace',
-  fontSize: 14,
+  fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+  fontSize: 15,
+  scrollback: 3000,
+  theme: {
+    background: '#101828',
+    foreground: '#f8fafc',
+    cursor: '#f8fafc',
+  },
 });
+
 const fitAddon = new FitAddon.FitAddon();
 term.loadAddon(fitAddon);
 term.open(document.getElementById('terminal'));
-fitAddon.fit();
-window.addEventListener('resize', () => fitAddon.fit());
 
-const status = document.getElementById('status');
-const attestationEl = document.getElementById('attestation');
-
-// Parse app name and token from URL
-const path = window.location.pathname;
-const appName = path.split('/session/')[1] || '';
-const params = new URLSearchParams(window.location.search);
-let token = params.get('token') || localStorage.getItem('dd_token');
-
-if (!token) {
-  token = prompt('GitHub token (from: gh auth token)');
-  if (token) localStorage.setItem('dd_token', token);
-}
-
-if (!token) {
-  status.innerHTML = '<span class="err">no token provided</span>';
-  throw new Error('no token');
-}
-
-// Connect WebSocket with token
-const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-const wsUrl = `${proto}//${window.location.host}/ws/session/${appName}?token=${encodeURIComponent(token)}`;
-
-status.innerHTML = `connecting to <span class="ok">${appName || 'shell'}</span>...`;
-
-const ws = new WebSocket(wsUrl);
-
-ws.onopen = () => {
-  status.innerHTML = `handshake with <span class="ok">${appName}</span>...`;
-  // Future: initiate Noise_XX handshake here
-  // For now, the agent auto-attaches on WebSocket connect
-};
-
-ws.onmessage = (event) => {
-  try {
-    const text = typeof event.data === 'string' ? event.data : new TextDecoder().decode(event.data);
-    const msg = JSON.parse(text);
-
-    switch (msg.type) {
-      case 'stdout':
-      case 'stderr': {
-        const output = typeof msg.data === 'string'
-          ? msg.data
-          : String.fromCharCode(...msg.data);
-        term.write(output);
-        break;
-      }
-      case 'ok':
-        if (msg.status) {
-          status.innerHTML = `<span class="ok">${msg.status}</span>`;
-        }
-        // Show attestation info if present
-        if (msg.attestation_type) {
-          attestationEl.style.display = 'block';
-          attestationEl.textContent = `attestation: ${msg.attestation_type}`;
-          if (msg.attestation_type === 'tdx') {
-            attestationEl.textContent += ' (hardware-verified enclave)';
-          }
-        }
-        term.focus();
-        break;
-      case 'error':
-        status.innerHTML = `<span class="err">${msg.message}</span>`;
-        break;
-      case 'attestation':
-        // Future: verify TDX quote client-side
-        attestationEl.style.display = 'block';
-        attestationEl.textContent = `attestation: ${msg.attestation_type || 'unknown'}`;
-        if (msg.vm_name) attestationEl.textContent += ` (${msg.vm_name})`;
-        break;
+function fitTerminal() {
+  requestAnimationFrame(() => {
+    try {
+      fitAddon.fit();
+    } catch (_) {
+      // xterm throws if the container is temporarily hidden or not yet measurable.
     }
-  } catch {
-    // Raw text fallback
-    const text = typeof event.data === 'string' ? event.data : new TextDecoder().decode(event.data);
-    term.write(text);
-  }
-};
+  });
+}
 
-ws.onclose = () => {
-  status.innerHTML = '<span class="err">disconnected</span>';
-  term.write('\r\n[session ended]\r\n');
-};
+fitTerminal();
+window.addEventListener('resize', fitTerminal);
+if (window.visualViewport) {
+  window.visualViewport.addEventListener('resize', fitTerminal);
+}
 
-ws.onerror = () => {
-  status.innerHTML = '<span class="err">connection error</span>';
-};
+function setStatus(tone, text, detail) {
+  statusEl.textContent = text;
+  statusEl.style.color =
+    tone === 'ok' ? '#166534' :
+    tone === 'warn' ? '#92400e' :
+    tone === 'err' ? '#991b1b' :
+    '#111827';
+  detailEl.textContent = detail || '';
+}
 
-// Terminal input → agent (will be Noise-encrypted in future)
-term.onData((data) => {
-  if (ws.readyState === WebSocket.OPEN) {
+function setAttestation(text) {
+  attestationEl.textContent = text || '';
+}
+
+function updateHomeLink(token) {
+  const url = new URL('/', window.location.origin);
+  if (token) url.searchParams.set('token', token);
+  homeLink.href = url.pathname + url.search;
+}
+
+function focusTerminal() {
+  term.focus();
+  fitTerminal();
+}
+
+let token = params.get('token') || localStorage.getItem('dd_token') || '';
+let ws = null;
+
+if (token) {
+  tokenInput.value = token;
+  localStorage.setItem('dd_token', token);
+}
+
+updateHomeLink(token);
+
+function sendInput(data) {
+  if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({
       type: 'stdin',
-      data: Array.from(new TextEncoder().encode(data))
+      data: Array.from(new TextEncoder().encode(data)),
     }));
   }
+}
+
+function connect(nextToken) {
+  if (!nextToken) {
+    setStatus('err', 'Token required', 'Enter a GitHub token to attach to this container.');
+    tokenInput.focus();
+    return;
+  }
+
+  token = nextToken;
+  localStorage.setItem('dd_token', token);
+  updateHomeLink(token);
+
+  if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+    ws.close();
+  }
+
+  setStatus('warn', 'Connecting', `Opening ${appName || 'shell'} session...`);
+  setAttestation('');
+
+  const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const wsUrl = `${proto}//${window.location.host}/ws/session/${encodeURIComponent(appName)}?token=${encodeURIComponent(token)}`;
+  ws = new WebSocket(wsUrl);
+
+  ws.onopen = () => {
+    setStatus('warn', 'Handshake', 'Waiting for the shell to become ready...');
+  };
+
+  ws.onmessage = (event) => {
+    try {
+      const text = typeof event.data === 'string' ? event.data : new TextDecoder().decode(event.data);
+      const msg = JSON.parse(text);
+
+      switch (msg.type) {
+        case 'stdout':
+        case 'stderr': {
+          const output = typeof msg.data === 'string'
+            ? msg.data
+            : String.fromCharCode(...msg.data);
+          term.write(output);
+          break;
+        }
+        case 'ok':
+          setStatus('ok', msg.status || 'Connected', 'Session ready.');
+          if (msg.attestation_type) {
+            let label = `attestation: ${msg.attestation_type}`;
+            if (msg.attestation_type === 'tdx') label += ' (hardware-verified enclave)';
+            setAttestation(label);
+          }
+          focusTerminal();
+          break;
+        case 'error':
+          setStatus('err', 'Error', msg.message || 'Session error.');
+          break;
+        case 'attestation': {
+          let label = `attestation: ${msg.attestation_type || 'unknown'}`;
+          if (msg.vm_name) label += ` (${msg.vm_name})`;
+          setAttestation(label);
+          break;
+        }
+      }
+    } catch (_) {
+      const text = typeof event.data === 'string' ? event.data : new TextDecoder().decode(event.data);
+      term.write(text);
+    }
+  };
+
+  ws.onclose = () => {
+    setStatus('err', 'Disconnected', 'Session ended.');
+    term.write('\r\n[session ended]\r\n');
+  };
+
+  ws.onerror = () => {
+    setStatus('err', 'Connection error', 'Check the token and whether the container is still running.');
+  };
+}
+
+tokenForm.addEventListener('submit', (event) => {
+  event.preventDefault();
+  connect(tokenInput.value.trim());
 });
+
+term.onData((data) => {
+  sendInput(data);
+});
+
+terminalFrame.addEventListener('click', focusTerminal);
+keyboardButton.addEventListener('click', () => {
+  if (!tokenInput.value.trim()) {
+    tokenInput.focus();
+    return;
+  }
+  focusTerminal();
+});
+
+for (const button of document.querySelectorAll('[data-send]')) {
+  button.addEventListener('click', () => {
+    focusTerminal();
+    sendInput(button.dataset.send);
+  });
+}
+
+clearButton.addEventListener('click', () => {
+  term.clear();
+  focusTerminal();
+});
+
+if (token) {
+  setStatus('warn', 'Connecting', `Opening ${appName || 'shell'} session...`);
+  connect(token);
+} else {
+  setStatus('idle', 'Waiting', 'Enter a GitHub token to attach to this container.');
+}
 </script>
 </body>
 </html>

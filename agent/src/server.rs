@@ -688,25 +688,33 @@ async fn dashboard(
     let metrics = collect_metrics().await;
     let deps = state.deployments.lock().await;
     let mut rows = String::new();
+    let session_query = query
+        .token
+        .as_deref()
+        .map(|token| format!("?token={token}"))
+        .unwrap_or_default();
     for d in deps.values() {
-        let status_color = match d.status.as_str() {
-            "running" => "#a6e3a1",
-            "deploying" => "#f9e2af",
-            "failed" | "exited" => "#f38ba8",
-            _ => "#a6adc8",
+        let status_class = match d.status.as_str() {
+            "running" => "running",
+            "deploying" => "deploying",
+            "failed" | "exited" => "failed",
+            _ => "idle",
         };
         let terminal_link = if d.status == "running" {
-            format!(r#"<a href="/session/{}">terminal</a>"#, d.app_name)
+            format!(
+                r#"<a class="action-link" href="/session/{}{}">open session</a>"#,
+                d.app_name, session_query
+            )
         } else {
-            String::new()
+            r#"<span class="muted">unavailable</span>"#.to_string()
         };
         rows.push_str(&format!(
             r#"<tr>
-                <td>{}</td>
-                <td><span style="color:{status_color}">{}</span></td>
-                <td>{}</td>
-                <td>{}</td>
-                <td>{terminal_link}</td>
+                <td data-label="App"><span class="app-name">{}</span></td>
+                <td data-label="Status"><span class="status-pill {status_class}">{}</span></td>
+                <td data-label="Image"><span class="image-name">{}</span></td>
+                <td data-label="Started">{}</td>
+                <td data-label="Session" class="actions">{terminal_link}</td>
             </tr>"#,
             d.app_name,
             d.status,
@@ -729,60 +737,197 @@ async fn dashboard(
 <html>
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>DD — {vm_name}</title>
 <style>
-  body {{ margin: 0; background: #1e1e2e; color: #cdd6f4; font-family: 'JetBrains Mono', monospace; padding: 24px; }}
-  h1 {{ color: #89b4fa; margin: 0 0 4px; font-size: 20px; }}
-  .subtitle {{ color: #585b70; font-size: 12px; margin-bottom: 16px; }}
-  .meta {{ color: #a6adc8; font-size: 13px; margin-bottom: 20px; }}
-  .meta .ok {{ color: #a6e3a1; }}
-  .metrics {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin-bottom: 24px; }}
-  .metric {{ background: #313244; border-radius: 8px; padding: 12px 16px; }}
-  .metric .label {{ color: #a6adc8; font-size: 11px; text-transform: uppercase; }}
-  .metric .value {{ color: #cdd6f4; font-size: 18px; font-weight: bold; margin-top: 4px; }}
-  .metric .bar {{ background: #45475a; border-radius: 4px; height: 4px; margin-top: 8px; }}
-  .metric .bar-fill {{ background: #89b4fa; border-radius: 4px; height: 4px; }}
-  .section {{ color: #a6adc8; font-size: 12px; text-transform: uppercase; margin: 20px 0 8px; }}
-  table {{ border-collapse: collapse; width: 100%; }}
-  th {{ text-align: left; color: #a6adc8; font-weight: normal; font-size: 12px; text-transform: uppercase; padding: 8px 12px; border-bottom: 1px solid #313244; }}
-  td {{ padding: 8px 12px; border-bottom: 1px solid #313244; font-size: 14px; }}
-  a {{ color: #89b4fa; text-decoration: none; }}
-  a:hover {{ text-decoration: underline; }}
-  .empty {{ color: #585b70; padding: 24px; text-align: center; }}
+  * {{ box-sizing: border-box; }}
+  body {{
+    margin: 0;
+    color: #111827;
+    font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    background: #fff;
+  }}
+  main {{
+    width: min(960px, 100%);
+    margin: 0 auto;
+    padding: 16px;
+  }}
+  header, section {{
+    margin-top: 18px;
+  }}
+  header {{
+    margin-top: 0;
+  }}
+  h1, h2, p {{
+    margin: 0;
+  }}
+  h1 {{
+    font-size: clamp(2rem, 6vw, 2.5rem);
+    line-height: 1.1;
+  }}
+  h2 {{
+    font-size: 1rem;
+  }}
+  p, li, td, th, a, code {{
+    font-size: 0.95rem;
+    line-height: 1.45;
+  }}
+  ul {{
+    margin: 12px 0 0;
+    padding-left: 1.2rem;
+  }}
+  .muted {{
+    color: #4b5563;
+  }}
+  .metrics {{
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 12px;
+    margin-top: 14px;
+  }}
+  .metric {{
+    border: 1px solid #d1d5db;
+    padding: 12px;
+  }}
+  .metric strong {{
+    display: block;
+    font-size: 1.25rem;
+    margin-top: 4px;
+  }}
+  .status {{
+    font-weight: 700;
+  }}
+  .status.running {{ color: #166534; }}
+  .status.deploying {{ color: #92400e; }}
+  .status.failed {{ color: #991b1b; }}
+  .status.idle {{ color: #4b5563; }}
+  .table-wrap {{ overflow-x: auto; }}
+  table {{
+    width: 100%;
+    border-collapse: collapse;
+    margin-top: 12px;
+  }}
+  thead {{
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
+  }}
+  tbody, tr {{ display: block; }}
+  tr {{
+    border-top: 1px solid #e5e7eb;
+    padding: 10px 0;
+  }}
+  td {{
+    display: grid;
+    grid-template-columns: minmax(76px, 90px) minmax(0, 1fr);
+    gap: 12px;
+    align-items: center;
+    padding: 6px 0;
+  }}
+  td::before {{
+    content: attr(data-label);
+    color: #4b5563;
+    font-size: 0.75rem;
+    font-weight: 700;
+    text-transform: uppercase;
+  }}
+  .actions {{ align-items: start; }}
+  a {{
+    color: #1d4ed8;
+    text-decoration-thickness: 1px;
+  }}
+  .empty {{
+    margin-top: 12px;
+    padding-top: 12px;
+    border-top: 1px solid #e5e7eb;
+  }}
+  code {{ font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }}
+  @media (min-width: 720px) {{
+    main {{ padding: 24px; }}
+    .metrics {{ grid-template-columns: repeat(4, minmax(0, 1fr)); }}
+  }}
+  @media (min-width: 840px) {{
+    thead {{
+      position: static;
+      width: auto;
+      height: auto;
+      margin: 0;
+      overflow: visible;
+      clip: auto;
+      white-space: normal;
+    }}
+    tbody {{ display: table-row-group; }}
+    tr {{
+      display: table-row;
+      padding: 0;
+    }}
+    th {{
+      padding: 0 0 10px;
+      text-align: left;
+      color: #4b5563;
+      font-size: 0.75rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      border-bottom: 1px solid #d1d5db;
+    }}
+    td {{
+      display: table-cell;
+      padding: 12px 0;
+      border-bottom: 1px solid #e5e7eb;
+      vertical-align: middle;
+    }}
+    td::before {{ display: none; }}
+    .actions {{ text-align: right; }}
+  }}
 </style>
 </head>
 <body>
-<h1>DevOps Defender</h1>
-<div class="subtitle">{agent_id}</div>
-<div class="meta">
-  {vm_name} &middot; <span class="ok">healthy</span> &middot; {att} &middot; owner: {owner} &middot; uptime {uptime}
-</div>
+<main>
+  <header>
+    <h1>DevOps Defender</h1>
+    <p class="muted">{agent_id}</p>
+    <ul>
+      <li>vm: <strong>{vm_name}</strong></li>
+      <li>health: <strong>healthy</strong></li>
+      <li>attestation: <strong>{att}</strong></li>
+      <li>owner: <strong>{owner}</strong></li>
+      <li>uptime: <strong>{uptime}</strong></li>
+    </ul>
+    <div class="metrics">
+      <div class="metric">
+        <div>CPU</div>
+        <strong>{cpu_pct}%</strong>
+        <div class="muted">live host utilization</div>
+      </div>
+      <div class="metric">
+        <div>Memory</div>
+        <strong>{mem_used}</strong>
+        <div class="muted">{mem_used} of {mem_total}</div>
+      </div>
+      <div class="metric">
+        <div>Disk</div>
+        <strong>{disk_used}</strong>
+        <div class="muted">{disk_used} of {disk_total}</div>
+      </div>
+      <div class="metric">
+        <div>Load</div>
+        <strong>{load_1m}</strong>
+        <div class="muted">normalized over CPUs</div>
+      </div>
+    </div>
+  </header>
 
-<div class="metrics">
-  <div class="metric">
-    <div class="label">CPU</div>
-    <div class="value">{cpu_pct}%</div>
-    <div class="bar"><div class="bar-fill" style="width:{cpu_pct}%"></div></div>
-  </div>
-  <div class="metric">
-    <div class="label">Memory</div>
-    <div class="value">{mem_used} / {mem_total}</div>
-    <div class="bar"><div class="bar-fill" style="width:{mem_pct}%"></div></div>
-  </div>
-  <div class="metric">
-    <div class="label">Disk</div>
-    <div class="value">{disk_used} / {disk_total}</div>
-    <div class="bar"><div class="bar-fill" style="width:{disk_pct}%"></div></div>
-  </div>
-  <div class="metric">
-    <div class="label">Load</div>
-    <div class="value">{load_1m}</div>
-    <div class="bar"><div class="bar-fill" style="width:{load_pct}%"></div></div>
-  </div>
-</div>
-
-<div class="section">Jobs ({count})</div>
-{table}
+  <section>
+    <h2>Jobs ({count})</h2>
+    {table}
+  </section>
+</main>
 </body>
 </html>"#,
         vm_name = state.vm_name,
@@ -794,20 +939,19 @@ async fn dashboard(
         cpu_pct = metrics.cpu_pct,
         mem_used = metrics.mem_used,
         mem_total = metrics.mem_total,
-        mem_pct = metrics.mem_pct,
         disk_used = metrics.disk_used,
         disk_total = metrics.disk_total,
-        disk_pct = metrics.disk_pct,
         load_1m = metrics.load_1m,
-        load_pct = metrics.load_pct,
         table = if deps.is_empty() {
             r#"<div class="empty">no jobs running &mdash; deploy something with <code>dd deploy</code></div>"#.to_string()
         } else {
             format!(
-                r#"<table>
-<tr><th>app</th><th>status</th><th>image</th><th>started</th><th></th></tr>
+                r#"<div class="table-wrap"><table>
+<thead><tr><th>app</th><th>status</th><th>image</th><th>started</th><th>session</th></tr></thead>
+<tbody>
 {rows}
-</table>"#
+</tbody>
+</table></div>"#
             )
         },
     )))
