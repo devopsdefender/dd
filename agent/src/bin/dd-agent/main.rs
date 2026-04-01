@@ -261,6 +261,7 @@ async fn run_agent_mode(cfg: AgentRuntimeConfig) {
                 last_seen: now,
                 status: "healthy".into(),
                 deployment_count: 0,
+                deployment_names: Vec::new(),
                 cpu_percent: 0,
                 memory_used_mb: 0,
                 memory_total_mb: 0,
@@ -279,10 +280,15 @@ async fn run_agent_mode(cfg: AgentRuntimeConfig) {
         .await
         .expect("failed to bind HTTP server");
 
-    // Monitoring loop (process liveness)
+    // Monitoring loop (process liveness + self-update in register mode)
     let monitor_deps = deployments.clone();
+    let monitor_registry = if register_mode {
+        Some((state.agent_registry.clone(), state.agent_id.clone()))
+    } else {
+        None
+    };
     tokio::spawn(async move {
-        monitoring_loop(monitor_deps).await;
+        monitoring_loop(monitor_deps, monitor_registry).await;
     });
 
     // Run HTTP server until shutdown
@@ -499,6 +505,7 @@ async fn connect_and_scrape(
                         "cpu_percent": h.get("cpu_percent").and_then(|v| v.as_u64()),
                         "memory_used_mb": h.get("memory_used_mb").and_then(|v| v.as_u64()),
                         "memory_total_mb": h.get("memory_total_mb").and_then(|v| v.as_u64()),
+                        "deployments": h.get("deployments"),
                     }));
                 }
             } else {
@@ -717,7 +724,10 @@ async fn register_via_noise(
 
 // ── Monitoring loop — check process liveness by PID ─────────────────────
 
-async fn monitoring_loop(deployments: Deployments) {
+async fn monitoring_loop(
+    deployments: Deployments,
+    self_registry: Option<(dd_agent::server::AgentRegistry, String)>,
+) {
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
     loop {
         interval.tick().await;
@@ -730,15 +740,37 @@ async fn monitoring_loop(deployments: Deployments) {
                 .collect()
         };
 
-        for (dep_id, pid) in entries {
+        for (dep_id, pid) in &entries {
             if let Some(pid) = pid {
-                if !dd_agent::process::is_running(pid) {
+                if !dd_agent::process::is_running(*pid) {
                     eprintln!("dd-agent: deployment {dep_id} process gone (pid {pid})");
                     let mut deps = deployments.lock().await;
-                    if let Some(info) = deps.get_mut(&dep_id) {
+                    if let Some(info) = deps.get_mut(dep_id) {
                         info.status = "exited".into();
                     }
                 }
+            }
+        }
+
+        // In register mode, update own entry with current metrics
+        if let Some((ref registry, ref self_id)) = self_registry {
+            let deps = deployments.lock().await;
+            let deployment_count = deps.len();
+            let dep_names: Vec<String> = deps
+                .values()
+                .filter(|d| d.status == "running")
+                .map(|d| d.app_name.clone())
+                .collect();
+            drop(deps);
+            let metrics = dd_agent::server::collect_system_metrics().await;
+            let mut reg = registry.lock().await;
+            if let Some(self_entry) = reg.get_mut(self_id) {
+                self_entry.last_seen = chrono::Utc::now();
+                self_entry.deployment_count = deployment_count;
+                self_entry.deployment_names = dep_names;
+                self_entry.cpu_percent = metrics.cpu_pct;
+                self_entry.memory_used_mb = metrics.mem_used_mb;
+                self_entry.memory_total_mb = metrics.mem_total_mb;
             }
         }
 
