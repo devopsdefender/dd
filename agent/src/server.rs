@@ -14,6 +14,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::Mutex;
 
 use crate::common::error::AppError;
+use crate::tunnel::CfConfig;
 
 // ── Types ─────────────────────────────────────────────────────────────────
 
@@ -109,6 +110,18 @@ pub struct PendingOauthState {
     pub expires_at: Instant,
 }
 
+/// Agent record in the fleet registry (register mode only).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RegisteredAgent {
+    pub agent_id: String,
+    pub hostname: String,
+    pub vm_name: String,
+    pub attestation_type: String,
+    pub registered_at: String,
+}
+
+pub type AgentRegistry = Arc<Mutex<HashMap<String, RegisteredAgent>>>;
+
 #[derive(Clone)]
 pub struct AgentState {
     pub owner: String,
@@ -121,6 +134,10 @@ pub struct AgentState {
     pub oauth: Option<GithubOAuthConfig>,
     pub browser_sessions: BrowserSessions,
     pub pending_oauth_states: PendingOauthStates,
+    /// Register mode: fleet registry + CF config for creating agent tunnels.
+    pub register_mode: bool,
+    pub agent_registry: AgentRegistry,
+    pub cf_config: Option<CfConfig>,
 }
 
 // ── Auth ──────────────────────────────────────────────────────────────────
@@ -1406,9 +1423,241 @@ async fn num_cpus() -> usize {
         .unwrap_or(1)
 }
 
+// ── Fleet dashboard (register mode) ──────────────────────────────────────
+
+async fn fleet_dashboard(
+    State(state): State<AgentState>,
+    query: axum::extract::Query<DashQuery>,
+    headers: HeaderMap,
+    OriginalUri(uri): OriginalUri,
+) -> Result<Response, AppError> {
+    if !state.owner.is_empty() {
+        match require_browser_token(&state, &headers, query.token.as_deref(), &uri).await {
+            Ok(_) => {}
+            Err(response) => return Ok(response),
+        }
+    }
+
+    Ok(fleet_dashboard_html(&state).await.into_response())
+}
+
+async fn fleet_dashboard_html(state: &AgentState) -> Html<String> {
+    let agents = state.agent_registry.lock().await;
+    let env = std::env::var("DD_ENV").unwrap_or_else(|_| "dev".into());
+
+    let mut rows = String::new();
+    for a in agents.values() {
+        rows.push_str(&format!(
+            r#"<tr>
+                <td><a href="https://{}">{}</a></td>
+                <td>{}</td>
+                <td><span style="color:#a6e3a1">registered</span></td>
+                <td>{}</td>
+                <td>{}</td>
+            </tr>"#,
+            a.hostname,
+            a.hostname,
+            a.vm_name,
+            a.attestation_type,
+            a.registered_at
+                .split('T')
+                .next()
+                .unwrap_or(&a.registered_at),
+        ));
+    }
+
+    let uptime = state.started_at.elapsed().as_secs();
+    let uptime_str = if uptime > 3600 {
+        format!("{}h {}m", uptime / 3600, (uptime % 3600) / 60)
+    } else if uptime > 60 {
+        format!("{}m", uptime / 60)
+    } else {
+        format!("{uptime}s")
+    };
+
+    Html(format!(
+        r#"<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>DD Fleet — {env}</title>
+<style>
+  body {{ margin:0; background:#1e1e2e; color:#cdd6f4; font-family:'JetBrains Mono',monospace; padding:24px; }}
+  h1 {{ color:#89b4fa; margin:0 0 4px; font-size:20px; }}
+  .sub {{ color:#585b70; font-size:12px; margin-bottom:16px; }}
+  .meta {{ color:#a6adc8; font-size:13px; margin-bottom:24px; }}
+  .meta .ok {{ color:#a6e3a1; }}
+  .section {{ color:#a6adc8; font-size:12px; text-transform:uppercase; margin:20px 0 8px; }}
+  table {{ border-collapse:collapse; width:100%; }}
+  th {{ text-align:left; color:#a6adc8; font-weight:normal; font-size:12px; text-transform:uppercase; padding:8px 12px; border-bottom:1px solid #313244; }}
+  td {{ padding:8px 12px; border-bottom:1px solid #313244; font-size:14px; }}
+  a {{ color:#89b4fa; text-decoration:none; }} a:hover {{ text-decoration:underline; }}
+  .empty {{ color:#585b70; padding:24px; text-align:center; }}
+</style></head><body>
+<h1>DevOps Defender</h1>
+<div class="sub">{env} fleet &middot; {agent_id}</div>
+<div class="meta"><span class="ok">healthy</span> &middot; uptime {uptime} &middot; {count} agent(s)</div>
+<div class="section">Agents</div>
+{table}
+</body></html>"#,
+        env = env,
+        agent_id = &state.agent_id[..8],
+        uptime = uptime_str,
+        count = agents.len(),
+        table = if agents.is_empty() {
+            r#"<div class="empty">no agents registered</div>"#.to_string()
+        } else {
+            format!(
+                r#"<table><tr><th>hostname</th><th>vm</th><th>status</th><th>attestation</th><th>registered</th></tr>{rows}</table>"#
+            )
+        },
+    ))
+}
+
+async fn ws_register(State(state): State<AgentState>, ws: WebSocketUpgrade) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| handle_ws_register(socket, state))
+}
+
+async fn handle_ws_register(socket: WebSocket, state: AgentState) {
+    let cf = match &state.cf_config {
+        Some(cf) => cf.clone(),
+        None => {
+            eprintln!("dd-register: no CF config, can't register agents");
+            return;
+        }
+    };
+
+    let (mut ws_tx, mut ws_rx) = socket.split();
+    let keypair = match crate::noise::generate_keypair() {
+        Ok(k) => k,
+        Err(_) => return,
+    };
+
+    let mut noise = match snow::Builder::new(crate::noise::NOISE_PATTERN.parse().unwrap())
+        .local_private_key(&keypair.private)
+        .and_then(|b| b.build_responder())
+    {
+        Ok(n) => n,
+        Err(_) => return,
+    };
+
+    let mut buf = vec![0u8; 65535];
+
+    // Noise XX handshake
+    let msg1 = match ws_rx.next().await {
+        Some(Ok(Message::Binary(d))) => d.to_vec(),
+        _ => return,
+    };
+    if noise.read_message(&msg1, &mut buf).is_err() {
+        return;
+    }
+
+    let mut msg2 = vec![0u8; 65535];
+    let len = match noise.write_message(&[], &mut msg2) {
+        Ok(n) => n,
+        Err(_) => return,
+    };
+    if ws_tx
+        .send(Message::Binary(msg2[..len].to_vec().into()))
+        .await
+        .is_err()
+    {
+        return;
+    }
+
+    let msg3 = match ws_rx.next().await {
+        Some(Ok(Message::Binary(d))) => d.to_vec(),
+        _ => return,
+    };
+    let payload_len = match noise.read_message(&msg3, &mut buf) {
+        Ok(n) => n,
+        Err(_) => return,
+    };
+
+    let attestation: crate::noise::AttestationPayload =
+        match serde_json::from_slice(&buf[..payload_len]) {
+            Ok(a) => a,
+            Err(_) => return,
+        };
+
+    let mut transport = match noise.into_transport_mode() {
+        Ok(t) => t,
+        Err(_) => return,
+    };
+
+    // Read registration request
+    let enc = match ws_rx.next().await {
+        Some(Ok(Message::Binary(d))) => d.to_vec(),
+        _ => return,
+    };
+    let req_len = match transport.read_message(&enc, &mut buf) {
+        Ok(n) => n,
+        Err(_) => return,
+    };
+
+    #[derive(serde::Deserialize)]
+    struct RegReq {
+        owner: String,
+        vm_name: String,
+    }
+    let reg: RegReq = match serde_json::from_slice(&buf[..req_len]) {
+        Ok(r) => r,
+        Err(_) => return,
+    };
+
+    // Create tunnel
+    let client = reqwest::Client::new();
+    let agent_id = uuid::Uuid::new_v4().to_string();
+    let tunnel_info =
+        match crate::tunnel::create_agent_tunnel(&client, &cf, &agent_id, &reg.vm_name).await {
+            Ok(info) => info,
+            Err(e) => {
+                eprintln!("dd-register: tunnel failed: {e}");
+                return;
+            }
+        };
+
+    eprintln!(
+        "dd-register: {} registered at {}",
+        reg.vm_name, tunnel_info.hostname
+    );
+
+    // Record
+    state.agent_registry.lock().await.insert(
+        agent_id.clone(),
+        RegisteredAgent {
+            agent_id,
+            hostname: tunnel_info.hostname.clone(),
+            vm_name: reg.vm_name,
+            attestation_type: attestation.attestation_type,
+            registered_at: chrono::Utc::now().to_rfc3339(),
+        },
+    );
+
+    // Send bootstrap config
+    let config = crate::noise::BootstrapConfig {
+        owner: reg.owner,
+        tunnel_token: tunnel_info.tunnel_token,
+        hostname: tunnel_info.hostname,
+    };
+    let json = serde_json::to_vec(&config).unwrap();
+    let mut enc_resp = vec![0u8; 65535];
+    if let Ok(len) = transport.write_message(&json, &mut enc_resp) {
+        let _ = ws_tx
+            .send(Message::Binary(enc_resp[..len].to_vec().into()))
+            .await;
+    }
+}
+
 pub fn build_router(state: AgentState) -> Router {
-    Router::new()
-        .route("/", get(dashboard))
+    let mut router = Router::new();
+
+    if state.register_mode {
+        router = router
+            .route("/", get(fleet_dashboard))
+            .route("/register", get(ws_register));
+    } else {
+        router = router.route("/", get(dashboard));
+    }
+
+    router
         .route("/logged-out", get(logged_out_page))
         .route("/auth/github/start", get(github_auth_start))
         .route("/auth/github/callback", get(github_auth_callback))

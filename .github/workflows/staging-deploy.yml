@@ -54,7 +54,6 @@ jobs:
             --prerelease \
             target/release/dd-agent
 
-          # Get the download URL
           url=$(gh release view "$tag" --json assets --jq '.assets[] | select(.name=="dd-agent") | .url')
           echo "url=${url}" >> "$GITHUB_OUTPUT"
           echo "Binary URL: ${url}"
@@ -131,11 +130,12 @@ jobs:
           curl -fsSL -o /usr/local/bin/cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
           chmod +x /usr/local/bin/cloudflared
 
-          # Download dd-agent from GitHub release
+          # Download dd-agent
           curl -fsSL -o /usr/local/bin/dd-agent "${BINARY_URL}" -H "Accept: application/octet-stream"
           chmod +x /usr/local/bin/dd-agent
 
           export DD_OWNER=devopsdefender
+          export DD_AGENT_MODE=register
           export DD_ENV=staging
           export DD_CF_API_TOKEN=${CLOUDFLARE_API_TOKEN}
           export DD_CF_ACCOUNT_ID=${CLOUDFLARE_ACCOUNT_ID}
@@ -146,7 +146,7 @@ jobs:
           export DD_GITHUB_CLIENT_SECRET=${DD_GITHUB_CLIENT_SECRET}
           export DD_GITHUB_CALLBACK_URL=${DD_GITHUB_CALLBACK_URL}
 
-          # Boot a shell as the demo workload
+          # Boot a demo shell workload
           export DD_BOOT_CMD=bash
           export DD_BOOT_APP=demo
 

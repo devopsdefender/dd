@@ -23,7 +23,7 @@ async fn main() {
     eprintln!("dd-agent: starting in {:?} mode", cfg.mode);
 
     match cfg.mode {
-        AgentMode::Agent => run_agent_mode(cfg).await,
+        AgentMode::Agent | AgentMode::Register => run_agent_mode(cfg).await,
         AgentMode::ControlPlane => run_control_plane_mode(cfg),
         AgentMode::Measure => measure::run_measure_mode(),
     }
@@ -184,6 +184,13 @@ async fn run_agent_mode(cfg: AgentRuntimeConfig) {
         eprintln!("dd-agent: boot workload {id} {status}");
     }
 
+    let register_mode = cfg.mode == config::AgentMode::Register;
+    let cf_config = if register_mode {
+        dd_agent::tunnel::CfConfig::from_env().ok()
+    } else {
+        None
+    };
+
     let state = AgentState {
         owner,
         vm_name,
@@ -195,9 +202,28 @@ async fn run_agent_mode(cfg: AgentRuntimeConfig) {
         oauth,
         browser_sessions,
         pending_oauth_states,
+        register_mode,
+        agent_registry: Arc::new(Mutex::new(HashMap::new())),
+        cf_config,
     };
 
-    // HTTP server (read-only: health, list deployments, logs)
+    // In register mode, add ourselves to the registry
+    if register_mode {
+        let hostname = std::env::var("DD_HOSTNAME").unwrap_or_else(|_| "localhost".into());
+        state.agent_registry.lock().await.insert(
+            state.agent_id.clone(),
+            dd_agent::server::RegisteredAgent {
+                agent_id: state.agent_id.clone(),
+                hostname,
+                vm_name: state.vm_name.clone(),
+                attestation_type: state.attestation_type.clone(),
+                registered_at: chrono::Utc::now().to_rfc3339(),
+            },
+        );
+        eprintln!("dd-agent: registered self in fleet registry");
+    }
+
+    // HTTP server
     let http_port = port;
     let app = dd_agent::server::build_router(state.clone());
     let bind_addr = format!("0.0.0.0:{http_port}");

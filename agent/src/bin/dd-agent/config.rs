@@ -7,6 +7,7 @@ use std::path::PathBuf;
 #[serde(rename_all = "kebab-case")]
 pub enum AgentMode {
     Agent,
+    Register,
     ControlPlane,
     Measure,
 }
@@ -15,6 +16,7 @@ impl AgentMode {
     fn from_str_loose(s: &str) -> Option<Self> {
         match s.to_lowercase().replace('_', "-").as_str() {
             "agent" => Some(Self::Agent),
+            "register" => Some(Self::Register),
             "control-plane" | "controlplane" | "cp" => Some(Self::ControlPlane),
             "measure" => Some(Self::Measure),
             _ => None,
