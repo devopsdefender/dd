@@ -1590,10 +1590,17 @@ async fn post_deregister(
             {
                 eprintln!("dd-register: deregister tunnel cleanup failed: {e}");
             } else {
-                eprintln!("dd-register: deregistered {} ({})", agent.agent_id, agent.hostname);
+                eprintln!(
+                    "dd-register: deregistered {} ({})",
+                    agent.agent_id, agent.hostname
+                );
             }
         }
-        (axum::http::StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response()
+        (
+            axum::http::StatusCode::OK,
+            Json(serde_json::json!({"ok": true})),
+        )
+            .into_response()
     } else {
         (
             axum::http::StatusCode::NOT_FOUND,
@@ -1729,7 +1736,10 @@ async fn handle_ws_scraper(socket: WebSocket, state: AgentState) {
             if agent_report.healthy {
                 healthy_count += 1;
                 // Update or insert healthy agent
-                if let Some(existing) = registry.values_mut().find(|a| a.hostname == agent_report.hostname) {
+                if let Some(existing) = registry
+                    .values_mut()
+                    .find(|a| a.hostname == agent_report.hostname)
+                {
                     existing.last_seen = now;
                     existing.status = "healthy".into();
                     if let Some(dc) = agent_report.deployment_count {
@@ -1746,25 +1756,37 @@ async fn handle_ws_scraper(socket: WebSocket, state: AgentState) {
                     }
                 } else if let Some(ref aid) = agent_report.agent_id {
                     // Discovered via CF tunnel but not in registry — insert
-                    registry.insert(aid.clone(), RegisteredAgent {
-                        agent_id: aid.clone(),
-                        hostname: agent_report.hostname.clone(),
-                        vm_name: agent_report.vm_name.clone().unwrap_or_default(),
-                        attestation_type: agent_report.attestation_type.clone().unwrap_or_else(|| "unknown".into()),
-                        registered_at: now.to_rfc3339(),
-                        last_seen: now,
-                        status: "healthy".into(),
-                        deployment_count: agent_report.deployment_count.unwrap_or(0),
-                        cpu_percent: agent_report.cpu_percent.unwrap_or(0),
-                        memory_used_mb: agent_report.memory_used_mb.unwrap_or(0),
-                        memory_total_mb: agent_report.memory_total_mb.unwrap_or(0),
-                    });
-                    eprintln!("dd-register: scraper discovered new agent {aid} at {}", agent_report.hostname);
+                    registry.insert(
+                        aid.clone(),
+                        RegisteredAgent {
+                            agent_id: aid.clone(),
+                            hostname: agent_report.hostname.clone(),
+                            vm_name: agent_report.vm_name.clone().unwrap_or_default(),
+                            attestation_type: agent_report
+                                .attestation_type
+                                .clone()
+                                .unwrap_or_else(|| "unknown".into()),
+                            registered_at: now.to_rfc3339(),
+                            last_seen: now,
+                            status: "healthy".into(),
+                            deployment_count: agent_report.deployment_count.unwrap_or(0),
+                            cpu_percent: agent_report.cpu_percent.unwrap_or(0),
+                            memory_used_mb: agent_report.memory_used_mb.unwrap_or(0),
+                            memory_total_mb: agent_report.memory_total_mb.unwrap_or(0),
+                        },
+                    );
+                    eprintln!(
+                        "dd-register: scraper discovered new agent {aid} at {}",
+                        agent_report.hostname
+                    );
                 }
             } else {
                 stale_count += 1;
                 // Mark unreachable agent as stale
-                if let Some(existing) = registry.values_mut().find(|a| a.hostname == agent_report.hostname) {
+                if let Some(existing) = registry
+                    .values_mut()
+                    .find(|a| a.hostname == agent_report.hostname)
+                {
                     if existing.status == "healthy" {
                         existing.status = "stale".into();
                         eprintln!(
@@ -1805,7 +1827,8 @@ async fn handle_ws_scraper(socket: WebSocket, state: AgentState) {
         for tunnel_name in &report.orphan_tunnels {
             if let Some(cf) = &state.cf_config {
                 let client = reqwest::Client::new();
-                if let Err(e) = crate::tunnel::delete_tunnel_by_name(&client, cf, tunnel_name).await {
+                if let Err(e) = crate::tunnel::delete_tunnel_by_name(&client, cf, tunnel_name).await
+                {
                     eprintln!("dd-register: scraper orphan cleanup failed for {tunnel_name}: {e}");
                 } else {
                     eprintln!("dd-register: scraper cleaned orphan tunnel {tunnel_name}");
@@ -1822,7 +1845,9 @@ async fn handle_ws_scraper(socket: WebSocket, state: AgentState) {
         let ack = serde_json::json!({"ok": true}).to_string();
         let mut enc = vec![0u8; 65535];
         if let Ok(len) = transport.write_message(ack.as_bytes(), &mut enc) {
-            let _ = ws_tx.send(Message::Binary(enc[..len].to_vec().into())).await;
+            let _ = ws_tx
+                .send(Message::Binary(enc[..len].to_vec().into()))
+                .await;
         }
     }
 

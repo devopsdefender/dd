@@ -351,7 +351,16 @@ async fn run_scraper_mode() {
 
     loop {
         eprintln!("dd-scraper: connecting to register at {ws_url}");
-        match connect_and_scrape(&ws_url, &cf, &tunnel_prefix, scrape_interval, scrape_timeout, attestation.as_ref()).await {
+        match connect_and_scrape(
+            &ws_url,
+            &cf,
+            &tunnel_prefix,
+            scrape_interval,
+            scrape_timeout,
+            attestation.as_ref(),
+        )
+        .await
+        {
             Ok(()) => eprintln!("dd-scraper: session ended, reconnecting..."),
             Err(e) => eprintln!("dd-scraper: error: {e}, reconnecting in 10s..."),
         }
@@ -394,23 +403,37 @@ async fn connect_and_scrape(
 
     // msg1
     let mut msg1 = vec![0u8; 65535];
-    let len = noise.write_message(&[], &mut msg1).map_err(|e| format!("msg1: {e}"))?;
-    ws_tx.send(tungstenite::Message::Binary(msg1[..len].to_vec())).await.map_err(|e| format!("send msg1: {e}"))?;
+    let len = noise
+        .write_message(&[], &mut msg1)
+        .map_err(|e| format!("msg1: {e}"))?;
+    ws_tx
+        .send(tungstenite::Message::Binary(msg1[..len].to_vec()))
+        .await
+        .map_err(|e| format!("send msg1: {e}"))?;
 
     // msg2
     let msg2 = match ws_rx.next().await {
         Some(Ok(tungstenite::Message::Binary(d))) => d.to_vec(),
         other => return Err(format!("expected msg2, got: {other:?}")),
     };
-    noise.read_message(&msg2, &mut buf).map_err(|e| format!("msg2: {e}"))?;
+    noise
+        .read_message(&msg2, &mut buf)
+        .map_err(|e| format!("msg2: {e}"))?;
 
     // msg3 with attestation
     let att_json = serde_json::to_vec(&attestation).unwrap();
     let mut msg3 = vec![0u8; 65535];
-    let len = noise.write_message(&att_json, &mut msg3).map_err(|e| format!("msg3: {e}"))?;
-    ws_tx.send(tungstenite::Message::Binary(msg3[..len].to_vec())).await.map_err(|e| format!("send msg3: {e}"))?;
+    let len = noise
+        .write_message(&att_json, &mut msg3)
+        .map_err(|e| format!("msg3: {e}"))?;
+    ws_tx
+        .send(tungstenite::Message::Binary(msg3[..len].to_vec()))
+        .await
+        .map_err(|e| format!("send msg3: {e}"))?;
 
-    let mut transport = noise.into_transport_mode().map_err(|e| format!("transport: {e}"))?;
+    let mut transport = noise
+        .into_transport_mode()
+        .map_err(|e| format!("transport: {e}"))?;
 
     eprintln!("dd-scraper: connected to register, starting scrape loop");
 
@@ -425,7 +448,10 @@ async fn connect_and_scrape(
 
         // 1. List CF tunnels
         let tunnels = list_cf_tunnels(&http, cf, tunnel_prefix).await;
-        eprintln!("dd-scraper: found {} tunnels matching {tunnel_prefix}*", tunnels.len());
+        eprintln!(
+            "dd-scraper: found {} tunnels matching {tunnel_prefix}*",
+            tunnels.len()
+        );
 
         // 2. Scrape all agents concurrently with timeout
         let scrape_futures: Vec<_> = tunnels
@@ -441,12 +467,14 @@ async fn connect_and_scrape(
                             let health: serde_json::Value = resp.json().await.unwrap_or_default();
                             (name, hostname, true, Some(health), None)
                         }
-                        Ok(resp) => {
-                            (name, hostname, false, None, Some(format!("status {}", resp.status())))
-                        }
-                        Err(e) => {
-                            (name, hostname, false, None, Some(e.to_string()))
-                        }
+                        Ok(resp) => (
+                            name,
+                            hostname,
+                            false,
+                            None,
+                            Some(format!("status {}", resp.status())),
+                        ),
+                        Err(e) => (name, hostname, false, None, Some(e.to_string())),
                     }
                 }
             })
@@ -480,7 +508,10 @@ async fn connect_and_scrape(
                     "error": error,
                 }));
                 // If agent didn't respond at all, it might be an orphan tunnel
-                if error.as_ref().is_some_and(|e| e.contains("connect") || e.contains("timed out")) {
+                if error
+                    .as_ref()
+                    .is_some_and(|e| e.contains("connect") || e.contains("timed out"))
+                {
                     orphan_tunnels.push(tunnel_name.clone());
                 }
             }
@@ -502,8 +533,13 @@ async fn connect_and_scrape(
         // 4. Send encrypted report to register
         let report_json = serde_json::to_vec(&report).unwrap();
         let mut enc = vec![0u8; 65535];
-        let len = transport.write_message(&report_json, &mut enc).map_err(|e| format!("encrypt: {e}"))?;
-        ws_tx.send(tungstenite::Message::Binary(enc[..len].to_vec())).await.map_err(|e| format!("send: {e}"))?;
+        let len = transport
+            .write_message(&report_json, &mut enc)
+            .map_err(|e| format!("encrypt: {e}"))?;
+        ws_tx
+            .send(tungstenite::Message::Binary(enc[..len].to_vec()))
+            .await
+            .map_err(|e| format!("send: {e}"))?;
 
         // Wait for ack
         match tokio::time::timeout(std::time::Duration::from_secs(10), ws_rx.next()).await {

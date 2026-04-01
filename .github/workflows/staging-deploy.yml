@@ -115,7 +115,6 @@ jobs:
           DD_GITHUB_CALLBACK_URL: ${{ vars.DD_GITHUB_CALLBACK_URL }}
           DD_GITHUB_CLIENT_SECRET: ${{ secrets.DD_GITHUB_CLIENT_SECRET }}
           BINARY_URL: ${{ needs.build.outputs.binary_url }}
-          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
         run: |
           set -euo pipefail
           VM_NAME="dd-staging-$(date +%s)"
