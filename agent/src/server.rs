@@ -53,6 +53,7 @@ pub struct HealthResponse {
     pub owner: String,
     pub attestation_type: String,
     pub deployment_count: usize,
+    pub deployments: Vec<String>,
     pub uptime_seconds: u64,
     pub cpu_percent: u64,
     pub memory_used_mb: u64,
@@ -126,6 +127,7 @@ pub struct RegisteredAgent {
     pub last_seen: chrono::DateTime<chrono::Utc>,
     pub status: String,
     pub deployment_count: usize,
+    pub deployment_names: Vec<String>,
     pub cpu_percent: u64,
     pub memory_used_mb: u64,
     pub memory_total_mb: u64,
@@ -276,7 +278,14 @@ async fn verify_owner(state: &AgentState, headers: &HeaderMap) -> Result<(), App
 // ── HTTP Handlers (read-only) ────────────────────────────────────────────
 
 async fn health(State(state): State<AgentState>) -> Json<HealthResponse> {
-    let deployment_count = state.deployments.lock().await.len();
+    let deps = state.deployments.lock().await;
+    let deployment_count = deps.len();
+    let deployment_names: Vec<String> = deps
+        .values()
+        .filter(|d| d.status == "running")
+        .map(|d| d.app_name.clone())
+        .collect();
+    drop(deps);
     let metrics = collect_metrics().await;
     Json(HealthResponse {
         ok: true,
@@ -285,6 +294,7 @@ async fn health(State(state): State<AgentState>) -> Json<HealthResponse> {
         owner: state.owner.clone(),
         attestation_type: state.attestation_type.clone(),
         deployment_count,
+        deployments: deployment_names,
         uptime_seconds: state.started_at.elapsed().as_secs(),
         cpu_percent: metrics.cpu_pct,
         memory_used_mb: parse_size_mb(&metrics.mem_used),
@@ -1451,6 +1461,22 @@ async fn collect_metrics() -> SystemMetrics {
     metrics
 }
 
+/// Public metrics for self-update in register mode.
+pub struct SimpleMetrics {
+    pub cpu_pct: u64,
+    pub mem_used_mb: u64,
+    pub mem_total_mb: u64,
+}
+
+pub async fn collect_system_metrics() -> SimpleMetrics {
+    let m = collect_metrics().await;
+    SimpleMetrics {
+        cpu_pct: m.cpu_pct,
+        mem_used_mb: parse_size_mb(&m.mem_used),
+        mem_total_mb: parse_size_mb(&m.mem_total),
+    }
+}
+
 async fn num_cpus() -> usize {
     tokio::fs::read_to_string("/proc/cpuinfo")
         .await
@@ -1518,7 +1544,11 @@ async fn fleet_dashboard_html(state: &AgentState) -> Html<String> {
             status_color = status_color,
             status = a.status,
             attestation = a.attestation_type,
-            deploys = a.deployment_count,
+            deploys = if a.deployment_names.is_empty() {
+                format!("{}", a.deployment_count)
+            } else {
+                a.deployment_names.join(", ")
+            },
             cpu = a.cpu_percent,
             mem = mem_str,
             last_seen = last_seen,
@@ -1564,7 +1594,7 @@ async fn fleet_dashboard_html(state: &AgentState) -> Html<String> {
             r#"<div class="empty">no agents registered</div>"#.to_string()
         } else {
             format!(
-                r#"<table><tr><th>hostname</th><th>vm</th><th>status</th><th>attestation</th><th>deploys</th><th>cpu</th><th>memory</th><th>last seen</th></tr>{rows}</table>"#
+                r#"<table><tr><th>hostname</th><th>vm</th><th>status</th><th>attestation</th><th>workloads</th><th>cpu</th><th>memory</th><th>last seen</th></tr>{rows}</table>"#
             )
         },
     ))
@@ -1624,6 +1654,8 @@ struct AgentHealthReport {
     attestation_type: Option<String>,
     #[serde(default)]
     deployment_count: Option<usize>,
+    #[serde(default)]
+    deployments: Option<Vec<String>>,
     #[serde(default)]
     cpu_percent: Option<u64>,
     #[serde(default)]
@@ -1754,6 +1786,9 @@ async fn handle_ws_scraper(socket: WebSocket, state: AgentState) {
                     if let Some(mem_total) = agent_report.memory_total_mb {
                         existing.memory_total_mb = mem_total;
                     }
+                    if let Some(ref names) = agent_report.deployments {
+                        existing.deployment_names = names.clone();
+                    }
                 } else if let Some(ref aid) = agent_report.agent_id {
                     // Discovered via CF tunnel but not in registry — insert
                     registry.insert(
@@ -1770,6 +1805,7 @@ async fn handle_ws_scraper(socket: WebSocket, state: AgentState) {
                             last_seen: now,
                             status: "healthy".into(),
                             deployment_count: agent_report.deployment_count.unwrap_or(0),
+                            deployment_names: Vec::new(),
                             cpu_percent: agent_report.cpu_percent.unwrap_or(0),
                             memory_used_mb: agent_report.memory_used_mb.unwrap_or(0),
                             memory_total_mb: agent_report.memory_total_mb.unwrap_or(0),
@@ -1975,6 +2011,7 @@ async fn handle_ws_register(socket: WebSocket, state: AgentState) {
             last_seen: now,
             status: "healthy".into(),
             deployment_count: 0,
+            deployment_names: Vec::new(),
             cpu_percent: 0,
             memory_used_mb: 0,
             memory_total_mb: 0,
