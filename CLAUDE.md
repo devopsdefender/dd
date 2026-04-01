@@ -16,17 +16,19 @@ Together: TDX proves the hardware is legit, GitHub OIDC proves the deployer is a
 
 ## Repository Structure
 
-This is a monorepo with the following components:
+This checkout currently contains the agent-side code and deployment workflows:
 
 ```
 dd/
 ├── agent/          # Rust binary that runs on TDX VMs, manages workloads
-├── control-plane/  # Rust Axum API server, orchestrates agents and deployments
-├── images/         # Packer definitions for building GCP agent VM images
-├── infra/          # Ansible playbooks for GCP deployments
-├── openapi/        # OpenAPI spec for control-plane API (used by agent code generation)
-└── website/        # Static landing page at devopsdefender.com
+├── images/         # Agent image/bootstrap assets
+└── .github/        # CI plus staging/production deployment workflows
 ```
+
+Historical docs below still reference a separate `control-plane/` tree, `infra/`, and `openapi/`.
+Those directories are not present in this repo checkout today. The only live workspace member is
+`agent/`, and any `dd-cp` binary is treated here as an external executable launched by `dd-agent`
+when `DD_AGENT_MODE=control-plane`.
 
 ## Component Details
 
@@ -48,7 +50,8 @@ A daemon that runs on each TDX VM node. It registers with the control plane via 
 - `src/attestation/tsm.rs` — TDX quote generation/parsing via configfs-tsm
 - `src/common/error.rs` — shared error types
 
-**Build system:** `build.rs` generates Rust structs from `openapi/control-plane.yaml` (code generation for API response types).
+**Control-plane mode:** `dd-agent` can run in `control-plane` mode, but in this repo that means
+spawning an external `dd-cp` binary. The `dd-cp` source is not present here.
 
 **Key env vars:** `DD_CONFIG`, `DD_AGENT_MODE`, `DD_CP_URL`, `DD_INTEL_API_KEY`, `DD_DATACENTER`, `DD_AGENT_SKIP_ATTESTATION`, `DD_PORT`
 
@@ -60,13 +63,15 @@ A daemon that runs on each TDX VM node. It registers with the control plane via 
 5. Start cloudflared tunnel, pull and run workload containers
 6. POST heartbeat every 30s to `/api/v1/agents/{id}/heartbeat`
 
-### control-plane/ (Rust + Axum)
+### control-plane/ (Historical Note)
 
-Central management API for agent registration, deployment orchestration, health monitoring, and attestation verification.
+Older documentation referred to a checked-in `control-plane/` service with SQLite-backed state.
+That source tree is not present in this checkout, so treat the following as legacy architecture
+notes rather than an accurate description of code that currently lives here.
 
 **Binaries:** `dd-cp` (server), `dd-admin` (CLI utility for password hashing)
 **Entry point:** `src/bin/dd-cp/main.rs`
-**Database:** SQLite via rusqlite
+**Database:** historically documented as SQLite via rusqlite
 
 **Architecture layers:**
 - `src/routes/` — Axum HTTP handlers (health, agents, deploy, accounts, auth, admin, stats, ui)
@@ -109,9 +114,19 @@ Central management API for agent registration, deployment orchestration, health 
 
 **Infrastructure:** See top-level `infra/` directory.
 
-### images/ (Packer)
+### Deployment Environments
 
-Builds GCP VM images for agent nodes with all dependencies pre-installed.
+Staging and production are separated by workflow/environment configuration, not by separate source
+directories in this repo.
+
+- **staging** deploys `dd-agent` to `app-staging.devopsdefender.com` and bootstraps a demo shell
+  workload via `DD_BOOT_CMD=bash` and `DD_BOOT_APP=demo`
+- **production** deploys `dd-agent` to `app.devopsdefender.com`
+- GitHub OAuth settings are injected per environment via GitHub Actions environment secrets/vars
+
+### images/ (Historical Note)
+
+The current repo checkout does not contain the image-building tree that older docs refer to.
 
 **Image type:**
 - `packer/gcp-agent-image.pkr.hcl` — GCP Compute Engine image (Ubuntu 24.04)
@@ -122,9 +137,10 @@ Builds GCP VM images for agent nodes with all dependencies pre-installed.
 - cloudflared (Cloudflare Tunnel client)
 - Creates systemd services: `devopsdefender-agent.service` (enabled) and `devopsdefender-control-plane.service` (disabled)
 
-### infra/ (Ansible)
+### infra/ (Historical Note)
 
-GCP infrastructure automation for deploying control-plane and agent fleets.
+Older docs refer to Ansible-based infrastructure automation. That tree is not present in this
+checkout; current staging/production rollout behavior is defined by `.github/workflows/`.
 
 **Key playbooks** (`ansible/playbooks/`):
 - `gcp-control-plane-new.yml` — launch TDX-enabled GCP VM for control plane
@@ -135,9 +151,9 @@ GCP infrastructure automation for deploying control-plane and agent fleets.
 
 **Templates** (`ansible/playbooks/templates/`): Jinja2 templates for agent and control-plane startup scripts and JSON configs.
 
-### openapi/
+### openapi/ (Historical Note)
 
-- `control-plane.yaml` — OpenAPI 3.0.0 spec for the control-plane API. Used by the agent's `build.rs` to generate Rust request/response types.
+Older docs refer to a checked-in control-plane OpenAPI spec. It is not present in this checkout.
 
 ### website/ (Static HTML)
 

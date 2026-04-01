@@ -160,12 +160,19 @@ curl -X POST https://app.devopsdefender.com/api/v1/deploy \
 
 ```
 dd/
-├── agent/          # Runs on secure machines -- manages your workloads
-├── control-plane/  # API server -- orchestrates deployments and health checks
-├── images/         # VM image definitions
-├── infra/          # Infrastructure automation
-└── openapi/        # API spec
+├── agent/          # Runs on secure machines -- manages workloads and web terminal access
+├── images/         # Agent/bootstrap assets
+└── .github/        # CI plus staging/production deployment workflows
 ```
+
+This repo checkout is agent-focused. Older architecture notes may mention a separate
+`control-plane/` tree, but that source is not present here.
+
+Staging and production are separated by GitHub workflow/environment config rather than separate
+source directories:
+
+- staging serves `https://app-staging.devopsdefender.com` and boots a demo shell workload
+- production serves `https://app.devopsdefender.com`
 
 ## Website
 
