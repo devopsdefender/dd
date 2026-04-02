@@ -51,36 +51,6 @@ fn maybe_init() {
         eprintln!("dd-agent: init: mount devpts: {e}");
     }
 
-    // Bring up loopback
-    let _ = std::process::Command::new("ip")
-        .args(["link", "set", "lo", "up"])
-        .status();
-
-    // DHCP on first non-lo interface
-    if let Ok(entries) = std::fs::read_dir("/sys/class/net") {
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name != "lo" {
-                eprintln!("dd-agent: init: bringing up {name}");
-                let _ = std::process::Command::new("ip")
-                    .args(["link", "set", &name, "up"])
-                    .status();
-                // Simple DHCP via busybox udhcpc or dhclient if available
-                if std::process::Command::new("udhcpc")
-                    .args(["-i", &name, "-n", "-q"])
-                    .status()
-                    .is_err()
-                {
-                    // Fallback: try dhclient
-                    let _ = std::process::Command::new("dhclient")
-                        .args([&name])
-                        .status();
-                }
-                break;
-            }
-        }
-    }
-
     // Parse kernel cmdline for dd.* params → set as env vars
     // e.g. dd.DD_OWNER=devopsdefender → env DD_OWNER=devopsdefender
     if let Ok(cmdline) = std::fs::read_to_string("/proc/cmdline") {
@@ -168,6 +138,47 @@ fn maybe_init() {
             .status();
     } else {
         eprintln!("dd-agent: init: no config disk at /dev/vdb");
+    }
+
+    // Set up networking from config (DD_IP, DD_GATEWAY, DD_DNS)
+    let ip_bin = "/sbin/ip";
+    let _ = std::process::Command::new(ip_bin)
+        .args(["link", "set", "lo", "up"])
+        .status();
+
+    // Find first non-lo interface
+    let iface = std::fs::read_dir("/sys/class/net")
+        .ok()
+        .and_then(|entries| {
+            entries
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .find(|n| n != "lo")
+        });
+
+    if let Some(ref iface) = iface {
+        let _ = std::process::Command::new(ip_bin)
+            .args(["link", "set", iface, "up"])
+            .status();
+
+        if let Ok(dd_ip) = std::env::var("DD_IP") {
+            eprintln!("dd-agent: init: setting {iface} ip={dd_ip}");
+            let _ = std::process::Command::new(ip_bin)
+                .args(["addr", "add", &dd_ip, "dev", iface])
+                .status();
+        }
+        if let Ok(gw) = std::env::var("DD_GATEWAY") {
+            eprintln!("dd-agent: init: default route via {gw}");
+            let _ = std::process::Command::new(ip_bin)
+                .args(["route", "add", "default", "via", &gw, "dev", iface])
+                .status();
+        }
+    }
+    if let Ok(dns) = std::env::var("DD_DNS") {
+        eprintln!("dd-agent: init: dns={dns}");
+        let _ = std::fs::write("/tmp/resolv.conf", format!("nameserver {dns}\n"));
+        // Bind-mount over the read-only /etc/resolv.conf
+        let _ = nix_mount_flags("/tmp/resolv.conf", "/etc/resolv.conf", "", libc::MS_BIND);
     }
 
     // Start zombie reaper thread (PID 1 must reap children)
@@ -1014,27 +1025,56 @@ async fn monitoring_loop(
 async fn start_cloudflared(tunnel_token: &str) -> Result<(), String> {
     use tokio::process::Command;
     eprintln!("dd-agent: starting cloudflared tunnel");
-    let mut child = Command::new("cloudflared")
+    let _child = Command::new("cloudflared")
         .args(["tunnel", "--no-autoupdate", "run", "--token", tunnel_token])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
         .spawn()
         .map_err(|e| format!("spawn cloudflared: {e}"))?;
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-    match child.try_wait() {
-        Ok(Some(status)) => Err(format!("cloudflared exited immediately: {status}")),
-        Ok(None) => {
-            eprintln!("dd-agent: cloudflared running");
-            Ok(())
-        }
-        Err(e) => Err(format!("cloudflared wait error: {e}")),
+    // Give it a moment, then check stderr if it died
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    if !is_process_running("cloudflared") {
+        // Try to read stderr from the dead process
+        eprintln!("dd-agent: cloudflared died quickly, checking output...");
+        let output = Command::new("cloudflared").args(["version"]).output().await;
+        eprintln!("dd-agent: cloudflared version: {output:?}");
+    }
+    // Wait for cloudflared to initialize, then check /proc for the process.
+    // We can't use try_wait() when PID 1 because the zombie reaper thread
+    // may have already reaped the child via waitpid(-1).
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    if is_process_running("cloudflared") {
+        eprintln!("dd-agent: cloudflared running");
+        Ok(())
+    } else {
+        Err("cloudflared not running after spawn".into())
     }
 }
 
 async fn check_cloudflared() {
-    use tokio::process::Command;
-    let output = Command::new("pgrep").arg("cloudflared").output().await;
-    if !matches!(output, Ok(o) if o.status.success()) {
+    if !is_process_running("cloudflared") {
         eprintln!("dd-agent: cloudflared not running (may need restart)");
     }
+}
+
+/// Check if a process with the given name is running by scanning /proc.
+fn is_process_running(name: &str) -> bool {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let fname = entry.file_name();
+        let pid_str = fname.to_string_lossy();
+        if pid_str.chars().all(|c| c.is_ascii_digit()) {
+            let cmdline_path = format!("/proc/{pid_str}/cmdline");
+            if let Ok(cmdline) = std::fs::read_to_string(&cmdline_path) {
+                if cmdline.contains(name) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 // ── Graceful shutdown ────────────────────────────────────────────────────

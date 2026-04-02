@@ -77,13 +77,18 @@ if command -v busybox >/dev/null; then
     mkdir -p "$ROOTFS/usr/share/udhcpc"
     cat > "$ROOTFS/usr/share/udhcpc/default.script" <<'DHCP'
 #!/bin/sh
+export PATH="/usr/local/bin:/sbin:/bin:/usr/bin"
 case "$1" in
     bound|renew)
+        ip addr flush dev "$interface" 2>/dev/null
         ip addr add "$ip/$mask" dev "$interface" 2>/dev/null
         if [ -n "$router" ]; then
             ip route add default via "$router" dev "$interface" 2>/dev/null
         fi
-        [ -n "$dns" ] && echo "nameserver $dns" > /etc/resolv.conf
+        if [ -n "$dns" ]; then
+            echo "nameserver $dns" > /etc/resolv.conf
+        fi
+        echo "udhcpc: got ip=$ip mask=$mask router=$router dns=$dns" >&2
         ;;
 esac
 DHCP
