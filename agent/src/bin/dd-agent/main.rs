@@ -51,6 +51,15 @@ fn maybe_init() {
         eprintln!("dd-agent: init: mount devpts: {e}");
     }
 
+    // Writable tmpfs for workload data (rootfs is read-only dm-verity)
+    if let Err(e) = nix_mount("tmpfs", "/var/lib/dd", "tmpfs") {
+        eprintln!("dd-agent: init: mount /var/lib/dd tmpfs: {e}");
+    } else {
+        let _ = std::fs::create_dir_all("/var/lib/dd/workloads");
+        let _ = std::fs::create_dir_all("/var/lib/dd/shared");
+        eprintln!("dd-agent: init: mounted /var/lib/dd (tmpfs, writable)");
+    }
+
     // Parse kernel cmdline for dd.* params → set as env vars
     // e.g. dd.DD_OWNER=devopsdefender → env DD_OWNER=devopsdefender
     if let Ok(cmdline) = std::fs::read_to_string("/proc/cmdline") {
