@@ -335,6 +335,8 @@ async fn handle_registration(socket: WebSocket, cf: CfConfig, registry: AgentReg
         owner: reg.owner,
         tunnel_token: tunnel_info.tunnel_token,
         hostname: tunnel_info.hostname,
+        auth_public_key: None,
+        auth_issuer: None,
     };
     let config_json = serde_json::to_vec(&config).unwrap();
     let mut enc_resp = vec![0u8; 65535];

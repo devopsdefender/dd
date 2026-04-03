@@ -303,6 +303,10 @@ async fn run_agent_mode(cfg: AgentRuntimeConfig) {
     // Ensure workloads directory exists
     let _ = tokio::fs::create_dir_all("/var/lib/dd/workloads/logs").await;
 
+    // Auth config from register bootstrap (populated if agent registers via Noise)
+    let mut bootstrap_auth_key: Option<jsonwebtoken::DecodingKey> = None;
+    let mut bootstrap_auth_issuer: Option<String> = None;
+
     // Bootstrap priority: pre-provisioned token > self-register via CF API > register via Noise > standalone
     if let Some(token) = std::env::var("DD_TUNNEL_TOKEN")
         .ok()
@@ -347,6 +351,14 @@ async fn run_agent_mode(cfg: AgentRuntimeConfig) {
         );
         if let Err(e) = start_cloudflared(&config.tunnel_token).await {
             eprintln!("dd-agent: cloudflared start failed: {e}");
+        }
+        // Store register-issued auth config for JWT verification
+        if let Some(ref key_b64) = config.auth_public_key {
+            if let Some((_, decoding)) = dd_agent::server::auth_keys_from_b64(key_b64) {
+                bootstrap_auth_key = Some(decoding);
+                bootstrap_auth_issuer = config.auth_issuer.clone();
+                eprintln!("dd-agent: register auth tokens enabled");
+            }
         }
     } else {
         eprintln!("dd-agent: no tunnel config set, running without tunnel");
@@ -481,6 +493,19 @@ async fn run_agent_mode(cfg: AgentRuntimeConfig) {
         None
     };
 
+    // In register mode, generate auth signing keypair for issuing JWTs to agents
+    let (auth_signing_key, auth_public_key_decoded, auth_public_key_b64, auth_issuer) =
+        if register_mode {
+            let (enc, dec, b64) = dd_agent::server::generate_auth_secret();
+            let hostname = std::env::var("DD_HOSTNAME").unwrap_or_else(|_| "localhost".into());
+            let issuer = format!("https://{hostname}");
+            eprintln!("dd-agent: register auth token signing enabled");
+            (Some(enc), Some(dec), Some(b64), Some(issuer))
+        } else {
+            // Agent mode: use bootstrap auth key if available
+            (None, bootstrap_auth_key, None, bootstrap_auth_issuer)
+        };
+
     let state = AgentState {
         owner,
         vm_name,
@@ -495,6 +520,10 @@ async fn run_agent_mode(cfg: AgentRuntimeConfig) {
         register_mode,
         agent_registry: Arc::new(Mutex::new(HashMap::new())),
         cf_config,
+        auth_signing_key,
+        auth_public_key_decoded,
+        auth_issuer,
+        auth_public_key_b64,
     };
 
     // In register mode, add ourselves to the registry
@@ -538,8 +567,16 @@ async fn run_agent_mode(cfg: AgentRuntimeConfig) {
     } else {
         None
     };
+    let monitor_reregister = std::env::var("DD_REGISTER_URL")
+        .ok()
+        .map(|url| ReregisterInfo {
+            vm_name: state.vm_name.clone(),
+            owner: state.owner.clone(),
+            register_url: url,
+            attestation: dd_agent::attestation::detect(),
+        });
     tokio::spawn(async move {
-        monitoring_loop(monitor_deps, monitor_registry).await;
+        monitoring_loop(monitor_deps, monitor_registry, monitor_reregister).await;
     });
 
     // Run HTTP server until shutdown
@@ -975,11 +1012,21 @@ async fn register_via_noise(
 
 // ── Monitoring loop — check process liveness by PID ─────────────────────
 
+struct ReregisterInfo {
+    vm_name: String,
+    owner: String,
+    register_url: String,
+    attestation: Box<dyn dd_agent::attestation::AttestationBackend>,
+}
+
 async fn monitoring_loop(
     deployments: Deployments,
     self_registry: Option<(dd_agent::server::AgentRegistry, String)>,
+    reregister: Option<ReregisterInfo>,
 ) {
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+    let mut last_reregister: Option<std::time::Instant> = None;
+    let reregister_cooldown = std::time::Duration::from_secs(5 * 60);
     loop {
         interval.tick().await;
 
@@ -1025,7 +1072,38 @@ async fn monitoring_loop(
             }
         }
 
-        check_cloudflared().await;
+        // Check if cloudflared is alive; if dead and we have a register URL, re-register (with cooldown)
+        if !is_cloudflared_running().await {
+            let can_reregister = last_reregister
+                .map(|t: std::time::Instant| t.elapsed() > reregister_cooldown)
+                .unwrap_or(true);
+            if let Some(ref info) = reregister {
+                if !can_reregister {
+                    eprintln!(
+                        "dd-agent: cloudflared dead, waiting for cooldown before re-registering"
+                    );
+                    continue;
+                }
+                last_reregister = Some(std::time::Instant::now());
+                eprintln!(
+                    "dd-agent: cloudflared dead, re-registering with {}",
+                    info.register_url
+                );
+                let config = register(
+                    &info.vm_name,
+                    &info.owner,
+                    &info.register_url,
+                    info.attestation.as_ref(),
+                )
+                .await;
+                eprintln!("dd-agent: re-registered — hostname={}", config.hostname);
+                if let Err(e) = start_cloudflared(&config.tunnel_token).await {
+                    eprintln!("dd-agent: cloudflared restart failed: {e}");
+                }
+            } else {
+                eprintln!("dd-agent: cloudflared not running (no register URL to reconnect)");
+            }
+        }
     }
 }
 
@@ -1060,10 +1138,8 @@ async fn start_cloudflared(tunnel_token: &str) -> Result<(), String> {
     }
 }
 
-async fn check_cloudflared() {
-    if !is_process_running("cloudflared") {
-        eprintln!("dd-agent: cloudflared not running (may need restart)");
-    }
+async fn is_cloudflared_running() -> bool {
+    is_process_running("cloudflared")
 }
 
 /// Check if a process with the given name is running by scanning /proc.
