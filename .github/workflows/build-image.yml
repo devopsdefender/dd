@@ -1,0 +1,66 @@
+name: Build Sealed VM Image
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "agent/**"
+      - "images/**"
+      - ".github/workflows/build-image.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools cryptsetup-bin busybox-static \
+            systemd-ukify systemd-boot dosfstools e2fsprogs
+
+      - name: Build static dd-agent
+        run: cargo build --release --bin dd-agent --target x86_64-unknown-linux-musl
+
+      - name: Download cloudflared
+        run: |
+          mkdir -p images/mkosi.extra/usr/local/bin
+          curl -fsSL -o images/mkosi.extra/usr/local/bin/cloudflared \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          chmod +x images/mkosi.extra/usr/local/bin/cloudflared
+
+      - name: Build sealed image
+        run: |
+          cd images
+          sudo ./build.sh
+          zstd dd-agent-vm.raw -o dd-agent-vm.raw.zst
+          ls -lh dd-agent-vm.raw dd-agent-vm.raw.zst
+
+      - name: Upload as release asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sha12="$(echo "${{ github.sha }}" | cut -c1-12)"
+          tag="image-${sha12}"
+
+          # Clean old image releases
+          gh release list --limit 20 | grep "^image-" | awk '{print $1}' | while read -r old; do
+            gh release delete "$old" --yes --cleanup-tag 2>/dev/null || true
+          done
+
+          gh release create "$tag" \
+            --title "Sealed VM image ${sha12}" \
+            --notes "Sealed VM image: dd-agent as PID 1, dm-verity, static binary" \
+            --prerelease \
+            images/dd-agent-vm.raw.zst
+
+          echo "Uploaded sealed image as release: $tag"

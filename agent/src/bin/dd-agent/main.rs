@@ -8,15 +8,257 @@ use tokio::sync::Mutex;
 use config::{AgentMode, AgentRuntimeConfig};
 use dd_agent::server::{AgentState, Deployments};
 
+// ── PID 1 init (sealed VM boot) ───────────────────────────────────────────
+
+/// When dd-agent is PID 1 (booting as init in a sealed VM), mount virtual
+/// filesystems and set up networking before doing anything else.
+fn maybe_init() {
+    if std::process::id() != 1 {
+        return;
+    }
+
+    eprintln!("dd-agent: running as PID 1 — sealed VM init");
+
+    // Set PATH so we can find busybox tools
+    std::env::set_var(
+        "PATH",
+        "/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin",
+    );
+
+    // Mount virtual filesystems
+    for (src, target, fstype) in [
+        ("proc", "/proc", "proc"),
+        ("sysfs", "/sys", "sysfs"),
+        ("devtmpfs", "/dev", "devtmpfs"),
+        ("tmpfs", "/tmp", "tmpfs"),
+        ("tmpfs", "/run", "tmpfs"),
+    ] {
+        match nix_mount(src, target, fstype) {
+            Ok(()) => eprintln!("dd-agent: init: mounted {target}"),
+            Err(e) => eprintln!("dd-agent: init: mount {target} ({fstype}): {e}"),
+        }
+    }
+
+    // Mount configfs for TDX attestation (tsm report interface)
+    let _ = std::fs::create_dir_all("/sys/kernel/config");
+    if let Err(e) = nix_mount("configfs", "/sys/kernel/config", "configfs") {
+        eprintln!("dd-agent: init: mount configfs: {e}");
+    }
+
+    // Create /dev/pts for PTY support (needed for TTY workloads)
+    let _ = std::fs::create_dir_all("/dev/pts");
+    if let Err(e) = nix_mount("devpts", "/dev/pts", "devpts") {
+        eprintln!("dd-agent: init: mount devpts: {e}");
+    }
+
+    // Writable tmpfs for workload data (rootfs is read-only dm-verity)
+    if let Err(e) = nix_mount("tmpfs", "/var/lib/dd", "tmpfs") {
+        eprintln!("dd-agent: init: mount /var/lib/dd tmpfs: {e}");
+    } else {
+        let _ = std::fs::create_dir_all("/var/lib/dd/workloads");
+        let _ = std::fs::create_dir_all("/var/lib/dd/shared");
+        eprintln!("dd-agent: init: mounted /var/lib/dd (tmpfs, writable)");
+    }
+
+    // Parse kernel cmdline for dd.* params → set as env vars
+    // e.g. dd.DD_OWNER=devopsdefender → env DD_OWNER=devopsdefender
+    if let Ok(cmdline) = std::fs::read_to_string("/proc/cmdline") {
+        for param in cmdline.split_whitespace() {
+            if let Some(kv) = param.strip_prefix("dd.") {
+                if let Some((key, val)) = kv.split_once('=') {
+                    std::env::set_var(key, val);
+                    eprintln!("dd-agent: init: cmdline env {key}={val}");
+                }
+            }
+            if let Some(hostname) = param.strip_prefix("hostname=") {
+                let _ = std::fs::write("/etc/hostname", hostname);
+                eprintln!("dd-agent: init: hostname={hostname}");
+            }
+        }
+    }
+
+    // Load config from config disk (second virtio disk with agent.env)
+    // This is the per-deployment config — not baked into the sealed image.
+    // Note: rootfs is read-only (dm-verity), so /mnt/config must exist in the image
+    // or we mount on /tmp/config instead (tmpfs is writable).
+    let config_dir = "/tmp/config";
+    let _ = std::fs::create_dir_all(config_dir);
+    // Wait for config disk device to appear
+    // Try vdb (virtio), sdb (scsi), or any second block device
+    let config_mounted = {
+        let mut mounted = false;
+        // List /dev to find available block devices
+        if let Ok(entries) = std::fs::read_dir("/dev") {
+            let devs: Vec<String> = entries
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .filter(|n| n.starts_with("vd") || n.starts_with("sd"))
+                .collect();
+            eprintln!("dd-agent: init: block devices: {devs:?}");
+        }
+        // Wait for device nodes to be fully created, then try mounting
+        std::thread::sleep(std::time::Duration::from_secs(1));
+
+        // Check device accessibility
+        eprintln!(
+            "dd-agent: init: /dev/vdb exists={}, metadata={:?}",
+            std::path::Path::new("/dev/vdb").exists(),
+            std::fs::metadata("/dev/vdb").err()
+        );
+
+        for dev in ["/dev/vdb", "/dev/sdb"] {
+            for fstype in ["ext4", "vfat", "ext2"] {
+                match nix_mount_ro(dev, config_dir, fstype) {
+                    Ok(()) => {
+                        eprintln!("dd-agent: init: mounted config disk ({dev}, {fstype})");
+                        mounted = true;
+                        break;
+                    }
+                    Err(e) => {
+                        eprintln!("dd-agent: init: mount {dev} ({fstype}): {e}");
+                    }
+                }
+            }
+            if mounted {
+                break;
+            }
+        }
+        mounted
+    };
+    if !config_mounted {
+        eprintln!("dd-agent: init: no config disk at /dev/vdb (or mount failed)");
+    }
+    if config_mounted {
+        let env_path = format!("{config_dir}/agent.env");
+        if let Ok(env_file) = std::fs::read_to_string(&env_path) {
+            for line in env_file.lines() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                if let Some((key, val)) = line.split_once('=') {
+                    std::env::set_var(key.trim(), val.trim());
+                    eprintln!("dd-agent: init: config env {key}={val}");
+                }
+            }
+        }
+        let _ = std::process::Command::new("umount")
+            .arg(config_dir)
+            .status();
+    } else {
+        eprintln!("dd-agent: init: no config disk at /dev/vdb");
+    }
+
+    // Set up networking from config (DD_IP, DD_GATEWAY, DD_DNS)
+    let ip_bin = "/sbin/ip";
+    let _ = std::process::Command::new(ip_bin)
+        .args(["link", "set", "lo", "up"])
+        .status();
+
+    // Find first non-lo interface
+    let iface = std::fs::read_dir("/sys/class/net")
+        .ok()
+        .and_then(|entries| {
+            entries
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .find(|n| n != "lo")
+        });
+
+    if let Some(ref iface) = iface {
+        let _ = std::process::Command::new(ip_bin)
+            .args(["link", "set", iface, "up"])
+            .status();
+
+        if let Ok(dd_ip) = std::env::var("DD_IP") {
+            eprintln!("dd-agent: init: setting {iface} ip={dd_ip}");
+            let _ = std::process::Command::new(ip_bin)
+                .args(["addr", "add", &dd_ip, "dev", iface])
+                .status();
+        }
+        if let Ok(gw) = std::env::var("DD_GATEWAY") {
+            eprintln!("dd-agent: init: default route via {gw}");
+            let _ = std::process::Command::new(ip_bin)
+                .args(["route", "add", "default", "via", &gw, "dev", iface])
+                .status();
+        }
+    }
+    if let Ok(dns) = std::env::var("DD_DNS") {
+        eprintln!("dd-agent: init: dns={dns}");
+        let _ = std::fs::write("/tmp/resolv.conf", format!("nameserver {dns}\n"));
+        // Bind-mount over the read-only /etc/resolv.conf
+        let _ = nix_mount_flags("/tmp/resolv.conf", "/etc/resolv.conf", "", libc::MS_BIND);
+    }
+
+    // Start zombie reaper thread (PID 1 must reap children)
+    std::thread::spawn(|| loop {
+        unsafe {
+            libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG);
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    });
+
+    eprintln!("dd-agent: init complete");
+}
+
+fn nix_mount(src: &str, target: &str, fstype: &str) -> Result<(), String> {
+    nix_mount_flags(src, target, fstype, 0)
+}
+
+fn nix_mount_ro(src: &str, target: &str, fstype: &str) -> Result<(), String> {
+    nix_mount_flags(src, target, fstype, libc::MS_RDONLY)
+}
+
+fn nix_mount_flags(
+    src: &str,
+    target: &str,
+    fstype: &str,
+    flags: libc::c_ulong,
+) -> Result<(), String> {
+    use std::ffi::CString;
+    let src = CString::new(src).unwrap();
+    let target = CString::new(target).unwrap();
+    let fstype = CString::new(fstype).unwrap();
+    let ret = unsafe {
+        libc::mount(
+            src.as_ptr(),
+            target.as_ptr(),
+            fstype.as_ptr(),
+            flags as libc::c_ulong,
+            std::ptr::null(),
+        )
+    };
+    if ret != 0 {
+        Err(format!("errno {}", std::io::Error::last_os_error()))
+    } else {
+        Ok(())
+    }
+}
+
+/// Exit safely — PID 1 cannot exit or the kernel panics.
+/// When running as init, sleep forever instead of exiting.
+fn safe_exit(code: i32) -> ! {
+    if std::process::id() == 1 {
+        eprintln!("dd-agent: fatal error (would exit {code}), halting as PID 1");
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(3600));
+        }
+    } else {
+        std::process::exit(code);
+    }
+}
+
 // ── Entry point ────────────────────────────────────────────────────────────
 
 #[tokio::main]
 async fn main() {
+    maybe_init();
+
     let cfg = match AgentRuntimeConfig::load() {
         Ok(c) => c,
         Err(e) => {
             eprintln!("dd-agent: configuration error: {e}");
-            std::process::exit(1);
+            safe_exit(1);
         }
     };
 
@@ -48,13 +290,13 @@ async fn run_agent_mode(cfg: AgentRuntimeConfig) {
 
     let owner = std::env::var("DD_OWNER").unwrap_or_else(|_| {
         eprintln!("dd-agent: DD_OWNER not set");
-        std::process::exit(1);
+        safe_exit(1);
     });
     let oauth = match dd_agent::server::GithubOAuthConfig::from_env() {
         Ok(config) => config,
         Err(error) => {
             eprintln!("dd-agent: configuration error: {error}");
-            std::process::exit(1);
+            safe_exit(1);
         }
     };
 
@@ -94,7 +336,7 @@ async fn run_agent_mode(cfg: AgentRuntimeConfig) {
             }
             Err(e) => {
                 eprintln!("dd-agent: self-registration failed: {e}");
-                std::process::exit(1);
+                safe_exit(1);
             }
         }
     } else if let Ok(register_url) = std::env::var("DD_REGISTER_URL") {
@@ -337,12 +579,12 @@ async fn run_agent_mode(cfg: AgentRuntimeConfig) {
 async fn run_scraper_mode() {
     let cf = dd_agent::tunnel::CfConfig::from_env().unwrap_or_else(|e| {
         eprintln!("dd-scraper: CF config required: {e}");
-        std::process::exit(1);
+        safe_exit(1);
     });
 
     let register_url = std::env::var("DD_REGISTER_URL").unwrap_or_else(|_| {
         eprintln!("dd-scraper: DD_REGISTER_URL required");
-        std::process::exit(1);
+        safe_exit(1);
     });
 
     let env_label = std::env::var("DD_ENV").unwrap_or_else(|_| "dev".into());
@@ -636,7 +878,7 @@ async fn register(
         Ok(config) => config,
         Err(e) => {
             eprintln!("dd-agent: registration failed: {e}");
-            std::process::exit(1);
+            safe_exit(1);
         }
     }
 }
@@ -792,27 +1034,56 @@ async fn monitoring_loop(
 async fn start_cloudflared(tunnel_token: &str) -> Result<(), String> {
     use tokio::process::Command;
     eprintln!("dd-agent: starting cloudflared tunnel");
-    let mut child = Command::new("cloudflared")
+    let _child = Command::new("cloudflared")
         .args(["tunnel", "--no-autoupdate", "run", "--token", tunnel_token])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
         .spawn()
         .map_err(|e| format!("spawn cloudflared: {e}"))?;
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-    match child.try_wait() {
-        Ok(Some(status)) => Err(format!("cloudflared exited immediately: {status}")),
-        Ok(None) => {
-            eprintln!("dd-agent: cloudflared running");
-            Ok(())
-        }
-        Err(e) => Err(format!("cloudflared wait error: {e}")),
+    // Give it a moment, then check stderr if it died
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    if !is_process_running("cloudflared") {
+        // Try to read stderr from the dead process
+        eprintln!("dd-agent: cloudflared died quickly, checking output...");
+        let output = Command::new("cloudflared").args(["version"]).output().await;
+        eprintln!("dd-agent: cloudflared version: {output:?}");
+    }
+    // Wait for cloudflared to initialize, then check /proc for the process.
+    // We can't use try_wait() when PID 1 because the zombie reaper thread
+    // may have already reaped the child via waitpid(-1).
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    if is_process_running("cloudflared") {
+        eprintln!("dd-agent: cloudflared running");
+        Ok(())
+    } else {
+        Err("cloudflared not running after spawn".into())
     }
 }
 
 async fn check_cloudflared() {
-    use tokio::process::Command;
-    let output = Command::new("pgrep").arg("cloudflared").output().await;
-    if !matches!(output, Ok(o) if o.status.success()) {
+    if !is_process_running("cloudflared") {
         eprintln!("dd-agent: cloudflared not running (may need restart)");
     }
+}
+
+/// Check if a process with the given name is running by scanning /proc.
+fn is_process_running(name: &str) -> bool {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let fname = entry.file_name();
+        let pid_str = fname.to_string_lossy();
+        if pid_str.chars().all(|c| c.is_ascii_digit()) {
+            let cmdline_path = format!("/proc/{pid_str}/cmdline");
+            if let Ok(cmdline) = std::fs::read_to_string(&cmdline_path) {
+                if cmdline.contains(name) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 // ── Graceful shutdown ────────────────────────────────────────────────────
@@ -853,11 +1124,11 @@ fn run_control_plane_mode(cfg: AgentRuntimeConfig) {
     match cmd.status() {
         Ok(status) if !status.success() => {
             eprintln!("dd-agent: dd-cp exited with {status}");
-            std::process::exit(status.code().unwrap_or(1));
+            safe_exit(status.code().unwrap_or(1));
         }
         Err(e) => {
             eprintln!("dd-agent: failed to start dd-cp: {e}");
-            std::process::exit(1);
+            safe_exit(1);
         }
         _ => {}
     }

@@ -1,24 +1,9 @@
 #!/bin/bash
-# Copy dd-agent binary into the image rootfs.
-# The binary is built by CI and placed in the build sources.
+# Binaries (dd-agent, cloudflared) are injected via ExtraTrees.
+# This script just enables the systemd service.
 set -euo pipefail
 
-echo "==> Installing dd-agent"
-
-if [ -f /work/src/dd-agent ]; then
-    install -m 0755 /work/src/dd-agent /usr/local/bin/dd-agent
-    echo "    installed dd-agent from build sources"
-else
-    echo "    WARNING: dd-agent binary not found in build sources"
-fi
-
-# Download cloudflared
-echo "==> Installing cloudflared"
-curl -fsSL -o /usr/local/bin/cloudflared \
-    https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
-chmod +x /usr/local/bin/cloudflared
-
-# Enable dd-agent service
+echo "==> Enabling dd-agent service"
 systemctl enable dd-agent.service
 
 echo "==> Build complete"
