@@ -151,6 +151,13 @@ pub struct AgentState {
     pub register_mode: bool,
     pub agent_registry: AgentRegistry,
     pub cf_config: Option<CfConfig>,
+    /// Register-issued auth: Ed25519 keypair (register) or public key (agent).
+    pub auth_signing_key: Option<jsonwebtoken::EncodingKey>,
+    pub auth_public_key_decoded: Option<jsonwebtoken::DecodingKey>,
+    /// Register URL for auth redirects (agents redirect here when dd_auth cookie is missing).
+    pub auth_issuer: Option<String>,
+    /// Base64-encoded Ed25519 public key (to send to agents during bootstrap).
+    pub auth_public_key_b64: Option<String>,
 }
 
 // ── Auth ──────────────────────────────────────────────────────────────────
@@ -158,6 +165,43 @@ pub struct AgentState {
 const SESSION_COOKIE: &str = "dd_session";
 const SESSION_TTL: Duration = Duration::from_secs(8 * 60 * 60);
 const OAUTH_STATE_TTL: Duration = Duration::from_secs(10 * 60);
+
+/// Register-issued auth token cookie (domain-scoped to .devopsdefender.com).
+const AUTH_COOKIE: &str = "dd_auth";
+const AUTH_TOKEN_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AuthClaims {
+    pub sub: String,
+    pub login: String,
+    pub iss: String,
+    pub iat: i64,
+    pub exp: i64,
+}
+
+/// Generate a random HMAC-SHA256 secret for register-issued auth tokens.
+/// Returns (EncodingKey, DecodingKey, base64-encoded secret for distribution to agents).
+pub fn generate_auth_secret() -> (jsonwebtoken::EncodingKey, jsonwebtoken::DecodingKey, String) {
+    // Use two UUIDv4s (128 bits each) for 256 bits of randomness
+    let mut secret = Vec::with_capacity(32);
+    secret.extend_from_slice(uuid::Uuid::new_v4().as_bytes());
+    secret.extend_from_slice(uuid::Uuid::new_v4().as_bytes());
+    let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &secret);
+    let encoding = jsonwebtoken::EncodingKey::from_secret(&secret);
+    let decoding = jsonwebtoken::DecodingKey::from_secret(&secret);
+    (encoding, decoding, b64)
+}
+
+/// Reconstruct auth keys from a base64-encoded secret (used by agents).
+pub fn auth_keys_from_b64(
+    b64: &str,
+) -> Option<(jsonwebtoken::EncodingKey, jsonwebtoken::DecodingKey)> {
+    let secret = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64).ok()?;
+    Some((
+        jsonwebtoken::EncodingKey::from_secret(&secret),
+        jsonwebtoken::DecodingKey::from_secret(&secret),
+    ))
+}
 
 fn extract_auth(headers: &HeaderMap) -> Option<String> {
     let value = headers.get("authorization")?.to_str().ok()?;
@@ -239,6 +283,19 @@ async fn resolve_github_token(
         return Ok(None);
     }
 
+    // Check register-issued dd_auth JWT cookie first
+    if let Some(ref decoding_key) = state.auth_public_key_decoded {
+        if let Some(jwt) = extract_cookie(headers, AUTH_COOKIE) {
+            let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
+            validation.validate_exp = true;
+            if let Ok(data) = jsonwebtoken::decode::<AuthClaims>(&jwt, decoding_key, &validation) {
+                if !data.claims.login.is_empty() {
+                    return Ok(Some(data.claims.login));
+                }
+            }
+        }
+    }
+
     if let Some(token) = query_token.filter(|token| !token.is_empty()) {
         verify_github_token(token, &state.owner).await?;
         return Ok(Some(token.to_string()));
@@ -266,6 +323,14 @@ async fn require_browser_token(
         Ok(token) => Ok(token),
         Err(AppError::Unauthorized) if state.oauth.is_some() => {
             Err(github_oauth_redirect(current_uri).into_response())
+        }
+        Err(AppError::Unauthorized) if state.auth_issuer.is_some() => {
+            // Redirect to register for auth. After login, the dd_auth cookie
+            // (scoped to .devopsdefender.com) will be set, and the user
+            // can return to this agent. Redirect to register's root which
+            // will trigger GitHub login and then show the fleet dashboard.
+            let issuer = state.auth_issuer.as_deref().unwrap();
+            Err(Redirect::to(issuer).into_response())
         }
         Err(err) => Err(err.into_response()),
     }
@@ -542,15 +607,61 @@ async fn github_auth_callback(
     state.browser_sessions.lock().await.insert(
         session_id.clone(),
         BrowserSession {
-            token,
+            token: token.clone(),
             expires_at: Instant::now() + SESSION_TTL,
         },
     );
 
-    Ok(response_with_cookie(
+    let mut response = response_with_cookie(
         Redirect::to(&next_path),
         build_session_cookie(&state, &session_id, SESSION_TTL.as_secs()),
-    ))
+    );
+
+    // If register has an auth signing key, also issue a domain-scoped dd_auth JWT.
+    if let Some(ref signing_key) = state.auth_signing_key {
+        // Fetch GitHub user info for the JWT claims
+        let login = match http
+            .get("https://api.github.com/user")
+            .header("Authorization", format!("Bearer {token}"))
+            .header("User-Agent", "dd-agent")
+            .send()
+            .await
+        {
+            Ok(resp) => resp
+                .json::<serde_json::Value>()
+                .await
+                .ok()
+                .and_then(|v| v["login"].as_str().map(String::from))
+                .unwrap_or_default(),
+            Err(_) => String::new(),
+        };
+
+        let now = chrono::Utc::now().timestamp();
+        let claims = AuthClaims {
+            sub: login.clone(),
+            login,
+            iss: state.auth_issuer.clone().unwrap_or_default(),
+            iat: now,
+            exp: now + AUTH_TOKEN_TTL.as_secs() as i64,
+        };
+        let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256);
+        if let Ok(jwt) = jsonwebtoken::encode(&header, &claims, signing_key) {
+            let domain = state
+                .cf_config
+                .as_ref()
+                .map(|c| c.domain.as_str())
+                .unwrap_or("devopsdefender.com");
+            let cookie = format!(
+                "{AUTH_COOKIE}={jwt}; Path=/; Domain=.{domain}; HttpOnly; Secure; SameSite=Lax; Max-Age={}",
+                AUTH_TOKEN_TTL.as_secs()
+            );
+            if let Ok(value) = HeaderValue::from_str(&cookie) {
+                response.headers_mut().append(SET_COOKIE, value);
+            }
+        }
+    }
+
+    Ok(response)
 }
 
 async fn github_auth_logout(State(state): State<AgentState>, headers: HeaderMap) -> Response {
@@ -2024,6 +2135,8 @@ async fn handle_ws_register(socket: WebSocket, state: AgentState) {
         owner: reg.owner,
         tunnel_token: tunnel_info.tunnel_token,
         hostname: tunnel_info.hostname,
+        auth_public_key: state.auth_public_key_b64.clone(),
+        auth_issuer: state.auth_issuer.clone(),
     };
     let json = serde_json::to_vec(&config).unwrap();
     let mut enc_resp = vec![0u8; 65535];

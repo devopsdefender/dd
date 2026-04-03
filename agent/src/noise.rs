@@ -108,6 +108,12 @@ pub struct BootstrapConfig {
     pub owner: String,
     pub tunnel_token: String,
     pub hostname: String,
+    /// Ed25519 public key (base64) for verifying register-issued JWTs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_public_key: Option<String>,
+    /// Register hostname for auth redirects (e.g. "https://app-staging.devopsdefender.com").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_issuer: Option<String>,
 }
 
 // ── Wire helpers ─────────────────────────────────────────────────────────
