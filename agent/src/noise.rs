@@ -21,14 +21,16 @@ const MAX_MSG_LEN: usize = 65535;
 #[serde(tag = "type")]
 pub enum NoiseMessage {
     // ── Job management (client → agent) ──
-    /// Start a workload in background.
+    /// Start a container in background.
     #[serde(rename = "deploy")]
     Deploy {
-        cmd: Vec<String>,
+        image: String,
         #[serde(default)]
         app_name: Option<String>,
         #[serde(default)]
         env: Option<Vec<String>>,
+        #[serde(default)]
+        cmd: Option<Vec<String>>,
         #[serde(default)]
         tty: bool,
     },
@@ -318,9 +320,9 @@ async fn handle_session(
                             message: None,
                         }
                     }
-                    NoiseMessage::Deploy { cmd, app_name, env, tty } => {
+                    NoiseMessage::Deploy { image, app_name, env, cmd, tty } => {
                         let req = crate::server::DeployRequest {
-                            cmd, env,
+                            image, env, cmd,
                             app_name: app_name.clone(),
                             app_version: None, tty,
                         };

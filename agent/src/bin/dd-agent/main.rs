@@ -395,6 +395,8 @@ async fn run_agent_mode(cfg: AgentRuntimeConfig) {
         Arc::new(Mutex::new(HashMap::new()));
 
     // Auto-deploy boot workload if configured
+    // DD_BOOT_CMD="bash" — run a direct command (no OCI pull)
+    // DD_BOOT_IMAGE="alpine:latest" — pull OCI image and chroot
     if let Ok(boot_cmd) = std::env::var("DD_BOOT_CMD") {
         let boot_app = std::env::var("DD_BOOT_APP").unwrap_or_else(|_| "shell".into());
         eprintln!("dd-agent: starting boot shell: {boot_cmd}");
@@ -451,6 +453,60 @@ async fn run_agent_mode(cfg: AgentRuntimeConfig) {
                 eprintln!("dd-agent: boot shell running");
             }
             Err(e) => eprintln!("dd-agent: boot shell failed: {e}"),
+        }
+    } else if let Ok(boot_image) = std::env::var("DD_BOOT_IMAGE") {
+        let boot_app = std::env::var("DD_BOOT_APP").unwrap_or_else(|_| "boot".into());
+        let boot_tty = std::env::var("DD_BOOT_TTY")
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(false);
+        // DD_BOOT_ENV: semicolon-separated KEY=VALUE pairs passed to the workload
+        let boot_env = std::env::var("DD_BOOT_ENV").ok().map(|s| {
+            s.split(';')
+                .map(|kv| kv.trim().to_string())
+                .filter(|kv| !kv.is_empty())
+                .collect::<Vec<String>>()
+        });
+        eprintln!("dd-agent: auto-deploying boot workload {boot_app} ({boot_image})");
+        let req = dd_agent::server::DeployRequest {
+            image: boot_image,
+            env: boot_env,
+            cmd: None,
+            app_name: Some(boot_app),
+            app_version: None,
+            tty: boot_tty,
+        };
+        let (id, status) = dd_agent::server::execute_deploy(&deployments, req).await;
+        eprintln!("dd-agent: boot workload {id} {status}");
+    }
+
+    // Deploy additional boot workloads: DD_BOOT_IMAGE_2, DD_BOOT_APP_2, etc.
+    for i in 2..=9 {
+        let image_key = format!("DD_BOOT_IMAGE_{i}");
+        if let Ok(image) = std::env::var(&image_key) {
+            let app_name =
+                std::env::var(format!("DD_BOOT_APP_{i}")).unwrap_or_else(|_| format!("boot-{i}"));
+            let tty = std::env::var(format!("DD_BOOT_TTY_{i}"))
+                .map(|v| v == "true" || v == "1")
+                .unwrap_or(false);
+            let env = std::env::var(format!("DD_BOOT_ENV_{i}")).ok().map(|s| {
+                s.split(';')
+                    .map(|kv| kv.trim().to_string())
+                    .filter(|kv| !kv.is_empty())
+                    .collect::<Vec<String>>()
+            });
+            eprintln!("dd-agent: auto-deploying additional workload {app_name} ({image})");
+            let req = dd_agent::server::DeployRequest {
+                image,
+                env,
+                cmd: None,
+                app_name: Some(app_name),
+                app_version: None,
+                tty,
+            };
+            let (id, status) = dd_agent::server::execute_deploy(&deployments, req).await;
+            eprintln!("dd-agent: additional workload {id} {status}");
+        } else {
+            break;
         }
     }
 
