@@ -1802,11 +1802,47 @@ async fn fleet_dashboard_html(state: &AgentState) -> Html<String> {
     let uptime_str = format_uptime(state.started_at.elapsed().as_secs());
     let nav = nav_bar(&[("Fleet", "/", true)]);
 
-    let table = if agents.is_empty() {
+    let agents_count = agents.len();
+    let agent_table = if agents.is_empty() {
         r#"<div class="empty">No agents registered</div>"#.to_string()
     } else {
         format!(
             r#"<table><tr><th>hostname</th><th>vm</th><th>status</th><th>attestation</th><th>workloads</th><th>cpu</th><th>memory</th><th>last seen</th></tr>{rows}</table>"#
+        )
+    };
+
+    // Own workloads (the register itself runs workloads too)
+    drop(agents);
+    let deps = state.deployments.lock().await;
+    let workload_rows = if deps.is_empty() {
+        r#"<div class="empty">No workloads running</div>"#.to_string()
+    } else {
+        let mut wr = String::new();
+        for d in deps.values() {
+            let status_class = match d.status.as_str() {
+                "running" => "running",
+                "deploying" => "deploying",
+                "failed" | "exited" => "failed",
+                _ => "idle",
+            };
+            let session_link = if d.status == "running" {
+                format!(
+                    r#"<a href="/session/{name}">session</a>"#,
+                    name = d.app_name
+                )
+            } else {
+                r#"<span class="dim">—</span>"#.to_string()
+            };
+            wr.push_str(&format!(
+                r#"<tr><td><a href="/workload/{id}">{name}</a></td><td><span class="pill {status_class}">{status}</span></td><td class="dim">{image}</td><td>{session_link}</td></tr>"#,
+                id = d.id,
+                name = d.app_name,
+                status = d.status,
+                image = d.image,
+            ));
+        }
+        format!(
+            r#"<table><tr><th>app</th><th>status</th><th>image</th><th>session</th></tr>{wr}</table>"#
         )
     };
 
@@ -1815,12 +1851,15 @@ async fn fleet_dashboard_html(state: &AgentState) -> Html<String> {
 <div class="sub">{env} fleet &middot; {agent_id}</div>
 <div class="meta"><span class="ok">healthy</span> &middot; uptime {uptime} &middot; {count} agent(s)</div>
 <div class="section">Agents</div>
-{table}"#,
+{agent_table}
+<div class="section">Workloads</div>
+{workload_rows}"#,
         env = env,
         agent_id = &state.agent_id[..8],
         uptime = uptime_str,
-        count = agents.len(),
-        table = table,
+        count = agents_count,
+        agent_table = agent_table,
+        workload_rows = workload_rows,
     );
 
     Html(page_shell(&format!("DD Fleet — {env}"), &nav, &content))
