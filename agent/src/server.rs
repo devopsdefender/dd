@@ -32,11 +32,9 @@ pub struct DeploymentInfo {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct DeployRequest {
-    pub image: String,
+    pub cmd: Vec<String>,
     #[serde(default)]
     pub env: Option<Vec<String>>,
-    #[serde(default)]
-    pub cmd: Option<Vec<String>>,
     #[serde(default)]
     pub app_name: Option<String>,
     #[serde(default)]
@@ -1386,9 +1384,9 @@ async fn handle_ws_noise_cmd(socket: WebSocket, state: AgentState) {
                 };
 
                 let response = match noise_msg {
-                    crate::noise::NoiseMessage::Deploy { image, app_name, env, cmd, tty } => {
+                    crate::noise::NoiseMessage::Deploy { cmd, app_name, env, tty } => {
                         let req = DeployRequest {
-                            image, env, cmd,
+                            cmd, env,
                             app_name: app_name.clone(),
                             app_version: None, tty,
                         };
@@ -2456,7 +2454,7 @@ pub async fn execute_deploy(deployments: &Deployments, req: DeployRequest) -> (S
         id: dep_id.clone(),
         pid: None,
         app_name: app_name.clone(),
-        image: req.image.clone(),
+        image: req.cmd.join(" "),
         status: "deploying".into(),
         error_message: None,
         started_at: chrono::Utc::now().to_rfc3339(),
@@ -2494,18 +2492,14 @@ async fn run_deploy(
         }
     }
 
-    // Pull image
-    let config = match crate::process::pull_image(&req.image, &app_name).await {
-        Ok(c) => c,
-        Err(e) => {
-            set_deploy_failed(&deployments, &dep_id, &e).await;
-            return;
-        }
-    };
-
-    // Spawn process
-    let extra_env = req.env.unwrap_or_default();
-    match crate::process::spawn_workload(&app_name, &config, extra_env, req.tty).await {
+    // Spawn command
+    if req.cmd.is_empty() {
+        set_deploy_failed(&deployments, &dep_id, "no cmd specified").await;
+        return;
+    }
+    let program = &req.cmd[0];
+    let args: Vec<&str> = req.cmd[1..].iter().map(|s| s.as_str()).collect();
+    match crate::process::spawn_command(program, &args, req.tty).await {
         Ok(child) => {
             let pid = child.id();
             eprintln!("dd-agent: deployment {dep_id} running (pid={pid:?})");
