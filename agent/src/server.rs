@@ -1897,7 +1897,12 @@ async fn agent_detail(Path(agent_id): Path<String>, State(state): State<AgentSta
     } else {
         a.deployment_names
             .iter()
-            .map(|d| format!("<li>{d}</li>"))
+            .map(|d| {
+                format!(
+                    r#"<li><a href="https://{hostname}/session/{d}" target="_blank">{d}</a></li>"#,
+                    hostname = a.hostname,
+                )
+            })
             .collect::<Vec<_>>()
             .join("\n")
     };
