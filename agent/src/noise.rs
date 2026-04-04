@@ -24,7 +24,10 @@ pub enum NoiseMessage {
     /// Start a workload in background.
     #[serde(rename = "deploy")]
     Deploy {
+        #[serde(default)]
         cmd: Vec<String>,
+        #[serde(default)]
+        image: Option<String>,
         #[serde(default)]
         app_name: Option<String>,
         #[serde(default)]
@@ -318,9 +321,9 @@ async fn handle_session(
                             message: None,
                         }
                     }
-                    NoiseMessage::Deploy { cmd, app_name, env, tty } => {
+                    NoiseMessage::Deploy { cmd, image, app_name, env, tty } => {
                         let req = crate::server::DeployRequest {
-                            cmd, env,
+                            cmd, image, env,
                             app_name: app_name.clone(),
                             app_version: None, tty,
                         };

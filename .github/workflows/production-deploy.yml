@@ -5,7 +5,7 @@ on:
     branches: [main]
     paths:
       - "agent/**"
-      - "infra/**"
+      - "scripts/**"
       - ".github/workflows/production-deploy.yml"
   workflow_dispatch:
 
@@ -60,7 +60,6 @@ jobs:
         with:
           credentials_json: ${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}
       - uses: google-github-actions/setup-gcloud@v2
-
       - name: Delete managed VMs
         env:
           GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
@@ -74,16 +73,12 @@ jobs:
             gcloud compute instances delete "$name" --project="$GCP_PROJECT_ID" --zone="$zone" --quiet || true
           done
 
-      # CF tunnel cleanup removed — create_agent_tunnel() in tunnel.rs
-      # already deletes any existing tunnel with the same name before
-      # creating a new one. Blanket deletion of dd-production-* tunnels
-      # was killing marketplace agent tunnels.
-
   deploy:
     needs: [build, cleanup]
     runs-on: ubuntu-latest
     environment: production
     steps:
+      - uses: actions/checkout@v4
       - uses: google-github-actions/auth@v2
         with:
           credentials_json: ${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}
@@ -99,134 +94,5 @@ jobs:
           DD_GITHUB_CALLBACK_URL: ${{ vars.DD_GITHUB_CALLBACK_URL }}
           DD_GITHUB_CLIENT_SECRET: ${{ secrets.DD_GITHUB_CLIENT_SECRET }}
           BINARY_URL: ${{ needs.build.outputs.binary_url }}
-        run: |
-          set -euo pipefail
-          VM_NAME="dd-prod-$(date +%s)"
-          HOSTNAME="app.${DD_DOMAIN}"
+        run: scripts/gcp-deploy.sh
 
-          cat > /tmp/startup.sh <<STARTUP
-          #!/bin/bash
-          set -euo pipefail
-          export DEBIAN_FRONTEND=noninteractive
-
-          # Install cloudflared
-          curl -fsSL -o /usr/local/bin/cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
-          chmod +x /usr/local/bin/cloudflared
-
-          # Download dd-agent from GitHub release
-          curl -fsSL -o /usr/local/bin/dd-agent "${BINARY_URL}" -H "Accept: application/octet-stream"
-          chmod +x /usr/local/bin/dd-agent
-
-          export DD_OWNER=devopsdefender
-          export DD_AGENT_MODE=register
-          export DD_ENV=production
-          export DD_CF_API_TOKEN=${CLOUDFLARE_API_TOKEN}
-          export DD_CF_ACCOUNT_ID=${CLOUDFLARE_ACCOUNT_ID}
-          export DD_CF_ZONE_ID=${CLOUDFLARE_ZONE_ID}
-          export DD_CF_DOMAIN=${DD_DOMAIN}
-          export DD_HOSTNAME=${HOSTNAME}
-          export DD_GITHUB_CLIENT_ID=${DD_GITHUB_CLIENT_ID}
-          export DD_GITHUB_CLIENT_SECRET=${DD_GITHUB_CLIENT_SECRET}
-          export DD_GITHUB_CALLBACK_URL=${DD_GITHUB_CALLBACK_URL}
-
-          # Boot a demo shell workload
-          export DD_BOOT_CMD=bash
-          export DD_BOOT_APP=demo
-
-          nohup /usr/local/bin/dd-agent > /var/log/dd-agent.log 2>&1 &
-
-          # Start scraper process (discovers agents from CF, reports to register)
-          sleep 5
-          DD_AGENT_MODE=scraper \
-          DD_CF_API_TOKEN=${CLOUDFLARE_API_TOKEN} \
-          DD_CF_ACCOUNT_ID=${CLOUDFLARE_ACCOUNT_ID} \
-          DD_CF_ZONE_ID=${CLOUDFLARE_ZONE_ID} \
-          DD_CF_DOMAIN=${DD_DOMAIN} \
-          DD_ENV=production \
-          DD_REGISTER_URL=ws://localhost:8080/scraper \
-          nohup /usr/local/bin/dd-agent > /var/log/dd-scraper.log 2>&1 &
-          STARTUP
-
-          gcloud compute instances create "$VM_NAME" \
-            --project="$GCP_PROJECT_ID" \
-            --zone="$GCP_ZONE" \
-            --machine-type=c3-standard-4 \
-            --confidential-compute-type=TDX \
-            --maintenance-policy=TERMINATE \
-            --boot-disk-size=256GB \
-            --image-family=ubuntu-2404-lts-amd64 \
-            --image-project=ubuntu-os-cloud \
-            --metadata-from-file=startup-script=/tmp/startup.sh \
-            --labels=devopsdefender=managed,dd_env=production \
-            --scopes=storage-ro \
-            --tags=dd-agent
-
-          EXTERNAL_IP=$(gcloud compute instances describe "$VM_NAME" \
-            --project="$GCP_PROJECT_ID" --zone="$GCP_ZONE" \
-            --format="value(networkInterfaces[0].accessConfigs[0].natIP)")
-          echo "VM: $VM_NAME IP: $EXTERNAL_IP"
-          echo "bootstrap_ip=$EXTERNAL_IP" >> "$GITHUB_ENV"
-
-      - name: Wait for agent health
-        run: |
-          for i in $(seq 1 60); do
-            curl -fsS "http://${bootstrap_ip}:8080/health" >/dev/null 2>&1 && echo "Agent healthy!" && exit 0
-            echo "  attempt ${i}/60..." && sleep 5
-          done
-          echo "::error::Agent not healthy within 5 minutes"
-          exit 1
-
-      - name: Smoke check via CF tunnel
-        run: |
-          url="https://app.${DD_DOMAIN}"
-          for i in $(seq 1 24); do
-            curl -fsS "${url}/health" >/dev/null 2>&1 && echo "Tunnel healthy!" && exit 0
-            echo "  attempt ${i}/24..." && sleep 5
-          done
-          echo "::error::Tunnel not reachable within 2 minutes"
-          exit 1
-
-      - name: Integration test
-        run: |
-          set -euo pipefail
-          url="https://app.${DD_DOMAIN}"
-
-          # 1. Health check
-          health=$(curl -fsS "${url}/health")
-          echo "Health: $health"
-          echo "$health" | jq -e '.ok == true' > /dev/null
-          echo "$health" | jq -e '.agent_id' > /dev/null
-          echo "✓ Agent healthy"
-
-          # 2. Wait for boot workload to deploy
-          for i in $(seq 1 30); do
-            count=$(echo "$(curl -fsS "${url}/health")" | jq -r '.deployment_count')
-            [ "$count" -gt 0 ] && echo "✓ Boot workload running (deployments: $count)" && break
-            echo "  waiting for boot workload... attempt ${i}/30"
-            sleep 5
-          done
-
-          # 3. Protected session page redirects into GitHub login
-          auth_ok=0
-          for i in $(seq 1 12); do
-            headers=$(curl -sSI "${url}/session/demo" || true)
-            if echo "$headers" | grep -iq '^location: /auth/github/start?next=%2Fsession%2Fdemo'; then
-              echo "✓ Web terminal page requires GitHub login"
-              auth_ok=1
-              break
-            fi
-            echo "  waiting for auth redirect... attempt ${i}/12"
-            sleep 5
-          done
-          [ "$auth_ok" -eq 1 ] || { echo "::error::Protected session page did not redirect to GitHub login"; exit 1; }
-
-          # 4. Deployments endpoint works
-          deps=$(curl -fsS "${url}/deployments" -H "Authorization: Bearer dummy" 2>/dev/null || echo "[]")
-          echo "Deployments: $deps"
-
-          echo ""
-          echo "═══════════════════════════════════════"
-          echo "  Production integration test passed!"
-          echo "  Agent: ${url}"
-          echo "  Terminal: ${url}/session/demo"
-          echo "═══════════════════════════════════════"

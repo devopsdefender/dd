@@ -22,6 +22,8 @@ use crate::tunnel::CfConfig;
 pub struct DeploymentInfo {
     pub id: String,
     pub pid: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub container_id: Option<String>,
     pub app_name: String,
     pub image: String,
     pub status: String,
@@ -32,7 +34,10 @@ pub struct DeploymentInfo {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct DeployRequest {
+    #[serde(default)]
     pub cmd: Vec<String>,
+    #[serde(default)]
+    pub image: Option<String>,
     #[serde(default)]
     pub env: Option<Vec<String>>,
     #[serde(default)]
@@ -548,13 +553,14 @@ async fn deployment_logs(
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     verify_owner(&state, &headers).await?;
-    let pid = {
+    let (pid, container_id) = {
         let deps = state.deployments.lock().await;
         let info = deps.get(&id).ok_or(AppError::NotFound)?;
-        info.pid
+        (info.pid, info.container_id.clone())
     };
-    // Read from the process log file
-    let logs: Vec<String> = if let Some(pid) = pid {
+    let logs: Vec<String> = if let Some(cid) = container_id {
+        crate::container::logs(&cid, 100).await.unwrap_or_default()
+    } else if let Some(pid) = pid {
         let log_path = format!("/var/lib/dd/workloads/logs/{pid}.log");
         let content = tokio::fs::read_to_string(&log_path)
             .await
@@ -621,8 +627,19 @@ async fn workload_page(
         })
         .unwrap_or_default();
 
-    // Read logs
-    let logs = if let Some(pid) = d.pid {
+    // Read logs (container via bollard, process via log file)
+    let logs = if let Some(ref cid) = d.container_id {
+        let lines = crate::container::logs(cid, 200).await.unwrap_or_default();
+        lines
+            .iter()
+            .map(|l| {
+                l.replace('&', "&amp;")
+                    .replace('<', "&lt;")
+                    .replace('>', "&gt;")
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else if let Some(pid) = d.pid {
         let log_path = format!("/var/lib/dd/workloads/logs/{pid}.log");
         let content = tokio::fs::read_to_string(&log_path)
             .await
@@ -1384,9 +1401,9 @@ async fn handle_ws_noise_cmd(socket: WebSocket, state: AgentState) {
                 };
 
                 let response = match noise_msg {
-                    crate::noise::NoiseMessage::Deploy { cmd, app_name, env, tty } => {
+                    crate::noise::NoiseMessage::Deploy { cmd, image, app_name, env, tty } => {
                         let req = DeployRequest {
-                            cmd, env,
+                            cmd, image, env,
                             app_name: app_name.clone(),
                             app_version: None, tty,
                         };
@@ -2428,13 +2445,14 @@ pub fn build_router(state: AgentState) -> Router {
 async fn post_deploy(
     axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
     State(state): State<AgentState>,
+    headers: HeaderMap,
     Json(req): Json<DeployRequest>,
 ) -> Response {
-    // Only allow deploys from localhost
-    if !addr.ip().is_loopback() {
+    // Localhost always allowed; remote requires auth
+    if !addr.ip().is_loopback() && verify_owner(&state, &headers).await.is_err() {
         return (
-            axum::http::StatusCode::FORBIDDEN,
-            Json(serde_json::json!({"error": "deploy only allowed from localhost"})),
+            axum::http::StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "authentication required"})),
         )
             .into_response();
     }
@@ -2450,11 +2468,18 @@ pub async fn execute_deploy(deployments: &Deployments, req: DeployRequest) -> (S
     let app_name = req.app_name.clone().unwrap_or_else(|| "unnamed".into());
     let short_id = dep_id[..8].to_string();
 
+    let image_label = if let Some(ref img) = req.image {
+        img.clone()
+    } else {
+        req.cmd.join(" ")
+    };
+
     let info = DeploymentInfo {
         id: dep_id.clone(),
         pid: None,
+        container_id: None,
         app_name: app_name.clone(),
-        image: req.cmd.join(" "),
+        image: image_label,
         status: "deploying".into(),
         error_message: None,
         started_at: chrono::Utc::now().to_rfc3339(),
@@ -2475,43 +2500,60 @@ async fn run_deploy(
     app_name: String,
     req: DeployRequest,
 ) {
-    // Kill old processes for same app
+    // Stop old workloads for same app
     {
         let deps = deployments.lock().await;
-        let old_pids: Vec<(String, Option<u32>)> = deps
+        let old: Vec<(String, Option<u32>, Option<String>)> = deps
             .values()
             .filter(|d| d.app_name == app_name && d.id != dep_id)
-            .map(|d| (d.id.clone(), d.pid))
+            .map(|d| (d.id.clone(), d.pid, d.container_id.clone()))
             .collect();
         drop(deps);
-        for (old_id, old_pid) in old_pids {
-            if let Some(pid) = old_pid {
+        for (old_id, old_pid, old_cid) in old {
+            if let Some(cid) = old_cid {
+                let _ = crate::container::stop(&cid).await;
+            } else if let Some(pid) = old_pid {
                 let _ = crate::process::kill_process(pid).await;
             }
             deployments.lock().await.remove(&old_id);
         }
     }
 
-    // Spawn command
-    if req.cmd.is_empty() {
-        set_deploy_failed(&deployments, &dep_id, "no cmd specified").await;
-        return;
-    }
-    let program = &req.cmd[0];
-    let args: Vec<&str> = req.cmd[1..].iter().map(|s| s.as_str()).collect();
-    match crate::process::spawn_command(program, &args, req.tty).await {
-        Ok(child) => {
-            let pid = child.id();
-            eprintln!("dd-agent: deployment {dep_id} running (pid={pid:?})");
-            let mut deps = deployments.lock().await;
-            if let Some(info) = deps.get_mut(&dep_id) {
-                info.pid = pid;
-                info.status = "running".into();
+    if let Some(ref image) = req.image {
+        // Container path — pull and run via bollard
+        match crate::container::pull_and_run(image, &app_name, req.env, true).await {
+            Ok(container_id) => {
+                eprintln!("dd-agent: deployment {dep_id} running (container={container_id})");
+                let mut deps = deployments.lock().await;
+                if let Some(info) = deps.get_mut(&dep_id) {
+                    info.container_id = Some(container_id);
+                    info.status = "running".into();
+                }
+            }
+            Err(e) => {
+                set_deploy_failed(&deployments, &dep_id, &e).await;
             }
         }
-        Err(e) => {
-            set_deploy_failed(&deployments, &dep_id, &e).await;
+    } else if !req.cmd.is_empty() {
+        // Process path — spawn command
+        let program = &req.cmd[0];
+        let args: Vec<&str> = req.cmd[1..].iter().map(|s| s.as_str()).collect();
+        match crate::process::spawn_command(program, &args, req.tty).await {
+            Ok(child) => {
+                let pid = child.id();
+                eprintln!("dd-agent: deployment {dep_id} running (pid={pid:?})");
+                let mut deps = deployments.lock().await;
+                if let Some(info) = deps.get_mut(&dep_id) {
+                    info.pid = pid;
+                    info.status = "running".into();
+                }
+            }
+            Err(e) => {
+                set_deploy_failed(&deployments, &dep_id, &e).await;
+            }
         }
+    } else {
+        set_deploy_failed(&deployments, &dep_id, "neither image nor cmd specified").await;
     }
 }
 
@@ -2525,7 +2567,7 @@ async fn set_deploy_failed(deployments: &Deployments, dep_id: &str, error: &str)
 }
 
 pub async fn execute_stop(deployments: &Deployments, id: &str) -> Result<(), String> {
-    let pid = {
+    let (pid, container_id) = {
         let deps = deployments.lock().await;
         let info = deps.get(id).ok_or("deployment not found")?;
         if info.status != "running" && info.status != "deploying" {
@@ -2534,10 +2576,12 @@ pub async fn execute_stop(deployments: &Deployments, id: &str) -> Result<(), Str
                 info.status
             ));
         }
-        info.pid
+        (info.pid, info.container_id.clone())
     };
 
-    if let Some(pid) = pid {
+    if let Some(cid) = container_id {
+        crate::container::stop(&cid).await?;
+    } else if let Some(pid) = pid {
         crate::process::kill_process(pid).await?;
     }
 

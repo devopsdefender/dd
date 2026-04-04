@@ -266,7 +266,18 @@ async fn main() {
 
     match cfg.mode {
         AgentMode::Agent | AgentMode::Register => run_agent_mode(cfg).await,
-        AgentMode::Scraper => run_scraper_mode().await,
+        AgentMode::Scraper => {
+            eprintln!("dd-agent: scraper mode deprecated — use dd-scraper binary instead");
+            // Fallback: run the scraper binary if available, otherwise exit
+            let status = tokio::process::Command::new("dd-scraper").status().await;
+            match status {
+                Ok(s) => std::process::exit(s.code().unwrap_or(1)),
+                Err(_) => {
+                    eprintln!("dd-agent: dd-scraper not found");
+                    std::process::exit(1);
+                }
+            }
+        }
         AgentMode::ControlPlane => run_control_plane_mode(cfg),
         AgentMode::Measure => measure::run_measure_mode(),
     }
@@ -394,7 +405,9 @@ async fn run_agent_mode(cfg: AgentRuntimeConfig) {
     let pending_oauth_states: dd_agent::server::PendingOauthStates =
         Arc::new(Mutex::new(HashMap::new()));
 
-    // Auto-deploy boot workload if configured
+    // Auto-deploy boot workloads
+    // DD_BOOT_CMD="bash" — run a direct process
+    // DD_BOOT_IMAGE="ghcr.io/openclaw/openclaw:latest" — run a container via bollard
     if let Ok(boot_cmd) = std::env::var("DD_BOOT_CMD") {
         let boot_app = std::env::var("DD_BOOT_APP").unwrap_or_else(|_| "shell".into());
         eprintln!("dd-agent: starting boot shell: {boot_cmd}");
@@ -409,6 +422,7 @@ async fn run_agent_mode(cfg: AgentRuntimeConfig) {
                     dd_agent::server::DeploymentInfo {
                         id: short_id,
                         pid,
+                        container_id: None,
                         app_name: boot_app,
                         image: boot_cmd,
                         status: "running".into(),
@@ -416,7 +430,6 @@ async fn run_agent_mode(cfg: AgentRuntimeConfig) {
                         started_at: chrono::Utc::now().to_rfc3339(),
                     },
                 );
-                // Store I/O handles for web terminal
                 let (stdout_tx, _) = tokio::sync::broadcast::channel::<Vec<u8>>(256);
                 if let Some(stdin) = child.stdin.take() {
                     process_handles.lock().await.insert(
@@ -427,7 +440,6 @@ async fn run_agent_mode(cfg: AgentRuntimeConfig) {
                         },
                     );
                 }
-                // Pipe stdout through broadcast channel
                 if let Some(stdout) = child.stdout.take() {
                     tokio::spawn(async move {
                         use tokio::io::AsyncReadExt;
@@ -444,7 +456,6 @@ async fn run_agent_mode(cfg: AgentRuntimeConfig) {
                         }
                     });
                 }
-                // Wait for process in background
                 tokio::spawn(async move {
                     let _ = child.wait().await;
                 });
@@ -452,6 +463,80 @@ async fn run_agent_mode(cfg: AgentRuntimeConfig) {
             }
             Err(e) => eprintln!("dd-agent: boot shell failed: {e}"),
         }
+    }
+
+    // Boot container workloads: DD_BOOT_IMAGE, DD_BOOT_IMAGE_2, etc.
+    for i in 0..=9 {
+        let image_key = if i == 0 {
+            "DD_BOOT_IMAGE".to_string()
+        } else {
+            format!("DD_BOOT_IMAGE_{i}")
+        };
+        let Ok(image) = std::env::var(&image_key) else {
+            if i > 0 {
+                break;
+            }
+            continue;
+        };
+        let app_name = if i == 0 {
+            std::env::var("DD_BOOT_APP").unwrap_or_else(|_| "boot".into())
+        } else {
+            std::env::var(format!("DD_BOOT_APP_{i}")).unwrap_or_else(|_| format!("boot-{i}"))
+        };
+        let env = if i == 0 {
+            std::env::var("DD_BOOT_ENV").ok()
+        } else {
+            std::env::var(format!("DD_BOOT_ENV_{i}")).ok()
+        }
+        .map(|s| {
+            s.split(';')
+                .map(|kv| kv.trim().to_string())
+                .filter(|kv| !kv.is_empty())
+                .collect::<Vec<String>>()
+        });
+
+        eprintln!("dd-agent: starting boot container: {app_name} ({image})");
+        let req = dd_agent::server::DeployRequest {
+            cmd: Vec::new(),
+            image: Some(image),
+            env,
+            app_name: Some(app_name),
+            app_version: None,
+            tty: false,
+        };
+        let (id, status) = dd_agent::server::execute_deploy(&deployments, req).await;
+        eprintln!("dd-agent: boot container {id} {status}");
+    }
+
+    // Additional boot commands: DD_BOOT_CMD_2, DD_BOOT_CMD_3, etc.
+    for i in 2..=9 {
+        let cmd_key = format!("DD_BOOT_CMD_{i}");
+        let Ok(cmd) = std::env::var(&cmd_key) else {
+            break;
+        };
+        let app_name =
+            std::env::var(format!("DD_BOOT_APP_{i}")).unwrap_or_else(|_| format!("cmd-{i}"));
+        let env = std::env::var(format!("DD_BOOT_ENV_{i}")).ok().map(|s| {
+            s.split(';')
+                .map(|kv| kv.trim().to_string())
+                .filter(|kv| !kv.is_empty())
+                .collect::<Vec<String>>()
+        });
+        let tty = std::env::var(format!("DD_BOOT_TTY_{i}"))
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(false);
+
+        eprintln!("dd-agent: starting boot command: {app_name} ({cmd})");
+        let req = dd_agent::server::DeployRequest {
+            cmd: vec![cmd],
+            image: None,
+            env,
+            app_name: Some(app_name),
+            app_version: None,
+            tty,
+        };
+        let (id, status) = dd_agent::server::execute_deploy(&deployments, req).await;
+        eprintln!("dd-agent: boot command {id} {status}");
     }
 
     let register_mode = cfg.mode == config::AgentMode::Register;
@@ -577,287 +662,6 @@ async fn run_agent_mode(cfg: AgentRuntimeConfig) {
 
     shutdown_deployments(deployments).await;
     eprintln!("dd-agent: shutdown complete");
-}
-
-// ── Scraper mode ──────────────────────────────────────────────────────────
-
-async fn run_scraper_mode() {
-    let cf = dd_agent::tunnel::CfConfig::from_env().unwrap_or_else(|e| {
-        eprintln!("dd-scraper: CF config required: {e}");
-        safe_exit(1);
-    });
-
-    let register_url = std::env::var("DD_REGISTER_URL").unwrap_or_else(|_| {
-        eprintln!("dd-scraper: DD_REGISTER_URL required");
-        safe_exit(1);
-    });
-
-    let env_label = std::env::var("DD_ENV").unwrap_or_else(|_| "dev".into());
-    let tunnel_prefix = format!("dd-{env_label}-");
-    let scrape_interval = std::time::Duration::from_secs(30);
-    let scrape_timeout = std::time::Duration::from_secs(3);
-
-    let attestation = dd_agent::attestation::detect();
-    eprintln!(
-        "dd-scraper: starting (env={env_label}, attestation={})",
-        attestation.attestation_type()
-    );
-
-    // Connect to register via Noise WebSocket
-    let ws_url = register_url.replace("/register", "/scraper");
-    let ws_url = if ws_url.ends_with("/scraper") {
-        ws_url
-    } else {
-        format!("{ws_url}/scraper")
-    };
-
-    loop {
-        eprintln!("dd-scraper: connecting to register at {ws_url}");
-        match connect_and_scrape(
-            &ws_url,
-            &cf,
-            &tunnel_prefix,
-            scrape_interval,
-            scrape_timeout,
-            attestation.as_ref(),
-        )
-        .await
-        {
-            Ok(()) => eprintln!("dd-scraper: session ended, reconnecting..."),
-            Err(e) => eprintln!("dd-scraper: error: {e}, reconnecting in 10s..."),
-        }
-        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-    }
-}
-
-async fn connect_and_scrape(
-    ws_url: &str,
-    cf: &dd_agent::tunnel::CfConfig,
-    tunnel_prefix: &str,
-    interval: std::time::Duration,
-    timeout: std::time::Duration,
-    backend: &dyn dd_agent::attestation::AttestationBackend,
-) -> Result<(), String> {
-    use futures_util::{SinkExt, StreamExt};
-    use tokio_tungstenite::tungstenite;
-
-    let keypair = dd_agent::noise::generate_keypair()?;
-    let attestation = dd_agent::noise::AttestationPayload {
-        attestation_type: backend.attestation_type().to_string(),
-        vm_name: "scraper".to_string(),
-        tdx_quote_b64: backend.generate_quote_b64(),
-    };
-
-    // Connect WebSocket
-    let (ws_stream, _) = tokio_tungstenite::connect_async(ws_url)
-        .await
-        .map_err(|e| format!("ws connect: {e}"))?;
-    let (mut ws_tx, mut ws_rx) = ws_stream.split();
-
-    // Noise XX handshake (scraper is initiator)
-    let mut noise = snow::Builder::new(dd_agent::noise::NOISE_PATTERN.parse().unwrap())
-        .local_private_key(&keypair.private)
-        .map_err(|e| format!("key: {e}"))?
-        .build_initiator()
-        .map_err(|e| format!("init: {e}"))?;
-
-    let mut buf = vec![0u8; 65535];
-
-    // msg1
-    let mut msg1 = vec![0u8; 65535];
-    let len = noise
-        .write_message(&[], &mut msg1)
-        .map_err(|e| format!("msg1: {e}"))?;
-    ws_tx
-        .send(tungstenite::Message::Binary(msg1[..len].to_vec()))
-        .await
-        .map_err(|e| format!("send msg1: {e}"))?;
-
-    // msg2
-    let msg2 = match ws_rx.next().await {
-        Some(Ok(tungstenite::Message::Binary(d))) => d.to_vec(),
-        other => return Err(format!("expected msg2, got: {other:?}")),
-    };
-    noise
-        .read_message(&msg2, &mut buf)
-        .map_err(|e| format!("msg2: {e}"))?;
-
-    // msg3 with attestation
-    let att_json = serde_json::to_vec(&attestation).unwrap();
-    let mut msg3 = vec![0u8; 65535];
-    let len = noise
-        .write_message(&att_json, &mut msg3)
-        .map_err(|e| format!("msg3: {e}"))?;
-    ws_tx
-        .send(tungstenite::Message::Binary(msg3[..len].to_vec()))
-        .await
-        .map_err(|e| format!("send msg3: {e}"))?;
-
-    let mut transport = noise
-        .into_transport_mode()
-        .map_err(|e| format!("transport: {e}"))?;
-
-    eprintln!("dd-scraper: connected to register, starting scrape loop");
-
-    let http = reqwest::Client::builder()
-        .timeout(timeout)
-        .build()
-        .map_err(|e| format!("http client: {e}"))?;
-
-    let mut ticker = tokio::time::interval(interval);
-    loop {
-        ticker.tick().await;
-
-        // 1. List CF tunnels
-        let tunnels = list_cf_tunnels(&http, cf, tunnel_prefix).await;
-        eprintln!(
-            "dd-scraper: found {} tunnels matching {tunnel_prefix}*",
-            tunnels.len()
-        );
-
-        // 2. Scrape all agents concurrently with timeout
-        let scrape_futures: Vec<_> = tunnels
-            .iter()
-            .map(|(name, hostname)| {
-                let http = http.clone();
-                let hostname = hostname.clone();
-                let name = name.clone();
-                async move {
-                    let url = format!("https://{hostname}/health");
-                    match http.get(&url).send().await {
-                        Ok(resp) if resp.status().is_success() => {
-                            let health: serde_json::Value = resp.json().await.unwrap_or_default();
-                            (name, hostname, true, Some(health), None)
-                        }
-                        Ok(resp) => (
-                            name,
-                            hostname,
-                            false,
-                            None,
-                            Some(format!("status {}", resp.status())),
-                        ),
-                        Err(e) => (name, hostname, false, None, Some(e.to_string())),
-                    }
-                }
-            })
-            .collect();
-
-        let results = futures_util::future::join_all(scrape_futures).await;
-
-        // 3. Build fleet report
-        let mut agents = Vec::new();
-        let mut orphan_tunnels = Vec::new();
-
-        for (tunnel_name, hostname, healthy, health, error) in &results {
-            if *healthy {
-                if let Some(h) = health {
-                    agents.push(serde_json::json!({
-                        "hostname": hostname,
-                        "healthy": true,
-                        "agent_id": h.get("agent_id").and_then(|v| v.as_str()),
-                        "vm_name": h.get("vm_name").and_then(|v| v.as_str()),
-                        "attestation_type": h.get("attestation_type").and_then(|v| v.as_str()),
-                        "deployment_count": h.get("deployment_count").and_then(|v| v.as_u64()),
-                        "cpu_percent": h.get("cpu_percent").and_then(|v| v.as_u64()),
-                        "memory_used_mb": h.get("memory_used_mb").and_then(|v| v.as_u64()),
-                        "memory_total_mb": h.get("memory_total_mb").and_then(|v| v.as_u64()),
-                        "deployments": h.get("deployments"),
-                    }));
-                }
-            } else {
-                agents.push(serde_json::json!({
-                    "hostname": hostname,
-                    "healthy": false,
-                    "error": error,
-                }));
-                // If agent didn't respond at all, it might be an orphan tunnel
-                if error
-                    .as_ref()
-                    .is_some_and(|e| e.contains("connect") || e.contains("timed out"))
-                {
-                    orphan_tunnels.push(tunnel_name.clone());
-                }
-            }
-        }
-
-        let report = serde_json::json!({
-            "agents": agents,
-            "orphan_tunnels": orphan_tunnels,
-        });
-
-        eprintln!(
-            "dd-scraper: reporting {} agents ({} healthy, {} unhealthy, {} orphans)",
-            results.len(),
-            results.iter().filter(|r| r.2).count(),
-            results.iter().filter(|r| !r.2).count(),
-            orphan_tunnels.len(),
-        );
-
-        // 4. Send encrypted report to register
-        let report_json = serde_json::to_vec(&report).unwrap();
-        let mut enc = vec![0u8; 65535];
-        let len = transport
-            .write_message(&report_json, &mut enc)
-            .map_err(|e| format!("encrypt: {e}"))?;
-        ws_tx
-            .send(tungstenite::Message::Binary(enc[..len].to_vec()))
-            .await
-            .map_err(|e| format!("send: {e}"))?;
-
-        // Wait for ack
-        match tokio::time::timeout(std::time::Duration::from_secs(10), ws_rx.next()).await {
-            Ok(Some(Ok(tungstenite::Message::Binary(data)))) => {
-                let data = data.to_vec();
-                let _ = transport.read_message(&data, &mut buf);
-            }
-            _ => {
-                return Err("no ack from register".into());
-            }
-        }
-    }
-}
-
-/// List CF tunnels matching prefix, returns (tunnel_name, hostname).
-async fn list_cf_tunnels(
-    client: &reqwest::Client,
-    cf: &dd_agent::tunnel::CfConfig,
-    prefix: &str,
-) -> Vec<(String, String)> {
-    let url = format!(
-        "https://api.cloudflare.com/client/v4/accounts/{}/cfd_tunnel?is_deleted=false",
-        cf.account_id
-    );
-
-    let resp = match client
-        .get(&url)
-        .header("Authorization", format!("Bearer {}", cf.api_token))
-        .timeout(std::time::Duration::from_secs(10))
-        .send()
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("dd-scraper: CF API error: {e}");
-            return Vec::new();
-        }
-    };
-
-    let body: serde_json::Value = resp.json().await.unwrap_or_default();
-    let mut tunnels = Vec::new();
-
-    if let Some(results) = body["result"].as_array() {
-        for t in results {
-            if let Some(name) = t["name"].as_str() {
-                if name.starts_with(prefix) {
-                    // Derive hostname from tunnel name: dd-{env}-{uuid} → dd-{env}-{uuid}.{domain}
-                    let hostname = format!("{name}.{}", cf.domain);
-                    tunnels.push((name.to_string(), hostname));
-                }
-            }
-        }
-    }
-
-    tunnels
 }
 
 fn build_attestation(
@@ -998,22 +802,27 @@ async fn monitoring_loop(
     loop {
         interval.tick().await;
 
-        let entries: Vec<(String, Option<u32>)> = {
+        let entries: Vec<(String, Option<u32>, Option<String>)> = {
             let deps = deployments.lock().await;
             deps.values()
                 .filter(|d| d.status == "running")
-                .map(|d| (d.id.clone(), d.pid))
+                .map(|d| (d.id.clone(), d.pid, d.container_id.clone()))
                 .collect()
         };
 
-        for (dep_id, pid) in &entries {
-            if let Some(pid) = pid {
-                if !dd_agent::process::is_running(*pid) {
-                    eprintln!("dd-agent: deployment {dep_id} process gone (pid {pid})");
-                    let mut deps = deployments.lock().await;
-                    if let Some(info) = deps.get_mut(dep_id) {
-                        info.status = "exited".into();
-                    }
+        for (dep_id, pid, container_id) in &entries {
+            let alive = if let Some(cid) = container_id {
+                dd_agent::container::is_running(cid).await
+            } else if let Some(pid) = pid {
+                dd_agent::process::is_running(*pid)
+            } else {
+                false
+            };
+            if !alive {
+                eprintln!("dd-agent: deployment {dep_id} workload gone");
+                let mut deps = deployments.lock().await;
+                if let Some(info) = deps.get_mut(dep_id) {
+                    info.status = "exited".into();
                 }
             }
         }
