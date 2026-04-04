@@ -1641,7 +1641,7 @@ async fn fleet_dashboard_html(state: &AgentState) -> Html<String> {
         };
         rows.push_str(&format!(
             r#"<tr>
-                <td><a href="https://{hostname}">{hostname}</a></td>
+                <td><a href="/agent/{agent_id}">{hostname}</a></td>
                 <td>{vm}</td>
                 <td><span style="color:{status_color}">{status}</span></td>
                 <td>{attestation}</td>
@@ -1650,6 +1650,7 @@ async fn fleet_dashboard_html(state: &AgentState) -> Html<String> {
                 <td>{mem}</td>
                 <td>{last_seen}</td>
             </tr>"#,
+            agent_id = a.agent_id,
             hostname = a.hostname,
             vm = a.vm_name,
             status_color = status_color,
@@ -1709,6 +1710,105 @@ async fn fleet_dashboard_html(state: &AgentState) -> Html<String> {
             )
         },
     ))
+}
+
+// ── Agent detail page (register mode) ─────────────────────────────────
+
+async fn agent_detail(Path(agent_id): Path<String>, State(state): State<AgentState>) -> Response {
+    let agents = state.agent_registry.lock().await;
+    let Some(a) = agents.get(&agent_id) else {
+        return (axum::http::StatusCode::NOT_FOUND, "agent not found").into_response();
+    };
+
+    let status_color = match a.status.as_str() {
+        "healthy" => "#a6e3a1",
+        "stale" => "#fab387",
+        "dead" => "#f38ba8",
+        _ => "#a6adc8",
+    };
+
+    let now = chrono::Utc::now();
+    let age_secs = now.signed_duration_since(a.last_seen).num_seconds();
+    let last_seen = if age_secs < 60 {
+        format!("{age_secs}s ago")
+    } else if age_secs < 3600 {
+        format!("{}m ago", age_secs / 60)
+    } else {
+        format!("{}h ago", age_secs / 3600)
+    };
+
+    let mem_str = if a.memory_total_mb > 0 {
+        format!("{}M / {}M", a.memory_used_mb, a.memory_total_mb)
+    } else {
+        "-".into()
+    };
+
+    let deployments_list = if a.deployment_names.is_empty() {
+        format!(
+            "<span class=\"dim\">{} deployment(s)</span>",
+            a.deployment_count
+        )
+    } else {
+        a.deployment_names
+            .iter()
+            .map(|d| format!("<li>{d}</li>"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    let html = format!(
+        r#"<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>{hostname} — DD Fleet</title>
+<style>
+  body {{ margin:0; background:#1e1e2e; color:#cdd6f4; font-family:'JetBrains Mono',monospace; padding:24px; }}
+  h1 {{ color:#89b4fa; margin:0 0 4px; font-size:20px; }}
+  .sub {{ color:#585b70; font-size:12px; margin-bottom:24px; }}
+  a {{ color:#89b4fa; text-decoration:none; }} a:hover {{ text-decoration:underline; }}
+  .back {{ font-size:13px; margin-bottom:20px; }}
+  .card {{ background:#181825; border:1px solid #313244; border-radius:8px; padding:20px; margin-bottom:16px; }}
+  .row {{ display:flex; justify-content:space-between; padding:8px 0; border-bottom:1px solid #313244; }}
+  .row:last-child {{ border-bottom:none; }}
+  .label {{ color:#a6adc8; font-size:12px; text-transform:uppercase; }}
+  .value {{ font-size:14px; }}
+  .section {{ color:#a6adc8; font-size:12px; text-transform:uppercase; margin:20px 0 8px; }}
+  .dim {{ color:#585b70; }}
+  ul {{ margin:0; padding:0 0 0 20px; }} li {{ padding:2px 0; font-size:14px; }}
+</style></head><body>
+<div class="back"><a href="/">&larr; fleet</a></div>
+<h1>{hostname}</h1>
+<div class="sub">{agent_id}</div>
+
+<div class="card">
+  <div class="row"><span class="label">Status</span><span class="value" style="color:{status_color}">{status}</span></div>
+  <div class="row"><span class="label">VM</span><span class="value">{vm}</span></div>
+  <div class="row"><span class="label">Attestation</span><span class="value">{attestation}</span></div>
+  <div class="row"><span class="label">Registered</span><span class="value">{registered_at}</span></div>
+  <div class="row"><span class="label">Last Seen</span><span class="value">{last_seen}</span></div>
+  <div class="row"><span class="label">Tunnel</span><span class="value"><a href="https://{hostname}" target="_blank">{hostname} &nearr;</a></span></div>
+</div>
+
+<div class="card">
+  <div class="row"><span class="label">CPU</span><span class="value">{cpu}%</span></div>
+  <div class="row"><span class="label">Memory</span><span class="value">{mem}</span></div>
+</div>
+
+<div class="section">Workloads</div>
+<div class="card"><ul>{deployments}</ul></div>
+</body></html>"#,
+        hostname = a.hostname,
+        agent_id = a.agent_id,
+        status_color = status_color,
+        status = a.status,
+        vm = a.vm_name,
+        attestation = a.attestation_type,
+        registered_at = a.registered_at,
+        last_seen = last_seen,
+        cpu = a.cpu_percent,
+        mem = mem_str,
+        deployments = deployments_list,
+    );
+
+    Html(html).into_response()
 }
 
 // ── Scraper + Deregister endpoints (register mode) ──────────────────────
@@ -2153,6 +2253,7 @@ pub fn build_router(state: AgentState) -> Router {
     if state.register_mode {
         router = router
             .route("/", get(fleet_dashboard))
+            .route("/agent/{agent_id}", get(agent_detail))
             .route("/register", get(ws_register))
             .route("/scraper", get(ws_scraper))
             .route("/deregister", post(post_deregister));

@@ -99,7 +99,8 @@ pub async fn pull_image(image: &str, app_name: &str) -> Result<ImageConfig, Stri
 }
 
 /// Spawn a workload process from a pulled OCI image.
-/// No chroot — the VM is the isolation boundary. Just run the binary directly.
+/// Uses chroot into the extracted rootfs — the VM is the security boundary,
+/// chroot provides filesystem isolation so images work as expected.
 pub async fn spawn_workload(
     app_name: &str,
     config: &ImageConfig,
@@ -122,19 +123,6 @@ pub async fn spawn_workload(
 
     let program = args.remove(0);
 
-    // Resolve the program path — look in the extracted image first, then system PATH
-    let resolved_program = if program.starts_with('/') {
-        // Absolute path — look inside extracted image
-        let in_image = workdir.join(program.trim_start_matches('/'));
-        if in_image.exists() {
-            in_image.to_string_lossy().to_string()
-        } else {
-            program.clone() // Fall back to system
-        }
-    } else {
-        program.clone()
-    };
-
     // Environment from image config + extras
     let mut env_map: HashMap<String, String> = HashMap::new();
     for kv in &config.env {
@@ -148,13 +136,11 @@ pub async fn spawn_workload(
         }
     }
 
-    // Prepend extracted image dirs to PATH so image binaries are found
-    let image_path = format!(
-        "{0}/usr/local/sbin:{0}/usr/local/bin:{0}/usr/sbin:{0}/usr/bin:{0}/sbin:{0}/bin",
-        workdir.display()
+    // Standard PATH inside the chroot
+    env_map.insert(
+        "PATH".into(),
+        "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".into(),
     );
-    let system_path = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
-    env_map.insert("PATH".into(), format!("{image_path}:{system_path}"));
     env_map
         .entry("HOME".into())
         .or_insert_with(|| "/root".into());
@@ -164,29 +150,36 @@ pub async fn spawn_workload(
 
     let _ = tokio::fs::create_dir_all("/var/lib/dd/workloads/logs").await;
 
+    // Prepare chroot: bind-mount /proc, /sys, /dev, and copy resolv.conf for DNS
+    setup_chroot_mounts(&workdir).await?;
+
+    // Working directory inside the chroot
+    let cwd = if !config.working_dir.is_empty() && config.working_dir != "/" {
+        config.working_dir.clone()
+    } else {
+        "/".into()
+    };
+
+    // Build the inner command (what runs inside chroot)
+    let inner_cmd = if args.is_empty() {
+        program.clone()
+    } else {
+        format!("{} {}", program, args.join(" "))
+    };
+
     let mut cmd = if tty {
-        let mut c = Command::new("script");
-        c.arg("-qfc");
-        c.arg(format!("{} {}", resolved_program, args.join(" ")));
-        c.arg("/dev/null");
+        let mut c = Command::new("chroot");
+        c.arg(workdir.as_os_str());
+        c.args(["script", "-qfc", &inner_cmd, "/dev/null"]);
         c
     } else {
-        let mut c = Command::new(&resolved_program);
+        let mut c = Command::new("chroot");
+        c.arg(workdir.as_os_str());
+        c.arg(&program);
         c.args(&args);
         c
     };
 
-    // Set working directory to the image's configured workdir (inside extracted image)
-    let cwd = if !config.working_dir.is_empty() && config.working_dir != "/" {
-        let img_cwd = workdir.join(config.working_dir.trim_start_matches('/'));
-        if img_cwd.exists() {
-            img_cwd
-        } else {
-            workdir.clone()
-        }
-    } else {
-        workdir.clone()
-    };
     cmd.current_dir(&cwd);
 
     cmd.env_clear();
@@ -205,12 +198,35 @@ pub async fn spawn_workload(
     let child = cmd.spawn().map_err(|e| format!("spawn {program}: {e}"))?;
 
     eprintln!(
-        "dd-agent: spawned {app_name} (pid={}) — {program} {:?}",
+        "dd-agent: spawned {app_name} (pid={}) — chroot {} {program} {:?}",
         child.id().unwrap_or(0),
+        workdir.display(),
         args
     );
 
     Ok(child)
+}
+
+/// Set up bind mounts inside the chroot rootfs for /proc, /sys, /dev, and DNS.
+async fn setup_chroot_mounts(rootfs: &Path) -> Result<(), String> {
+    use tokio::process::Command;
+
+    for dir in &["proc", "sys", "dev"] {
+        let target = rootfs.join(dir);
+        let _ = tokio::fs::create_dir_all(&target).await;
+        let source = format!("/{dir}");
+        let _ = Command::new("mount")
+            .args(["--bind", &source, &target.to_string_lossy()])
+            .output()
+            .await;
+    }
+
+    // Copy resolv.conf for DNS resolution
+    let etc = rootfs.join("etc");
+    let _ = tokio::fs::create_dir_all(&etc).await;
+    let _ = tokio::fs::copy("/etc/resolv.conf", etc.join("resolv.conf")).await;
+
+    Ok(())
 }
 
 /// Spawn a direct command (not from an OCI image). For system tools like tmux, bash, etc.
