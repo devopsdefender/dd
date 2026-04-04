@@ -576,6 +576,112 @@ async fn deployment_logs(
     Ok(Json(serde_json::json!({ "logs": logs })))
 }
 
+// ── Workload detail page ─────────────────────────────────────────────────
+
+async fn workload_page(
+    State(state): State<AgentState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    OriginalUri(uri): OriginalUri,
+) -> Result<Response, AppError> {
+    if !state.owner.is_empty() {
+        match require_browser_token(&state, &headers, None, &uri).await {
+            Ok(_) => {}
+            Err(response) => return Ok(response),
+        }
+    }
+
+    let d = {
+        let deps = state.deployments.lock().await;
+        deps.get(&id).cloned().ok_or(AppError::NotFound)?
+    };
+
+    let status_class = match d.status.as_str() {
+        "running" => "running",
+        "deploying" => "deploying",
+        "failed" | "exited" => "failed",
+        _ => "idle",
+    };
+
+    let session_link = if d.status == "running" {
+        format!(
+            r#"<a href="/session/{name}">Open terminal session</a>"#,
+            name = d.app_name
+        )
+    } else {
+        String::new()
+    };
+
+    let error_row = d
+        .error_message
+        .as_deref()
+        .filter(|e| !e.is_empty())
+        .map(|e| {
+            format!(
+                r#"<div class="row"><span class="label">Error</span><span style="color:#f38ba8">{e}</span></div>"#
+            )
+        })
+        .unwrap_or_default();
+
+    // Read logs
+    let logs = if let Some(pid) = d.pid {
+        let log_path = format!("/var/lib/dd/workloads/logs/{pid}.log");
+        let content = tokio::fs::read_to_string(&log_path)
+            .await
+            .unwrap_or_default();
+        let lines: Vec<&str> = content.lines().collect();
+        let tail: Vec<&str> = if lines.len() > 200 {
+            lines[lines.len() - 200..].to_vec()
+        } else {
+            lines
+        };
+        tail.iter()
+            .map(|l| {
+                l.replace('&', "&amp;")
+                    .replace('<', "&lt;")
+                    .replace('>', "&gt;")
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else {
+        String::new()
+    };
+
+    let nav = nav_bar(&[("Dashboard", "/", false)]);
+    let content = format!(
+        r#"<div class="back"><a href="/">&larr; dashboard</a></div>
+<h1>{name}</h1>
+<div class="sub">{id}</div>
+
+<div class="card">
+  <div class="row"><span class="label">Status</span><span class="pill {status_class}">{status}</span></div>
+  <div class="row"><span class="label">Image</span><span>{image}</span></div>
+  <div class="row"><span class="label">Started</span><span>{started}</span></div>
+  {error_row}
+</div>
+
+{session_link}
+
+<div class="section">Logs (last 200 lines)</div>
+<pre style="background:#11111b;border:1px solid #313244;border-radius:8px;padding:16px;overflow-x:auto;font-size:12px;line-height:1.5;max-height:60vh;overflow-y:auto;color:#a6adc8">{logs}</pre>"#,
+        name = d.app_name,
+        id = id,
+        status_class = status_class,
+        status = d.status,
+        image = d.image,
+        started = d.started_at,
+        error_row = error_row,
+        session_link = session_link,
+        logs = if logs.is_empty() {
+            "<span class=\"dim\">No logs available</span>".into()
+        } else {
+            logs
+        },
+    );
+
+    Ok(Html(page_shell(&format!("DD — {}", d.app_name), &nav, &content)).into_response())
+}
+
 // ── Web terminal ─────────────────────────────────────────────────────────
 
 async fn session_page(
@@ -1423,12 +1529,13 @@ async fn dashboard(
         };
         rows.push_str(&format!(
             r#"<tr>
-                <td>{name}</td>
+                <td><a href="/workload/{id}">{name}</a></td>
                 <td><span class="pill {status_class}">{status}</span></td>
                 <td class="dim">{image}</td>
                 <td>{started}</td>
                 <td>{terminal_link}</td>
             </tr>"#,
+            id = d.id,
             name = d.app_name,
             status = d.status,
             image = d.image,
@@ -2262,6 +2369,7 @@ pub fn build_router(state: AgentState) -> Router {
     router
         .route("/logged-out", get(logged_out_page))
         .route("/health", get(health))
+        .route("/workload/{id}", get(workload_page))
         .route("/deployments", get(list_deployments))
         .route("/deployments/{id}", get(get_deployment))
         .route("/deployments/{id}/logs", get(deployment_logs))
