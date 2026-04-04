@@ -135,6 +135,20 @@ pub struct RegisteredAgent {
 
 pub type AgentRegistry = Arc<Mutex<HashMap<String, RegisteredAgent>>>;
 
+/// Authentication mode for the dashboard.
+#[derive(Debug, Clone)]
+pub enum AuthMode {
+    /// No local auth — allow all (dev mode), or rely on register-issued JWT only.
+    None,
+    /// GitHub OAuth (used by register agent / marketplace hub).
+    GitHub(GithubOAuthConfig),
+    /// Simple shared password (used by marketplace agents).
+    Password {
+        password: String,
+        secure_cookies: bool,
+    },
+}
+
 #[derive(Clone)]
 pub struct AgentState {
     pub owner: String,
@@ -144,7 +158,7 @@ pub struct AgentState {
     pub deployments: Deployments,
     pub process_handles: ProcessHandles,
     pub started_at: std::time::Instant,
-    pub oauth: Option<GithubOAuthConfig>,
+    pub auth_mode: AuthMode,
     pub browser_sessions: BrowserSessions,
     pub pending_oauth_states: PendingOauthStates,
     /// Register mode: fleet registry + CF config for creating agent tunnels.
@@ -242,15 +256,18 @@ fn github_oauth_redirect(next: &Uri) -> Redirect {
     Redirect::to(&location)
 }
 
+fn is_secure_cookies(state: &AgentState) -> bool {
+    match &state.auth_mode {
+        AuthMode::GitHub(oauth) => oauth.secure_cookies,
+        AuthMode::Password { secure_cookies, .. } => *secure_cookies,
+        AuthMode::None => false,
+    }
+}
+
 fn build_session_cookie(state: &AgentState, session_id: &str, max_age: u64) -> String {
     let mut cookie =
         format!("{SESSION_COOKIE}={session_id}; Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age}");
-    if state
-        .oauth
-        .as_ref()
-        .map(|oauth| oauth.secure_cookies)
-        .unwrap_or(false)
-    {
+    if is_secure_cookies(state) {
         cookie.push_str("; Secure");
     }
     cookie
@@ -274,7 +291,9 @@ async fn session_token_from_cookie(state: &AgentState, headers: &HeaderMap) -> O
         .map(|session| session.token.clone())
 }
 
-async fn resolve_github_token(
+const PASSWORD_SESSION_MARKER: &str = "password-session";
+
+async fn resolve_auth(
     state: &AgentState,
     headers: &HeaderMap,
     query_token: Option<&str>,
@@ -283,7 +302,7 @@ async fn resolve_github_token(
         return Ok(None);
     }
 
-    // Check register-issued dd_auth JWT cookie first
+    // 1. Check register-issued dd_auth JWT cookie first (works for all auth modes)
     if let Some(ref decoding_key) = state.auth_public_key_decoded {
         if let Some(jwt) = extract_cookie(headers, AUTH_COOKIE) {
             let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
@@ -296,21 +315,47 @@ async fn resolve_github_token(
         }
     }
 
-    if let Some(token) = query_token.filter(|token| !token.is_empty()) {
-        verify_github_token(token, &state.owner).await?;
-        return Ok(Some(token.to_string()));
-    }
-
-    if let Some(token) = extract_auth(headers) {
-        verify_github_token(&token, &state.owner).await?;
-        return Ok(Some(token));
-    }
-
+    // 2. Check session cookie (works for both GitHub and password sessions)
     if let Some(token) = session_token_from_cookie(state, headers).await {
+        // Password sessions use a marker — no GitHub verification needed
+        if token == PASSWORD_SESSION_MARKER {
+            return Ok(Some(token));
+        }
+        // GitHub sessions: token is a GitHub access token, accept it
         return Ok(Some(token));
+    }
+
+    // 3. GitHub-mode only: check query param and Authorization header
+    if matches!(state.auth_mode, AuthMode::GitHub(_)) {
+        if let Some(token) = query_token.filter(|token| !token.is_empty()) {
+            verify_github_token(token, &state.owner).await?;
+            return Ok(Some(token.to_string()));
+        }
+
+        if let Some(token) = extract_auth(headers) {
+            verify_github_token(&token, &state.owner).await?;
+            return Ok(Some(token));
+        }
     }
 
     Err(AppError::Unauthorized)
+}
+
+fn auth_redirect(state: &AgentState, current_uri: &Uri) -> Redirect {
+    match &state.auth_mode {
+        AuthMode::GitHub(_) => github_oauth_redirect(current_uri),
+        AuthMode::Password { .. } => {
+            let mut url = reqwest::Url::parse("http://localhost/auth/login").unwrap();
+            let next_path = current_uri
+                .path_and_query()
+                .map(|pq| pq.as_str())
+                .unwrap_or("/");
+            url.query_pairs_mut().append_pair("next", next_path);
+            let location = format!("{}?{}", url.path(), url.query().unwrap_or_default());
+            Redirect::to(&location)
+        }
+        AuthMode::None => Redirect::to("/auth/login"),
+    }
 }
 
 async fn require_browser_token(
@@ -319,16 +364,20 @@ async fn require_browser_token(
     query_token: Option<&str>,
     current_uri: &Uri,
 ) -> Result<Option<String>, Response> {
-    match resolve_github_token(state, headers, query_token).await {
+    match resolve_auth(state, headers, query_token).await {
         Ok(token) => Ok(token),
-        Err(AppError::Unauthorized) if state.oauth.is_some() => {
-            Err(github_oauth_redirect(current_uri).into_response())
+        Err(AppError::Unauthorized)
+            if matches!(
+                state.auth_mode,
+                AuthMode::GitHub(_) | AuthMode::Password { .. }
+            ) =>
+        {
+            Err(auth_redirect(state, current_uri).into_response())
         }
         Err(AppError::Unauthorized) if state.auth_issuer.is_some() => {
             // Redirect to register for auth. After login, the dd_auth cookie
             // (scoped to .devopsdefender.com) will be set, and the user
-            // can return to this agent. Redirect to register's root which
-            // will trigger GitHub login and then show the fleet dashboard.
+            // can return to this agent.
             let issuer = state.auth_issuer.as_deref().unwrap();
             Err(Redirect::to(issuer).into_response())
         }
@@ -337,7 +386,7 @@ async fn require_browser_token(
 }
 
 async fn verify_owner(state: &AgentState, headers: &HeaderMap) -> Result<(), AppError> {
-    resolve_github_token(state, headers, None).await.map(|_| ())
+    resolve_auth(state, headers, None).await.map(|_| ())
 }
 
 // ── HTTP Handlers (read-only) ────────────────────────────────────────────
@@ -387,24 +436,92 @@ fn parse_size_gb(s: &str) -> u64 {
     }
 }
 
-async fn logged_out_page() -> Html<&'static str> {
-    Html(
+// ── Shared page shell (Catppuccin Mocha theme) ──────────────────────────
+
+const CATPPUCCIN_CSS: &str = r#"
+  * { box-sizing:border-box; margin:0; padding:0; }
+  body { background:#1e1e2e; color:#cdd6f4; font-family:'JetBrains Mono',ui-monospace,monospace; }
+  a { color:#89b4fa; text-decoration:none; } a:hover { text-decoration:underline; }
+  nav { display:flex; align-items:center; gap:16px; padding:12px 24px; border-bottom:1px solid #313244; }
+  nav .brand { color:#89b4fa; font-weight:700; font-size:14px; }
+  nav a { color:#a6adc8; font-size:13px; } nav a:hover, nav a.active { color:#cdd6f4; }
+  nav .spacer { flex:1; }
+  main { max-width:960px; margin:0 auto; padding:24px; }
+  h1 { color:#89b4fa; font-size:20px; margin-bottom:4px; }
+  .sub { color:#585b70; font-size:12px; margin-bottom:16px; }
+  .meta { color:#a6adc8; font-size:13px; margin-bottom:24px; }
+  .meta .ok { color:#a6e3a1; }
+  .section { color:#a6adc8; font-size:12px; text-transform:uppercase; margin:20px 0 8px; }
+  .cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:12px; margin-bottom:16px; }
+  .card { background:#181825; border:1px solid #313244; border-radius:8px; padding:16px; }
+  .card .label { color:#a6adc8; font-size:11px; text-transform:uppercase; }
+  .card .value { font-size:20px; margin-top:4px; }
+  .card .value.green { color:#a6e3a1; }
+  .card .value.blue { color:#89b4fa; }
+  .card .value.peach { color:#fab387; }
+  .card .value.mauve { color:#cba6f7; }
+  .row { display:flex; justify-content:space-between; padding:8px 0; border-bottom:1px solid #313244; }
+  .row:last-child { border-bottom:none; }
+  table { border-collapse:collapse; width:100%; }
+  th { text-align:left; color:#a6adc8; font-weight:normal; font-size:12px; text-transform:uppercase; padding:8px 12px; border-bottom:1px solid #313244; }
+  td { padding:8px 12px; border-bottom:1px solid #313244; font-size:14px; }
+  .pill { display:inline-block; padding:2px 8px; border-radius:4px; font-size:12px; font-weight:600; }
+  .pill.healthy, .pill.running { background:#a6e3a122; color:#a6e3a1; }
+  .pill.stale, .pill.deploying { background:#fab38722; color:#fab387; }
+  .pill.dead, .pill.failed, .pill.exited { background:#f38ba822; color:#f38ba8; }
+  .pill.idle { background:#31324488; color:#a6adc8; }
+  .empty { color:#585b70; padding:24px; text-align:center; }
+  .dim { color:#585b70; }
+  .back { font-size:13px; margin-bottom:20px; }
+  @media(max-width:640px) { main { padding:16px; } .cards { grid-template-columns:1fr 1fr; } }
+"#;
+
+fn page_shell(title: &str, nav_html: &str, content: &str) -> String {
+    format!(
         r#"<!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>DD — Signed Out</title>
-</head>
-<body>
-<main>
-  <h1>Signed out</h1>
-  <p>Your browser session has been cleared.</p>
-  <p><a href="/">Return to dashboard</a></p>
-</main>
-</body>
-</html>"#,
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{title}</title>
+<style>{css}</style></head><body>
+{nav}
+<main>{content}</main>
+</body></html>"#,
+        title = title,
+        css = CATPPUCCIN_CSS,
+        nav = nav_html,
+        content = content,
     )
+}
+
+fn nav_bar(items: &[(&str, &str, bool)]) -> String {
+    let mut html = String::from(r#"<nav><span class="brand">DD</span>"#);
+    for (label, href, active) in items {
+        if *active {
+            html.push_str(&format!(r#"<a href="{href}" class="active">{label}</a>"#));
+        } else {
+            html.push_str(&format!(r#"<a href="{href}">{label}</a>"#));
+        }
+    }
+    html.push_str(r#"<span class="spacer"></span><a href="/auth/logout">log out</a></nav>"#);
+    html
+}
+
+fn format_uptime(secs: u64) -> String {
+    if secs > 3600 {
+        format!("{}h {}m", secs / 3600, (secs % 3600) / 60)
+    } else if secs > 60 {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{secs}s")
+    }
+}
+
+async fn logged_out_page() -> Html<String> {
+    let content = r#"<div style="text-align:center;padding:80px 0">
+<h1>Signed out</h1>
+<p style="color:#a6adc8;margin-top:12px">Your session has been cleared.</p>
+<p style="margin-top:16px"><a href="/">Return to dashboard</a></p>
+</div>"#;
+    Html(page_shell("Signed out — DD", "", content))
 }
 
 async fn list_deployments(
@@ -459,6 +576,112 @@ async fn deployment_logs(
     Ok(Json(serde_json::json!({ "logs": logs })))
 }
 
+// ── Workload detail page ─────────────────────────────────────────────────
+
+async fn workload_page(
+    State(state): State<AgentState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    OriginalUri(uri): OriginalUri,
+) -> Result<Response, AppError> {
+    if !state.owner.is_empty() {
+        match require_browser_token(&state, &headers, None, &uri).await {
+            Ok(_) => {}
+            Err(response) => return Ok(response),
+        }
+    }
+
+    let d = {
+        let deps = state.deployments.lock().await;
+        deps.get(&id).cloned().ok_or(AppError::NotFound)?
+    };
+
+    let status_class = match d.status.as_str() {
+        "running" => "running",
+        "deploying" => "deploying",
+        "failed" | "exited" => "failed",
+        _ => "idle",
+    };
+
+    let session_link = if d.status == "running" {
+        format!(
+            r#"<a href="/session/{name}">Open terminal session</a>"#,
+            name = d.app_name
+        )
+    } else {
+        String::new()
+    };
+
+    let error_row = d
+        .error_message
+        .as_deref()
+        .filter(|e| !e.is_empty())
+        .map(|e| {
+            format!(
+                r#"<div class="row"><span class="label">Error</span><span style="color:#f38ba8">{e}</span></div>"#
+            )
+        })
+        .unwrap_or_default();
+
+    // Read logs
+    let logs = if let Some(pid) = d.pid {
+        let log_path = format!("/var/lib/dd/workloads/logs/{pid}.log");
+        let content = tokio::fs::read_to_string(&log_path)
+            .await
+            .unwrap_or_default();
+        let lines: Vec<&str> = content.lines().collect();
+        let tail: Vec<&str> = if lines.len() > 200 {
+            lines[lines.len() - 200..].to_vec()
+        } else {
+            lines
+        };
+        tail.iter()
+            .map(|l| {
+                l.replace('&', "&amp;")
+                    .replace('<', "&lt;")
+                    .replace('>', "&gt;")
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else {
+        String::new()
+    };
+
+    let nav = nav_bar(&[("Dashboard", "/", false)]);
+    let content = format!(
+        r#"<div class="back"><a href="/">&larr; dashboard</a></div>
+<h1>{name}</h1>
+<div class="sub">{id}</div>
+
+<div class="card">
+  <div class="row"><span class="label">Status</span><span class="pill {status_class}">{status}</span></div>
+  <div class="row"><span class="label">Image</span><span>{image}</span></div>
+  <div class="row"><span class="label">Started</span><span>{started}</span></div>
+  {error_row}
+</div>
+
+{session_link}
+
+<div class="section">Logs (last 200 lines)</div>
+<pre style="background:#11111b;border:1px solid #313244;border-radius:8px;padding:16px;overflow-x:auto;font-size:12px;line-height:1.5;max-height:60vh;overflow-y:auto;color:#a6adc8">{logs}</pre>"#,
+        name = d.app_name,
+        id = id,
+        status_class = status_class,
+        status = d.status,
+        image = d.image,
+        started = d.started_at,
+        error_row = error_row,
+        session_link = session_link,
+        logs = if logs.is_empty() {
+            "<span class=\"dim\">No logs available</span>".into()
+        } else {
+            logs
+        },
+    );
+
+    Ok(Html(page_shell(&format!("DD — {}", d.app_name), &nav, &content)).into_response())
+}
+
 // ── Web terminal ─────────────────────────────────────────────────────────
 
 async fn session_page(
@@ -491,7 +714,7 @@ async fn ws_session(
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Result<impl IntoResponse, AppError> {
-    resolve_github_token(&state, &headers, query.token.as_deref()).await?;
+    resolve_auth(&state, &headers, query.token.as_deref()).await?;
     Ok(ws.on_upgrade(move |socket| handle_ws_session(socket, state, app_name)))
 }
 
@@ -517,10 +740,9 @@ async fn github_auth_start(
     State(state): State<AgentState>,
     query: axum::extract::Query<AuthStartQuery>,
 ) -> Result<Redirect, AppError> {
-    let oauth = state
-        .oauth
-        .as_ref()
-        .ok_or_else(|| AppError::Config("GitHub OAuth is not configured".into()))?;
+    let AuthMode::GitHub(ref oauth) = state.auth_mode else {
+        return Err(AppError::Config("GitHub OAuth is not configured".into()));
+    };
     let next_path = sanitize_next_path(query.next.as_deref());
     let state_id = uuid::Uuid::new_v4().simple().to_string();
 
@@ -550,10 +772,9 @@ async fn github_auth_callback(
         return Err(AppError::External(description.into()));
     }
 
-    let oauth = state
-        .oauth
-        .as_ref()
-        .ok_or_else(|| AppError::Config("GitHub OAuth is not configured".into()))?;
+    let AuthMode::GitHub(ref oauth) = state.auth_mode else {
+        return Err(AppError::Config("GitHub OAuth is not configured".into()));
+    };
     let code = query
         .code
         .as_deref()
@@ -674,6 +895,115 @@ async fn github_auth_logout(State(state): State<AgentState>, headers: HeaderMap)
         build_session_cookie(&state, "", 0),
     )
 }
+
+// ── Password auth ────────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct LoginQuery {
+    next: Option<String>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LoginForm {
+    password: String,
+    next: Option<String>,
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+async fn login_page(
+    State(state): State<AgentState>,
+    query: axum::extract::Query<LoginQuery>,
+) -> Html<String> {
+    let hostname = std::env::var("DD_HOSTNAME").unwrap_or_else(|_| state.vm_name.clone());
+    let next = sanitize_next_path(query.next.as_deref());
+    let error_html = if query.error.is_some() {
+        r#"<div class="error">Incorrect password</div>"#
+    } else {
+        ""
+    };
+
+    Html(format!(
+        r#"<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Sign in — DevOps Defender</title>
+<style>
+  * {{ box-sizing:border-box; }}
+  body {{ margin:0; background:#1e1e2e; color:#cdd6f4; font-family:'JetBrains Mono',ui-monospace,monospace; display:flex; align-items:center; justify-content:center; min-height:100vh; }}
+  .card {{ background:#181825; border:1px solid #313244; border-radius:12px; padding:32px; width:100%; max-width:360px; }}
+  h1 {{ color:#89b4fa; font-size:18px; margin:0 0 4px; }}
+  .sub {{ color:#585b70; font-size:12px; margin-bottom:24px; }}
+  label {{ display:block; color:#a6adc8; font-size:12px; text-transform:uppercase; margin-bottom:6px; }}
+  input[type=password] {{ width:100%; padding:10px 12px; background:#11111b; border:1px solid #313244; border-radius:6px; color:#cdd6f4; font-family:inherit; font-size:14px; outline:none; }}
+  input[type=password]:focus {{ border-color:#89b4fa; }}
+  button {{ width:100%; padding:10px; margin-top:16px; background:#89b4fa; color:#1e1e2e; border:none; border-radius:6px; font-family:inherit; font-size:14px; font-weight:600; cursor:pointer; }}
+  button:hover {{ background:#74c7ec; }}
+  .error {{ color:#f38ba8; font-size:13px; margin-bottom:12px; }}
+</style></head><body>
+<div class="card">
+  <h1>DevOps Defender</h1>
+  <div class="sub">{hostname}</div>
+  {error}
+  <form method="POST" action="/auth/login">
+    <input type="hidden" name="next" value="{next}">
+    <label for="password">Password</label>
+    <input type="password" id="password" name="password" autofocus>
+    <button type="submit">Sign in</button>
+  </form>
+</div>
+</body></html>"#,
+        hostname = hostname,
+        error = error_html,
+        next = next,
+    ))
+}
+
+async fn login_submit(
+    State(state): State<AgentState>,
+    axum::extract::Form(form): axum::extract::Form<LoginForm>,
+) -> Response {
+    let expected = match &state.auth_mode {
+        AuthMode::Password { ref password, .. } => password.as_bytes(),
+        _ => return AppError::Config("Password auth not configured".into()).into_response(),
+    };
+
+    let next = sanitize_next_path(form.next.as_deref());
+
+    if !constant_time_eq(form.password.as_bytes(), expected) {
+        let mut url = reqwest::Url::parse("http://localhost/auth/login").unwrap();
+        url.query_pairs_mut()
+            .append_pair("error", "invalid")
+            .append_pair("next", &next);
+        let location = format!("{}?{}", url.path(), url.query().unwrap_or_default());
+        return Redirect::to(&location).into_response();
+    }
+
+    let session_id = uuid::Uuid::new_v4().simple().to_string();
+    state.browser_sessions.lock().await.insert(
+        session_id.clone(),
+        BrowserSession {
+            token: PASSWORD_SESSION_MARKER.into(),
+            expires_at: Instant::now() + SESSION_TTL,
+        },
+    );
+
+    response_with_cookie(
+        Redirect::to(&next),
+        build_session_cookie(&state, &session_id, SESSION_TTL.as_secs()),
+    )
+}
+
+// ── GitHub token verification ────────────────────────────────────────────
 
 async fn verify_github_token(token: &str, owner: &str) -> Result<(), AppError> {
     let client = reqwest::Client::new();
@@ -1182,11 +1512,6 @@ async fn dashboard(
     let metrics = collect_metrics().await;
     let deps = state.deployments.lock().await;
     let mut rows = String::new();
-    let session_query = query
-        .token
-        .as_deref()
-        .map(|token| format!("?token={token}"))
-        .unwrap_or_default();
     for d in deps.values() {
         let status_class = match d.status.as_str() {
             "running" => "running",
@@ -1196,259 +1521,73 @@ async fn dashboard(
         };
         let terminal_link = if d.status == "running" {
             format!(
-                r#"<a class="action-link" href="/session/{}{}">open session</a>"#,
-                d.app_name, session_query
+                r#"<a href="/session/{name}">open session</a>"#,
+                name = d.app_name
             )
         } else {
-            r#"<span class="muted">unavailable</span>"#.to_string()
+            r#"<span class="dim">—</span>"#.to_string()
         };
         rows.push_str(&format!(
             r#"<tr>
-                <td data-label="App"><span class="app-name">{}</span></td>
-                <td data-label="Status"><span class="status-pill {status_class}">{}</span></td>
-                <td data-label="Image"><span class="image-name">{}</span></td>
-                <td data-label="Started">{}</td>
-                <td data-label="Session" class="actions">{terminal_link}</td>
+                <td><a href="/workload/{id}">{name}</a></td>
+                <td><span class="pill {status_class}">{status}</span></td>
+                <td class="dim">{image}</td>
+                <td>{started}</td>
+                <td>{terminal_link}</td>
             </tr>"#,
-            d.app_name,
-            d.status,
-            d.image,
-            d.started_at.split('T').next().unwrap_or(&d.started_at),
+            id = d.id,
+            name = d.app_name,
+            status = d.status,
+            image = d.image,
+            started = d.started_at.split('T').next().unwrap_or(&d.started_at),
         ));
     }
 
-    let uptime = state.started_at.elapsed().as_secs();
-    let uptime_str = if uptime > 3600 {
-        format!("{}h {}m", uptime / 3600, (uptime % 3600) / 60)
-    } else if uptime > 60 {
-        format!("{}m {}s", uptime / 60, uptime % 60)
+    let uptime_str = format_uptime(state.started_at.elapsed().as_secs());
+
+    let nav = nav_bar(&[("Dashboard", "/", true)]);
+    let hostname = std::env::var("DD_HOSTNAME").unwrap_or_else(|_| state.vm_name.clone());
+
+    let table = if deps.is_empty() {
+        r#"<div class="empty">No workloads running</div>"#.to_string()
     } else {
-        format!("{uptime}s")
+        format!(
+            r#"<table><tr><th>app</th><th>status</th><th>image</th><th>started</th><th>session</th></tr>{rows}</table>"#
+        )
     };
 
-    Ok(Html(format!(
-        r#"<!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>DD — {vm_name}</title>
-<style>
-  * {{ box-sizing: border-box; }}
-  body {{
-    margin: 0;
-    color: #111827;
-    font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-    background: #fff;
-  }}
-  main {{
-    width: min(960px, 100%);
-    margin: 0 auto;
-    padding: 16px;
-  }}
-  header, section {{
-    margin-top: 18px;
-  }}
-  header {{
-    margin-top: 0;
-  }}
-  h1, h2, p {{
-    margin: 0;
-  }}
-  h1 {{
-    font-size: clamp(2rem, 6vw, 2.5rem);
-    line-height: 1.1;
-  }}
-  h2 {{
-    font-size: 1rem;
-  }}
-  p, li, td, th, a, code {{
-    font-size: 0.95rem;
-    line-height: 1.45;
-  }}
-  ul {{
-    margin: 12px 0 0;
-    padding-left: 1.2rem;
-  }}
-  .muted {{
-    color: #4b5563;
-  }}
-  .metrics {{
-    display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-    gap: 12px;
-    margin-top: 14px;
-  }}
-  .metric {{
-    border: 1px solid #d1d5db;
-    padding: 12px;
-  }}
-  .metric strong {{
-    display: block;
-    font-size: 1.25rem;
-    margin-top: 4px;
-  }}
-  .status {{
-    font-weight: 700;
-  }}
-  .status.running {{ color: #166534; }}
-  .status.deploying {{ color: #92400e; }}
-  .status.failed {{ color: #991b1b; }}
-  .status.idle {{ color: #4b5563; }}
-  .table-wrap {{ overflow-x: auto; }}
-  table {{
-    width: 100%;
-    border-collapse: collapse;
-    margin-top: 12px;
-  }}
-  thead {{
-    position: absolute;
-    width: 1px;
-    height: 1px;
-    padding: 0;
-    margin: -1px;
-    overflow: hidden;
-    clip: rect(0, 0, 0, 0);
-    white-space: nowrap;
-    border: 0;
-  }}
-  tbody, tr {{ display: block; }}
-  tr {{
-    border-top: 1px solid #e5e7eb;
-    padding: 10px 0;
-  }}
-  td {{
-    display: grid;
-    grid-template-columns: minmax(76px, 90px) minmax(0, 1fr);
-    gap: 12px;
-    align-items: center;
-    padding: 6px 0;
-  }}
-  td::before {{
-    content: attr(data-label);
-    color: #4b5563;
-    font-size: 0.75rem;
-    font-weight: 700;
-    text-transform: uppercase;
-  }}
-  .actions {{ align-items: start; }}
-  a {{
-    color: #1d4ed8;
-    text-decoration-thickness: 1px;
-  }}
-  .empty {{
-    margin-top: 12px;
-    padding-top: 12px;
-    border-top: 1px solid #e5e7eb;
-  }}
-  code {{ font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }}
-  @media (min-width: 720px) {{
-    main {{ padding: 24px; }}
-    .metrics {{ grid-template-columns: repeat(4, minmax(0, 1fr)); }}
-  }}
-  @media (min-width: 840px) {{
-    thead {{
-      position: static;
-      width: auto;
-      height: auto;
-      margin: 0;
-      overflow: visible;
-      clip: auto;
-      white-space: normal;
-    }}
-    tbody {{ display: table-row-group; }}
-    tr {{
-      display: table-row;
-      padding: 0;
-    }}
-    th {{
-      padding: 0 0 10px;
-      text-align: left;
-      color: #4b5563;
-      font-size: 0.75rem;
-      font-weight: 700;
-      text-transform: uppercase;
-      border-bottom: 1px solid #d1d5db;
-    }}
-    td {{
-      display: table-cell;
-      padding: 12px 0;
-      border-bottom: 1px solid #e5e7eb;
-      vertical-align: middle;
-    }}
-    td::before {{ display: none; }}
-    .actions {{ text-align: right; }}
-  }}
-</style>
-</head>
-<body>
-<main>
-  <header>
-    <h1>DevOps Defender</h1>
-    <p class="muted">{agent_id}</p>
-    <p><a href="/auth/logout">Log out</a></p>
-    <ul>
-      <li>vm: <strong>{vm_name}</strong></li>
-      <li>health: <strong>healthy</strong></li>
-      <li>attestation: <strong>{att}</strong></li>
-      <li>owner: <strong>{owner}</strong></li>
-      <li>uptime: <strong>{uptime}</strong></li>
-    </ul>
-    <div class="metrics">
-      <div class="metric">
-        <div>CPU</div>
-        <strong>{cpu_pct}%</strong>
-        <div class="muted">live host utilization</div>
-      </div>
-      <div class="metric">
-        <div>Memory</div>
-        <strong>{mem_used}</strong>
-        <div class="muted">{mem_used} of {mem_total}</div>
-      </div>
-      <div class="metric">
-        <div>Disk</div>
-        <strong>{disk_used}</strong>
-        <div class="muted">{disk_used} of {disk_total}</div>
-      </div>
-      <div class="metric">
-        <div>Load</div>
-        <strong>{load_1m}</strong>
-        <div class="muted">normalized over CPUs</div>
-      </div>
-    </div>
-  </header>
+    let content = format!(
+        r#"<h1>{hostname}</h1>
+<div class="sub">{agent_id} &middot; {att}</div>
+<div class="meta"><span class="ok">healthy</span> &middot; uptime {uptime} &middot; {count} workload(s)</div>
 
-  <section>
-    <h2>Jobs ({count})</h2>
-    {table}
-  </section>
-</main>
-</body>
-</html>"#,
-        vm_name = state.vm_name,
-        agent_id = state.agent_id,
+<div class="cards">
+  <div class="card"><div class="label">CPU</div><div class="value green">{cpu}%</div></div>
+  <div class="card"><div class="label">Memory</div><div class="value blue">{mem_used} / {mem_total}</div></div>
+  <div class="card"><div class="label">Disk</div><div class="value peach">{disk_used} / {disk_total}</div></div>
+  <div class="card"><div class="label">Load</div><div class="value mauve">{load}</div></div>
+</div>
+
+<div class="section">Workloads</div>
+{table}"#,
+        hostname = hostname,
+        agent_id = &state.agent_id[..8.min(state.agent_id.len())],
         att = state.attestation_type,
-        owner = state.owner,
         uptime = uptime_str,
         count = deps.len(),
-        cpu_pct = metrics.cpu_pct,
+        cpu = metrics.cpu_pct,
         mem_used = metrics.mem_used,
         mem_total = metrics.mem_total,
         disk_used = metrics.disk_used,
         disk_total = metrics.disk_total,
-        load_1m = metrics.load_1m,
-        table = if deps.is_empty() {
-            r#"<div class="empty">no jobs running &mdash; deploy something with <code>dd deploy</code></div>"#.to_string()
-        } else {
-            format!(
-                r#"<div class="table-wrap"><table>
-<thead><tr><th>app</th><th>status</th><th>image</th><th>started</th><th>session</th></tr></thead>
-<tbody>
-{rows}
-</tbody>
-</table></div>"#
-            )
-        },
+        load = metrics.load_1m,
+        table = table,
+    );
+
+    Ok(Html(page_shell(
+        &format!("DD — {}", state.vm_name),
+        &nav,
+        &content,
     ))
     .into_response())
 }
@@ -1616,16 +1755,10 @@ async fn fleet_dashboard(
 async fn fleet_dashboard_html(state: &AgentState) -> Html<String> {
     let agents = state.agent_registry.lock().await;
     let env = std::env::var("DD_ENV").unwrap_or_else(|_| "dev".into());
-
     let now = chrono::Utc::now();
+
     let mut rows = String::new();
     for a in agents.values() {
-        let status_color = match a.status.as_str() {
-            "healthy" => "#a6e3a1",
-            "stale" => "#fab387",
-            "dead" => "#f38ba8",
-            _ => "#a6adc8",
-        };
         let age_secs = now.signed_duration_since(a.last_seen).num_seconds();
         let last_seen = if age_secs < 60 {
             format!("{age_secs}s ago")
@@ -1643,7 +1776,7 @@ async fn fleet_dashboard_html(state: &AgentState) -> Html<String> {
             r#"<tr>
                 <td><a href="/agent/{agent_id}">{hostname}</a></td>
                 <td>{vm}</td>
-                <td><span style="color:{status_color}">{status}</span></td>
+                <td><span class="pill {status}">{status}</span></td>
                 <td>{attestation}</td>
                 <td>{deploys}</td>
                 <td>{cpu}%</td>
@@ -1653,7 +1786,6 @@ async fn fleet_dashboard_html(state: &AgentState) -> Html<String> {
             agent_id = a.agent_id,
             hostname = a.hostname,
             vm = a.vm_name,
-            status_color = status_color,
             status = a.status,
             attestation = a.attestation_type,
             deploys = if a.deployment_names.is_empty() {
@@ -1667,49 +1799,70 @@ async fn fleet_dashboard_html(state: &AgentState) -> Html<String> {
         ));
     }
 
-    let uptime = state.started_at.elapsed().as_secs();
-    let uptime_str = if uptime > 3600 {
-        format!("{}h {}m", uptime / 3600, (uptime % 3600) / 60)
-    } else if uptime > 60 {
-        format!("{}m", uptime / 60)
+    let uptime_str = format_uptime(state.started_at.elapsed().as_secs());
+    let nav = nav_bar(&[("Fleet", "/", true)]);
+
+    let agents_count = agents.len();
+    let agent_table = if agents.is_empty() {
+        r#"<div class="empty">No agents registered</div>"#.to_string()
     } else {
-        format!("{uptime}s")
+        format!(
+            r#"<table><tr><th>hostname</th><th>vm</th><th>status</th><th>attestation</th><th>workloads</th><th>cpu</th><th>memory</th><th>last seen</th></tr>{rows}</table>"#
+        )
     };
 
-    Html(format!(
-        r#"<!DOCTYPE html>
-<html><head><meta charset="utf-8"><title>DD Fleet — {env}</title>
-<style>
-  body {{ margin:0; background:#1e1e2e; color:#cdd6f4; font-family:'JetBrains Mono',monospace; padding:24px; }}
-  h1 {{ color:#89b4fa; margin:0 0 4px; font-size:20px; }}
-  .sub {{ color:#585b70; font-size:12px; margin-bottom:16px; }}
-  .meta {{ color:#a6adc8; font-size:13px; margin-bottom:24px; }}
-  .meta .ok {{ color:#a6e3a1; }}
-  .section {{ color:#a6adc8; font-size:12px; text-transform:uppercase; margin:20px 0 8px; }}
-  table {{ border-collapse:collapse; width:100%; }}
-  th {{ text-align:left; color:#a6adc8; font-weight:normal; font-size:12px; text-transform:uppercase; padding:8px 12px; border-bottom:1px solid #313244; }}
-  td {{ padding:8px 12px; border-bottom:1px solid #313244; font-size:14px; }}
-  a {{ color:#89b4fa; text-decoration:none; }} a:hover {{ text-decoration:underline; }}
-  .empty {{ color:#585b70; padding:24px; text-align:center; }}
-</style></head><body>
-<h1>DevOps Defender</h1>
+    // Own workloads (the register itself runs workloads too)
+    drop(agents);
+    let deps = state.deployments.lock().await;
+    let workload_rows = if deps.is_empty() {
+        r#"<div class="empty">No workloads running</div>"#.to_string()
+    } else {
+        let mut wr = String::new();
+        for d in deps.values() {
+            let status_class = match d.status.as_str() {
+                "running" => "running",
+                "deploying" => "deploying",
+                "failed" | "exited" => "failed",
+                _ => "idle",
+            };
+            let session_link = if d.status == "running" {
+                format!(
+                    r#"<a href="/session/{name}">session</a>"#,
+                    name = d.app_name
+                )
+            } else {
+                r#"<span class="dim">—</span>"#.to_string()
+            };
+            wr.push_str(&format!(
+                r#"<tr><td><a href="/workload/{id}">{name}</a></td><td><span class="pill {status_class}">{status}</span></td><td class="dim">{image}</td><td>{session_link}</td></tr>"#,
+                id = d.id,
+                name = d.app_name,
+                status = d.status,
+                image = d.image,
+            ));
+        }
+        format!(
+            r#"<table><tr><th>app</th><th>status</th><th>image</th><th>session</th></tr>{wr}</table>"#
+        )
+    };
+
+    let content = format!(
+        r#"<h1>DevOps Defender</h1>
 <div class="sub">{env} fleet &middot; {agent_id}</div>
 <div class="meta"><span class="ok">healthy</span> &middot; uptime {uptime} &middot; {count} agent(s)</div>
 <div class="section">Agents</div>
-{table}
-</body></html>"#,
+{agent_table}
+<div class="section">Workloads</div>
+{workload_rows}"#,
         env = env,
         agent_id = &state.agent_id[..8],
         uptime = uptime_str,
-        count = agents.len(),
-        table = if agents.is_empty() {
-            r#"<div class="empty">no agents registered</div>"#.to_string()
-        } else {
-            format!(
-                r#"<table><tr><th>hostname</th><th>vm</th><th>status</th><th>attestation</th><th>workloads</th><th>cpu</th><th>memory</th><th>last seen</th></tr>{rows}</table>"#
-            )
-        },
-    ))
+        count = agents_count,
+        agent_table = agent_table,
+        workload_rows = workload_rows,
+    );
+
+    Html(page_shell(&format!("DD Fleet — {env}"), &nav, &content))
 }
 
 // ── Agent detail page (register mode) ─────────────────────────────────
@@ -1718,13 +1871,6 @@ async fn agent_detail(Path(agent_id): Path<String>, State(state): State<AgentSta
     let agents = state.agent_registry.lock().await;
     let Some(a) = agents.get(&agent_id) else {
         return (axum::http::StatusCode::NOT_FOUND, "agent not found").into_response();
-    };
-
-    let status_color = match a.status.as_str() {
-        "healthy" => "#a6e3a1",
-        "stale" => "#fab387",
-        "dead" => "#f38ba8",
-        _ => "#a6adc8",
     };
 
     let now = chrono::Utc::now();
@@ -1743,9 +1889,9 @@ async fn agent_detail(Path(agent_id): Path<String>, State(state): State<AgentSta
         "-".into()
     };
 
-    let deployments_list = if a.deployment_names.is_empty() {
+    let workloads = if a.deployment_names.is_empty() {
         format!(
-            "<span class=\"dim\">{} deployment(s)</span>",
+            r#"<span class="dim">{} deployment(s)</span>"#,
             a.deployment_count
         )
     } else {
@@ -1756,48 +1902,30 @@ async fn agent_detail(Path(agent_id): Path<String>, State(state): State<AgentSta
             .join("\n")
     };
 
-    let html = format!(
-        r#"<!DOCTYPE html>
-<html><head><meta charset="utf-8"><title>{hostname} — DD Fleet</title>
-<style>
-  body {{ margin:0; background:#1e1e2e; color:#cdd6f4; font-family:'JetBrains Mono',monospace; padding:24px; }}
-  h1 {{ color:#89b4fa; margin:0 0 4px; font-size:20px; }}
-  .sub {{ color:#585b70; font-size:12px; margin-bottom:24px; }}
-  a {{ color:#89b4fa; text-decoration:none; }} a:hover {{ text-decoration:underline; }}
-  .back {{ font-size:13px; margin-bottom:20px; }}
-  .card {{ background:#181825; border:1px solid #313244; border-radius:8px; padding:20px; margin-bottom:16px; }}
-  .row {{ display:flex; justify-content:space-between; padding:8px 0; border-bottom:1px solid #313244; }}
-  .row:last-child {{ border-bottom:none; }}
-  .label {{ color:#a6adc8; font-size:12px; text-transform:uppercase; }}
-  .value {{ font-size:14px; }}
-  .section {{ color:#a6adc8; font-size:12px; text-transform:uppercase; margin:20px 0 8px; }}
-  .dim {{ color:#585b70; }}
-  ul {{ margin:0; padding:0 0 0 20px; }} li {{ padding:2px 0; font-size:14px; }}
-</style></head><body>
-<div class="back"><a href="/">&larr; fleet</a></div>
+    let nav = nav_bar(&[("Fleet", "/", false)]);
+    let content = format!(
+        r#"<div class="back"><a href="/">&larr; fleet</a></div>
 <h1>{hostname}</h1>
 <div class="sub">{agent_id}</div>
 
 <div class="card">
-  <div class="row"><span class="label">Status</span><span class="value" style="color:{status_color}">{status}</span></div>
-  <div class="row"><span class="label">VM</span><span class="value">{vm}</span></div>
-  <div class="row"><span class="label">Attestation</span><span class="value">{attestation}</span></div>
-  <div class="row"><span class="label">Registered</span><span class="value">{registered_at}</span></div>
-  <div class="row"><span class="label">Last Seen</span><span class="value">{last_seen}</span></div>
-  <div class="row"><span class="label">Tunnel</span><span class="value"><a href="https://{hostname}" target="_blank">{hostname} &nearr;</a></span></div>
+  <div class="row"><span class="label">Status</span><span class="pill {status}">{status}</span></div>
+  <div class="row"><span class="label">VM</span><span>{vm}</span></div>
+  <div class="row"><span class="label">Attestation</span><span>{attestation}</span></div>
+  <div class="row"><span class="label">Registered</span><span>{registered_at}</span></div>
+  <div class="row"><span class="label">Last Seen</span><span>{last_seen}</span></div>
+  <div class="row"><span class="label">Tunnel</span><span><a href="https://{hostname}" target="_blank">{hostname} &nearr;</a></span></div>
 </div>
 
-<div class="card">
-  <div class="row"><span class="label">CPU</span><span class="value">{cpu}%</span></div>
-  <div class="row"><span class="label">Memory</span><span class="value">{mem}</span></div>
+<div class="cards">
+  <div class="card"><div class="label">CPU</div><div class="value green">{cpu}%</div></div>
+  <div class="card"><div class="label">Memory</div><div class="value blue">{mem}</div></div>
 </div>
 
 <div class="section">Workloads</div>
-<div class="card"><ul>{deployments}</ul></div>
-</body></html>"#,
+<div class="card"><ul>{workloads}</ul></div>"#,
         hostname = a.hostname,
         agent_id = a.agent_id,
-        status_color = status_color,
         status = a.status,
         vm = a.vm_name,
         attestation = a.attestation_type,
@@ -1805,10 +1933,15 @@ async fn agent_detail(Path(agent_id): Path<String>, State(state): State<AgentSta
         last_seen = last_seen,
         cpu = a.cpu_percent,
         mem = mem_str,
-        deployments = deployments_list,
+        workloads = workloads,
     );
 
-    Html(html).into_response()
+    Html(page_shell(
+        &format!("{} — DD Fleet", a.hostname),
+        &nav,
+        &content,
+    ))
+    .into_response()
 }
 
 // ── Scraper + Deregister endpoints (register mode) ──────────────────────
@@ -2261,12 +2394,21 @@ pub fn build_router(state: AgentState) -> Router {
         router = router.route("/", get(dashboard));
     }
 
+    // Auth routes — password login is always available, GitHub only when configured
+    router = router
+        .route("/auth/login", get(login_page).post(login_submit))
+        .route("/auth/logout", get(github_auth_logout));
+
+    if matches!(state.auth_mode, AuthMode::GitHub(_)) {
+        router = router
+            .route("/auth/github/start", get(github_auth_start))
+            .route("/auth/github/callback", get(github_auth_callback));
+    }
+
     router
         .route("/logged-out", get(logged_out_page))
-        .route("/auth/github/start", get(github_auth_start))
-        .route("/auth/github/callback", get(github_auth_callback))
-        .route("/auth/logout", get(github_auth_logout))
         .route("/health", get(health))
+        .route("/workload/{id}", get(workload_page))
         .route("/deployments", get(list_deployments))
         .route("/deployments/{id}", get(get_deployment))
         .route("/deployments/{id}/logs", get(deployment_logs))

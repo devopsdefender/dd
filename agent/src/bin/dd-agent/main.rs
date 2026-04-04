@@ -292,8 +292,32 @@ async fn run_agent_mode(cfg: AgentRuntimeConfig) {
         eprintln!("dd-agent: DD_OWNER not set");
         safe_exit(1);
     });
-    let oauth = match dd_agent::server::GithubOAuthConfig::from_env() {
-        Ok(config) => config,
+    let auth_mode = match dd_agent::server::GithubOAuthConfig::from_env() {
+        Ok(Some(config)) => {
+            if std::env::var("DD_PASSWORD")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .is_some()
+            {
+                eprintln!("dd-agent: warning: DD_PASSWORD ignored (GitHub OAuth takes priority)");
+            }
+            dd_agent::server::AuthMode::GitHub(config)
+        }
+        Ok(None) => {
+            if let Some(password) = std::env::var("DD_PASSWORD").ok().filter(|s| !s.is_empty()) {
+                let secure = std::env::var("DD_HOSTNAME")
+                    .ok()
+                    .map(|h| !h.contains("localhost"))
+                    .unwrap_or(false);
+                eprintln!("dd-agent: password auth enabled");
+                dd_agent::server::AuthMode::Password {
+                    password,
+                    secure_cookies: secure,
+                }
+            } else {
+                dd_agent::server::AuthMode::None
+            }
+        }
         Err(error) => {
             eprintln!("dd-agent: configuration error: {error}");
             safe_exit(1);
@@ -514,7 +538,7 @@ async fn run_agent_mode(cfg: AgentRuntimeConfig) {
         deployments: deployments.clone(),
         process_handles,
         started_at: std::time::Instant::now(),
-        oauth,
+        auth_mode,
         browser_sessions,
         pending_oauth_states,
         register_mode,
