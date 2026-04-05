@@ -66,6 +66,10 @@ pub struct DeployRequest {
     pub app_version: Option<String>,
     #[serde(default)]
     pub tty: bool,
+    /// Commands to exec inside the container after it starts.
+    /// Each entry is a list of strings (program + args).
+    #[serde(default)]
+    pub post_deploy: Option<Vec<Vec<String>>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1449,6 +1453,7 @@ async fn handle_ws_noise_cmd(socket: WebSocket, state: AgentState) {
                             cmd, image, env,
                             app_name: app_name.clone(),
                             volumes: None, app_version: None, tty,
+                            post_deploy: None,
                         };
                         let (id, status) = execute_deploy(&state.deployments, req).await;
                         crate::noise::NoiseMessage::Ok {
@@ -2510,6 +2515,7 @@ async fn new_terminal(
         app_name: Some(name.clone()),
         app_version: None,
         tty: true,
+        post_deploy: None,
     };
 
     let (id, _status) =
@@ -2688,8 +2694,66 @@ async fn run_deploy(
                 eprintln!("dd-agent: deployment {dep_id} running (container={container_id})");
                 let mut deps = deployments.lock().await;
                 if let Some(info) = deps.get_mut(&dep_id) {
-                    info.container_id = Some(container_id);
+                    info.container_id = Some(container_id.clone());
                     info.status = "running".into();
+                }
+                drop(deps);
+
+                // Run post-deploy commands inside the container
+                if let Some(ref commands) = req.post_deploy {
+                    // Wait for container to be ready
+                    for _ in 0..60 {
+                        if crate::container::is_running(&container_id).await {
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    }
+
+                    for cmd in commands {
+                        if cmd.is_empty() {
+                            continue;
+                        }
+                        eprintln!("dd-agent: post-deploy exec: {}", cmd.join(" "));
+                        match crate::container::exec(&app_name, cmd).await {
+                            Ok((code, stdout, stderr)) => {
+                                if code != 0 {
+                                    eprintln!(
+                                        "dd-agent: post-deploy cmd failed (exit {}): {}{}",
+                                        code,
+                                        stdout.trim(),
+                                        if stderr.is_empty() {
+                                            String::new()
+                                        } else {
+                                            format!(" stderr: {}", stderr.trim())
+                                        }
+                                    );
+                                    set_deploy_failed(
+                                        &deployments,
+                                        &dep_id,
+                                        &format!(
+                                            "post-deploy failed: {} (exit {code})",
+                                            cmd.join(" ")
+                                        ),
+                                    )
+                                    .await;
+                                    return;
+                                }
+                                if !stdout.trim().is_empty() {
+                                    eprintln!("dd-agent: post-deploy: {}", stdout.trim());
+                                }
+                            }
+                            Err(e) => {
+                                set_deploy_failed(
+                                    &deployments,
+                                    &dep_id,
+                                    &format!("post-deploy exec error: {e}"),
+                                )
+                                .await;
+                                return;
+                            }
+                        }
+                    }
+                    eprintln!("dd-agent: post-deploy commands complete for {app_name}");
                 }
             }
             Err(e) => {

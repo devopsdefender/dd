@@ -104,6 +104,60 @@ pub async fn pull_and_run(
     Ok(container.id)
 }
 
+/// Execute a command inside a running container. Returns (exit_code, stdout, stderr).
+pub async fn exec(container_name: &str, cmd: &[String]) -> Result<(i64, String, String), String> {
+    use bollard::exec::{CreateExecOptions, StartExecOptions};
+
+    let docker = connect()?;
+    let exec = docker
+        .create_exec(
+            container_name,
+            CreateExecOptions {
+                cmd: Some(cmd.to_vec()),
+                attach_stdout: Some(true),
+                attach_stderr: Some(true),
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(|e| format!("create exec: {e}"))?;
+
+    let output = docker
+        .start_exec(
+            &exec.id,
+            Some(StartExecOptions {
+                detach: false,
+                ..Default::default()
+            }),
+        )
+        .await
+        .map_err(|e| format!("start exec: {e}"))?;
+
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    if let bollard::exec::StartExecResults::Attached { mut output, .. } = output {
+        while let Some(Ok(msg)) = output.next().await {
+            match msg {
+                bollard::container::LogOutput::StdOut { message } => {
+                    stdout.push_str(&String::from_utf8_lossy(&message));
+                }
+                bollard::container::LogOutput::StdErr { message } => {
+                    stderr.push_str(&String::from_utf8_lossy(&message));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let inspect = docker
+        .inspect_exec(&exec.id)
+        .await
+        .map_err(|e| format!("inspect exec: {e}"))?;
+    let exit_code = inspect.exit_code.unwrap_or(-1);
+
+    Ok((exit_code, stdout, stderr))
+}
+
 /// Stop and remove a container.
 pub async fn stop(container_id: &str) -> Result<(), String> {
     let docker = connect()?;

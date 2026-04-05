@@ -326,6 +326,7 @@ async fn handle_session(
                             cmd, image, env,
                             app_name: app_name.clone(),
                             volumes: None, app_version: None, tty,
+                            post_deploy: None,
                         };
                         let (id, status) = crate::server::execute_deploy(deployments, req).await;
                         NoiseMessage::Ok {
