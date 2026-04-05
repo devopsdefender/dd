@@ -99,3 +99,13 @@ jobs:
           BINARY_URL: ${{ needs.build.outputs.binary_url }}
         run: scripts/gcp-deploy.sh
 
+      - name: Wait for agent health
+        run: |
+          for i in $(seq 1 60); do
+            curl -fsS "http://${bootstrap_ip}:8080/health" >/dev/null 2>&1 && echo "Agent healthy!" && exit 0
+            echo "  attempt ${i}/60..." && sleep 5
+          done
+          echo "::error::Agent not healthy within 5 minutes"
+          exit 1
+
+

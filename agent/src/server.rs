@@ -508,6 +508,19 @@ fn nav_bar(items: &[(&str, &str, bool)]) -> String {
     html
 }
 
+fn nav_bar_with_terminal(items: &[(&str, &str, bool)]) -> String {
+    let mut html = String::from(r#"<nav><span class="brand">DD</span>"#);
+    for (label, href, active) in items {
+        if *active {
+            html.push_str(&format!(r#"<a href="{href}" class="active">{label}</a>"#));
+        } else {
+            html.push_str(&format!(r#"<a href="{href}">{label}</a>"#));
+        }
+    }
+    html.push_str(r#"<span class="spacer"></span><form method="POST" action="/terminal" style="display:inline"><button type="submit" style="background:#a6e3a1;color:#1e1e2e;border:none;border-radius:4px;padding:4px 12px;font-family:inherit;font-size:13px;font-weight:600;cursor:pointer">+ Terminal</button></form> <a href="/auth/logout">log out</a></nav>"#);
+    html
+}
+
 fn format_uptime(secs: u64) -> String {
     if secs > 3600 {
         format!("{}h {}m", secs / 3600, (secs % 3600) / 60)
@@ -662,7 +675,7 @@ async fn workload_page(
         String::new()
     };
 
-    let nav = nav_bar(&[("Dashboard", "/", false)]);
+    let nav = nav_bar_with_terminal(&[("Dashboard", "/", false)]);
     let content = format!(
         r#"<div class="back"><a href="/">&larr; dashboard</a></div>
 <h1>{name}</h1>
@@ -1560,7 +1573,7 @@ async fn dashboard(
 
     let uptime_str = format_uptime(state.started_at.elapsed().as_secs());
 
-    let nav = nav_bar(&[("Dashboard", "/", true)]);
+    let nav = nav_bar_with_terminal(&[("Dashboard", "/", true)]);
     let hostname = std::env::var("DD_HOSTNAME").unwrap_or_else(|_| state.vm_name.clone());
 
     let table = if deps.is_empty() {
@@ -2437,10 +2450,45 @@ pub fn build_router(state: AgentState) -> Router {
         .route("/noise/session/{app_name}", get(ws_noise_session))
         .route("/noise/cmd", get(ws_noise_cmd))
         .route("/deploy", post(post_deploy))
+        .route("/terminal", post(new_terminal))
         .with_state(state)
 }
 
 // ── POST /deploy — localhost-only deploy endpoint ───────────────────────
+
+async fn new_terminal(
+    State(state): State<AgentState>,
+    headers: HeaderMap,
+    OriginalUri(uri): OriginalUri,
+) -> Response {
+    // Require auth
+    if !state.owner.is_empty() {
+        match require_browser_token(&state, &headers, None, &uri).await {
+            Ok(_) => {}
+            Err(response) => return response,
+        }
+    }
+
+    // Deploy a fresh bash shell with a random name
+    let name = format!("term-{}", &uuid::Uuid::new_v4().to_string()[..6]);
+    let req = DeployRequest {
+        cmd: vec!["bash".into()],
+        image: None,
+        env: None,
+        app_name: Some(name.clone()),
+        app_version: None,
+        tty: true,
+    };
+
+    let (id, _status) =
+        execute_deploy_with_handles(&state.deployments, Some(&state.process_handles), req).await;
+    eprintln!("dd-agent: new terminal {name} (deploy {id})");
+
+    // Wait briefly for the process to start so the session handler can find it
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    Redirect::to(&format!("/session/{name}")).into_response()
+}
 
 async fn post_deploy(
     axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
@@ -2464,6 +2512,14 @@ async fn post_deploy(
 // ── Deploy/Stop logic (called by Noise command channel) ──────────────────
 
 pub async fn execute_deploy(deployments: &Deployments, req: DeployRequest) -> (String, String) {
+    execute_deploy_with_handles(deployments, None, req).await
+}
+
+pub async fn execute_deploy_with_handles(
+    deployments: &Deployments,
+    handles: Option<&ProcessHandles>,
+    req: DeployRequest,
+) -> (String, String) {
     let dep_id = uuid::Uuid::new_v4().to_string();
     let app_name = req.app_name.clone().unwrap_or_else(|| "unnamed".into());
     let short_id = dep_id[..8].to_string();
@@ -2487,8 +2543,9 @@ pub async fn execute_deploy(deployments: &Deployments, req: DeployRequest) -> (S
     deployments.lock().await.insert(dep_id.clone(), info);
 
     let deployments_clone = deployments.clone();
+    let handles_clone = handles.cloned();
     tokio::spawn(async move {
-        run_deploy(deployments_clone, dep_id, app_name, req).await;
+        run_deploy(deployments_clone, handles_clone, dep_id, app_name, req).await;
     });
 
     (short_id, "deploying".into())
@@ -2496,6 +2553,7 @@ pub async fn execute_deploy(deployments: &Deployments, req: DeployRequest) -> (S
 
 async fn run_deploy(
     deployments: Deployments,
+    process_handles: Option<ProcessHandles>,
     dep_id: String,
     app_name: String,
     req: DeployRequest,
@@ -2539,7 +2597,7 @@ async fn run_deploy(
         let program = &req.cmd[0];
         let args: Vec<&str> = req.cmd[1..].iter().map(|s| s.as_str()).collect();
         match crate::process::spawn_command(program, &args, req.tty).await {
-            Ok(child) => {
+            Ok(mut child) => {
                 let pid = child.id();
                 eprintln!("dd-agent: deployment {dep_id} running (pid={pid:?})");
                 let mut deps = deployments.lock().await;
@@ -2547,6 +2605,44 @@ async fn run_deploy(
                     info.pid = pid;
                     info.status = "running".into();
                 }
+                drop(deps);
+
+                // Wire up I/O for web terminal access
+                if req.tty {
+                    if let Some(ref handles) = process_handles {
+                        let (stdout_tx, _) = tokio::sync::broadcast::channel::<Vec<u8>>(256);
+                        if let Some(stdin) = child.stdin.take() {
+                            handles.lock().await.insert(
+                                app_name.clone(),
+                                ProcessIO {
+                                    stdin,
+                                    stdout_tx: stdout_tx.clone(),
+                                },
+                            );
+                        }
+                        if let Some(stdout) = child.stdout.take() {
+                            tokio::spawn(async move {
+                                use tokio::io::AsyncReadExt;
+                                let mut stdout = stdout;
+                                let mut buf = vec![0u8; 4096];
+                                loop {
+                                    match stdout.read(&mut buf).await {
+                                        Ok(0) => break,
+                                        Ok(n) => {
+                                            let _ = stdout_tx.send(buf[..n].to_vec());
+                                        }
+                                        Err(_) => break,
+                                    }
+                                }
+                            });
+                        }
+                    }
+                }
+
+                // Wait for process in background
+                tokio::spawn(async move {
+                    let _ = child.wait().await;
+                });
             }
             Err(e) => {
                 set_deploy_failed(&deployments, &dep_id, &e).await;
