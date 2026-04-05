@@ -343,12 +343,14 @@ async fn run_agent_mode(cfg: AgentRuntimeConfig) {
     let mut bootstrap_auth_issuer: Option<String> = None;
 
     // Bootstrap priority: pre-provisioned token > self-register via CF API > register via Noise > standalone
+    let mut saved_tunnel_token: Option<String> = None;
     if let Some(token) = std::env::var("DD_TUNNEL_TOKEN")
         .ok()
         .map(|t| t.trim().to_string())
         .filter(|t| !t.is_empty())
     {
         eprintln!("dd-agent: using pre-provisioned tunnel token");
+        saved_tunnel_token = Some(token.clone());
         if let Err(e) = start_cloudflared(&token).await {
             eprintln!("dd-agent: cloudflared start failed: {e}");
         }
@@ -369,6 +371,7 @@ async fn run_agent_mode(cfg: AgentRuntimeConfig) {
         {
             Ok(info) => {
                 eprintln!("dd-agent: tunnel created — hostname={}", info.hostname);
+                saved_tunnel_token = Some(info.tunnel_token.clone());
                 if let Err(e) = start_cloudflared(&info.tunnel_token).await {
                     eprintln!("dd-agent: cloudflared start failed: {e}");
                 }
@@ -384,6 +387,7 @@ async fn run_agent_mode(cfg: AgentRuntimeConfig) {
             "dd-agent: registered — owner={} hostname={}",
             config.owner, config.hostname
         );
+        saved_tunnel_token = Some(config.tunnel_token.clone());
         if let Err(e) = start_cloudflared(&config.tunnel_token).await {
             eprintln!("dd-agent: cloudflared start failed: {e}");
         }
@@ -629,7 +633,13 @@ async fn run_agent_mode(cfg: AgentRuntimeConfig) {
             attestation: dd_agent::attestation::detect(),
         });
     tokio::spawn(async move {
-        monitoring_loop(monitor_deps, monitor_registry, monitor_reregister).await;
+        monitoring_loop(
+            monitor_deps,
+            monitor_registry,
+            monitor_reregister,
+            saved_tunnel_token,
+        )
+        .await;
     });
 
     // Run HTTP server until shutdown
@@ -795,6 +805,7 @@ async fn monitoring_loop(
     deployments: Deployments,
     self_registry: Option<(dd_agent::server::AgentRegistry, String)>,
     reregister: Option<ReregisterInfo>,
+    tunnel_token: Option<String>,
 ) {
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
     let mut last_reregister: Option<std::time::Instant> = None;
@@ -877,8 +888,20 @@ async fn monitoring_loop(
                 if let Err(e) = start_cloudflared(&config.tunnel_token).await {
                     eprintln!("dd-agent: cloudflared restart failed: {e}");
                 }
+            } else if let Some(ref token) = tunnel_token {
+                // Self-registered or pre-provisioned tunnel — restart with saved token
+                let can_restart = last_reregister
+                    .map(|t: std::time::Instant| t.elapsed() > reregister_cooldown)
+                    .unwrap_or(true);
+                if can_restart {
+                    last_reregister = Some(std::time::Instant::now());
+                    eprintln!("dd-agent: cloudflared dead, restarting with saved tunnel token");
+                    if let Err(e) = start_cloudflared(token).await {
+                        eprintln!("dd-agent: cloudflared restart failed: {e}");
+                    }
+                }
             } else {
-                eprintln!("dd-agent: cloudflared not running (no register URL to reconnect)");
+                eprintln!("dd-agent: cloudflared not running (no way to reconnect)");
             }
         }
     }
