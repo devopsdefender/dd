@@ -41,6 +41,8 @@ pub struct DeployRequest {
     #[serde(default)]
     pub env: Option<Vec<String>>,
     #[serde(default)]
+    pub volumes: Option<Vec<String>>,
+    #[serde(default)]
     pub app_name: Option<String>,
     #[serde(default)]
     pub app_version: Option<String>,
@@ -1418,7 +1420,7 @@ async fn handle_ws_noise_cmd(socket: WebSocket, state: AgentState) {
                         let req = DeployRequest {
                             cmd, image, env,
                             app_name: app_name.clone(),
-                            app_version: None, tty,
+                            volumes: None, app_version: None, tty,
                         };
                         let (id, status) = execute_deploy(&state.deployments, req).await;
                         crate::noise::NoiseMessage::Ok {
@@ -2475,6 +2477,7 @@ async fn new_terminal(
         cmd: vec!["bash".into()],
         image: None,
         env: None,
+        volumes: None,
         app_name: Some(name.clone()),
         app_version: None,
         tty: true,
@@ -2579,7 +2582,7 @@ async fn run_deploy(
 
     if let Some(ref image) = req.image {
         // Container path — pull and run via bollard
-        match crate::container::pull_and_run(image, &app_name, req.env, true).await {
+        match crate::container::pull_and_run(image, &app_name, req.env, req.volumes, true).await {
             Ok(container_id) => {
                 eprintln!("dd-agent: deployment {dep_id} running (container={container_id})");
                 let mut deps = deployments.lock().await;
