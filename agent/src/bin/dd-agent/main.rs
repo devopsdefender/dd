@@ -502,6 +502,7 @@ async fn run_agent_mode(cfg: AgentRuntimeConfig) {
             image: Some(image),
             env,
             app_name: Some(app_name),
+            volumes: None,
             app_version: None,
             tty: false,
         };
@@ -533,6 +534,7 @@ async fn run_agent_mode(cfg: AgentRuntimeConfig) {
             image: None,
             env,
             app_name: Some(app_name),
+            volumes: None,
             app_version: None,
             tty,
         };
