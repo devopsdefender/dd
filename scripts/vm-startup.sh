@@ -45,25 +45,24 @@ DD_BOOT_CMD=bash \
 DD_BOOT_APP=demo \
 nohup /usr/local/bin/dd-agent > /var/log/dd-agent.log 2>&1 &
 
-# ── Deploy scraper container via dd-agent API (localhost, no auth needed) ─
-echo "Waiting for agent API..."
-for i in $(seq 1 30); do
-  curl -fsS http://localhost:8080/health >/dev/null 2>&1 && break
-  sleep 2
-done
-
-echo "Deploying scraper container..."
-curl -sS -X POST http://localhost:8080/deploy \
-  -H "Content-Type: application/json" \
-  -d "{
-    \"image\": \"ghcr.io/devopsdefender/dd-scraper:latest\",
-    \"app_name\": \"scraper\",
-    \"env\": [
-      \"DD_CF_API_TOKEN=${CLOUDFLARE_API_TOKEN}\",
-      \"DD_CF_ACCOUNT_ID=${CLOUDFLARE_ACCOUNT_ID}\",
-      \"DD_CF_ZONE_ID=${CLOUDFLARE_ZONE_ID}\",
-      \"DD_CF_DOMAIN=${DD_DOMAIN}\",
-      \"DD_ENV=${DD_ENV}\",
-      \"DD_REGISTER_URL=ws://localhost:8080/scraper\"
-    ]
-  }" && echo "✓ Scraper deployed" || echo "WARNING: scraper deploy failed"
+# ── Deploy scraper container via localhost API ────────────────────────────
+(
+  for i in $(seq 1 30); do
+    curl -fsS http://localhost:8080/health >/dev/null 2>&1 && break
+    sleep 2
+  done
+  curl -sS -X POST http://localhost:8080/deploy \
+    -H "Content-Type: application/json" \
+    -d "{
+      \"image\": \"ghcr.io/devopsdefender/dd-scraper:latest\",
+      \"app_name\": \"scraper\",
+      \"env\": [
+        \"DD_CF_API_TOKEN=${CLOUDFLARE_API_TOKEN}\",
+        \"DD_CF_ACCOUNT_ID=${CLOUDFLARE_ACCOUNT_ID}\",
+        \"DD_CF_ZONE_ID=${CLOUDFLARE_ZONE_ID}\",
+        \"DD_CF_DOMAIN=${DD_DOMAIN}\",
+        \"DD_ENV=${DD_ENV}\",
+        \"DD_REGISTER_URL=ws://localhost:8080/scraper\"
+      ]
+    }" && echo "scraper deployed" || echo "scraper deploy failed"
+) &
