@@ -477,9 +477,6 @@ async fn run_agent_mode(cfg: AgentRuntimeConfig) {
             format!("DD_BOOT_IMAGE_{i}")
         };
         let Ok(image) = std::env::var(&image_key) else {
-            if i > 0 {
-                break;
-            }
             continue;
         };
         let app_name = if i == 0 {
