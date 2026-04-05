@@ -33,6 +33,24 @@ pub struct DeploymentInfo {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct ExecRequest {
+    pub cmd: Vec<String>,
+    #[serde(default = "default_exec_timeout")]
+    pub timeout_secs: u64,
+}
+
+fn default_exec_timeout() -> u64 {
+    30
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ExecResponse {
+    pub exit_code: i32,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct DeployRequest {
     #[serde(default)]
     pub cmd: Vec<String>,
@@ -330,7 +348,17 @@ async fn resolve_auth(
         return Ok(Some(token));
     }
 
-    // 3. GitHub-mode only: check query param and Authorization header
+    // 3. Password-mode: check Authorization header against DD_PASSWORD
+    if let AuthMode::Password { ref password, .. } = state.auth_mode {
+        if let Some(token) = extract_auth(headers) {
+            if constant_time_eq(token.as_bytes(), password.as_bytes()) {
+                return Ok(Some("password-bearer".to_string()));
+            }
+            return Err(AppError::Unauthorized);
+        }
+    }
+
+    // 4. GitHub-mode only: check query param and Authorization header
     if matches!(state.auth_mode, AuthMode::GitHub(_)) {
         if let Some(token) = query_token.filter(|token| !token.is_empty()) {
             verify_github_token(token, &state.owner).await?;
@@ -2452,6 +2480,7 @@ pub fn build_router(state: AgentState) -> Router {
         .route("/noise/session/{app_name}", get(ws_noise_session))
         .route("/noise/cmd", get(ws_noise_cmd))
         .route("/deploy", post(post_deploy))
+        .route("/exec", post(post_exec))
         .route("/terminal", post(new_terminal))
         .with_state(state)
 }
@@ -2510,6 +2539,78 @@ async fn post_deploy(
 
     let (id, status) = execute_deploy(&state.deployments, req).await;
     Json(serde_json::json!({"id": id, "status": status})).into_response()
+}
+
+// ── POST /exec — synchronous command execution ─────────────────────────
+
+async fn post_exec(
+    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    State(state): State<AgentState>,
+    headers: HeaderMap,
+    Json(req): Json<ExecRequest>,
+) -> Response {
+    if !addr.ip().is_loopback() && verify_owner(&state, &headers).await.is_err() {
+        return (
+            axum::http::StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "authentication required"})),
+        )
+            .into_response();
+    }
+
+    if req.cmd.is_empty() {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "cmd must not be empty"})),
+        )
+            .into_response();
+    }
+
+    let timeout = std::time::Duration::from_secs(req.timeout_secs.min(300));
+    let program = &req.cmd[0];
+    let args: Vec<&str> = req.cmd[1..].iter().map(|s| s.as_str()).collect();
+
+    let mut cmd = tokio::process::Command::new(program);
+    cmd.args(&args);
+    cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+
+    let child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(e) => {
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("spawn failed: {e}")})),
+            )
+                .into_response();
+        }
+    };
+
+    let pid = child.id();
+
+    match tokio::time::timeout(timeout, child.wait_with_output()).await {
+        Ok(Ok(output)) => Json(ExecResponse {
+            exit_code: output.status.code().unwrap_or(-1),
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        })
+        .into_response(),
+        Ok(Err(e)) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("wait failed: {e}")})),
+        )
+            .into_response(),
+        Err(_) => {
+            if let Some(pid) = pid {
+                let _ = crate::process::kill_process(pid).await;
+            }
+            (
+                axum::http::StatusCode::REQUEST_TIMEOUT,
+                Json(serde_json::json!({"error": format!("command timed out after {}s", timeout.as_secs())})),
+            )
+                .into_response()
+        }
+    }
 }
 
 // ── Deploy/Stop logic (called by Noise command channel) ──────────────────
