@@ -26,6 +26,7 @@ pub async fn pull_and_run(
     image: &str,
     name: &str,
     env: Option<Vec<String>>,
+    volumes: Option<Vec<String>>,
     network_host: bool,
 ) -> Result<String, String> {
     let docker = connect()?;
@@ -59,6 +60,7 @@ pub async fn pull_and_run(
 
     // Create container
     let host_config = bollard::models::HostConfig {
+        binds: volumes,
         network_mode: if network_host {
             Some("host".to_string())
         } else {
