@@ -505,6 +505,7 @@ async fn run_agent_mode(cfg: AgentRuntimeConfig) {
             volumes: None,
             app_version: None,
             tty: false,
+            post_deploy: None,
         };
         let (id, status) = dd_agent::server::execute_deploy(&deployments, req).await;
         eprintln!("dd-agent: boot container {id} {status}");
@@ -537,6 +538,7 @@ async fn run_agent_mode(cfg: AgentRuntimeConfig) {
             volumes: None,
             app_version: None,
             tty,
+            post_deploy: None,
         };
         let (id, status) = dd_agent::server::execute_deploy(&deployments, req).await;
         eprintln!("dd-agent: boot command {id} {status}");
