@@ -2632,7 +2632,6 @@ pub async fn execute_deploy_with_handles(
 ) -> (String, String) {
     let dep_id = uuid::Uuid::new_v4().to_string();
     let app_name = req.app_name.clone().unwrap_or_else(|| "unnamed".into());
-    let short_id = dep_id[..8].to_string();
 
     let image_label = if let Some(ref img) = req.image {
         img.clone()
@@ -2652,13 +2651,14 @@ pub async fn execute_deploy_with_handles(
     };
     deployments.lock().await.insert(dep_id.clone(), info);
 
+    let return_id = dep_id.clone();
     let deployments_clone = deployments.clone();
     let handles_clone = handles.cloned();
     tokio::spawn(async move {
         run_deploy(deployments_clone, handles_clone, dep_id, app_name, req).await;
     });
 
-    (short_id, "deploying".into())
+    (return_id, "deploying".into())
 }
 
 async fn run_deploy(
