@@ -1,13 +1,14 @@
 # DevOps Defender (DD)
 
-A Rust agent that runs on Intel TDX VMs, manages workloads as plain processes, and exposes them through Cloudflare Tunnels with a web dashboard and terminal.
+A Rust agent that runs on Intel TDX VMs, manages workloads as plain processes or container images, and exposes them through Cloudflare Tunnels with a web dashboard and terminal.
 
 ## What it does
 
-- Runs shell commands as workloads on TDX-protected VMs
+- Runs shell commands and container workloads on TDX-protected VMs
 - Registers with a fleet dashboard via Noise-encrypted WebSocket
 - Gets a public hostname via Cloudflare Tunnel (no open ports)
 - Provides a web terminal and dashboard with GitHub OAuth or password auth
+- Supports authenticated remote deploy and exec APIs
 - Hardware attestation via Intel TDX (configfs-tsm)
 
 ## Repository structure
@@ -15,7 +16,7 @@ A Rust agent that runs on Intel TDX VMs, manages workloads as plain processes, a
 ```
 dd/
 ├── agent/    # Rust binary — dd-agent, dd-register
-└── images/   # sealed VM image builder (dm-verity, TDX measurement)
+└── scripts/  # GCP VM bootstrap and deploy helpers
 ```
 
 ## Agent modes
@@ -88,8 +89,11 @@ Then visit `http://localhost:8080` for the dashboard, or `http://localhost:8080/
 | GET | `/workload/{id}` | Yes | Workload detail page with logs |
 | GET | `/session/{app}` | Yes | Web terminal (xterm.js) |
 | GET | `/agent/{id}` | Yes | Agent detail page (register mode) |
-| POST | `/deploy` | Localhost | Deploy a workload: `{"cmd": ["bash"], "app_name": "demo"}` |
+| POST | `/deploy` | Localhost or authenticated remote | Deploy a workload: `{"cmd": ["bash"], "app_name": "demo"}` or `{"image": "ghcr.io/me/app:sha", "app_name": "demo"}` |
 | GET | `/deployments` | Yes | List deployments (JSON) |
+| GET | `/deployments/{id}` | Yes | Get deployment status and metadata |
+| GET | `/deployments/{id}/logs` | Yes | Get deployment logs |
+| POST | `/exec` | Localhost or authenticated remote | Run a synchronous command: `{"cmd": ["podman", "ps", "-a"]}` |
 
 ## Noise protocol
 
@@ -102,7 +106,7 @@ cargo build              # debug build
 cargo build --release    # release build
 cargo test               # run tests
 cargo fmt --check        # check formatting
-cargo clippy --all-targets  # lint (CI uses RUSTFLAGS="-Dwarnings")
+cargo clippy --workspace --all-targets  # lint (CI uses RUSTFLAGS="-Dwarnings")
 ```
 
 ## CI/CD
@@ -110,7 +114,7 @@ cargo clippy --all-targets  # lint (CI uses RUSTFLAGS="-Dwarnings")
 - **ci.yml** — fmt, clippy, test on every push/PR
 - **staging-deploy.yml** — builds binary, deploys TDX VM to GCP on PRs to main
 - **production-deploy.yml** — same, triggered on push to main
-- **build-image.yml** — builds sealed VM image (custom builder + dm-verity)
+- **release.yml** — builds release binaries on version tags
 
 ## Under the hood
 
@@ -118,4 +122,4 @@ cargo clippy --all-targets  # lint (CI uses RUSTFLAGS="-Dwarnings")
 - **Cloudflare Tunnels** — outbound-only secure networking, no open ports
 - **Noise protocol** — end-to-end encrypted shell sessions (snow crate)
 - **Axum** — async HTTP/WebSocket server
-- **No container runtime** — workloads are plain processes on the VM
+- **Docker/Podman integration** — optional container deploys via the local engine API
