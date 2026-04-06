@@ -15,7 +15,7 @@ A Rust agent that runs on Intel TDX VMs, manages workloads as plain processes, a
 ```
 dd/
 ├── agent/    # Rust binary — dd-agent, dd-register
-└── images/   # mkosi definitions for sealed VM images (dm-verity, TDX measurement)
+└── images/   # sealed VM image builder (dm-verity, TDX measurement)
 ```
 
 ## Agent modes
@@ -110,7 +110,7 @@ cargo clippy --all-targets  # lint (CI uses RUSTFLAGS="-Dwarnings")
 - **ci.yml** — fmt, clippy, test on every push/PR
 - **staging-deploy.yml** — builds binary, deploys TDX VM to GCP on PRs to main
 - **production-deploy.yml** — same, triggered on push to main
-- **build-image.yml** — builds sealed VM image (mkosi + dm-verity)
+- **build-image.yml** — builds sealed VM image (custom builder + dm-verity)
 
 ## Under the hood
 

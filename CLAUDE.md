@@ -9,7 +9,7 @@ A confidential computing platform that runs workloads as plain processes on Inte
 ```
 dd/
 ├── agent/    # Rust binary — dd-agent (workload manager) and dd-register (fleet server)
-└── images/   # mkosi definitions for sealed VM images (dm-verity, TDX measurement)
+└── images/   # sealed VM image builder (dm-verity, TDX measurement)
 ```
 
 ## agent/ (Rust)
@@ -115,14 +115,13 @@ Workloads are plain processes spawned via `spawn_command()`. No container runtim
 | `DD_PORT` | HTTP port (default: `8080`) |
 | `DD_ENV` | Environment label (`staging`, `production`, `dev`) |
 
-## images/ (mkosi)
+## images/ (sealed image builder)
 
 Builds sealed VM images with dd-agent as PID 1.
 
-- `mkosi.conf` — Ubuntu 24.04 LTS base, dm-verity, systemd-boot
-- `build.sh` — build script (static musl binary, cloudflared, mkosi)
-- `mkosi.skeleton/` — systemd service files
-- `mkosi.pkgmngr/` — package manager config (CUDA sources for GPU support)
+- `build.sh` — custom raw image builder (static musl binary, initrd, dm-verity)
+- `Makefile` — convenience wrapper for staging binaries, building, and upload prep
+- `flake.nix` — dev shell for the surviving image-build toolchain
 
 Output: `dd-agent-vm.raw.zst` — reproducible, measured root filesystem verifiable via TDX quote + dm-verity roothash.
 
@@ -201,5 +200,5 @@ gh workflow run production-deploy.yml --repo devopsdefender/dd
 - `ci.yml` — fmt, clippy, test on every push/PR
 - `staging-deploy.yml` — build binary, cleanup old GCP VMs, deploy TDX VM, integration test
 - `production-deploy.yml` — same, triggered on push to main
-- `build-image.yml` — build sealed VM image (mkosi + dm-verity)
+- `build-image.yml` — build sealed VM image (custom builder + dm-verity)
 - `release.yml` — build release binaries on tag push

@@ -33,10 +33,10 @@ jobs:
 
       - name: Download cloudflared
         run: |
-          mkdir -p images/mkosi.extra/usr/local/bin
-          curl -fsSL -o images/mkosi.extra/usr/local/bin/cloudflared \
+          mkdir -p images/image-extra/usr/local/bin
+          curl -fsSL -o images/image-extra/usr/local/bin/cloudflared \
             https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
-          chmod +x images/mkosi.extra/usr/local/bin/cloudflared
+          chmod +x images/image-extra/usr/local/bin/cloudflared
 
       - name: Build sealed image
         run: |

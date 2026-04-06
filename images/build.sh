@@ -9,7 +9,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 WORK="${SCRIPT_DIR}/build"
 OUTPUT="${SCRIPT_DIR}/dd-agent-vm.raw"
 DD_AGENT="${SCRIPT_DIR}/../target/x86_64-unknown-linux-musl/release/dd-agent"
-CLOUDFLARED="${SCRIPT_DIR}/mkosi.extra/usr/local/bin/cloudflared"
+CLOUDFLARED="${SCRIPT_DIR}/image-extra/usr/local/bin/cloudflared"
 
 # Sizes
 ROOT_SIZE_MB=256
