@@ -7,7 +7,8 @@
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::WebSocketUpgrade;
 use axum::response::Html;
-use axum::routing::get;
+use axum::routing::{get, post};
+use axum::Json;
 use axum::Router;
 use futures_util::{SinkExt, StreamExt};
 use std::collections::HashMap;
@@ -34,12 +35,18 @@ struct RegisterRequest {
     vm_name: String,
 }
 
+#[derive(Debug, serde::Deserialize)]
+struct DeregisterRequest {
+    agent_id: String,
+}
+
 #[tokio::main]
 async fn main() {
     let port: u16 = std::env::var("DD_REGISTER_PORT")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(8080);
+    let bind_addr = std::env::var("DD_REGISTER_BIND_ADDR").unwrap_or_else(|_| "0.0.0.0".into());
 
     let cf = match CfConfig::from_env() {
         Ok(c) => c,
@@ -82,10 +89,10 @@ async fn main() {
     let token = tunnel_info.tunnel_token.clone();
     tokio::spawn(async move {
         eprintln!("dd-register: starting cloudflared");
-        let mut child = tokio::process::Command::new("cloudflared")
-            .args(["tunnel", "--no-autoupdate", "run", "--token", &token])
-            .spawn()
-            .expect("failed to spawn cloudflared");
+        let mut cmd = tokio::process::Command::new("cloudflared");
+        cmd.args(["tunnel", "--no-autoupdate", "run", "--token", &token]);
+        configure_parent_death_signal(&mut cmd);
+        let mut child = cmd.spawn().expect("failed to spawn cloudflared");
         let _ = child.wait().await;
         eprintln!("dd-register: cloudflared exited");
     });
@@ -100,6 +107,8 @@ async fn main() {
 
     let register_cf = cf.clone();
     let register_registry = registry.clone();
+    let deregister_cf = cf.clone();
+    let deregister_registry = registry.clone();
 
     let app = Router::new()
         .route(
@@ -123,9 +132,17 @@ async fn main() {
                 let reg = register_registry.clone();
                 async move { ws.on_upgrade(move |socket| handle_registration(socket, cf, reg)) }
             }),
+        )
+        .route(
+            "/deregister",
+            post(move |Json(req): Json<DeregisterRequest>| {
+                let cf = deregister_cf.clone();
+                let reg = deregister_registry.clone();
+                async move { post_deregister(cf, reg, req).await }
+            }),
         );
 
-    let addr = format!("0.0.0.0:{port}");
+    let addr = format!("{bind_addr}:{port}");
     eprintln!("dd-register: listening on {addr}");
     eprintln!("dd-register: dashboard at https://{hostname}/");
     eprintln!("dd-register: agents register at wss://{hostname}/register");
@@ -344,5 +361,41 @@ async fn handle_registration(socket: WebSocket, cf: CfConfig, registry: AgentReg
         let _ = ws_tx
             .send(Message::Binary(enc_resp[..len].to_vec().into()))
             .await;
+    }
+}
+
+async fn post_deregister(
+    cf: CfConfig,
+    registry: AgentRegistry,
+    req: DeregisterRequest,
+) -> Json<serde_json::Value> {
+    let agent = registry.lock().await.remove(&req.agent_id);
+    if let Some(agent) = agent {
+        let client = reqwest::Client::new();
+        if let Err(e) = tunnel::remove_agent(&client, &cf, &agent.agent_id, &agent.hostname).await {
+            eprintln!("dd-register: deregister tunnel cleanup failed: {e}");
+        } else {
+            eprintln!(
+                "dd-register: deregistered {} ({})",
+                agent.agent_id, agent.hostname
+            );
+        }
+        Json(serde_json::json!({"ok": true}))
+    } else {
+        Json(serde_json::json!({"ok": true, "removed": false}))
+    }
+}
+
+fn configure_parent_death_signal(cmd: &mut tokio::process::Command) {
+    #[cfg(target_os = "linux")]
+    {
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
     }
 }

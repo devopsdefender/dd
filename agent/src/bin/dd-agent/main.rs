@@ -341,8 +341,12 @@ async fn run_agent_mode(cfg: AgentRuntimeConfig) {
     // Auth config from register bootstrap (populated if agent registers via Noise)
     let mut bootstrap_auth_key: Option<jsonwebtoken::DecodingKey> = None;
     let mut bootstrap_auth_issuer: Option<String> = None;
+    let mut register_url_for_deregister: Option<String> = None;
+    let mut monitor_reregister: Option<ReregisterInfo> = None;
+    let mut bootstrap_register_child: Option<tokio::process::Child> = None;
 
-    // Bootstrap priority: pre-provisioned token > self-register via CF API > register via Noise > standalone
+    // Bootstrap priority: pre-provisioned token > local register bootstrap > self-register via
+    // CF API > register via Noise > standalone.
     let mut saved_tunnel_token: Option<String> = None;
     if let Some(token) = std::env::var("DD_TUNNEL_TOKEN")
         .ok()
@@ -353,6 +357,39 @@ async fn run_agent_mode(cfg: AgentRuntimeConfig) {
         saved_tunnel_token = Some(token.clone());
         if let Err(e) = start_cloudflared(&token).await {
             eprintln!("dd-agent: cloudflared start failed: {e}");
+        }
+    } else if let Some(register_binary_url) = env_var_nonempty("DD_BOOTSTRAP_REGISTER_BINARY_URL") {
+        match bootstrap_local_register(&register_binary_url).await {
+            Ok((child, register_url)) => {
+                bootstrap_register_child = Some(child);
+                let config = register(&vm_name, &owner, &register_url, attestation.as_ref()).await;
+                eprintln!(
+                    "dd-agent: registered via local bootstrap register — owner={} hostname={}",
+                    config.owner, config.hostname
+                );
+                saved_tunnel_token = Some(config.tunnel_token.clone());
+                register_url_for_deregister = Some(register_url.clone());
+                monitor_reregister = Some(ReregisterInfo {
+                    vm_name: vm_name.clone(),
+                    owner: owner.clone(),
+                    register_url,
+                    attestation: dd_agent::attestation::detect(),
+                });
+                if let Err(e) = start_cloudflared(&config.tunnel_token).await {
+                    eprintln!("dd-agent: cloudflared start failed: {e}");
+                }
+                if let Some(ref key_b64) = config.auth_public_key {
+                    if let Some((_, decoding)) = dd_agent::server::auth_keys_from_b64(key_b64) {
+                        bootstrap_auth_key = Some(decoding);
+                        bootstrap_auth_issuer = config.auth_issuer.clone();
+                        eprintln!("dd-agent: register auth tokens enabled");
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("dd-agent: bootstrap register failed: {e}");
+                safe_exit(1);
+            }
         }
     } else if dd_agent::tunnel::CfConfig::from_env().is_ok() {
         // Self-register: agent has CF API credentials, creates its own tunnel
@@ -388,6 +425,13 @@ async fn run_agent_mode(cfg: AgentRuntimeConfig) {
             config.owner, config.hostname
         );
         saved_tunnel_token = Some(config.tunnel_token.clone());
+        register_url_for_deregister = Some(register_url.clone());
+        monitor_reregister = Some(ReregisterInfo {
+            vm_name: vm_name.clone(),
+            owner: owner.clone(),
+            register_url,
+            attestation: dd_agent::attestation::detect(),
+        });
         if let Err(e) = start_cloudflared(&config.tunnel_token).await {
             eprintln!("dd-agent: cloudflared start failed: {e}");
         }
@@ -625,14 +669,6 @@ async fn run_agent_mode(cfg: AgentRuntimeConfig) {
     } else {
         None
     };
-    let monitor_reregister = std::env::var("DD_REGISTER_URL")
-        .ok()
-        .map(|url| ReregisterInfo {
-            vm_name: state.vm_name.clone(),
-            owner: state.owner.clone(),
-            register_url: url,
-            attestation: dd_agent::attestation::detect(),
-        });
     tokio::spawn(async move {
         monitoring_loop(
             monitor_deps,
@@ -644,7 +680,6 @@ async fn run_agent_mode(cfg: AgentRuntimeConfig) {
     });
 
     // Run HTTP server until shutdown
-    let register_url_for_deregister = std::env::var("DD_REGISTER_URL").ok();
     let app = app.into_make_service_with_connect_info::<std::net::SocketAddr>();
     let server = axum::serve(listener, app).with_graceful_shutdown(async {
         tokio::signal::ctrl_c().await.ok();
@@ -656,7 +691,7 @@ async fn run_agent_mode(cfg: AgentRuntimeConfig) {
     }
 
     // Deregister from fleet on clean shutdown
-    if let Some(register_url) = register_url_for_deregister {
+    if let Some(ref register_url) = register_url_for_deregister {
         let url = register_url
             .replace("wss://", "https://")
             .replace("ws://", "http://")
@@ -669,6 +704,12 @@ async fn run_agent_mode(cfg: AgentRuntimeConfig) {
             .send()
             .await;
         eprintln!("dd-agent: deregistered from fleet");
+    }
+
+    if let Some(mut child) = bootstrap_register_child {
+        if let Err(e) = stop_bootstrap_register(&mut child).await {
+            eprintln!("dd-agent: bootstrap register shutdown failed: {e}");
+        }
     }
 
     shutdown_deployments(deployments).await;
@@ -701,6 +742,115 @@ async fn register(
             safe_exit(1);
         }
     }
+}
+
+async fn bootstrap_local_register(
+    register_binary_url: &str,
+) -> Result<(tokio::process::Child, String), String> {
+    let port = env_var_nonempty("DD_BOOTSTRAP_REGISTER_PORT")
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or(8081);
+    let wait_secs = env_var_nonempty("DD_BOOTSTRAP_REGISTER_WAIT_SECS")
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(60);
+    let install_dir = "/var/lib/dd/bootstrap";
+    let binary_path = format!("{install_dir}/dd-register");
+    let health_url = format!("http://127.0.0.1:{port}/health");
+    let register_url = format!("ws://127.0.0.1:{port}/register");
+
+    tokio::fs::create_dir_all(install_dir)
+        .await
+        .map_err(|e| format!("create bootstrap dir: {e}"))?;
+    download_file(register_binary_url, &binary_path).await?;
+
+    let mut perms = tokio::fs::metadata(&binary_path)
+        .await
+        .map_err(|e| format!("stat bootstrap register: {e}"))?
+        .permissions();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        perms.set_mode(0o755);
+    }
+    tokio::fs::set_permissions(&binary_path, perms)
+        .await
+        .map_err(|e| format!("chmod bootstrap register: {e}"))?;
+
+    eprintln!("dd-agent: starting local bootstrap register on 127.0.0.1:{port}");
+    let mut cmd = tokio::process::Command::new(&binary_path);
+    cmd.env("DD_REGISTER_BIND_ADDR", "127.0.0.1")
+        .env("DD_REGISTER_PORT", port.to_string())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit());
+    configure_parent_death_signal(&mut cmd);
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("spawn bootstrap register: {e}"))?;
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(3))
+        .build()
+        .map_err(|e| format!("build bootstrap health client: {e}"))?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(wait_secs);
+
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|e| format!("check bootstrap register: {e}"))?
+        {
+            return Err(format!("bootstrap register exited early with {status}"));
+        }
+
+        match client.get(&health_url).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                eprintln!("dd-agent: local bootstrap register healthy");
+                return Ok((child, register_url));
+            }
+            Ok(_) | Err(_) if std::time::Instant::now() >= deadline => {
+                let _ = stop_bootstrap_register(&mut child).await;
+                return Err(format!(
+                    "bootstrap register did not become healthy within {wait_secs}s"
+                ));
+            }
+            Ok(_) | Err(_) => {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+        }
+    }
+}
+
+async fn download_file(url: &str, path: &str) -> Result<(), String> {
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::limited(10))
+        .build()
+        .map_err(|e| format!("build download client: {e}"))?;
+    let response = client
+        .get(url)
+        .header(reqwest::header::ACCEPT, "application/octet-stream")
+        .send()
+        .await
+        .map_err(|e| format!("download {url}: {e}"))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("download {url} failed: {status} {body}"));
+    }
+
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|e| format!("read download {url}: {e}"))?;
+    let tmp_path = format!("{path}.tmp");
+    tokio::fs::write(&tmp_path, bytes)
+        .await
+        .map_err(|e| format!("write {tmp_path}: {e}"))?;
+    tokio::fs::rename(&tmp_path, path)
+        .await
+        .map_err(|e| format!("rename {tmp_path} -> {path}: {e}"))?;
+    Ok(())
 }
 
 // ── Noise registration (agent calls out to registration service) ─────────
@@ -939,8 +1089,48 @@ async fn start_cloudflared(tunnel_token: &str) -> Result<(), String> {
     }
 }
 
+async fn stop_bootstrap_register(child: &mut tokio::process::Child) -> Result<(), String> {
+    if child
+        .try_wait()
+        .map_err(|e| format!("check bootstrap register: {e}"))?
+        .is_some()
+    {
+        return Ok(());
+    }
+
+    child
+        .start_kill()
+        .map_err(|e| format!("signal bootstrap register: {e}"))?;
+    match tokio::time::timeout(std::time::Duration::from_secs(5), child.wait()).await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(e)) => Err(format!("wait bootstrap register: {e}")),
+        Err(_) => Err("timed out waiting for bootstrap register exit".into()),
+    }
+}
+
 async fn is_cloudflared_running() -> bool {
     is_process_running("cloudflared")
+}
+
+fn configure_parent_death_signal(cmd: &mut tokio::process::Command) {
+    #[cfg(target_os = "linux")]
+    {
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+}
+
+fn env_var_nonempty(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
 }
 
 /// Check if a process with the given name is running by scanning /proc.

@@ -15,7 +15,7 @@ A Rust agent that runs on Intel TDX VMs, manages workloads as plain processes or
 
 ```
 dd/
-├── agent/    # Rust binary — dd-agent, dd-register
+├── agent/    # Rust binaries — dd-agent, dd-register, dd-scraper
 └── scripts/  # GCP VM bootstrap and deploy helpers
 ```
 
@@ -26,8 +26,8 @@ Set via `DD_AGENT_MODE`:
 | Mode | Purpose |
 |------|---------|
 | `agent` (default) | Run workloads, serve dashboard, manage tunnels |
-| `register` | Fleet dashboard — registers agents, manages tunnels, runs scraper |
-| `scraper` | Discovers agents from CF tunnel listing, reports health to register |
+| `register` | Fleet dashboard and register service |
+| `scraper` | Deprecated in `dd-agent`; use the standalone `dd-scraper` binary |
 
 ## Running locally
 
@@ -73,12 +73,23 @@ Then visit `http://localhost:8080` for the dashboard, or `http://localhost:8080/
 | Variable | Description |
 |----------|-------------|
 | `DD_TUNNEL_TOKEN` | Pre-provisioned Cloudflare tunnel token |
+| `DD_BOOTSTRAP_REGISTER_BINARY_URL` | Optional URL for `dd-agent` to download and launch a local `dd-register` before self-registering |
+| `DD_BOOTSTRAP_REGISTER_PORT` | Local bootstrap register port (default: `8081`) |
+| `DD_BOOTSTRAP_REGISTER_WAIT_SECS` | How long to wait for the local bootstrap register health check (default: `60`) |
 | `DD_REGISTER_URL` | WebSocket URL to register with fleet (e.g. `wss://app.devopsdefender.com/register`) |
 | `DD_CF_API_TOKEN` | Cloudflare API token (for self-registration) |
 | `DD_CF_ACCOUNT_ID` | Cloudflare account ID |
 | `DD_CF_ZONE_ID` | Cloudflare zone ID |
 | `DD_CF_DOMAIN` | Domain for tunnel hostnames (default: `devopsdefender.com`) |
 | `DD_HOSTNAME` | Public hostname override |
+| `DD_REGISTER_BIND_ADDR` | Bind address for standalone `dd-register` (default: `0.0.0.0`) |
+
+### Bootstrap styles
+
+- `DD_TUNNEL_TOKEN`: use a pre-provisioned Cloudflare tunnel token.
+- `DD_BOOTSTRAP_REGISTER_BINARY_URL`: launch a localhost `dd-register`, wait for `/health`, then self-register against `ws://127.0.0.1:<port>/register`.
+- `DD_CF_API_TOKEN` / `DD_CF_ACCOUNT_ID` / `DD_CF_ZONE_ID`: self-register directly with Cloudflare.
+- `DD_REGISTER_URL`: register with an already-running remote register service.
 
 ## HTTP endpoints
 
