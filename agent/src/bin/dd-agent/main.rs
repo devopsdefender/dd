@@ -78,7 +78,7 @@ fn maybe_init() {
     }
 
     // Load config from config disk (second virtio disk with agent.env)
-    // This is the per-deployment config — not baked into the sealed image.
+    // This is the per-deployment config — not baked into the VM image.
     // Note: rootfs is read-only (dm-verity), so /mnt/config must exist in the image
     // or we mount on /tmp/config instead (tmpfs is writable).
     let config_dir = "/tmp/config";
