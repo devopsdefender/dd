@@ -101,6 +101,7 @@ Then visit `http://localhost:8080` for the dashboard, or `http://localhost:8080/
 | GET | `/session/{app}` | Yes | Web terminal (xterm.js) |
 | GET | `/agent/{id}` | Yes | Agent detail page (register mode) |
 | POST | `/deploy` | Localhost or authenticated remote | Deploy a workload: `{"cmd": ["bash"], "app_name": "demo"}` or `{"image": "ghcr.io/me/app:sha", "app_name": "demo"}` |
+| POST | `/api/fleet/report` | Localhost or authenticated remote | Accept a scraper fleet report in register mode |
 | GET | `/deployments` | Yes | List deployments (JSON) |
 | GET | `/deployments/{id}` | Yes | Get deployment status and metadata |
 | GET | `/deployments/{id}/logs` | Yes | Get deployment logs |

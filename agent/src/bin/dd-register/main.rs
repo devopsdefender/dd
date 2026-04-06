@@ -5,8 +5,8 @@
 //! WebSocket to get their own tunnel tokens.
 
 use axum::extract::ws::{Message, WebSocket};
-use axum::extract::WebSocketUpgrade;
-use axum::response::Html;
+use axum::extract::{ConnectInfo, WebSocketUpgrade};
+use axum::response::{Html, IntoResponse};
 use axum::routing::{get, post};
 use axum::Json;
 use axum::Router;
@@ -25,6 +25,7 @@ struct AgentRecord {
     vm_name: String,
     attestation_type: String,
     registered_at: String,
+    status: String,
 }
 
 type AgentRegistry = Arc<Mutex<HashMap<String, AgentRecord>>>;
@@ -38,6 +39,36 @@ struct RegisterRequest {
 #[derive(Debug, serde::Deserialize)]
 struct DeregisterRequest {
     agent_id: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct AgentHealthReport {
+    hostname: String,
+    healthy: bool,
+    #[serde(default)]
+    agent_id: Option<String>,
+    #[serde(default)]
+    vm_name: Option<String>,
+    #[serde(default)]
+    attestation_type: Option<String>,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct FleetReport {
+    agents: Vec<AgentHealthReport>,
+    #[serde(default)]
+    orphan_tunnels: Vec<String>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct FleetReportAck {
+    ok: bool,
+    healthy_agents: usize,
+    stale_agents: usize,
+    orphan_tunnels: usize,
+    dead_agents_cleaned: usize,
 }
 
 #[tokio::main]
@@ -140,6 +171,17 @@ async fn main() {
                 let reg = deregister_registry.clone();
                 async move { post_deregister(cf, reg, req).await }
             }),
+        )
+        .route(
+            "/api/fleet/report",
+            post(
+                move |ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
+                      Json(report): Json<FleetReport>| {
+                    let cf = cf.clone();
+                    let reg = registry.clone();
+                    async move { post_fleet_report(addr, cf, reg, report).await }
+                },
+            ),
         );
 
     let addr = format!("{bind_addr}:{port}");
@@ -150,6 +192,7 @@ async fn main() {
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .expect("failed to bind");
+    let app = app.into_make_service_with_connect_info::<std::net::SocketAddr>();
     axum::serve(listener, app).await.expect("server error");
 }
 
@@ -169,12 +212,13 @@ async fn fleet_dashboard(
             r#"<tr>
                 <td><a href="https://{hostname}">{hostname}</a></td>
                 <td>{vm_name}</td>
-                <td><span style="color:#a6e3a1">registered</span></td>
+                <td>{status}</td>
                 <td>{att}</td>
                 <td>{registered}</td>
             </tr>"#,
             hostname = agent.hostname,
             vm_name = agent.vm_name,
+            status = agent.status,
             att = agent.attestation_type,
             registered = agent
                 .registered_at
@@ -344,6 +388,7 @@ async fn handle_registration(socket: WebSocket, cf: CfConfig, registry: AgentReg
             vm_name: reg.vm_name.clone(),
             attestation_type: attestation.attestation_type,
             registered_at: chrono::Utc::now().to_rfc3339(),
+            status: "healthy".into(),
         },
     );
 
@@ -383,6 +428,124 @@ async fn post_deregister(
         Json(serde_json::json!({"ok": true}))
     } else {
         Json(serde_json::json!({"ok": true, "removed": false}))
+    }
+}
+
+async fn post_fleet_report(
+    addr: std::net::SocketAddr,
+    cf: CfConfig,
+    registry: AgentRegistry,
+    report: FleetReport,
+) -> impl axum::response::IntoResponse {
+    if !addr.ip().is_loopback() {
+        return (
+            axum::http::StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "loopback access required"})),
+        )
+            .into_response();
+    }
+
+    Json(apply_fleet_report(&cf, &registry, report).await).into_response()
+}
+
+async fn apply_fleet_report(
+    cf: &CfConfig,
+    registry: &AgentRegistry,
+    report: FleetReport,
+) -> FleetReportAck {
+    let mut registry_guard = registry.lock().await;
+    let mut healthy_count = 0usize;
+    let mut stale_count = 0usize;
+
+    for agent_report in &report.agents {
+        if agent_report.healthy {
+            healthy_count += 1;
+            if let Some(existing) = registry_guard
+                .values_mut()
+                .find(|a| a.hostname == agent_report.hostname)
+            {
+                existing.status = "healthy".into();
+            } else if let Some(ref aid) = agent_report.agent_id {
+                registry_guard.insert(
+                    aid.clone(),
+                    AgentRecord {
+                        agent_id: aid.clone(),
+                        hostname: agent_report.hostname.clone(),
+                        vm_name: agent_report.vm_name.clone().unwrap_or_default(),
+                        attestation_type: agent_report
+                            .attestation_type
+                            .clone()
+                            .unwrap_or_else(|| "unknown".into()),
+                        registered_at: chrono::Utc::now().to_rfc3339(),
+                        status: "healthy".into(),
+                    },
+                );
+                eprintln!(
+                    "dd-register: scraper discovered new agent {aid} at {}",
+                    agent_report.hostname
+                );
+            }
+        } else {
+            stale_count += 1;
+            if let Some(existing) = registry_guard
+                .values_mut()
+                .find(|a| a.hostname == agent_report.hostname)
+            {
+                if existing.status == "healthy" {
+                    existing.status = "stale".into();
+                    eprintln!(
+                        "dd-register: scraper: {} stale ({})",
+                        existing.hostname,
+                        agent_report.error.as_deref().unwrap_or("unreachable")
+                    );
+                } else if existing.status == "stale" {
+                    existing.status = "dead".into();
+                    eprintln!("dd-register: scraper: {} dead", existing.hostname);
+                }
+            }
+        }
+    }
+
+    let dead: Vec<(String, String)> = registry_guard
+        .values()
+        .filter(|a| a.status == "dead")
+        .map(|a| (a.agent_id.clone(), a.hostname.clone()))
+        .collect();
+    drop(registry_guard);
+
+    for (agent_id, hostname) in &dead {
+        let client = reqwest::Client::new();
+        if let Err(e) = tunnel::remove_agent(&client, cf, agent_id, hostname).await {
+            eprintln!("dd-register: scraper cleanup failed for {hostname}: {e}");
+        } else {
+            eprintln!("dd-register: scraper cleaned up {hostname}");
+        }
+        registry.lock().await.remove(agent_id);
+    }
+
+    for tunnel_name in &report.orphan_tunnels {
+        let client = reqwest::Client::new();
+        if let Err(e) = tunnel::delete_tunnel_by_name(&client, cf, tunnel_name).await {
+            eprintln!("dd-register: scraper orphan cleanup failed for {tunnel_name}: {e}");
+        } else {
+            eprintln!("dd-register: scraper cleaned orphan tunnel {tunnel_name}");
+        }
+    }
+
+    eprintln!(
+        "dd-register: scraper report: {} healthy, {} stale/unreachable, {} orphan tunnels, {} dead cleaned",
+        healthy_count,
+        stale_count,
+        report.orphan_tunnels.len(),
+        dead.len()
+    );
+
+    FleetReportAck {
+        ok: true,
+        healthy_agents: healthy_count,
+        stale_agents: stale_count,
+        orphan_tunnels: report.orphan_tunnels.len(),
+        dead_agents_cleaned: dead.len(),
     }
 }
 

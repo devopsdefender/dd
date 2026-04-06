@@ -62,7 +62,7 @@ nohup /usr/local/bin/dd-agent > /var/log/dd-agent.log 2>&1 &
         \"DD_CF_ZONE_ID=${CLOUDFLARE_ZONE_ID}\",
         \"DD_CF_DOMAIN=${DD_DOMAIN}\",
         \"DD_ENV=${DD_ENV}\",
-        \"DD_REGISTER_URL=ws://localhost:8080/scraper\"
+        \"DD_REGISTER_URL=http://localhost:8080\"
       ]
     }" && echo "scraper deployed" || echo "scraper deploy failed"
 ) &
