@@ -1,9 +1,0 @@
-#!/bin/bash
-# Binaries (dd-agent, cloudflared) are injected via ExtraTrees.
-# This script just enables the systemd service.
-set -euo pipefail
-
-echo "==> Enabling dd-agent service"
-systemctl enable dd-agent.service
-
-echo "==> Build complete"

@@ -17,17 +17,16 @@
         devShells.default = pkgs.mkShell {
           name = "dd-image-builder";
           buildInputs = [
-            pkgs.mkosi-full
             pkgs.qemu
             pkgs.qemu-utils
             pkgs.dosfstools
             pkgs.e2fsprogs
             pkgs.cryptsetup
-            pkgs.squashfsTools
-            pkgs.mtools
-            pkgs.apt
-            pkgs.dpkg
-            pkgs.debootstrap
+            pkgs.util-linux
+            pkgs.zstd
+            pkgs.busybox
+            pkgs.cpio
+            pkgs.kmod
           ];
         };
       }
