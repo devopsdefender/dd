@@ -42,6 +42,9 @@ async fn main() {
     let scrape_interval = std::time::Duration::from_secs(30);
     let scrape_timeout = std::time::Duration::from_secs(3);
     let report_url = fleet_report_url(&register_url);
+    let report_token = std::env::var("DD_SCRAPER_REPORT_TOKEN")
+        .ok()
+        .filter(|value| !value.is_empty());
     let status = Arc::new(RwLock::new(ScraperStatus {
         env_label: env_label.clone(),
         report_url: report_url.clone(),
@@ -64,7 +67,16 @@ async fn main() {
     let mut ticker = tokio::time::interval(scrape_interval);
     loop {
         ticker.tick().await;
-        if let Err(e) = scrape_once(&http, &report_url, &cf, &tunnel_prefix, &status).await {
+        if let Err(e) = scrape_once(
+            &http,
+            &report_url,
+            report_token.as_deref(),
+            &cf,
+            &tunnel_prefix,
+            &status,
+        )
+        .await
+        {
             eprintln!("dd-scraper: error: {e}");
             let mut guard = status.write().await;
             guard.last_scrape_at = Some(now_rfc3339());
@@ -204,6 +216,7 @@ ul {{ margin: 0; padding-left: 20px; }}
 async fn scrape_once(
     http: &reqwest::Client,
     report_url: &str,
+    report_token: Option<&str>,
     cf: &dd_agent::tunnel::CfConfig,
     tunnel_prefix: &str,
     status: &SharedStatus,
@@ -291,9 +304,11 @@ async fn scrape_once(
         orphan_tunnels.len(),
     );
 
-    let response = http
-        .post(report_url)
-        .json(&report)
+    let mut request = http.post(report_url).json(&report);
+    if let Some(token) = report_token {
+        request = request.bearer_auth(token);
+    }
+    let response = request
         .send()
         .await
         .map_err(|e| format!("post fleet report: {e}"))?;

@@ -1,14 +1,46 @@
-use axum::extract::State;
-use axum::response::{Html, IntoResponse};
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use axum::extract::{Form, Query, State};
+use axum::http::header::{COOKIE, SET_COOKIE};
+use axum::http::{HeaderMap, HeaderValue};
+use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::get;
 use axum::{Json, Router};
-use std::sync::Arc;
+use tokio::sync::Mutex;
 
 #[derive(Clone)]
 struct AdminState {
     register_fleet_url: String,
+    register_api_token: Option<String>,
     http: reqwest::Client,
+    auth_password: Option<String>,
+    secure_cookies: bool,
+    sessions: BrowserSessions,
 }
+
+type BrowserSessions = Arc<Mutex<HashMap<String, BrowserSession>>>;
+
+#[derive(Clone)]
+struct BrowserSession {
+    expires_at: Instant,
+}
+
+#[derive(serde::Deserialize)]
+struct LoginQuery {
+    next: Option<String>,
+    error: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct LoginForm {
+    password: String,
+    next: Option<String>,
+}
+
+const SESSION_COOKIE: &str = "dd_admin_session";
+const SESSION_TTL: Duration = Duration::from_secs(8 * 60 * 60);
 
 #[tokio::main]
 async fn main() {
@@ -20,16 +52,34 @@ async fn main() {
     let register_fleet_url = register_fleet_url();
     let state = Arc::new(AdminState {
         register_fleet_url: register_fleet_url.clone(),
+        register_api_token: std::env::var("DD_ADMIN_API_TOKEN")
+            .ok()
+            .filter(|value| !value.is_empty()),
         http: reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10))
             .build()
             .expect("failed to build dd-admin HTTP client"),
+        auth_password: std::env::var("DD_ADMIN_PASSWORD")
+            .ok()
+            .filter(|value| !value.is_empty())
+            .or_else(|| {
+                std::env::var("DD_PASSWORD")
+                    .ok()
+                    .filter(|value| !value.is_empty())
+            }),
+        secure_cookies: std::env::var("DD_ADMIN_SECURE_COOKIES")
+            .ok()
+            .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+            .unwrap_or(false),
+        sessions: Arc::new(Mutex::new(HashMap::new())),
     });
 
     let app = Router::new()
         .route("/", get(index))
         .route("/health", get(health))
         .route("/api/fleet", get(api_fleet))
+        .route("/auth/login", get(login_page).post(login_submit))
+        .route("/auth/logout", get(logout))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(format!("{bind_addr}:{port}"))
@@ -44,7 +94,15 @@ async fn main() {
     }
 }
 
-async fn index(State(state): State<Arc<AdminState>>) -> Html<String> {
+async fn index(
+    State(state): State<Arc<AdminState>>,
+    headers: HeaderMap,
+    query: Query<LoginQuery>,
+) -> Response {
+    if let Some(response) = require_session(&state, &headers, query.next.as_deref()).await {
+        return response;
+    }
+
     Html(format!(
         r#"<!doctype html>
 <html lang="en">
@@ -56,6 +114,9 @@ async fn index(State(state): State<Arc<AdminState>>) -> Html<String> {
       body {{ font-family: ui-monospace, SFMono-Regular, Menlo, monospace; background: #0b1020; color: #eef2ff; margin: 0; padding: 32px; }}
       h1 {{ margin: 0 0 8px; font-size: 30px; }}
       .sub {{ color: #93c5fd; margin-bottom: 20px; }}
+      .toolbar {{ margin-bottom: 20px; display: flex; justify-content: space-between; gap: 12px; align-items: center; }}
+      .toolbar a {{ color: #93c5fd; text-decoration: none; }}
+      .toolbar a:hover {{ text-decoration: underline; }}
       .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin-bottom: 20px; }}
       .card {{ background: #121936; border: 1px solid #22305f; border-radius: 16px; padding: 18px; }}
       .label {{ color: #94a3b8; font-size: 12px; text-transform: uppercase; margin-bottom: 8px; }}
@@ -73,8 +134,13 @@ async fn index(State(state): State<Arc<AdminState>>) -> Html<String> {
     </style>
   </head>
   <body>
-    <h1>DD Admin</h1>
-    <div class="sub">Fleet source: <code>{fleet_source}</code></div>
+    <div class="toolbar">
+      <div>
+        <h1>DD Admin</h1>
+        <div class="sub">Fleet source: <code>{fleet_source}</code></div>
+      </div>
+      <a href="/auth/logout">Log out</a>
+    </div>
     <div id="summary" class="grid"></div>
     <table>
       <thead>
@@ -135,6 +201,10 @@ async fn index(State(state): State<Arc<AdminState>>) -> Html<String> {
         error.textContent = '';
         try {{
           const response = await fetch('/api/fleet');
+          if (response.status === 401) {{
+            window.location.href = '/auth/login';
+            return;
+          }}
           if (!response.ok) {{
             throw new Error(`fleet request failed: ${{response.status}}`);
           }}
@@ -153,6 +223,7 @@ async fn index(State(state): State<Arc<AdminState>>) -> Html<String> {
 </html>"#,
         fleet_source = state.register_fleet_url,
     ))
+    .into_response()
 }
 
 async fn health() -> Json<serde_json::Value> {
@@ -162,8 +233,17 @@ async fn health() -> Json<serde_json::Value> {
     }))
 }
 
-async fn api_fleet(State(state): State<Arc<AdminState>>) -> impl IntoResponse {
-    match state.http.get(&state.register_fleet_url).send().await {
+async fn api_fleet(State(state): State<Arc<AdminState>>, headers: HeaderMap) -> impl IntoResponse {
+    if let Some(response) = require_session(&state, &headers, Some("/")).await {
+        return response;
+    }
+
+    let mut request = state.http.get(&state.register_fleet_url);
+    if let Some(token) = state.register_api_token.as_deref() {
+        request = request.bearer_auth(token);
+    }
+
+    match request.send().await {
         Ok(response) if response.status().is_success() => match response.text().await {
             Ok(body) => (
                 axum::http::StatusCode::OK,
@@ -190,6 +270,115 @@ async fn api_fleet(State(state): State<Arc<AdminState>>) -> impl IntoResponse {
     }
 }
 
+async fn login_page(State(state): State<Arc<AdminState>>, query: Query<LoginQuery>) -> Response {
+    if state.auth_password.is_none() {
+        return Redirect::to("/").into_response();
+    }
+
+    let next = sanitize_next_path(query.next.as_deref());
+    let error = query
+        .error
+        .as_deref()
+        .map(|value| format!(r#"<div class="error">{value}</div>"#))
+        .unwrap_or_default();
+
+    Html(format!(
+        r#"<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>DD Admin Login</title>
+    <style>
+      body {{ font-family: ui-monospace, SFMono-Regular, Menlo, monospace; background: #0b1020; color: #eef2ff; margin: 0; min-height: 100vh; display: grid; place-items: center; }}
+      .card {{ width: min(420px, calc(100vw - 32px)); background: #121936; border: 1px solid #22305f; border-radius: 16px; padding: 24px; }}
+      h1 {{ margin: 0 0 8px; font-size: 28px; }}
+      p {{ color: #c7d2fe; line-height: 1.5; }}
+      input {{ width: 100%; margin-top: 12px; padding: 12px; border-radius: 10px; border: 1px solid #334155; background: #0f172a; color: #eef2ff; font: inherit; }}
+      button {{ width: 100%; margin-top: 16px; padding: 12px; border: none; border-radius: 10px; background: #38bdf8; color: #082f49; font: inherit; font-weight: 700; cursor: pointer; }}
+      .error {{ margin-top: 12px; color: #fca5a5; }}
+    </style>
+  </head>
+  <body>
+    <form class="card" method="post" action="/auth/login">
+      <h1>DD Admin</h1>
+      <p>Enter the admin password to access the fleet UI.</p>
+      {error}
+      <input type="hidden" name="next" value="{next}" />
+      <input type="password" name="password" placeholder="Password" autofocus />
+      <button type="submit">Log In</button>
+    </form>
+  </body>
+</html>"#,
+        error = error,
+        next = next,
+    ))
+    .into_response()
+}
+
+async fn login_submit(
+    State(state): State<Arc<AdminState>>,
+    Form(form): Form<LoginForm>,
+) -> Response {
+    let expected = match state.auth_password.as_deref() {
+        Some(password) => password,
+        None => return Redirect::to("/").into_response(),
+    };
+
+    if !secure_eq(form.password.as_bytes(), expected.as_bytes()) {
+        let next = sanitize_next_path(form.next.as_deref());
+        return Redirect::to(&format!("/auth/login?next={next}&error=invalid-password"))
+            .into_response();
+    }
+
+    let session_id = uuid::Uuid::new_v4().simple().to_string();
+    state.sessions.lock().await.insert(
+        session_id.clone(),
+        BrowserSession {
+            expires_at: Instant::now() + SESSION_TTL,
+        },
+    );
+
+    let next = sanitize_next_path(form.next.as_deref());
+    response_with_cookie(
+        Redirect::to(&next),
+        build_session_cookie(&state, &session_id, SESSION_TTL.as_secs()),
+    )
+}
+
+async fn logout(State(state): State<Arc<AdminState>>, headers: HeaderMap) -> Response {
+    if let Some(session_id) = extract_cookie(&headers, SESSION_COOKIE) {
+        state.sessions.lock().await.remove(&session_id);
+    }
+    response_with_cookie(
+        Redirect::to("/auth/login"),
+        build_session_cookie(&state, "", 0),
+    )
+}
+
+async fn require_session(
+    state: &AdminState,
+    headers: &HeaderMap,
+    next: Option<&str>,
+) -> Option<Response> {
+    state.auth_password.as_ref()?;
+
+    let session_id = extract_cookie(headers, SESSION_COOKIE);
+    let mut sessions = state.sessions.lock().await;
+    let now = Instant::now();
+    sessions.retain(|_, session| session.expires_at > now);
+    if session_id
+        .as_ref()
+        .and_then(|id| sessions.get(id))
+        .is_some()
+    {
+        return None;
+    }
+
+    let next = sanitize_next_path(next);
+    Some(Redirect::to(&format!("/auth/login?next={next}")).into_response())
+}
+
 fn register_fleet_url() -> String {
     if let Ok(url) = std::env::var("DD_REGISTER_ADMIN_URL") {
         return normalize_register_base_url(&url);
@@ -210,4 +399,52 @@ fn normalize_register_base_url(url: &str) -> String {
     } else {
         format!("{}/api/fleet", normalized.trim_end_matches('/'))
     }
+}
+
+fn extract_cookie(headers: &HeaderMap, name: &str) -> Option<String> {
+    let cookies = headers.get(COOKIE)?.to_str().ok()?;
+    for cookie in cookies.split(';') {
+        let mut parts = cookie.trim().splitn(2, '=');
+        let key = parts.next()?.trim();
+        let value = parts.next()?.trim();
+        if key == name {
+            return Some(value.to_string());
+        }
+    }
+    None
+}
+
+fn build_session_cookie(state: &AdminState, session_id: &str, max_age: u64) -> String {
+    let mut cookie =
+        format!("{SESSION_COOKIE}={session_id}; Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age}");
+    if state.secure_cookies {
+        cookie.push_str("; Secure");
+    }
+    cookie
+}
+
+fn response_with_cookie(response: impl IntoResponse, cookie: String) -> Response {
+    let mut response = response.into_response();
+    if let Ok(value) = HeaderValue::from_str(&cookie) {
+        response.headers_mut().append(SET_COOKIE, value);
+    }
+    response
+}
+
+fn sanitize_next_path(next: Option<&str>) -> String {
+    match next {
+        Some(path) if path.starts_with('/') && !path.starts_with("//") => path.to_string(),
+        _ => "/".to_string(),
+    }
+}
+
+fn secure_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (l, r) in left.iter().zip(right.iter()) {
+        diff |= l ^ r;
+    }
+    diff == 0
 }

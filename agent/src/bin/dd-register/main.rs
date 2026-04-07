@@ -6,6 +6,7 @@
 
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{ConnectInfo, WebSocketUpgrade};
+use axum::http::HeaderMap;
 use axum::response::{Html, IntoResponse};
 use axum::routing::{get, post};
 use axum::Json;
@@ -107,6 +108,13 @@ fn register_epoch() -> u64 {
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(1)
+}
+
+fn register_redirect_url() -> Option<String> {
+    std::env::var("DD_REGISTER_REDIRECT_URL")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 #[tokio::main]
@@ -216,10 +224,11 @@ async fn main() {
             "/api/fleet/report",
             post(
                 move |ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
+                      headers: HeaderMap,
                       Json(report): Json<FleetReport>| {
                     let cf = cf.clone();
                     let reg = report_registry.clone();
-                    async move { post_fleet_report(addr, cf, reg, report).await }
+                    async move { post_fleet_report(addr, headers, cf, reg, report).await }
                 },
             ),
         );
@@ -228,10 +237,19 @@ async fn main() {
         get({
             let registry = fleet_registry.clone();
             let env_label = env_label.clone();
-            move || {
+            move |ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>, headers: HeaderMap| {
                 let registry = registry.clone();
                 let env_label = env_label.clone();
-                async move { Json(fleet_snapshot(&registry, &env_label).await) }
+                async move {
+                    if !is_authorized_admin_api_request(&headers, addr.ip().is_loopback()) {
+                        return (
+                            axum::http::StatusCode::UNAUTHORIZED,
+                            Json(serde_json::json!({"error": "authentication required"})),
+                        )
+                            .into_response();
+                    }
+                    Json(fleet_snapshot(&registry, &env_label).await).into_response()
+                }
             }
         }),
     );
@@ -474,6 +492,7 @@ async fn handle_registration(socket: WebSocket, cf: CfConfig, registry: AgentReg
         hostname: tunnel_info.hostname,
         lease_ttl_secs: register_lease_ttl_secs(),
         register_epoch: register_epoch(),
+        redirect_url: register_redirect_url(),
         auth_public_key: None,
         auth_issuer: None,
     };
@@ -496,6 +515,7 @@ async fn handle_registration(socket: WebSocket, cf: CfConfig, registry: AgentReg
         };
         let current_epoch = register_epoch();
         let current_ttl = register_lease_ttl_secs();
+        let redirect_url = register_redirect_url();
         let revoked = {
             let mut registry = registry.lock().await;
             match registry.get_mut(&renew.agent_id) {
@@ -512,6 +532,7 @@ async fn handle_registration(socket: WebSocket, cf: CfConfig, registry: AgentReg
             lease_ttl_secs: current_ttl,
             register_epoch: current_epoch,
             revoked,
+            redirect_url,
         };
         let json = serde_json::to_vec(&response).unwrap();
         let mut enc_resp = vec![0u8; 65535];
@@ -557,14 +578,15 @@ async fn post_deregister(
 
 async fn post_fleet_report(
     addr: std::net::SocketAddr,
+    headers: HeaderMap,
     cf: CfConfig,
     registry: AgentRegistry,
     report: FleetReport,
 ) -> impl axum::response::IntoResponse {
-    if !addr.ip().is_loopback() {
+    if !is_authorized_scraper_report_request(&headers, addr.ip().is_loopback()) {
         return (
             axum::http::StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({"error": "loopback access required"})),
+            Json(serde_json::json!({"error": "authentication required"})),
         )
             .into_response();
     }
@@ -730,5 +752,39 @@ fn configure_parent_death_signal(cmd: &mut tokio::process::Command) {
                 Ok(())
             });
         }
+    }
+}
+
+fn is_authorized_admin_api_request(headers: &HeaderMap, is_loopback: bool) -> bool {
+    if is_loopback {
+        return true;
+    }
+
+    match std::env::var("DD_ADMIN_API_TOKEN") {
+        Ok(expected) if !expected.is_empty() => extract_bearer_token(headers)
+            .map(|token| token == expected)
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
+fn extract_bearer_token(headers: &HeaderMap) -> Option<String> {
+    let value = headers.get("authorization")?.to_str().ok()?;
+    let token = value
+        .strip_prefix("Bearer ")
+        .or(value.strip_prefix("bearer "))?;
+    Some(token.to_string())
+}
+
+fn is_authorized_scraper_report_request(headers: &HeaderMap, is_loopback: bool) -> bool {
+    if is_loopback {
+        return true;
+    }
+
+    match std::env::var("DD_SCRAPER_REPORT_TOKEN") {
+        Ok(expected) if !expected.is_empty() => extract_bearer_token(headers)
+            .map(|token| token == expected)
+            .unwrap_or(false),
+        _ => false,
     }
 }

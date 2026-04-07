@@ -146,6 +146,14 @@ pub struct AgentState {
     pub auth_public_key_b64: Option<String>,
 }
 
+fn browser_ui_enabled(state: &AgentState) -> bool {
+    state.register_mode
+        || std::env::var("DD_AGENT_BROWSER_UI")
+            .ok()
+            .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+}
+
 // ── Auth ──────────────────────────────────────────────────────────────────
 
 const SESSION_COOKIE: &str = "dd_session";
@@ -1778,35 +1786,38 @@ async fn num_cpus() -> usize {
 
 pub fn build_router(state: AgentState) -> Router {
     let mut router: Router<AgentState> = Router::new();
+    let browser_ui = browser_ui_enabled(&state);
 
     if state.register_mode {
         router = register::add_routes(router);
-    } else {
+    } else if browser_ui {
         router = router.route("/", get(dashboard));
     }
 
-    // Auth routes — password login is always available, GitHub only when configured
-    router = router
-        .route("/auth/login", get(login_page).post(login_submit))
-        .route("/auth/logout", get(github_auth_logout));
-
-    if matches!(state.auth_mode, AuthMode::GitHub(_)) {
+    if browser_ui {
+        // Auth routes — password login is always available, GitHub only when configured
         router = router
-            .route("/auth/github/start", get(github_auth_start))
-            .route("/auth/github/callback", get(github_auth_callback));
+            .route("/auth/login", get(login_page).post(login_submit))
+            .route("/auth/logout", get(github_auth_logout))
+            .route("/logged-out", get(logged_out_page))
+            .route("/workload/{id}", get(workload_page))
+            .route("/session/{app_name}", get(session_page))
+            .route("/ws/session/{app_name}", get(ws_session));
+
+        if matches!(state.auth_mode, AuthMode::GitHub(_)) {
+            router = router
+                .route("/auth/github/start", get(github_auth_start))
+                .route("/auth/github/callback", get(github_auth_callback));
+        }
     }
 
     let router = router
-        .route("/logged-out", get(logged_out_page))
         .route("/health", get(health))
-        .route("/workload/{id}", get(workload_page))
         .route("/deployments", get(list_deployments))
         .route("/deployments/{id}", get(get_deployment))
         .route("/deployments/{id}/logs", get(deployment_logs))
-        .route("/session/{app_name}", get(session_page))
-        .route("/ws/session/{app_name}", get(ws_session))
         .route("/noise/session/{app_name}", get(ws_noise_session))
         .route("/noise/cmd", get(ws_noise_cmd));
 
-    deploy::add_routes(router).with_state(state)
+    deploy::add_routes(router, browser_ui).with_state(state)
 }

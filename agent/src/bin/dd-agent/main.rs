@@ -732,7 +732,7 @@ struct RegisterSupervisorConfig {
 async fn start_register_supervisor(
     cfg: RegisterSupervisorConfig,
 ) -> Result<dd_agent::noise::BootstrapConfig, String> {
-    let session = connect_register_session(&cfg).await?;
+    let session = connect_register_session(&cfg, &cfg.register_url).await?;
     let initial_config = session.config.clone();
     apply_bootstrap_config(&initial_config, None).await?;
     tokio::spawn(async move {
@@ -743,6 +743,10 @@ async fn start_register_supervisor(
 
 async fn register_supervisor_loop(cfg: RegisterSupervisorConfig, mut session: RegisterSession) {
     let mut current_config = session.config.clone();
+    let mut current_register_url = current_config
+        .redirect_url
+        .clone()
+        .unwrap_or_else(|| cfg.register_url.clone());
 
     loop {
         let renew_secs = std::cmp::max(current_config.lease_ttl_secs / 3, 5);
@@ -750,32 +754,55 @@ async fn register_supervisor_loop(cfg: RegisterSupervisorConfig, mut session: Re
 
         match renew_register_lease(&mut session, &cfg.agent_id, current_config.register_epoch).await
         {
-            Ok(response) if response.revoked => {
-                eprintln!("dd-agent: register lease revoked, reconnecting");
-            }
-            Ok(response) if !response.ok => {
-                eprintln!("dd-agent: register lease renewal rejected, reconnecting");
-            }
-            Ok(response) if response.register_epoch > current_config.register_epoch => {
-                eprintln!(
-                    "dd-agent: register epoch advanced from {} to {}, reconnecting",
-                    current_config.register_epoch, response.register_epoch
-                );
-                current_config.register_epoch = response.register_epoch;
-            }
             Ok(response) => {
-                current_config.lease_ttl_secs = response.lease_ttl_secs.max(5);
-                session.config.lease_ttl_secs = current_config.lease_ttl_secs;
-                if !is_cloudflared_running().await {
-                    eprintln!("dd-agent: cloudflared missing during active lease, restarting");
-                    if let Err(error) =
-                        apply_bootstrap_config(&current_config, Some(&current_config.tunnel_token))
-                            .await
-                    {
-                        eprintln!("dd-agent: cloudflared restart failed: {error}");
+                let redirect_url = response
+                    .redirect_url
+                    .clone()
+                    .filter(|url| url != &current_register_url);
+
+                if response.revoked {
+                    if let Some(ref url) = redirect_url {
+                        current_register_url = url.clone();
                     }
+                    eprintln!("dd-agent: register lease revoked, reconnecting");
+                } else if !response.ok {
+                    if let Some(ref url) = redirect_url {
+                        current_register_url = url.clone();
+                    }
+                    eprintln!("dd-agent: register lease renewal rejected, reconnecting");
+                } else if response.register_epoch > current_config.register_epoch {
+                    if let Some(ref url) = redirect_url {
+                        current_register_url = url.clone();
+                    }
+                    eprintln!(
+                        "dd-agent: register epoch advanced from {} to {}, reconnecting{}",
+                        current_config.register_epoch,
+                        response.register_epoch,
+                        redirect_url
+                            .as_ref()
+                            .map(|url| format!(" via {url}"))
+                            .unwrap_or_default()
+                    );
+                    current_config.register_epoch = response.register_epoch;
+                } else if let Some(url) = redirect_url {
+                    eprintln!("dd-agent: register redirected control plane to {url}");
+                    current_register_url = url;
+                } else {
+                    current_config.lease_ttl_secs = response.lease_ttl_secs.max(5);
+                    session.config.lease_ttl_secs = current_config.lease_ttl_secs;
+                    if !is_cloudflared_running().await {
+                        eprintln!("dd-agent: cloudflared missing during active lease, restarting");
+                        if let Err(error) = apply_bootstrap_config(
+                            &current_config,
+                            Some(&current_config.tunnel_token),
+                        )
+                        .await
+                        {
+                            eprintln!("dd-agent: cloudflared restart failed: {error}");
+                        }
+                    }
+                    continue;
                 }
-                continue;
             }
             Err(error) => {
                 eprintln!("dd-agent: register lease renewal failed: {error}");
@@ -785,7 +812,7 @@ async fn register_supervisor_loop(cfg: RegisterSupervisorConfig, mut session: Re
         let mut reconnect_delay = std::time::Duration::from_secs(1);
         loop {
             tokio::time::sleep(reconnect_delay).await;
-            match connect_register_session(&cfg).await {
+            match connect_register_session(&cfg, &current_register_url).await {
                 Ok(new_session) => {
                     let next_config = new_session.config.clone();
                     if let Err(error) =
@@ -797,10 +824,15 @@ async fn register_supervisor_loop(cfg: RegisterSupervisorConfig, mut session: Re
                         );
                     }
                     current_config = next_config;
+                    if let Some(ref redirect_url) = current_config.redirect_url {
+                        current_register_url = redirect_url.clone();
+                    }
                     session = new_session;
                     eprintln!(
-                        "dd-agent: re-registered — hostname={} epoch={}",
-                        current_config.hostname, current_config.register_epoch
+                        "dd-agent: re-registered — hostname={} epoch={} register={}",
+                        current_config.hostname,
+                        current_config.register_epoch,
+                        current_register_url
                     );
                     break;
                 }
@@ -818,13 +850,14 @@ async fn register_supervisor_loop(cfg: RegisterSupervisorConfig, mut session: Re
 
 async fn connect_register_session(
     cfg: &RegisterSupervisorConfig,
+    register_url: &str,
 ) -> Result<RegisterSession, String> {
     use futures_util::SinkExt;
     use tokio_tungstenite::tungstenite;
 
     let keypair = dd_agent::noise::generate_keypair()?;
     let attestation = build_attestation(&cfg.vm_name, cfg.attestation.as_ref(), &keypair.public);
-    let ws_url = cfg.register_url.clone();
+    let ws_url = register_url.to_string();
 
     let (mut ws_stream, _) = tokio_tungstenite::connect_async(&ws_url)
         .await

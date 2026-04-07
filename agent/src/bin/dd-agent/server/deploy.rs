@@ -72,11 +72,18 @@ pub struct DeployRequest {
     pub post_deploy: Option<Vec<Vec<String>>>,
 }
 
-pub(super) fn add_routes(router: Router<AgentState>) -> Router<AgentState> {
-    router
+pub(super) fn add_routes(
+    router: Router<AgentState>,
+    browser_ui_enabled: bool,
+) -> Router<AgentState> {
+    let router = router
         .route("/deploy", post(post_deploy))
-        .route("/exec", post(post_exec))
-        .route("/terminal", post(new_terminal))
+        .route("/exec", post(post_exec));
+    if browser_ui_enabled {
+        router.route("/terminal", post(new_terminal))
+    } else {
+        router
+    }
 }
 
 async fn new_terminal(

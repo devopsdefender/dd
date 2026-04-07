@@ -113,6 +113,8 @@ pub struct BootstrapConfig {
     pub hostname: String,
     pub lease_ttl_secs: u64,
     pub register_epoch: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub redirect_url: Option<String>,
     /// Ed25519 public key (base64) for verifying register-issued JWTs.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auth_public_key: Option<String>,
@@ -141,6 +143,8 @@ pub struct LeaseRenewResponse {
     pub register_epoch: u64,
     #[serde(default)]
     pub revoked: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub redirect_url: Option<String>,
 }
 
 // ── Wire helpers ─────────────────────────────────────────────────────────

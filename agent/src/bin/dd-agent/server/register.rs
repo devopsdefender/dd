@@ -88,6 +88,13 @@ fn register_epoch() -> u64 {
         .unwrap_or(1)
 }
 
+fn register_redirect_url() -> Option<String> {
+    std::env::var("DD_REGISTER_REDIRECT_URL")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
 pub(super) fn add_routes(router: Router<AgentState>) -> Router<AgentState> {
     router
         .route("/", get(fleet_dashboard))
@@ -99,8 +106,15 @@ pub(super) fn add_routes(router: Router<AgentState>) -> Router<AgentState> {
         .route("/deregister", post(post_deregister))
 }
 
-async fn get_fleet_snapshot(State(state): State<AgentState>) -> Json<FleetSnapshot> {
-    Json(fleet_snapshot(&state).await)
+async fn get_fleet_snapshot(
+    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    State(state): State<AgentState>,
+    headers: HeaderMap,
+) -> Result<Json<FleetSnapshot>, AppError> {
+    if !is_authorized_admin_api_request(&state, &headers, addr.ip().is_loopback()).await {
+        return Err(AppError::Unauthorized);
+    }
+    Ok(Json(fleet_snapshot(&state).await))
 }
 
 async fn fleet_dashboard(
@@ -356,7 +370,7 @@ async fn post_fleet_report(
     headers: HeaderMap,
     Json(report): Json<FleetReport>,
 ) -> Response {
-    if !addr.ip().is_loopback() && super::verify_owner(&state, &headers).await.is_err() {
+    if !is_authorized_scraper_report_request(&state, &headers, addr.ip().is_loopback()).await {
         return (
             axum::http::StatusCode::UNAUTHORIZED,
             Json(serde_json::json!({"error": "authentication required"})),
@@ -632,6 +646,46 @@ async fn fleet_snapshot(state: &AgentState) -> FleetSnapshot {
     }
 }
 
+async fn is_authorized_admin_api_request(
+    state: &AgentState,
+    headers: &HeaderMap,
+    is_loopback: bool,
+) -> bool {
+    if is_loopback {
+        return true;
+    }
+
+    if let Ok(expected) = std::env::var("DD_ADMIN_API_TOKEN") {
+        if !expected.is_empty()
+            && super::extract_auth(headers).as_deref() == Some(expected.as_str())
+        {
+            return true;
+        }
+    }
+
+    super::verify_owner(state, headers).await.is_ok()
+}
+
+async fn is_authorized_scraper_report_request(
+    state: &AgentState,
+    headers: &HeaderMap,
+    is_loopback: bool,
+) -> bool {
+    if is_loopback {
+        return true;
+    }
+
+    if let Ok(expected) = std::env::var("DD_SCRAPER_REPORT_TOKEN") {
+        if !expected.is_empty()
+            && super::extract_auth(headers).as_deref() == Some(expected.as_str())
+        {
+            return true;
+        }
+    }
+
+    super::verify_owner(state, headers).await.is_ok()
+}
+
 async fn ws_register(State(state): State<AgentState>, ws: WebSocketUpgrade) -> impl IntoResponse {
     ws.on_upgrade(move |socket| handle_ws_register(socket, state))
 }
@@ -780,6 +834,7 @@ async fn handle_ws_register(socket: WebSocket, state: AgentState) {
         hostname: tunnel_info.hostname,
         lease_ttl_secs: register_lease_ttl_secs(),
         register_epoch: register_epoch(),
+        redirect_url: register_redirect_url(),
         auth_public_key: state.auth_public_key_b64.clone(),
         auth_issuer: state.auth_issuer.clone(),
     };
@@ -802,6 +857,7 @@ async fn handle_ws_register(socket: WebSocket, state: AgentState) {
         };
         let current_epoch = register_epoch();
         let current_ttl = register_lease_ttl_secs();
+        let redirect_url = register_redirect_url();
         let revoked = {
             let mut registry = state.agent_registry.lock().await;
             match registry.get_mut(&renew.agent_id) {
@@ -818,6 +874,7 @@ async fn handle_ws_register(socket: WebSocket, state: AgentState) {
             lease_ttl_secs: current_ttl,
             register_epoch: current_epoch,
             revoked,
+            redirect_url,
         };
         let json = serde_json::to_vec(&response).unwrap();
         let mut enc_resp = vec![0u8; 65535];
