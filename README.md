@@ -149,7 +149,7 @@ Example:
 
 ```bash
 ddctl wait-ready
-ddctl spawn --app-name scraper --image ghcr.io/devopsdefender/dd-scraper:latest
+ddctl spawn --app-name scraper --image ghcr.io/devopsdefender/dd-scraper-ci:latest
 ```
 
 ## Admin and scraper UI

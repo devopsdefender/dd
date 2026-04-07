@@ -11,6 +11,9 @@ on:
 permissions:
   packages: write
 
+env:
+  DD_SCRAPER_IMAGE_REPO: ghcr.io/devopsdefender/dd-scraper-ci
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -27,5 +30,6 @@ jobs:
           file: Dockerfile.scraper
           push: true
           tags: |
-            ghcr.io/devopsdefender/dd-scraper:${{ github.sha }}
-            ghcr.io/devopsdefender/dd-scraper:latest
+            ${{ env.DD_SCRAPER_IMAGE_REPO }}:${{ github.sha }}
+            ${{ env.DD_SCRAPER_IMAGE_REPO }}:latest
+          labels: org.opencontainers.image.source=https://github.com/${{ github.repository }}

@@ -52,7 +52,7 @@ nohup /usr/local/bin/dd-agent > /var/log/dd-agent.log 2>&1 &
 /usr/local/bin/ddctl wait-ready --timeout 60
 /usr/local/bin/ddctl spawn \
   --app-name scraper \
-  --image "${DD_SCRAPER_IMAGE:-ghcr.io/devopsdefender/dd-scraper:latest}" \
+  --image "${DD_SCRAPER_IMAGE:-ghcr.io/devopsdefender/dd-scraper-ci:latest}" \
   --env "DD_CF_API_TOKEN=${CLOUDFLARE_API_TOKEN}" \
   --env "DD_CF_ACCOUNT_ID=${CLOUDFLARE_ACCOUNT_ID}" \
   --env "DD_CF_ZONE_ID=${CLOUDFLARE_ZONE_ID}" \
