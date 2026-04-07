@@ -5,6 +5,7 @@
 # Required env vars (set by the deploy script):
 #   BINARY_URL              — dd-agent binary download URL
 #   DDCTL_BINARY_URL        — ddctl binary download URL
+#   DD_SCRAPER_IMAGE        — dd-scraper image reference
 #   DD_ENV                  — staging or production
 #   DD_DOMAIN               — Domain (e.g. devopsdefender.com)
 #   DD_HOSTNAME             — Public hostname for this register
@@ -51,7 +52,7 @@ nohup /usr/local/bin/dd-agent > /var/log/dd-agent.log 2>&1 &
 /usr/local/bin/ddctl wait-ready --timeout 60
 /usr/local/bin/ddctl spawn \
   --app-name scraper \
-  --image ghcr.io/devopsdefender/dd-scraper:latest \
+  --image "${DD_SCRAPER_IMAGE:-ghcr.io/devopsdefender/dd-scraper:latest}" \
   --env "DD_CF_API_TOKEN=${CLOUDFLARE_API_TOKEN}" \
   --env "DD_CF_ACCOUNT_ID=${CLOUDFLARE_ACCOUNT_ID}" \
   --env "DD_CF_ZONE_ID=${CLOUDFLARE_ZONE_ID}" \

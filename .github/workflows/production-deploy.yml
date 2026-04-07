@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - "agent/**"
+      - "Dockerfile.scraper"
       - "scripts/**"
       - ".github/workflows/production-deploy.yml"
   workflow_dispatch:
@@ -21,6 +22,7 @@ env:
 
 permissions:
   contents: write
+  packages: write
 
 jobs:
   build:
@@ -29,6 +31,7 @@ jobs:
     outputs:
       binary_url: ${{ steps.upload.outputs.url }}
       ddctl_binary_url: ${{ steps.upload.outputs.ddctl_url }}
+      scraper_image: ${{ steps.scraper_meta.outputs.image }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -55,6 +58,21 @@ jobs:
           ddctl_url=$(gh release view "$tag" --json assets --jq '.assets[] | select(.name=="ddctl") | .url')
           echo "url=${url}" >> "$GITHUB_OUTPUT"
           echo "ddctl_url=${ddctl_url}" >> "$GITHUB_OUTPUT"
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Set scraper image tag
+        id: scraper_meta
+        run: echo "image=ghcr.io/devopsdefender/dd-scraper:${{ github.sha }}" >> "$GITHUB_OUTPUT"
+      - name: Build and push scraper image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.scraper
+          push: true
+          tags: ${{ steps.scraper_meta.outputs.image }}
 
   cleanup:
     runs-on: ubuntu-latest
@@ -99,6 +117,7 @@ jobs:
           DD_GITHUB_CLIENT_SECRET: ${{ secrets.DD_GITHUB_CLIENT_SECRET }}
           BINARY_URL: ${{ needs.build.outputs.binary_url }}
           DDCTL_BINARY_URL: ${{ needs.build.outputs.ddctl_binary_url }}
+          DD_SCRAPER_IMAGE: ${{ needs.build.outputs.scraper_image }}
         run: scripts/gcp-deploy.sh
 
       - name: Wait for agent health
@@ -109,4 +128,3 @@ jobs:
           done
           echo "::error::Agent not healthy within 5 minutes"
           exit 1
-

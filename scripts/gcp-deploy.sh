@@ -9,6 +9,7 @@
 #   DD_DOMAIN               — Domain (e.g. devopsdefender.com)
 #   BINARY_URL              — dd-agent binary download URL
 #   DDCTL_BINARY_URL        — ddctl binary download URL
+#   DD_SCRAPER_IMAGE        — dd-scraper image reference
 #   CLOUDFLARE_API_TOKEN    — CF API token
 #   CLOUDFLARE_ACCOUNT_ID   — CF account ID
 #   CLOUDFLARE_ZONE_ID      — CF zone ID
@@ -41,6 +42,7 @@ cat > /tmp/startup.sh <<STARTUP
 #!/bin/bash
 export BINARY_URL="${BINARY_URL}"
 export DDCTL_BINARY_URL="${DDCTL_BINARY_URL}"
+export DD_SCRAPER_IMAGE="${DD_SCRAPER_IMAGE}"
 export DD_ENV="${DD_ENV}"
 export DD_DOMAIN="${DD_DOMAIN}"
 export DD_HOSTNAME="${DD_HOSTNAME}"
