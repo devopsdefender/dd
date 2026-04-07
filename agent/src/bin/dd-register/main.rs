@@ -15,7 +15,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-use dd_agent::noise::{self, AttestationPayload, BootstrapConfig};
+use dd_agent::noise::{
+    self, AttestationPayload, BootstrapConfig, LeaseRenewRequest, LeaseRenewResponse,
+    RegisterRequest,
+};
 use dd_agent::tunnel::{self, CfConfig};
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -25,16 +28,16 @@ struct AgentRecord {
     vm_name: String,
     attestation_type: String,
     registered_at: String,
+    last_seen: String,
     status: String,
+    deployment_count: usize,
+    deployment_names: Vec<String>,
+    cpu_percent: u64,
+    memory_used_mb: u64,
+    memory_total_mb: u64,
 }
 
 type AgentRegistry = Arc<Mutex<HashMap<String, AgentRecord>>>;
-
-#[derive(Debug, serde::Deserialize)]
-struct RegisterRequest {
-    owner: String,
-    vm_name: String,
-}
 
 #[derive(Debug, serde::Deserialize)]
 struct DeregisterRequest {
@@ -51,6 +54,16 @@ struct AgentHealthReport {
     vm_name: Option<String>,
     #[serde(default)]
     attestation_type: Option<String>,
+    #[serde(default)]
+    deployment_count: Option<usize>,
+    #[serde(default)]
+    deployments: Option<Vec<String>>,
+    #[serde(default)]
+    cpu_percent: Option<u64>,
+    #[serde(default)]
+    memory_used_mb: Option<u64>,
+    #[serde(default)]
+    memory_total_mb: Option<u64>,
     #[serde(default)]
     error: Option<String>,
 }
@@ -69,6 +82,31 @@ struct FleetReportAck {
     stale_agents: usize,
     orphan_tunnels: usize,
     dead_agents_cleaned: usize,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct FleetSnapshot {
+    env: String,
+    total_agents: usize,
+    healthy_agents: usize,
+    stale_agents: usize,
+    dead_agents: usize,
+    agents: Vec<AgentRecord>,
+}
+
+fn register_lease_ttl_secs() -> u64 {
+    std::env::var("DD_REGISTER_LEASE_TTL_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(90)
+}
+
+fn register_epoch() -> u64 {
+    std::env::var("DD_REGISTER_EPOCH")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(1)
 }
 
 #[tokio::main]
@@ -140,6 +178,8 @@ async fn main() {
     let register_registry = registry.clone();
     let deregister_cf = cf.clone();
     let deregister_registry = registry.clone();
+    let report_registry = registry.clone();
+    let fleet_registry = registry.clone();
 
     let app = Router::new()
         .route(
@@ -178,11 +218,23 @@ async fn main() {
                 move |ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
                       Json(report): Json<FleetReport>| {
                     let cf = cf.clone();
-                    let reg = registry.clone();
+                    let reg = report_registry.clone();
                     async move { post_fleet_report(addr, cf, reg, report).await }
                 },
             ),
         );
+    let app = app.route(
+        "/api/fleet",
+        get({
+            let registry = fleet_registry.clone();
+            let env_label = env_label.clone();
+            move || {
+                let registry = registry.clone();
+                let env_label = env_label.clone();
+                async move { Json(fleet_snapshot(&registry, &env_label).await) }
+            }
+        }),
+    );
 
     let addr = format!("{bind_addr}:{port}");
     eprintln!("dd-register: listening on {addr}");
@@ -280,6 +332,8 @@ async fn fleet_dashboard(
 
 async fn handle_registration(socket: WebSocket, cf: CfConfig, registry: AgentRegistry) {
     let (mut ws_tx, mut ws_rx) = socket.split();
+    let attestation_backend = dd_agent::attestation::detect();
+    let register_vm_name = std::env::var("DD_HOSTNAME").unwrap_or_else(|_| "dd-register".into());
 
     let keypair = match noise::generate_keypair() {
         Ok(k) => k,
@@ -311,8 +365,15 @@ async fn handle_registration(socket: WebSocket, cf: CfConfig, registry: AgentReg
         return;
     }
 
+    let attestation = noise::build_attestation_payload(
+        &register_vm_name,
+        None,
+        attestation_backend.as_ref(),
+        &keypair.public,
+    );
+    let attestation_json = serde_json::to_vec(&attestation).unwrap();
     let mut msg2_buf = vec![0u8; 65535];
-    let msg2_len = match noise.write_message(&[], &mut msg2_buf) {
+    let msg2_len = match noise.write_message(&attestation_json, &mut msg2_buf) {
         Ok(n) => n,
         Err(_) => return,
     };
@@ -337,6 +398,14 @@ async fn handle_registration(socket: WebSocket, cf: CfConfig, registry: AgentReg
         Ok(a) => a,
         Err(_) => return,
     };
+    let remote_static = match noise.get_remote_static() {
+        Some(key) => key,
+        None => return,
+    };
+    if let Err(error) = noise::verify_remote_attestation(&attestation, remote_static) {
+        eprintln!("dd-register: attestation verify failed: {error}");
+        return;
+    }
 
     eprintln!(
         "dd-register: agent {} ({})",
@@ -364,9 +433,8 @@ async fn handle_registration(socket: WebSocket, cf: CfConfig, registry: AgentReg
 
     // Create tunnel for the agent
     let client = reqwest::Client::new();
-    let agent_id = uuid::Uuid::new_v4().to_string();
     let tunnel_info =
-        match tunnel::create_agent_tunnel(&client, &cf, &agent_id, &reg.vm_name, None).await {
+        match tunnel::create_agent_tunnel(&client, &cf, &reg.agent_id, &reg.vm_name, None).await {
             Ok(info) => info,
             Err(e) => {
                 eprintln!("dd-register: tunnel failed: {e}");
@@ -381,22 +449,31 @@ async fn handle_registration(socket: WebSocket, cf: CfConfig, registry: AgentReg
 
     // Record in registry
     registry.lock().await.insert(
-        agent_id.clone(),
+        reg.agent_id.clone(),
         AgentRecord {
-            agent_id,
+            agent_id: reg.agent_id.clone(),
             hostname: tunnel_info.hostname.clone(),
             vm_name: reg.vm_name.clone(),
             attestation_type: attestation.attestation_type,
             registered_at: chrono::Utc::now().to_rfc3339(),
+            last_seen: chrono::Utc::now().to_rfc3339(),
             status: "healthy".into(),
+            deployment_count: 0,
+            deployment_names: Vec::new(),
+            cpu_percent: 0,
+            memory_used_mb: 0,
+            memory_total_mb: 0,
         },
     );
 
     // Send bootstrap config
     let config = BootstrapConfig {
+        agent_id: reg.agent_id,
         owner: reg.owner,
         tunnel_token: tunnel_info.tunnel_token,
         hostname: tunnel_info.hostname,
+        lease_ttl_secs: register_lease_ttl_secs(),
+        register_epoch: register_epoch(),
         auth_public_key: None,
         auth_issuer: None,
     };
@@ -406,6 +483,53 @@ async fn handle_registration(socket: WebSocket, cf: CfConfig, registry: AgentReg
         let _ = ws_tx
             .send(Message::Binary(enc_resp[..len].to_vec().into()))
             .await;
+    }
+
+    while let Some(Ok(Message::Binary(data))) = ws_rx.next().await {
+        let renew_len = match transport.read_message(&data, &mut buf) {
+            Ok(n) => n,
+            Err(_) => break,
+        };
+        let renew: LeaseRenewRequest = match serde_json::from_slice(&buf[..renew_len]) {
+            Ok(r) => r,
+            Err(_) => break,
+        };
+        let current_epoch = register_epoch();
+        let current_ttl = register_lease_ttl_secs();
+        let revoked = {
+            let mut registry = registry.lock().await;
+            match registry.get_mut(&renew.agent_id) {
+                Some(agent) if renew.agent_id == config.agent_id && agent.status != "dead" => {
+                    agent.last_seen = chrono::Utc::now().to_rfc3339();
+                    agent.status = "healthy".into();
+                    false
+                }
+                _ => true,
+            }
+        };
+        let response = LeaseRenewResponse {
+            ok: !revoked,
+            lease_ttl_secs: current_ttl,
+            register_epoch: current_epoch,
+            revoked,
+        };
+        let json = serde_json::to_vec(&response).unwrap();
+        let mut enc_resp = vec![0u8; 65535];
+        let len = match transport.write_message(&json, &mut enc_resp) {
+            Ok(n) => n,
+            Err(_) => break,
+        };
+        if ws_tx
+            .send(Message::Binary(enc_resp[..len].to_vec().into()))
+            .await
+            .is_err()
+        {
+            break;
+        }
+        if revoked {
+            eprintln!("dd-register: revoked agent {}", renew.agent_id);
+            break;
+        }
     }
 }
 
@@ -465,6 +589,22 @@ async fn apply_fleet_report(
                 .find(|a| a.hostname == agent_report.hostname)
             {
                 existing.status = "healthy".into();
+                existing.last_seen = chrono::Utc::now().to_rfc3339();
+                if let Some(deployment_count) = agent_report.deployment_count {
+                    existing.deployment_count = deployment_count;
+                }
+                if let Some(ref deployments) = agent_report.deployments {
+                    existing.deployment_names = deployments.clone();
+                }
+                if let Some(cpu_percent) = agent_report.cpu_percent {
+                    existing.cpu_percent = cpu_percent;
+                }
+                if let Some(memory_used_mb) = agent_report.memory_used_mb {
+                    existing.memory_used_mb = memory_used_mb;
+                }
+                if let Some(memory_total_mb) = agent_report.memory_total_mb {
+                    existing.memory_total_mb = memory_total_mb;
+                }
             } else if let Some(ref aid) = agent_report.agent_id {
                 registry_guard.insert(
                     aid.clone(),
@@ -477,7 +617,13 @@ async fn apply_fleet_report(
                             .clone()
                             .unwrap_or_else(|| "unknown".into()),
                         registered_at: chrono::Utc::now().to_rfc3339(),
+                        last_seen: chrono::Utc::now().to_rfc3339(),
                         status: "healthy".into(),
+                        deployment_count: agent_report.deployment_count.unwrap_or(0),
+                        deployment_names: agent_report.deployments.clone().unwrap_or_default(),
+                        cpu_percent: agent_report.cpu_percent.unwrap_or(0),
+                        memory_used_mb: agent_report.memory_used_mb.unwrap_or(0),
+                        memory_total_mb: agent_report.memory_total_mb.unwrap_or(0),
                     },
                 );
                 eprintln!(
@@ -546,6 +692,30 @@ async fn apply_fleet_report(
         stale_agents: stale_count,
         orphan_tunnels: report.orphan_tunnels.len(),
         dead_agents_cleaned: dead.len(),
+    }
+}
+
+async fn fleet_snapshot(registry: &AgentRegistry, env: &str) -> FleetSnapshot {
+    let mut agents: Vec<AgentRecord> = registry.lock().await.values().cloned().collect();
+    agents.sort_by(|left, right| left.hostname.cmp(&right.hostname));
+    let total_agents = agents.len();
+    let healthy_agents = agents
+        .iter()
+        .filter(|agent| agent.status == "healthy")
+        .count();
+    let stale_agents = agents
+        .iter()
+        .filter(|agent| agent.status == "stale")
+        .count();
+    let dead_agents = agents.iter().filter(|agent| agent.status == "dead").count();
+
+    FleetSnapshot {
+        env: env.to_string(),
+        total_agents,
+        healthy_agents,
+        stale_agents,
+        dead_agents,
+        agents,
     }
 }
 

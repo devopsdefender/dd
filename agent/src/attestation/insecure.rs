@@ -10,7 +10,7 @@ impl AttestationBackend for InsecureBackend {
         "insecure"
     }
 
-    fn generate_quote_b64(&self) -> Option<String> {
+    fn generate_quote_b64_with_report_data(&self, _report_data: &[u8]) -> Option<String> {
         None
     }
 

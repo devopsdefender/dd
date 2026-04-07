@@ -1,5 +1,30 @@
 //! dd-scraper — discovers agents from Cloudflare tunnels and reports health to the register.
 
+use std::sync::Arc;
+
+use axum::extract::State;
+use axum::response::Html;
+use axum::routing::get;
+use axum::{Json, Router};
+use tokio::sync::RwLock;
+
+#[derive(Clone, Debug, Default, serde::Serialize)]
+struct ScraperStatus {
+    env_label: String,
+    report_url: String,
+    tunnel_prefix: String,
+    last_scrape_at: Option<String>,
+    last_report_ok_at: Option<String>,
+    last_error: Option<String>,
+    tunnels_found: usize,
+    healthy_agents: usize,
+    unhealthy_agents: usize,
+    orphan_tunnels: usize,
+    recent_hostnames: Vec<String>,
+}
+
+type SharedStatus = Arc<RwLock<ScraperStatus>>;
+
 #[tokio::main]
 async fn main() {
     let cf = dd_agent::tunnel::CfConfig::from_env().unwrap_or_else(|e| {
@@ -17,6 +42,12 @@ async fn main() {
     let scrape_interval = std::time::Duration::from_secs(30);
     let scrape_timeout = std::time::Duration::from_secs(3);
     let report_url = fleet_report_url(&register_url);
+    let status = Arc::new(RwLock::new(ScraperStatus {
+        env_label: env_label.clone(),
+        report_url: report_url.clone(),
+        tunnel_prefix: tunnel_prefix.clone(),
+        ..ScraperStatus::default()
+    }));
 
     eprintln!("dd-scraper: starting (env={env_label}, report_url={report_url})");
 
@@ -28,13 +59,146 @@ async fn main() {
             std::process::exit(1);
         });
 
+    start_status_server(status.clone());
+
     let mut ticker = tokio::time::interval(scrape_interval);
     loop {
         ticker.tick().await;
-        if let Err(e) = scrape_once(&http, &report_url, &cf, &tunnel_prefix).await {
+        if let Err(e) = scrape_once(&http, &report_url, &cf, &tunnel_prefix, &status).await {
             eprintln!("dd-scraper: error: {e}");
+            let mut guard = status.write().await;
+            guard.last_scrape_at = Some(now_rfc3339());
+            guard.last_error = Some(e);
         }
     }
+}
+
+fn start_status_server(status: SharedStatus) {
+    let bind_addr = std::env::var("DD_SCRAPER_BIND_ADDR").unwrap_or_else(|_| "0.0.0.0".to_string());
+    let port = std::env::var("DD_SCRAPER_PORT")
+        .ok()
+        .and_then(|value| value.parse::<u16>().ok())
+        .unwrap_or(8082);
+    let addr = format!("{bind_addr}:{port}");
+
+    tokio::spawn(async move {
+        let app = Router::new()
+            .route("/", get(scraper_dashboard))
+            .route("/health", get(scraper_health))
+            .route("/api/status", get(scraper_status))
+            .with_state(status);
+
+        match tokio::net::TcpListener::bind(&addr).await {
+            Ok(listener) => {
+                eprintln!("dd-scraper: status server listening on {addr}");
+                if let Err(error) = axum::serve(listener, app).await {
+                    eprintln!("dd-scraper: status server error: {error}");
+                }
+            }
+            Err(error) => {
+                eprintln!("dd-scraper: failed to bind status server {addr}: {error}");
+            }
+        }
+    });
+}
+
+async fn scraper_health(State(status): State<SharedStatus>) -> Json<serde_json::Value> {
+    let snapshot = status.read().await.clone();
+    Json(serde_json::json!({
+        "ok": true,
+        "service": "dd-scraper",
+        "env": snapshot.env_label,
+        "report_url": snapshot.report_url,
+        "last_report_ok_at": snapshot.last_report_ok_at,
+        "last_error": snapshot.last_error,
+        "healthy_agents": snapshot.healthy_agents,
+        "unhealthy_agents": snapshot.unhealthy_agents,
+        "orphan_tunnels": snapshot.orphan_tunnels,
+    }))
+}
+
+async fn scraper_status(State(status): State<SharedStatus>) -> Json<ScraperStatus> {
+    Json(status.read().await.clone())
+}
+
+async fn scraper_dashboard(State(status): State<SharedStatus>) -> Html<String> {
+    let snapshot = status.read().await.clone();
+    let error_class = if snapshot.last_error.is_some() {
+        "error"
+    } else {
+        ""
+    };
+    let last_error = snapshot
+        .last_error
+        .clone()
+        .unwrap_or_else(|| "none".to_string());
+    let recent = if snapshot.recent_hostnames.is_empty() {
+        "<div class=\"empty\">No hostnames scraped yet</div>".to_string()
+    } else {
+        snapshot
+            .recent_hostnames
+            .iter()
+            .map(|hostname| format!("<li>{hostname}</li>"))
+            .collect::<Vec<_>>()
+            .join("")
+    };
+
+    Html(format!(
+        r#"<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>DD Scraper</title>
+<style>
+body {{ margin: 0; background: #111827; color: #e5e7eb; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; padding: 24px; }}
+h1 {{ margin: 0 0 6px; color: #f9fafb; font-size: 22px; }}
+.sub {{ color: #9ca3af; margin-bottom: 20px; }}
+.grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin-bottom: 20px; }}
+.card {{ background: #1f2937; border: 1px solid #374151; border-radius: 12px; padding: 14px; }}
+.label {{ color: #9ca3af; font-size: 12px; text-transform: uppercase; margin-bottom: 8px; }}
+.value {{ color: #f9fafb; font-size: 20px; }}
+.meta {{ margin-bottom: 16px; color: #d1d5db; }}
+.error {{ color: #fca5a5; }}
+.empty {{ color: #9ca3af; }}
+ul {{ margin: 0; padding-left: 20px; }}
+</style>
+</head>
+<body>
+<h1>DD Scraper</h1>
+<div class="sub">{env} &middot; prefix {prefix}</div>
+<div class="meta">Report URL: {report_url}</div>
+<div class="meta">Last scrape: {last_scrape}</div>
+<div class="meta">Last successful report: {last_ok}</div>
+<div class="meta {error_class}">Last error: {last_error}</div>
+<div class="grid">
+  <div class="card"><div class="label">Tunnels Found</div><div class="value">{tunnels_found}</div></div>
+  <div class="card"><div class="label">Healthy Agents</div><div class="value">{healthy_agents}</div></div>
+  <div class="card"><div class="label">Unhealthy Agents</div><div class="value">{unhealthy_agents}</div></div>
+  <div class="card"><div class="label">Orphan Tunnels</div><div class="value">{orphan_tunnels}</div></div>
+</div>
+<div class="card">
+  <div class="label">Recent Hostnames</div>
+  <ul>{recent}</ul>
+</div>
+</body>
+</html>"#,
+        env = snapshot.env_label,
+        prefix = snapshot.tunnel_prefix,
+        report_url = snapshot.report_url,
+        last_scrape = snapshot
+            .last_scrape_at
+            .unwrap_or_else(|| "never".to_string()),
+        last_ok = snapshot
+            .last_report_ok_at
+            .unwrap_or_else(|| "never".to_string()),
+        last_error = last_error,
+        error_class = error_class,
+        tunnels_found = snapshot.tunnels_found,
+        healthy_agents = snapshot.healthy_agents,
+        unhealthy_agents = snapshot.unhealthy_agents,
+        orphan_tunnels = snapshot.orphan_tunnels,
+        recent = recent,
+    ))
 }
 
 async fn scrape_once(
@@ -42,6 +206,7 @@ async fn scrape_once(
     report_url: &str,
     cf: &dd_agent::tunnel::CfConfig,
     tunnel_prefix: &str,
+    status: &SharedStatus,
 ) -> Result<(), String> {
     let tunnels = list_cf_tunnels(http, cf, tunnel_prefix).await;
     eprintln!(
@@ -79,6 +244,8 @@ async fn scrape_once(
 
     let mut agents = Vec::new();
     let mut orphan_tunnels = Vec::new();
+    let healthy_agents = results.iter().filter(|result| result.2).count();
+    let unhealthy_agents = results.len().saturating_sub(healthy_agents);
 
     for (tunnel_name, hostname, healthy, health, error) in &results {
         if *healthy {
@@ -119,8 +286,8 @@ async fn scrape_once(
     eprintln!(
         "dd-scraper: reporting {} agents ({} healthy, {} unhealthy, {} orphans)",
         results.len(),
-        results.iter().filter(|r| r.2).count(),
-        results.iter().filter(|r| !r.2).count(),
+        healthy_agents,
+        unhealthy_agents,
         orphan_tunnels.len(),
     );
 
@@ -137,7 +304,27 @@ async fn scrape_once(
         return Err(format!("fleet report rejected: {status} {body}"));
     }
 
+    {
+        let mut guard = status.write().await;
+        guard.last_scrape_at = Some(now_rfc3339());
+        guard.last_report_ok_at = guard.last_scrape_at.clone();
+        guard.last_error = None;
+        guard.tunnels_found = tunnels.len();
+        guard.healthy_agents = healthy_agents;
+        guard.unhealthy_agents = unhealthy_agents;
+        guard.orphan_tunnels = orphan_tunnels.len();
+        guard.recent_hostnames = results
+            .iter()
+            .map(|(_, hostname, _, _, _)| hostname.clone())
+            .take(12)
+            .collect();
+    }
+
     Ok(())
+}
+
+fn now_rfc3339() -> String {
+    chrono::Utc::now().to_rfc3339()
 }
 
 fn fleet_report_url(register_url: &str) -> String {

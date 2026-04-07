@@ -8,6 +8,7 @@
 #   DD_ENV                  — staging or production
 #   DD_DOMAIN               — Domain (e.g. devopsdefender.com)
 #   BINARY_URL              — dd-agent binary download URL
+#   DDCTL_BINARY_URL        — ddctl binary download URL
 #   CLOUDFLARE_API_TOKEN    — CF API token
 #   CLOUDFLARE_ACCOUNT_ID   — CF account ID
 #   CLOUDFLARE_ZONE_ID      — CF zone ID
@@ -39,6 +40,7 @@ STARTUP_TEMPLATE="${SCRIPT_DIR}/vm-startup.sh"
 cat > /tmp/startup.sh <<STARTUP
 #!/bin/bash
 export BINARY_URL="${BINARY_URL}"
+export DDCTL_BINARY_URL="${DDCTL_BINARY_URL}"
 export DD_ENV="${DD_ENV}"
 export DD_DOMAIN="${DD_DOMAIN}"
 export DD_HOSTNAME="${DD_HOSTNAME}"

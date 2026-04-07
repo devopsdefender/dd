@@ -167,7 +167,7 @@ pub fn generate_tdx_quote(report_root: &str, user_data: &[u8]) -> AppResult<Vec<
 /// Generate a TDX quote and return it as a base64-encoded string.
 ///
 /// Uses the default configfs-tsm report path.
-pub fn generate_tdx_quote_base64() -> AppResult<String> {
+pub fn generate_tdx_quote_base64_with_user_data(user_data: &[u8]) -> AppResult<String> {
     use base64::Engine;
 
     // Create a unique report entry under configfs-tsm.
@@ -178,12 +178,16 @@ pub fn generate_tdx_quote_base64() -> AppResult<String> {
     std::fs::create_dir_all(&report_root)
         .map_err(|e| AppError::External(format!("create tsm report dir: {e}")))?;
 
-    let quote_bytes = generate_tdx_quote(&report_root, &[])?;
+    let quote_bytes = generate_tdx_quote(&report_root, user_data)?;
 
     // Clean up.
     let _ = std::fs::remove_dir_all(&report_root);
 
     Ok(base64::engine::general_purpose::STANDARD.encode(&quote_bytes))
+}
+
+pub fn generate_tdx_quote_base64() -> AppResult<String> {
+    generate_tdx_quote_base64_with_user_data(&[])
 }
 
 // ── Utility functions ──────────────────────────────────────────────────────
@@ -215,8 +219,8 @@ impl super::AttestationBackend for TdxBackend {
         "tdx"
     }
 
-    fn generate_quote_b64(&self) -> Option<String> {
-        generate_tdx_quote_base64().ok()
+    fn generate_quote_b64_with_report_data(&self, report_data: &[u8]) -> Option<String> {
+        generate_tdx_quote_base64_with_user_data(report_data).ok()
     }
 
     fn health_metadata(&self) -> serde_json::Value {
@@ -247,6 +251,10 @@ mod tests {
     /// Build a fake TDX v4 quote with known sentinel bytes at the expected
     /// offsets so we can verify the parser pulls them out correctly.
     fn build_fake_quote() -> Vec<u8> {
+        build_fake_quote_with_report_data(None)
+    }
+
+    fn build_fake_quote_with_report_data(report_data: Option<[u8; 64]>) -> Vec<u8> {
         let mut buf = vec![0u8; MIN_QUOTE_SIZE + 64]; // a bit larger than minimum
 
         // Version = 4 (little-endian).
@@ -274,15 +282,20 @@ mod tests {
             *b = 0x40;
         }
 
-        // Report data: first 4 bytes = "cafe", rest 0xFF.
-        buf[body + REPORT_DATA_OFFSET] = 0xCA;
-        buf[body + REPORT_DATA_OFFSET + 1] = 0xFE;
-        buf[body + REPORT_DATA_OFFSET + 2] = 0xBA;
-        buf[body + REPORT_DATA_OFFSET + 3] = 0xBE;
-        for b in
-            &mut buf[body + REPORT_DATA_OFFSET + 4..body + REPORT_DATA_OFFSET + REPORT_DATA_LEN]
-        {
-            *b = 0xFF;
+        if let Some(report_data) = report_data {
+            buf[body + REPORT_DATA_OFFSET..body + REPORT_DATA_OFFSET + REPORT_DATA_LEN]
+                .copy_from_slice(&report_data);
+        } else {
+            // Report data: first 4 bytes = "cafe", rest 0xFF.
+            buf[body + REPORT_DATA_OFFSET] = 0xCA;
+            buf[body + REPORT_DATA_OFFSET + 1] = 0xFE;
+            buf[body + REPORT_DATA_OFFSET + 2] = 0xBA;
+            buf[body + REPORT_DATA_OFFSET + 3] = 0xBE;
+            for b in
+                &mut buf[body + REPORT_DATA_OFFSET + 4..body + REPORT_DATA_OFFSET + REPORT_DATA_LEN]
+            {
+                *b = 0xFF;
+            }
         }
 
         buf
@@ -332,5 +345,19 @@ mod tests {
         // The report data starts with 0xCA 0xFE 0xBA 0xBE → "cafebabe".
         assert!(report_data_starts_with_nonce_hex(&q, "cafebabe"));
         assert!(!report_data_starts_with_nonce_hex(&q, "deadbeef"));
+    }
+
+    #[test]
+    fn quote_binding_matches_expected_noise_static() {
+        let public_key = b"noise-static-public-key";
+        let report_data = crate::attestation::report_data_for_noise_static(public_key);
+        let raw = build_fake_quote_with_report_data(Some(report_data));
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&raw);
+
+        assert!(crate::attestation::verify_quote_binds_noise_static(&b64, public_key).is_ok());
+        assert!(
+            crate::attestation::verify_quote_binds_noise_static(&b64, b"different-public-key")
+                .is_err()
+        );
     }
 }

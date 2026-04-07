@@ -6,10 +6,8 @@
 
 use serde::{Deserialize, Serialize};
 use snow::Builder;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-
-use crate::server::Deployments;
 
 pub const NOISE_PATTERN: &str = "Noise_XX_25519_ChaChaPoly_SHA256";
 const MAX_MSG_LEN: usize = 65535;
@@ -99,22 +97,50 @@ pub struct JobInfo {
 pub struct AttestationPayload {
     pub attestation_type: String,
     pub vm_name: String,
+    pub noise_static_pubkey_hash_hex: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tdx_quote_b64: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
 }
 
 /// Bootstrap config for registration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BootstrapConfig {
+    pub agent_id: String,
     pub owner: String,
     pub tunnel_token: String,
     pub hostname: String,
+    pub lease_ttl_secs: u64,
+    pub register_epoch: u64,
     /// Ed25519 public key (base64) for verifying register-issued JWTs.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auth_public_key: Option<String>,
     /// Register hostname for auth redirects (e.g. "https://app-staging.devopsdefender.com").
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auth_issuer: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegisterRequest {
+    pub owner: String,
+    pub vm_name: String,
+    pub agent_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LeaseRenewRequest {
+    pub agent_id: String,
+    pub register_epoch: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LeaseRenewResponse {
+    pub ok: bool,
+    pub lease_ttl_secs: u64,
+    pub register_epoch: u64,
+    #[serde(default)]
+    pub revoked: bool,
 }
 
 // ── Wire helpers ─────────────────────────────────────────────────────────
@@ -157,6 +183,47 @@ pub fn generate_keypair() -> Result<snow::Keypair, String> {
         .map_err(|e| format!("keypair generation failed: {e}"))
 }
 
+pub fn build_attestation_payload(
+    vm_name: &str,
+    owner: Option<&str>,
+    backend: &dyn crate::attestation::AttestationBackend,
+    noise_static_public_key: &[u8],
+) -> AttestationPayload {
+    let report_data = crate::attestation::report_data_for_noise_static(noise_static_public_key);
+    AttestationPayload {
+        attestation_type: backend.attestation_type().to_string(),
+        vm_name: vm_name.to_string(),
+        noise_static_pubkey_hash_hex: crate::attestation::noise_static_pubkey_hash_hex(
+            noise_static_public_key,
+        ),
+        tdx_quote_b64: backend.generate_quote_b64_with_report_data(&report_data),
+        owner: owner.map(|value| value.to_string()),
+    }
+}
+
+pub fn verify_remote_attestation(
+    payload: &AttestationPayload,
+    remote_static_public_key: &[u8],
+) -> Result<(), String> {
+    let expected_hash = crate::attestation::noise_static_pubkey_hash_hex(remote_static_public_key);
+    if payload.noise_static_pubkey_hash_hex != expected_hash {
+        return Err("attestation payload hash does not match Noise static key".into());
+    }
+
+    match payload.attestation_type.as_str() {
+        "tdx" => {
+            let quote = payload
+                .tdx_quote_b64
+                .as_deref()
+                .ok_or_else(|| "missing TDX quote in attestation payload".to_string())?;
+            crate::attestation::verify_quote_binds_noise_static(quote, remote_static_public_key)
+        }
+        other => Err(format!(
+            "unsupported Noise attestation type '{other}' for required attestation"
+        )),
+    }
+}
+
 // ── Transport: encrypt/decrypt over an established Noise session ─────────
 
 /// Send a NoiseMessage over an established transport.
@@ -184,260 +251,6 @@ async fn recv_encrypted(
         .read_message(&enc, &mut buf)
         .map_err(|e| format!("decrypt: {e}"))?;
     serde_json::from_slice(&buf[..len]).map_err(|e| format!("parse message: {e}"))
-}
-
-// ── Agent-side: persistent session server ────────────────────────────────
-
-/// Handle one persistent shell session from a client.
-async fn handle_session(
-    mut stream: TcpStream,
-    private_key: &[u8],
-    attestation: &AttestationPayload,
-    deployments: &Deployments,
-) -> Option<BootstrapConfig> {
-    let mut noise = match Builder::new(NOISE_PATTERN.parse().unwrap())
-        .local_private_key(private_key)
-        .and_then(|b| b.build_responder())
-    {
-        Ok(n) => n,
-        Err(e) => {
-            eprintln!("dd-agent: noise setup: {e}");
-            return None;
-        }
-    };
-
-    let mut buf = vec![0u8; MAX_MSG_LEN];
-
-    // XX handshake: read msg1 → write msg2 (attestation) → read msg3
-    let msg1 = recv_msg(&mut stream).await.ok()?;
-    noise.read_message(&msg1, &mut buf).ok()?;
-
-    let attestation_json = serde_json::to_vec(attestation).unwrap();
-    let mut msg2_buf = vec![0u8; MAX_MSG_LEN];
-    let msg2_len = noise.write_message(&attestation_json, &mut msg2_buf).ok()?;
-    send_msg(&mut stream, &msg2_buf[..msg2_len]).await.ok()?;
-
-    let msg3 = recv_msg(&mut stream).await.ok()?;
-    noise.read_message(&msg3, &mut buf).ok()?;
-
-    let mut transport = noise.into_transport_mode().ok()?;
-
-    eprintln!("dd-agent: Noise session established");
-
-    // Channel for container stdout → client (used when fg'd)
-    let (container_tx, mut container_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
-
-    let mut bootstrap_result = None;
-    let mut fg_task: Option<tokio::task::JoinHandle<()>> = None;
-    let mut fg_input: Option<std::pin::Pin<Box<dyn tokio::io::AsyncWrite + Send>>> = None;
-
-    loop {
-        tokio::select! {
-            // Container output → send to client as Stdout
-            Some(data) = container_rx.recv() => {
-                let msg = NoiseMessage::Stdout { data };
-                if send_encrypted(&mut stream, &mut transport, &msg).await.is_err() {
-                    break;
-                }
-            }
-            // Client message
-            result = recv_encrypted(&mut stream, &mut transport) => {
-                let msg = match result {
-                    Ok(m) => m,
-                    Err(e) => {
-                        eprintln!("dd-agent: session recv: {e}");
-                        break;
-                    }
-                };
-
-                let response = match msg {
-                    NoiseMessage::Stdin { data } => {
-                        // Forward to foreground container's stdin
-                        if let Some(ref mut input) = fg_input {
-                            let _ = input.write_all(&data).await;
-                            let _ = input.flush().await;
-                        }
-                        continue; // no response needed for stdin
-                    }
-                    NoiseMessage::Fg { id } => {
-                        // Detach current fg if any
-                        if let Some(task) = fg_task.take() {
-                            task.abort();
-                        }
-                        fg_input = None;
-
-                        // Find process PID and tail its log
-                        let pid = {
-                            let deps = deployments.lock().await;
-                            deps.get(&id).and_then(|d| d.pid)
-                        };
-
-                        match pid {
-                            Some(pid) => {
-                                let log_path = format!("/var/lib/dd/workloads/logs/{pid}.log");
-                                match tokio::fs::File::open(&log_path).await {
-                                    Ok(file) => {
-                                        let tx = container_tx.clone();
-                                        fg_task = Some(tokio::spawn(async move {
-                                            let mut reader = BufReader::new(file).lines();
-                                            loop {
-                                                match reader.next_line().await {
-                                                    Ok(Some(line)) => {
-                                                        if tx.send(format!("{line}\n").into_bytes()).await.is_err() {
-                                                            break;
-                                                        }
-                                                    }
-                                                    Ok(None) => {
-                                                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                                                    }
-                                                    Err(_) => break,
-                                                }
-                                            }
-                                        }));
-                                        NoiseMessage::Ok {
-                                            id: Some(id),
-                                            status: Some("attached".into()),
-                                            message: None,
-                                        }
-                                    }
-                                    Err(e) => NoiseMessage::Error {
-                                        message: format!("open log: {e}"),
-                                    },
-                                }
-                            }
-                            None => NoiseMessage::Error {
-                                message: "job not found or not running".into(),
-                            },
-                        }
-                    }
-                    NoiseMessage::Bg => {
-                        if let Some(task) = fg_task.take() {
-                            task.abort();
-                        }
-                        fg_input = None;
-                        NoiseMessage::Ok {
-                            id: None,
-                            status: Some("detached".into()),
-                            message: None,
-                        }
-                    }
-                    NoiseMessage::Deploy { cmd, image, app_name, env, tty } => {
-                        let req = crate::server::DeployRequest {
-                            cmd, image, env,
-                            app_name: app_name.clone(),
-                            volumes: None, app_version: None, tty,
-                            post_deploy: None,
-                        };
-                        let (id, status) = crate::server::execute_deploy(deployments, req).await;
-                        NoiseMessage::Ok {
-                            id: Some(id),
-                            status: Some(status),
-                            message: app_name,
-                        }
-                    }
-                    NoiseMessage::Stop { id } => {
-                        match crate::server::execute_stop(deployments, &id).await {
-                            Ok(()) => NoiseMessage::Ok {
-                                id: Some(id), status: Some("stopped".into()), message: None,
-                            },
-                            Err(e) => NoiseMessage::Error { message: e },
-                        }
-                    }
-                    NoiseMessage::Jobs => {
-                        let deps = deployments.lock().await;
-                        let jobs: Vec<JobInfo> = deps.values().map(|d| JobInfo {
-                            id: d.id.clone(),
-                            app_name: d.app_name.clone(),
-                            image: d.image.clone(),
-                            status: d.status.clone(),
-                            tty: false,
-                        }).collect();
-                        NoiseMessage::JobList { jobs }
-                    }
-                    NoiseMessage::Logs { id } => {
-                        let pid = {
-                            let deps = deployments.lock().await;
-                            deps.get(&id).and_then(|d| d.pid)
-                        };
-                        match pid {
-                            Some(pid) => {
-                                let log_path = format!("/var/lib/dd/workloads/logs/{pid}.log");
-                                let content = tokio::fs::read_to_string(&log_path).await.unwrap_or_default();
-                                let tail: String = content.lines().rev().take(50).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n");
-                                NoiseMessage::Stdout { data: tail.into_bytes() }
-                            }
-                            None => NoiseMessage::Error { message: "job not found".into() },
-                        }
-                    }
-                    NoiseMessage::Bootstrap(config) => {
-                        bootstrap_result = Some(config);
-                        NoiseMessage::Ok { id: None, status: Some("bootstrapped".into()), message: None }
-                    }
-                    NoiseMessage::Exit => {
-                        let _ = send_encrypted(&mut stream, &mut transport, &NoiseMessage::Ok {
-                            id: None, status: Some("goodbye".into()), message: None,
-                        }).await;
-                        break;
-                    }
-                    _ => NoiseMessage::Error { message: "unexpected message type".into() },
-                };
-
-                if send_encrypted(&mut stream, &mut transport, &response).await.is_err() {
-                    break;
-                }
-            }
-        }
-    }
-
-    // Cleanup: abort fg task on session end
-    if let Some(task) = fg_task {
-        task.abort();
-    }
-
-    bootstrap_result
-}
-
-/// Run the Noise session server. Accepts persistent shell sessions.
-pub async fn run_session_server(
-    port: u16,
-    private_key: &[u8],
-    attestation: &AttestationPayload,
-    deployments: Deployments,
-    bootstrap_tx: tokio::sync::oneshot::Sender<BootstrapConfig>,
-) {
-    let listener = match tokio::net::TcpListener::bind(format!("0.0.0.0:{port}")).await {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("dd-agent: noise server bind: {e}");
-            return;
-        }
-    };
-
-    eprintln!("dd-agent: Noise shell server listening on port {port}");
-
-    let mut bootstrap_tx = Some(bootstrap_tx);
-
-    loop {
-        let (stream, addr) = match listener.accept().await {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("dd-agent: noise accept: {e}");
-                continue;
-            }
-        };
-
-        eprintln!("dd-agent: session from {addr}");
-
-        let result = handle_session(stream, private_key, attestation, &deployments).await;
-
-        if let Some(config) = result {
-            if let Some(tx) = bootstrap_tx.take() {
-                let _ = tx.send(config);
-            }
-        }
-
-        eprintln!("dd-agent: session from {addr} ended");
-    }
 }
 
 // ── CLI-side: send a single command (backward compat) ────────────────────
@@ -473,6 +286,10 @@ pub async fn send_command(
         .map_err(|e| format!("msg2: {e}"))?;
     let attestation: AttestationPayload =
         serde_json::from_slice(&buf[..payload_len]).map_err(|e| format!("attestation: {e}"))?;
+    let remote_static = noise
+        .get_remote_static()
+        .ok_or_else(|| "noise responder static key missing after msg2".to_string())?;
+    verify_remote_attestation(&attestation, remote_static)?;
 
     let mut msg3_buf = vec![0u8; MAX_MSG_LEN];
     let msg3_len = noise

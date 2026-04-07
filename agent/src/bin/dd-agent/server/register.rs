@@ -7,7 +7,8 @@ use axum::{Json, Router};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 
-use crate::common::error::AppError;
+use dd_agent::common::error::AppError;
+use dd_agent::noise::{BootstrapConfig, LeaseRenewRequest, LeaseRenewResponse, RegisterRequest};
 
 use super::{format_uptime, nav_bar, page_shell, require_browser_token};
 use super::{AgentState, RegisteredAgent};
@@ -62,14 +63,44 @@ struct FleetReportAck {
     dead_agents_cleaned: usize,
 }
 
+#[derive(Serialize)]
+struct FleetSnapshot {
+    env: String,
+    total_agents: usize,
+    healthy_agents: usize,
+    stale_agents: usize,
+    dead_agents: usize,
+    agents: Vec<RegisteredAgent>,
+}
+
+fn register_lease_ttl_secs() -> u64 {
+    std::env::var("DD_REGISTER_LEASE_TTL_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(90)
+}
+
+fn register_epoch() -> u64 {
+    std::env::var("DD_REGISTER_EPOCH")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(1)
+}
+
 pub(super) fn add_routes(router: Router<AgentState>) -> Router<AgentState> {
     router
         .route("/", get(fleet_dashboard))
         .route("/agent/{agent_id}", get(agent_detail))
         .route("/register", get(ws_register))
         .route("/scraper", get(ws_scraper))
+        .route("/api/fleet", get(get_fleet_snapshot))
         .route("/api/fleet/report", post(post_fleet_report))
         .route("/deregister", post(post_deregister))
+}
+
+async fn get_fleet_snapshot(State(state): State<AgentState>) -> Json<FleetSnapshot> {
+    Json(fleet_snapshot(&state).await)
 }
 
 async fn fleet_dashboard(
@@ -291,7 +322,7 @@ async fn post_deregister(
         if let Some(cf) = &state.cf_config {
             let client = reqwest::Client::new();
             if let Err(e) =
-                crate::tunnel::remove_agent(&client, cf, &agent.agent_id, &agent.hostname).await
+                dd_agent::tunnel::remove_agent(&client, cf, &agent.agent_id, &agent.hostname).await
             {
                 eprintln!("dd-register: deregister tunnel cleanup failed: {e}");
             } else {
@@ -339,13 +370,14 @@ async fn post_fleet_report(
 
 async fn handle_ws_scraper(socket: WebSocket, state: AgentState) {
     let (mut ws_tx, mut ws_rx) = socket.split();
+    let attestation_backend = dd_agent::attestation::detect();
 
-    let keypair = match crate::noise::generate_keypair() {
+    let keypair = match dd_agent::noise::generate_keypair() {
         Ok(k) => k,
         Err(_) => return,
     };
 
-    let mut noise = match snow::Builder::new(crate::noise::NOISE_PATTERN.parse().unwrap())
+    let mut noise = match snow::Builder::new(dd_agent::noise::NOISE_PATTERN.parse().unwrap())
         .local_private_key(&keypair.private)
         .and_then(|b| b.build_responder())
     {
@@ -363,8 +395,15 @@ async fn handle_ws_scraper(socket: WebSocket, state: AgentState) {
         return;
     }
 
+    let attestation = dd_agent::noise::build_attestation_payload(
+        &state.vm_name,
+        Some(&state.owner),
+        attestation_backend.as_ref(),
+        &keypair.public,
+    );
+    let attestation_json = serde_json::to_vec(&attestation).unwrap();
     let mut msg2 = vec![0u8; 65535];
-    let len = match noise.write_message(&[], &mut msg2) {
+    let len = match noise.write_message(&attestation_json, &mut msg2) {
         Ok(n) => n,
         Err(_) => return,
     };
@@ -385,11 +424,19 @@ async fn handle_ws_scraper(socket: WebSocket, state: AgentState) {
         Err(_) => return,
     };
 
-    let attestation: crate::noise::AttestationPayload =
+    let attestation: dd_agent::noise::AttestationPayload =
         match serde_json::from_slice(&buf[..payload_len]) {
             Ok(a) => a,
             Err(_) => return,
         };
+    let remote_static = match noise.get_remote_static() {
+        Some(key) => key,
+        None => return,
+    };
+    if let Err(error) = dd_agent::noise::verify_remote_attestation(&attestation, remote_static) {
+        eprintln!("dd-register: scraper attestation verify failed: {error}");
+        return;
+    }
     eprintln!(
         "dd-register: scraper connected (attestation: {})",
         attestation.attestation_type
@@ -516,7 +563,7 @@ async fn apply_fleet_report(state: &AgentState, report: FleetReport) -> FleetRep
     for (agent_id, hostname) in &dead {
         if let Some(cf) = &state.cf_config {
             let client = reqwest::Client::new();
-            if let Err(e) = crate::tunnel::remove_agent(&client, cf, agent_id, hostname).await {
+            if let Err(e) = dd_agent::tunnel::remove_agent(&client, cf, agent_id, hostname).await {
                 eprintln!("dd-register: scraper cleanup failed for {hostname}: {e}");
             } else {
                 eprintln!("dd-register: scraper cleaned up {hostname}");
@@ -528,7 +575,8 @@ async fn apply_fleet_report(state: &AgentState, report: FleetReport) -> FleetRep
     for tunnel_name in &report.orphan_tunnels {
         if let Some(cf) = &state.cf_config {
             let client = reqwest::Client::new();
-            if let Err(e) = crate::tunnel::delete_tunnel_by_name(&client, cf, tunnel_name).await {
+            if let Err(e) = dd_agent::tunnel::delete_tunnel_by_name(&client, cf, tunnel_name).await
+            {
                 eprintln!("dd-register: scraper orphan cleanup failed for {tunnel_name}: {e}");
             } else {
                 eprintln!("dd-register: scraper cleaned orphan tunnel {tunnel_name}");
@@ -553,6 +601,37 @@ async fn apply_fleet_report(state: &AgentState, report: FleetReport) -> FleetRep
     }
 }
 
+async fn fleet_snapshot(state: &AgentState) -> FleetSnapshot {
+    let env = std::env::var("DD_ENV").unwrap_or_else(|_| "dev".into());
+    let mut agents: Vec<RegisteredAgent> = state
+        .agent_registry
+        .lock()
+        .await
+        .values()
+        .cloned()
+        .collect();
+    agents.sort_by(|left, right| left.hostname.cmp(&right.hostname));
+    let total_agents = agents.len();
+    let healthy_agents = agents
+        .iter()
+        .filter(|agent| agent.status == "healthy")
+        .count();
+    let stale_agents = agents
+        .iter()
+        .filter(|agent| agent.status == "stale")
+        .count();
+    let dead_agents = agents.iter().filter(|agent| agent.status == "dead").count();
+
+    FleetSnapshot {
+        env,
+        total_agents,
+        healthy_agents,
+        stale_agents,
+        dead_agents,
+        agents,
+    }
+}
+
 async fn ws_register(State(state): State<AgentState>, ws: WebSocketUpgrade) -> impl IntoResponse {
     ws.on_upgrade(move |socket| handle_ws_register(socket, state))
 }
@@ -567,12 +646,13 @@ async fn handle_ws_register(socket: WebSocket, state: AgentState) {
     };
 
     let (mut ws_tx, mut ws_rx) = socket.split();
-    let keypair = match crate::noise::generate_keypair() {
+    let attestation_backend = dd_agent::attestation::detect();
+    let keypair = match dd_agent::noise::generate_keypair() {
         Ok(k) => k,
         Err(_) => return,
     };
 
-    let mut noise = match snow::Builder::new(crate::noise::NOISE_PATTERN.parse().unwrap())
+    let mut noise = match snow::Builder::new(dd_agent::noise::NOISE_PATTERN.parse().unwrap())
         .local_private_key(&keypair.private)
         .and_then(|b| b.build_responder())
     {
@@ -590,8 +670,15 @@ async fn handle_ws_register(socket: WebSocket, state: AgentState) {
         return;
     }
 
+    let responder_attestation = dd_agent::noise::build_attestation_payload(
+        &state.vm_name,
+        Some(&state.owner),
+        attestation_backend.as_ref(),
+        &keypair.public,
+    );
+    let responder_attestation_json = serde_json::to_vec(&responder_attestation).unwrap();
     let mut msg2 = vec![0u8; 65535];
-    let len = match noise.write_message(&[], &mut msg2) {
+    let len = match noise.write_message(&responder_attestation_json, &mut msg2) {
         Ok(n) => n,
         Err(_) => return,
     };
@@ -612,11 +699,19 @@ async fn handle_ws_register(socket: WebSocket, state: AgentState) {
         Err(_) => return,
     };
 
-    let attestation: crate::noise::AttestationPayload =
+    let attestation: dd_agent::noise::AttestationPayload =
         match serde_json::from_slice(&buf[..payload_len]) {
             Ok(a) => a,
             Err(_) => return,
         };
+    let remote_static = match noise.get_remote_static() {
+        Some(key) => key,
+        None => return,
+    };
+    if let Err(error) = dd_agent::noise::verify_remote_attestation(&attestation, remote_static) {
+        eprintln!("dd-register: agent attestation verify failed: {error}");
+        return;
+    }
 
     let mut transport = match noise.into_transport_mode() {
         Ok(t) => t,
@@ -632,27 +727,27 @@ async fn handle_ws_register(socket: WebSocket, state: AgentState) {
         Err(_) => return,
     };
 
-    #[derive(serde::Deserialize)]
-    struct RegReq {
-        owner: String,
-        vm_name: String,
-    }
-    let reg: RegReq = match serde_json::from_slice(&buf[..req_len]) {
+    let reg: RegisterRequest = match serde_json::from_slice(&buf[..req_len]) {
         Ok(r) => r,
         Err(_) => return,
     };
 
     let client = reqwest::Client::new();
-    let agent_id = uuid::Uuid::new_v4().to_string();
-    let tunnel_info =
-        match crate::tunnel::create_agent_tunnel(&client, &cf, &agent_id, &reg.vm_name, None).await
-        {
-            Ok(info) => info,
-            Err(e) => {
-                eprintln!("dd-register: tunnel failed: {e}");
-                return;
-            }
-        };
+    let tunnel_info = match dd_agent::tunnel::create_agent_tunnel(
+        &client,
+        &cf,
+        &reg.agent_id,
+        &reg.vm_name,
+        None,
+    )
+    .await
+    {
+        Ok(info) => info,
+        Err(e) => {
+            eprintln!("dd-register: tunnel failed: {e}");
+            return;
+        }
+    };
 
     eprintln!(
         "dd-register: {} registered at {}",
@@ -661,9 +756,9 @@ async fn handle_ws_register(socket: WebSocket, state: AgentState) {
 
     let now = chrono::Utc::now();
     state.agent_registry.lock().await.insert(
-        agent_id.clone(),
+        reg.agent_id.clone(),
         RegisteredAgent {
-            agent_id,
+            agent_id: reg.agent_id.clone(),
             hostname: tunnel_info.hostname.clone(),
             vm_name: reg.vm_name,
             attestation_type: attestation.attestation_type,
@@ -678,10 +773,13 @@ async fn handle_ws_register(socket: WebSocket, state: AgentState) {
         },
     );
 
-    let config = crate::noise::BootstrapConfig {
+    let config = BootstrapConfig {
+        agent_id: reg.agent_id,
         owner: reg.owner,
         tunnel_token: tunnel_info.tunnel_token,
         hostname: tunnel_info.hostname,
+        lease_ttl_secs: register_lease_ttl_secs(),
+        register_epoch: register_epoch(),
         auth_public_key: state.auth_public_key_b64.clone(),
         auth_issuer: state.auth_issuer.clone(),
     };
@@ -691,5 +789,52 @@ async fn handle_ws_register(socket: WebSocket, state: AgentState) {
         let _ = ws_tx
             .send(Message::Binary(enc_resp[..len].to_vec().into()))
             .await;
+    }
+
+    while let Some(Ok(Message::Binary(d))) = ws_rx.next().await {
+        let renew_len = match transport.read_message(&d, &mut buf) {
+            Ok(n) => n,
+            Err(_) => break,
+        };
+        let renew: LeaseRenewRequest = match serde_json::from_slice(&buf[..renew_len]) {
+            Ok(r) => r,
+            Err(_) => break,
+        };
+        let current_epoch = register_epoch();
+        let current_ttl = register_lease_ttl_secs();
+        let revoked = {
+            let mut registry = state.agent_registry.lock().await;
+            match registry.get_mut(&renew.agent_id) {
+                Some(agent) if renew.agent_id == config.agent_id && agent.status != "dead" => {
+                    agent.last_seen = chrono::Utc::now();
+                    agent.status = "healthy".into();
+                    false
+                }
+                _ => true,
+            }
+        };
+        let response = LeaseRenewResponse {
+            ok: !revoked,
+            lease_ttl_secs: current_ttl,
+            register_epoch: current_epoch,
+            revoked,
+        };
+        let json = serde_json::to_vec(&response).unwrap();
+        let mut enc_resp = vec![0u8; 65535];
+        let len = match transport.write_message(&json, &mut enc_resp) {
+            Ok(n) => n,
+            Err(_) => break,
+        };
+        if ws_tx
+            .send(Message::Binary(enc_resp[..len].to_vec().into()))
+            .await
+            .is_err()
+        {
+            break;
+        }
+        if revoked {
+            eprintln!("dd-register: revoked agent {}", renew.agent_id);
+            break;
+        }
     }
 }

@@ -1,12 +1,14 @@
 mod config;
+mod local_control;
 mod measure;
+mod server;
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use config::{AgentMode, AgentRuntimeConfig};
-use dd_agent::server::{AgentState, Deployments};
+use server::{AgentState, Deployments};
 
 // ── PID 1 init (sealed VM boot) ───────────────────────────────────────────
 
@@ -291,7 +293,7 @@ async fn run_agent_mode(cfg: AgentRuntimeConfig) {
     }
 
     let vm_name = hostname();
-    let agent_id = uuid::Uuid::new_v4().to_string();
+    let agent_id = stable_agent_id(&vm_name);
     let port: u16 = cfg.port.unwrap_or(8080);
     let attestation = dd_agent::attestation::detect();
     eprintln!(
@@ -303,7 +305,7 @@ async fn run_agent_mode(cfg: AgentRuntimeConfig) {
         eprintln!("dd-agent: DD_OWNER not set");
         safe_exit(1);
     });
-    let auth_mode = match dd_agent::server::GithubOAuthConfig::from_env() {
+    let auth_mode = match server::GithubOAuthConfig::from_env() {
         Ok(Some(config)) => {
             if std::env::var("DD_PASSWORD")
                 .ok()
@@ -312,7 +314,7 @@ async fn run_agent_mode(cfg: AgentRuntimeConfig) {
             {
                 eprintln!("dd-agent: warning: DD_PASSWORD ignored (GitHub OAuth takes priority)");
             }
-            dd_agent::server::AuthMode::GitHub(config)
+            server::AuthMode::GitHub(config)
         }
         Ok(None) => {
             if let Some(password) = std::env::var("DD_PASSWORD").ok().filter(|s| !s.is_empty()) {
@@ -321,12 +323,12 @@ async fn run_agent_mode(cfg: AgentRuntimeConfig) {
                     .map(|h| !h.contains("localhost"))
                     .unwrap_or(false);
                 eprintln!("dd-agent: password auth enabled");
-                dd_agent::server::AuthMode::Password {
+                server::AuthMode::Password {
                     password,
                     secure_cookies: secure,
                 }
             } else {
-                dd_agent::server::AuthMode::None
+                server::AuthMode::None
             }
         }
         Err(error) => {
@@ -342,7 +344,6 @@ async fn run_agent_mode(cfg: AgentRuntimeConfig) {
     let mut bootstrap_auth_key: Option<jsonwebtoken::DecodingKey> = None;
     let mut bootstrap_auth_issuer: Option<String> = None;
     let mut register_url_for_deregister: Option<String> = None;
-    let mut monitor_reregister: Option<ReregisterInfo> = None;
     let mut bootstrap_register_child: Option<tokio::process::Child> = None;
 
     // Bootstrap priority: pre-provisioned token > local register bootstrap > self-register via
@@ -362,24 +363,28 @@ async fn run_agent_mode(cfg: AgentRuntimeConfig) {
         match bootstrap_local_register(&register_binary_url).await {
             Ok((child, register_url)) => {
                 bootstrap_register_child = Some(child);
-                let config = register(&vm_name, &owner, &register_url, attestation.as_ref()).await;
+                let config = match start_register_supervisor(RegisterSupervisorConfig {
+                    agent_id: agent_id.clone(),
+                    vm_name: vm_name.clone(),
+                    owner: owner.clone(),
+                    register_url: register_url.clone(),
+                    attestation: dd_agent::attestation::detect(),
+                })
+                .await
+                {
+                    Ok(config) => config,
+                    Err(e) => {
+                        eprintln!("dd-agent: register supervisor bootstrap failed: {e}");
+                        safe_exit(1);
+                    }
+                };
                 eprintln!(
                     "dd-agent: registered via local bootstrap register — owner={} hostname={}",
                     config.owner, config.hostname
                 );
-                saved_tunnel_token = Some(config.tunnel_token.clone());
                 register_url_for_deregister = Some(register_url.clone());
-                monitor_reregister = Some(ReregisterInfo {
-                    vm_name: vm_name.clone(),
-                    owner: owner.clone(),
-                    register_url,
-                    attestation: dd_agent::attestation::detect(),
-                });
-                if let Err(e) = start_cloudflared(&config.tunnel_token).await {
-                    eprintln!("dd-agent: cloudflared start failed: {e}");
-                }
                 if let Some(ref key_b64) = config.auth_public_key {
-                    if let Some((_, decoding)) = dd_agent::server::auth_keys_from_b64(key_b64) {
+                    if let Some((_, decoding)) = server::auth_keys_from_b64(key_b64) {
                         bootstrap_auth_key = Some(decoding);
                         bootstrap_auth_issuer = config.auth_issuer.clone();
                         eprintln!("dd-agent: register auth tokens enabled");
@@ -419,25 +424,29 @@ async fn run_agent_mode(cfg: AgentRuntimeConfig) {
             }
         }
     } else if let Ok(register_url) = std::env::var("DD_REGISTER_URL") {
-        let config = register(&vm_name, &owner, &register_url, attestation.as_ref()).await;
+        let config = match start_register_supervisor(RegisterSupervisorConfig {
+            agent_id: agent_id.clone(),
+            vm_name: vm_name.clone(),
+            owner: owner.clone(),
+            register_url: register_url.clone(),
+            attestation: dd_agent::attestation::detect(),
+        })
+        .await
+        {
+            Ok(config) => config,
+            Err(e) => {
+                eprintln!("dd-agent: register supervisor bootstrap failed: {e}");
+                safe_exit(1);
+            }
+        };
         eprintln!(
             "dd-agent: registered — owner={} hostname={}",
             config.owner, config.hostname
         );
-        saved_tunnel_token = Some(config.tunnel_token.clone());
         register_url_for_deregister = Some(register_url.clone());
-        monitor_reregister = Some(ReregisterInfo {
-            vm_name: vm_name.clone(),
-            owner: owner.clone(),
-            register_url,
-            attestation: dd_agent::attestation::detect(),
-        });
-        if let Err(e) = start_cloudflared(&config.tunnel_token).await {
-            eprintln!("dd-agent: cloudflared start failed: {e}");
-        }
         // Store register-issued auth config for JWT verification
         if let Some(ref key_b64) = config.auth_public_key {
-            if let Some((_, decoding)) = dd_agent::server::auth_keys_from_b64(key_b64) {
+            if let Some((_, decoding)) = server::auth_keys_from_b64(key_b64) {
                 bootstrap_auth_key = Some(decoding);
                 bootstrap_auth_issuer = config.auth_issuer.clone();
                 eprintln!("dd-agent: register auth tokens enabled");
@@ -448,145 +457,9 @@ async fn run_agent_mode(cfg: AgentRuntimeConfig) {
     }
 
     let deployments: Deployments = Arc::new(Mutex::new(HashMap::new()));
-    let process_handles: dd_agent::server::ProcessHandles = Arc::new(Mutex::new(HashMap::new()));
-    let browser_sessions: dd_agent::server::BrowserSessions = Arc::new(Mutex::new(HashMap::new()));
-    let pending_oauth_states: dd_agent::server::PendingOauthStates =
-        Arc::new(Mutex::new(HashMap::new()));
-
-    // Auto-deploy boot workloads
-    // DD_BOOT_CMD="bash" — run a direct process
-    // DD_BOOT_IMAGE="ghcr.io/openclaw/openclaw:latest" — run a container via bollard
-    if let Ok(boot_cmd) = std::env::var("DD_BOOT_CMD") {
-        let boot_app = std::env::var("DD_BOOT_APP").unwrap_or_else(|_| "shell".into());
-        eprintln!("dd-agent: starting boot shell: {boot_cmd}");
-        let boot_app_clone = boot_app.clone();
-        match dd_agent::process::spawn_command(&boot_cmd, &[], true).await {
-            Ok(mut child) => {
-                let dep_id = uuid::Uuid::new_v4().to_string();
-                let short_id = dep_id[..8].to_string();
-                let pid = child.id();
-                deployments.lock().await.insert(
-                    short_id.clone(),
-                    dd_agent::server::DeploymentInfo {
-                        id: short_id,
-                        pid,
-                        container_id: None,
-                        app_name: boot_app,
-                        image: boot_cmd,
-                        status: "running".into(),
-                        error_message: None,
-                        started_at: chrono::Utc::now().to_rfc3339(),
-                    },
-                );
-                let (stdout_tx, _) = tokio::sync::broadcast::channel::<Vec<u8>>(256);
-                if let Some(stdin) = child.stdin.take() {
-                    process_handles.lock().await.insert(
-                        boot_app_clone.clone(),
-                        dd_agent::server::ProcessIO {
-                            stdin,
-                            stdout_tx: stdout_tx.clone(),
-                        },
-                    );
-                }
-                if let Some(stdout) = child.stdout.take() {
-                    tokio::spawn(async move {
-                        use tokio::io::AsyncReadExt;
-                        let mut stdout = stdout;
-                        let mut buf = vec![0u8; 4096];
-                        loop {
-                            match stdout.read(&mut buf).await {
-                                Ok(0) => break,
-                                Ok(n) => {
-                                    let _ = stdout_tx.send(buf[..n].to_vec());
-                                }
-                                Err(_) => break,
-                            }
-                        }
-                    });
-                }
-                tokio::spawn(async move {
-                    let _ = child.wait().await;
-                });
-                eprintln!("dd-agent: boot shell running");
-            }
-            Err(e) => eprintln!("dd-agent: boot shell failed: {e}"),
-        }
-    }
-
-    // Boot container workloads: DD_BOOT_IMAGE, DD_BOOT_IMAGE_2, etc.
-    for i in 0..=9 {
-        let image_key = if i == 0 {
-            "DD_BOOT_IMAGE".to_string()
-        } else {
-            format!("DD_BOOT_IMAGE_{i}")
-        };
-        let Ok(image) = std::env::var(&image_key) else {
-            continue;
-        };
-        let app_name = if i == 0 {
-            std::env::var("DD_BOOT_APP").unwrap_or_else(|_| "boot".into())
-        } else {
-            std::env::var(format!("DD_BOOT_APP_{i}")).unwrap_or_else(|_| format!("boot-{i}"))
-        };
-        let env = if i == 0 {
-            std::env::var("DD_BOOT_ENV").ok()
-        } else {
-            std::env::var(format!("DD_BOOT_ENV_{i}")).ok()
-        }
-        .map(|s| {
-            s.split(';')
-                .map(|kv| kv.trim().to_string())
-                .filter(|kv| !kv.is_empty())
-                .collect::<Vec<String>>()
-        });
-
-        eprintln!("dd-agent: starting boot container: {app_name} ({image})");
-        let req = dd_agent::server::DeployRequest {
-            cmd: Vec::new(),
-            image: Some(image),
-            env,
-            app_name: Some(app_name),
-            volumes: None,
-            app_version: None,
-            tty: false,
-            post_deploy: None,
-        };
-        let (id, status) = dd_agent::server::execute_deploy(&deployments, req).await;
-        eprintln!("dd-agent: boot container {id} {status}");
-    }
-
-    // Additional boot commands: DD_BOOT_CMD_2, DD_BOOT_CMD_3, etc.
-    for i in 2..=9 {
-        let cmd_key = format!("DD_BOOT_CMD_{i}");
-        let Ok(cmd) = std::env::var(&cmd_key) else {
-            break;
-        };
-        let app_name =
-            std::env::var(format!("DD_BOOT_APP_{i}")).unwrap_or_else(|_| format!("cmd-{i}"));
-        let env = std::env::var(format!("DD_BOOT_ENV_{i}")).ok().map(|s| {
-            s.split(';')
-                .map(|kv| kv.trim().to_string())
-                .filter(|kv| !kv.is_empty())
-                .collect::<Vec<String>>()
-        });
-        let tty = std::env::var(format!("DD_BOOT_TTY_{i}"))
-            .map(|v| v == "true" || v == "1")
-            .unwrap_or(false);
-
-        eprintln!("dd-agent: starting boot command: {app_name} ({cmd})");
-        let req = dd_agent::server::DeployRequest {
-            cmd: vec![cmd],
-            image: None,
-            env,
-            app_name: Some(app_name),
-            volumes: None,
-            app_version: None,
-            tty,
-            post_deploy: None,
-        };
-        let (id, status) = dd_agent::server::execute_deploy(&deployments, req).await;
-        eprintln!("dd-agent: boot command {id} {status}");
-    }
+    let process_handles: server::ProcessHandles = Arc::new(Mutex::new(HashMap::new()));
+    let browser_sessions: server::BrowserSessions = Arc::new(Mutex::new(HashMap::new()));
+    let pending_oauth_states: server::PendingOauthStates = Arc::new(Mutex::new(HashMap::new()));
 
     let register_mode = cfg.mode == config::AgentMode::Register;
     let cf_config = if register_mode {
@@ -598,7 +471,7 @@ async fn run_agent_mode(cfg: AgentRuntimeConfig) {
     // In register mode, generate auth signing keypair for issuing JWTs to agents
     let (auth_signing_key, auth_public_key_decoded, auth_public_key_b64, auth_issuer) =
         if register_mode {
-            let (enc, dec, b64) = dd_agent::server::generate_auth_secret();
+            let (enc, dec, b64) = server::generate_auth_secret();
             let hostname = std::env::var("DD_HOSTNAME").unwrap_or_else(|_| "localhost".into());
             let issuer = format!("https://{hostname}");
             eprintln!("dd-agent: register auth token signing enabled");
@@ -634,7 +507,7 @@ async fn run_agent_mode(cfg: AgentRuntimeConfig) {
         let now = chrono::Utc::now();
         state.agent_registry.lock().await.insert(
             state.agent_id.clone(),
-            dd_agent::server::RegisteredAgent {
+            server::RegisteredAgent {
                 agent_id: state.agent_id.clone(),
                 hostname,
                 vm_name: state.vm_name.clone(),
@@ -652,9 +525,19 @@ async fn run_agent_mode(cfg: AgentRuntimeConfig) {
         eprintln!("dd-agent: registered self in fleet registry");
     }
 
+    let local_mode = if register_mode { "register" } else { "agent" };
+    let local_control_socket = match local_control::start(state.clone(), local_mode).await {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("dd-agent: local control startup failed: {error}");
+            safe_exit(1);
+        }
+    };
+    eprintln!("dd-agent: local control listening on {local_control_socket}");
+
     // HTTP server
     let http_port = port;
-    let app = dd_agent::server::build_router(state.clone());
+    let app = server::build_router(state.clone());
     let bind_addr = format!("0.0.0.0:{http_port}");
     eprintln!("dd-agent: HTTP server listening on {bind_addr}");
 
@@ -670,13 +553,7 @@ async fn run_agent_mode(cfg: AgentRuntimeConfig) {
         None
     };
     tokio::spawn(async move {
-        monitoring_loop(
-            monitor_deps,
-            monitor_registry,
-            monitor_reregister,
-            saved_tunnel_token,
-        )
-        .await;
+        monitoring_loop(monitor_deps, monitor_registry, saved_tunnel_token).await;
     });
 
     // Run HTTP server until shutdown
@@ -719,29 +596,9 @@ async fn run_agent_mode(cfg: AgentRuntimeConfig) {
 fn build_attestation(
     vm_name: &str,
     backend: &dyn dd_agent::attestation::AttestationBackend,
+    noise_static_public_key: &[u8],
 ) -> dd_agent::noise::AttestationPayload {
-    dd_agent::noise::AttestationPayload {
-        attestation_type: backend.attestation_type().to_string(),
-        vm_name: vm_name.to_string(),
-        tdx_quote_b64: backend.generate_quote_b64(),
-    }
-}
-
-// ── Bootstrap resolution ─────────────────────────────────────────────────
-
-async fn register(
-    vm_name: &str,
-    owner: &str,
-    register_url: &str,
-    backend: &dyn dd_agent::attestation::AttestationBackend,
-) -> dd_agent::noise::BootstrapConfig {
-    match register_via_noise(register_url, vm_name, owner, backend).await {
-        Ok(config) => config,
-        Err(e) => {
-            eprintln!("dd-agent: registration failed: {e}");
-            safe_exit(1);
-        }
-    }
+    dd_agent::noise::build_attestation_payload(vm_name, None, backend, noise_static_public_key)
 }
 
 async fn bootstrap_local_register(
@@ -855,25 +712,123 @@ async fn download_file(url: &str, path: &str) -> Result<(), String> {
 
 // ── Noise registration (agent calls out to registration service) ─────────
 
-async fn register_via_noise(
-    register_url: &str,
-    vm_name: &str,
-    owner: &str,
-    backend: &dyn dd_agent::attestation::AttestationBackend,
+type RegisterWsStream =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+struct RegisterSession {
+    ws_stream: RegisterWsStream,
+    transport: snow::TransportState,
+    config: dd_agent::noise::BootstrapConfig,
+}
+
+struct RegisterSupervisorConfig {
+    agent_id: String,
+    vm_name: String,
+    owner: String,
+    register_url: String,
+    attestation: Box<dyn dd_agent::attestation::AttestationBackend>,
+}
+
+async fn start_register_supervisor(
+    cfg: RegisterSupervisorConfig,
 ) -> Result<dd_agent::noise::BootstrapConfig, String> {
-    use futures_util::{SinkExt, StreamExt};
+    let session = connect_register_session(&cfg).await?;
+    let initial_config = session.config.clone();
+    apply_bootstrap_config(&initial_config, None).await?;
+    tokio::spawn(async move {
+        register_supervisor_loop(cfg, session).await;
+    });
+    Ok(initial_config)
+}
+
+async fn register_supervisor_loop(cfg: RegisterSupervisorConfig, mut session: RegisterSession) {
+    let mut current_config = session.config.clone();
+
+    loop {
+        let renew_secs = std::cmp::max(current_config.lease_ttl_secs / 3, 5);
+        tokio::time::sleep(std::time::Duration::from_secs(renew_secs)).await;
+
+        match renew_register_lease(&mut session, &cfg.agent_id, current_config.register_epoch).await
+        {
+            Ok(response) if response.revoked => {
+                eprintln!("dd-agent: register lease revoked, reconnecting");
+            }
+            Ok(response) if !response.ok => {
+                eprintln!("dd-agent: register lease renewal rejected, reconnecting");
+            }
+            Ok(response) if response.register_epoch > current_config.register_epoch => {
+                eprintln!(
+                    "dd-agent: register epoch advanced from {} to {}, reconnecting",
+                    current_config.register_epoch, response.register_epoch
+                );
+                current_config.register_epoch = response.register_epoch;
+            }
+            Ok(response) => {
+                current_config.lease_ttl_secs = response.lease_ttl_secs.max(5);
+                session.config.lease_ttl_secs = current_config.lease_ttl_secs;
+                if !is_cloudflared_running().await {
+                    eprintln!("dd-agent: cloudflared missing during active lease, restarting");
+                    if let Err(error) =
+                        apply_bootstrap_config(&current_config, Some(&current_config.tunnel_token))
+                            .await
+                    {
+                        eprintln!("dd-agent: cloudflared restart failed: {error}");
+                    }
+                }
+                continue;
+            }
+            Err(error) => {
+                eprintln!("dd-agent: register lease renewal failed: {error}");
+            }
+        }
+
+        let mut reconnect_delay = std::time::Duration::from_secs(1);
+        loop {
+            tokio::time::sleep(reconnect_delay).await;
+            match connect_register_session(&cfg).await {
+                Ok(new_session) => {
+                    let next_config = new_session.config.clone();
+                    if let Err(error) =
+                        apply_bootstrap_config(&next_config, Some(&current_config.tunnel_token))
+                            .await
+                    {
+                        eprintln!(
+                            "dd-agent: apply bootstrap config after reconnect failed: {error}"
+                        );
+                    }
+                    current_config = next_config;
+                    session = new_session;
+                    eprintln!(
+                        "dd-agent: re-registered — hostname={} epoch={}",
+                        current_config.hostname, current_config.register_epoch
+                    );
+                    break;
+                }
+                Err(error) => {
+                    eprintln!("dd-agent: register reconnect failed: {error}");
+                    reconnect_delay = std::cmp::min(
+                        reconnect_delay.saturating_mul(2),
+                        std::time::Duration::from_secs(60),
+                    );
+                }
+            }
+        }
+    }
+}
+
+async fn connect_register_session(
+    cfg: &RegisterSupervisorConfig,
+) -> Result<RegisterSession, String> {
+    use futures_util::SinkExt;
     use tokio_tungstenite::tungstenite;
 
     let keypair = dd_agent::noise::generate_keypair()?;
-    let attestation = build_attestation(vm_name, backend);
+    let attestation = build_attestation(&cfg.vm_name, cfg.attestation.as_ref(), &keypair.public);
+    let ws_url = cfg.register_url.clone();
 
-    // Connect via WebSocket — DD_REGISTER_URL is already a full URL like wss://host/register
-    let ws_url = register_url.to_string();
-    let (ws_stream, _) = tokio_tungstenite::connect_async(&ws_url)
+    let (mut ws_stream, _) = tokio_tungstenite::connect_async(&ws_url)
         .await
         .map_err(|e| format!("ws connect to {ws_url}: {e}"))?;
-
-    let (mut ws_tx, mut ws_rx) = ws_stream.split();
 
     let mut noise = snow::Builder::new(dd_agent::noise::NOISE_PATTERN.parse().unwrap())
         .local_private_key(&keypair.private)
@@ -883,34 +838,32 @@ async fn register_via_noise(
 
     let mut buf = vec![0u8; 65535];
 
-    // XX handshake over WebSocket binary frames
-
-    // msg1
     let mut msg1_buf = vec![0u8; 65535];
     let msg1_len = noise
         .write_message(&[], &mut msg1_buf)
         .map_err(|e| format!("msg1: {e}"))?;
-    ws_tx
+    ws_stream
         .send(tungstenite::Message::Binary(msg1_buf[..msg1_len].to_vec()))
         .await
         .map_err(|e| format!("send msg1: {e}"))?;
 
-    // msg2
-    let msg2 = match ws_rx.next().await {
-        Some(Ok(tungstenite::Message::Binary(data))) => data.to_vec(),
-        other => return Err(format!("expected binary msg2, got: {other:?}")),
-    };
-    noise
+    let msg2 = next_register_binary_message(&mut ws_stream, "msg2").await?;
+    let payload_len = noise
         .read_message(&msg2, &mut buf)
         .map_err(|e| format!("msg2: {e}"))?;
+    let responder_attestation: dd_agent::noise::AttestationPayload =
+        serde_json::from_slice(&buf[..payload_len]).map_err(|e| format!("attestation: {e}"))?;
+    let remote_static = noise
+        .get_remote_static()
+        .ok_or_else(|| "noise responder static key missing after msg2".to_string())?;
+    dd_agent::noise::verify_remote_attestation(&responder_attestation, remote_static)?;
 
-    // msg3 with attestation
     let attestation_json = serde_json::to_vec(&attestation).unwrap();
     let mut msg3_buf = vec![0u8; 65535];
     let msg3_len = noise
         .write_message(&attestation_json, &mut msg3_buf)
         .map_err(|e| format!("msg3: {e}"))?;
-    ws_tx
+    ws_stream
         .send(tungstenite::Message::Binary(msg3_buf[..msg3_len].to_vec()))
         .await
         .map_err(|e| format!("send msg3: {e}"))?;
@@ -919,43 +872,110 @@ async fn register_via_noise(
         .into_transport_mode()
         .map_err(|e| format!("transport: {e}"))?;
 
-    // Send encrypted registration request
-    let req = serde_json::json!({ "owner": owner, "vm_name": vm_name });
+    let req = dd_agent::noise::RegisterRequest {
+        owner: cfg.owner.clone(),
+        vm_name: cfg.vm_name.clone(),
+        agent_id: cfg.agent_id.clone(),
+    };
     let req_json = serde_json::to_vec(&req).unwrap();
     let mut enc_buf = vec![0u8; 65535];
     let enc_len = transport
         .write_message(&req_json, &mut enc_buf)
-        .map_err(|e| format!("encrypt: {e}"))?;
-    ws_tx
+        .map_err(|e| format!("encrypt register request: {e}"))?;
+    ws_stream
         .send(tungstenite::Message::Binary(enc_buf[..enc_len].to_vec()))
         .await
-        .map_err(|e| format!("send req: {e}"))?;
+        .map_err(|e| format!("send register request: {e}"))?;
 
-    // Read encrypted bootstrap config
-    let enc_resp = match ws_rx.next().await {
-        Some(Ok(tungstenite::Message::Binary(data))) => data.to_vec(),
-        other => return Err(format!("expected binary response, got: {other:?}")),
-    };
+    let enc_resp = next_register_binary_message(&mut ws_stream, "bootstrap").await?;
     let resp_len = transport
         .read_message(&enc_resp, &mut buf)
-        .map_err(|e| format!("decrypt: {e}"))?;
+        .map_err(|e| format!("decrypt bootstrap config: {e}"))?;
+    let config: dd_agent::noise::BootstrapConfig =
+        serde_json::from_slice(&buf[..resp_len]).map_err(|e| format!("parse config: {e}"))?;
 
-    serde_json::from_slice(&buf[..resp_len]).map_err(|e| format!("parse config: {e}"))
+    Ok(RegisterSession {
+        ws_stream,
+        transport,
+        config,
+    })
+}
+
+async fn renew_register_lease(
+    session: &mut RegisterSession,
+    agent_id: &str,
+    register_epoch: u64,
+) -> Result<dd_agent::noise::LeaseRenewResponse, String> {
+    use futures_util::SinkExt;
+    use tokio_tungstenite::tungstenite;
+
+    let request = dd_agent::noise::LeaseRenewRequest {
+        agent_id: agent_id.to_string(),
+        register_epoch,
+    };
+    let request_json = serde_json::to_vec(&request).unwrap();
+    let mut enc_buf = vec![0u8; 65535];
+    let enc_len = session
+        .transport
+        .write_message(&request_json, &mut enc_buf)
+        .map_err(|e| format!("encrypt lease renew: {e}"))?;
+    session
+        .ws_stream
+        .send(tungstenite::Message::Binary(enc_buf[..enc_len].to_vec()))
+        .await
+        .map_err(|e| format!("send lease renew: {e}"))?;
+
+    let enc_resp = next_register_binary_message(&mut session.ws_stream, "lease renew").await?;
+    let mut buf = vec![0u8; 65535];
+    let resp_len = session
+        .transport
+        .read_message(&enc_resp, &mut buf)
+        .map_err(|e| format!("decrypt lease renew response: {e}"))?;
+    serde_json::from_slice(&buf[..resp_len]).map_err(|e| format!("parse lease renew response: {e}"))
+}
+
+async fn next_register_binary_message(
+    ws_stream: &mut RegisterWsStream,
+    label: &str,
+) -> Result<Vec<u8>, String> {
+    use futures_util::StreamExt;
+    use tokio_tungstenite::tungstenite;
+
+    match ws_stream.next().await {
+        Some(Ok(tungstenite::Message::Binary(data))) => Ok(data.to_vec()),
+        Some(Ok(tungstenite::Message::Close(frame))) => {
+            Err(format!("register closed during {label}: {frame:?}"))
+        }
+        Some(Ok(other)) => Err(format!("expected binary {label}, got {other:?}")),
+        Some(Err(error)) => Err(format!("receive {label}: {error}")),
+        None => Err(format!("register stream ended during {label}")),
+    }
+}
+
+async fn apply_bootstrap_config(
+    config: &dd_agent::noise::BootstrapConfig,
+    previous_tunnel_token: Option<&str>,
+) -> Result<(), String> {
+    let token_changed = previous_tunnel_token
+        .map(|token| token != config.tunnel_token)
+        .unwrap_or(true);
+
+    if token_changed {
+        stop_cloudflared().await?;
+    }
+
+    if token_changed || !is_cloudflared_running().await {
+        start_cloudflared(&config.tunnel_token).await?;
+    }
+
+    Ok(())
 }
 
 // ── Monitoring loop — check process liveness by PID ─────────────────────
 
-struct ReregisterInfo {
-    vm_name: String,
-    owner: String,
-    register_url: String,
-    attestation: Box<dyn dd_agent::attestation::AttestationBackend>,
-}
-
 async fn monitoring_loop(
     deployments: Deployments,
-    self_registry: Option<(dd_agent::server::AgentRegistry, String)>,
-    reregister: Option<ReregisterInfo>,
+    self_registry: Option<(server::AgentRegistry, String)>,
     tunnel_token: Option<String>,
 ) {
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
@@ -999,7 +1019,7 @@ async fn monitoring_loop(
                 .map(|d| d.app_name.clone())
                 .collect();
             drop(deps);
-            let metrics = dd_agent::server::collect_system_metrics().await;
+            let metrics = server::collect_system_metrics().await;
             let mut reg = registry.lock().await;
             if let Some(self_entry) = reg.get_mut(self_id) {
                 self_entry.last_seen = chrono::Utc::now();
@@ -1011,40 +1031,14 @@ async fn monitoring_loop(
             }
         }
 
-        // Check if cloudflared is alive; if dead and we have a register URL, re-register (with cooldown)
+        // Check if cloudflared is alive; if dead and we have a static tunnel token, restart it.
         if !is_cloudflared_running().await {
             let can_reregister = last_reregister
                 .map(|t: std::time::Instant| t.elapsed() > reregister_cooldown)
                 .unwrap_or(true);
-            if let Some(ref info) = reregister {
-                if !can_reregister {
-                    eprintln!(
-                        "dd-agent: cloudflared dead, waiting for cooldown before re-registering"
-                    );
-                    continue;
-                }
-                last_reregister = Some(std::time::Instant::now());
-                eprintln!(
-                    "dd-agent: cloudflared dead, re-registering with {}",
-                    info.register_url
-                );
-                let config = register(
-                    &info.vm_name,
-                    &info.owner,
-                    &info.register_url,
-                    info.attestation.as_ref(),
-                )
-                .await;
-                eprintln!("dd-agent: re-registered — hostname={}", config.hostname);
-                if let Err(e) = start_cloudflared(&config.tunnel_token).await {
-                    eprintln!("dd-agent: cloudflared restart failed: {e}");
-                }
-            } else if let Some(ref token) = tunnel_token {
+            if let Some(ref token) = tunnel_token {
                 // Self-registered or pre-provisioned tunnel — restart with saved token
-                let can_restart = last_reregister
-                    .map(|t: std::time::Instant| t.elapsed() > reregister_cooldown)
-                    .unwrap_or(true);
-                if can_restart {
+                if can_reregister {
                     last_reregister = Some(std::time::Instant::now());
                     eprintln!("dd-agent: cloudflared dead, restarting with saved tunnel token");
                     if let Err(e) = start_cloudflared(token).await {
@@ -1112,6 +1106,30 @@ async fn is_cloudflared_running() -> bool {
     is_process_running("cloudflared")
 }
 
+async fn stop_cloudflared() -> Result<(), String> {
+    let pids = process_ids_by_name("cloudflared");
+    for pid in pids {
+        dd_agent::process::kill_process(pid).await?;
+    }
+    Ok(())
+}
+
+fn stable_agent_id(vm_name: &str) -> String {
+    if let Some(id) = env_var_nonempty("DD_AGENT_ID") {
+        return id;
+    }
+
+    let env = std::env::var("DD_ENV").unwrap_or_else(|_| "dev".into());
+    let owner = std::env::var("DD_OWNER").unwrap_or_else(|_| "unknown".into());
+    let source = format!("{owner}:{env}:{vm_name}");
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(source.as_bytes());
+    digest[..16]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 fn configure_parent_death_signal(cmd: &mut tokio::process::Command) {
     #[cfg(target_os = "linux")]
     {
@@ -1135,9 +1153,14 @@ fn env_var_nonempty(name: &str) -> Option<String> {
 
 /// Check if a process with the given name is running by scanning /proc.
 fn is_process_running(name: &str) -> bool {
+    !process_ids_by_name(name).is_empty()
+}
+
+fn process_ids_by_name(name: &str) -> Vec<u32> {
     let Ok(entries) = std::fs::read_dir("/proc") else {
-        return false;
+        return Vec::new();
     };
+    let mut pids = Vec::new();
     for entry in entries.flatten() {
         let fname = entry.file_name();
         let pid_str = fname.to_string_lossy();
@@ -1145,12 +1168,14 @@ fn is_process_running(name: &str) -> bool {
             let cmdline_path = format!("/proc/{pid_str}/cmdline");
             if let Ok(cmdline) = std::fs::read_to_string(&cmdline_path) {
                 if cmdline.contains(name) {
-                    return true;
+                    if let Ok(pid) = pid_str.parse::<u32>() {
+                        pids.push(pid);
+                    }
                 }
             }
         }
     }
-    false
+    pids
 }
 
 // ── Graceful shutdown ────────────────────────────────────────────────────
