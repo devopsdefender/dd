@@ -27,6 +27,21 @@ pub use deploy::{
 // ── Types ─────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize)]
+pub struct DeploymentSummary {
+    pub app_name: String,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
+    /// Argv of the most recent post_deploy step (if any).
+    /// Useful for CI to identify which step a failed deploy stopped on
+    /// without exposing stdout/stderr on the unauthenticated /health endpoint.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_step_cmd: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_step_exit_code: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct HealthResponse {
     pub ok: bool,
     pub agent_id: String,
@@ -35,6 +50,13 @@ pub struct HealthResponse {
     pub attestation_type: String,
     pub deployment_count: usize,
     pub deployments: Vec<String>,
+    /// All deployments with status + last-step metadata, regardless of state.
+    /// `deployments` above keeps the existing running-only Vec<String> shape for
+    /// back-compat; this field is the richer view CI uses to detect failures.
+    /// Stdout/stderr are deliberately *not* exposed here — fetch
+    /// /deployments/{id} (auth required) for full output.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub all_deployments: Vec<DeploymentSummary>,
     pub uptime_seconds: u64,
     pub cpu_percent: u64,
     pub memory_used_mb: u64,
@@ -389,6 +411,19 @@ async fn health(State(state): State<AgentState>) -> Json<HealthResponse> {
         .filter(|d| d.status == "running")
         .map(|d| d.app_name.clone())
         .collect();
+    let all_deployments: Vec<DeploymentSummary> = deps
+        .values()
+        .map(|d| {
+            let last_step = d.post_deploy_steps.last();
+            DeploymentSummary {
+                app_name: d.app_name.clone(),
+                status: d.status.clone(),
+                error_message: d.error_message.clone(),
+                last_step_cmd: last_step.map(|s| s.cmd.clone()),
+                last_step_exit_code: last_step.map(|s| s.exit_code),
+            }
+        })
+        .collect();
     drop(deps);
     let metrics = collect_metrics().await;
     Json(HealthResponse {
@@ -399,6 +434,7 @@ async fn health(State(state): State<AgentState>) -> Json<HealthResponse> {
         attestation_type: state.attestation_type.clone(),
         deployment_count,
         deployments: deployment_names,
+        all_deployments,
         uptime_seconds: state.started_at.elapsed().as_secs(),
         cpu_percent: metrics.cpu_pct,
         memory_used_mb: parse_size_mb(&metrics.mem_used),
