@@ -11,6 +11,17 @@ use tokio::sync::Mutex;
 use super::{require_browser_token, verify_owner, AgentState};
 
 #[derive(Debug, Clone, Serialize)]
+pub struct PostDeployStep {
+    pub cmd: Vec<String>,
+    pub exit_code: i64,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub stdout: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub stderr: String,
+    pub duration_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct DeploymentInfo {
     pub id: String,
     pub pid: Option<u32>,
@@ -22,6 +33,8 @@ pub struct DeploymentInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
     pub started_at: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub post_deploy_steps: Vec<PostDeployStep>,
 }
 
 pub type Deployments = Arc<Mutex<HashMap<String, DeploymentInfo>>>;
@@ -232,6 +245,7 @@ pub async fn execute_deploy_with_handles(
         status: "deploying".into(),
         error_message: None,
         started_at: chrono::Utc::now().to_rfc3339(),
+        post_deploy_steps: Vec::new(),
     };
     deployments.lock().await.insert(dep_id.clone(), info);
 
@@ -295,8 +309,23 @@ async fn run_deploy(
                             continue;
                         }
                         eprintln!("dd-agent: post-deploy exec: {}", cmd.join(" "));
-                        match dd_agent::container::exec(&app_name, cmd).await {
+                        let started = std::time::Instant::now();
+                        let result = dd_agent::container::exec(&app_name, cmd).await;
+                        let duration_ms = started.elapsed().as_millis() as u64;
+                        match result {
                             Ok((code, stdout, stderr)) => {
+                                {
+                                    let mut deps = deployments.lock().await;
+                                    if let Some(info) = deps.get_mut(&dep_id) {
+                                        info.post_deploy_steps.push(PostDeployStep {
+                                            cmd: cmd.clone(),
+                                            exit_code: code,
+                                            stdout: stdout.clone(),
+                                            stderr: stderr.clone(),
+                                            duration_ms,
+                                        });
+                                    }
+                                }
                                 if code != 0 {
                                     eprintln!(
                                         "dd-agent: post-deploy cmd failed (exit {}): {}{}",
@@ -324,6 +353,18 @@ async fn run_deploy(
                                 }
                             }
                             Err(e) => {
+                                {
+                                    let mut deps = deployments.lock().await;
+                                    if let Some(info) = deps.get_mut(&dep_id) {
+                                        info.post_deploy_steps.push(PostDeployStep {
+                                            cmd: cmd.clone(),
+                                            exit_code: -1,
+                                            stdout: String::new(),
+                                            stderr: e.clone(),
+                                            duration_ms,
+                                        });
+                                    }
+                                }
                                 set_deploy_failed(
                                     &deployments,
                                     &dep_id,
