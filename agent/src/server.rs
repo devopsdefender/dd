@@ -2393,8 +2393,43 @@ async fn handle_ws_register(socket: WebSocket, state: AgentState) {
         Err(_) => return,
     };
 
-    // Create tunnel
     let client = reqwest::Client::new();
+
+    // Re-registration cleanup: if any existing entries match this vm_name,
+    // remove their tunnels + registry entries before issuing a new agent_id.
+    // Without this the fleet dashboard accumulates stale entries on every
+    // dd-agent release, since each redeploy generates a new agent_id but
+    // the scraper-based cleanup only fires after multiple failed scrapes.
+    let stale: Vec<(String, String)> = {
+        let registry = state.agent_registry.lock().await;
+        registry
+            .values()
+            .filter(|a| a.vm_name == reg.vm_name)
+            .map(|a| (a.agent_id.clone(), a.hostname.clone()))
+            .collect()
+    };
+    if !stale.is_empty() {
+        for (old_agent_id, old_hostname) in &stale {
+            if let Err(e) =
+                crate::tunnel::remove_agent(&client, &cf, old_agent_id, old_hostname).await
+            {
+                eprintln!("dd-register: stale tunnel cleanup failed for {old_hostname}: {e}");
+                // Don't block re-registration on CF API hiccups; the next
+                // scraper pass will retry.
+            } else {
+                eprintln!(
+                    "dd-register: removed stale tunnel for vm {} (agent_id={old_agent_id}, hostname={old_hostname})",
+                    reg.vm_name
+                );
+            }
+        }
+        let mut registry = state.agent_registry.lock().await;
+        for (old_agent_id, _) in &stale {
+            registry.remove(old_agent_id);
+        }
+    }
+
+    // Create tunnel
     let agent_id = uuid::Uuid::new_v4().to_string();
     let tunnel_info =
         match crate::tunnel::create_agent_tunnel(&client, &cf, &agent_id, &reg.vm_name, None).await
