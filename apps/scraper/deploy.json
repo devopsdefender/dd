@@ -1,4 +1,7 @@
 {
   "image": "ghcr.io/devopsdefender/dd-scraper:latest",
-  "app_name": "scraper"
+  "app_name": "scraper",
+  "env": [
+    "DD_REGISTER_URL=wss://localhost/scraper"
+  ]
 }

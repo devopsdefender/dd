@@ -1,28 +1,38 @@
-//! dd-scraper — discovers agents from Cloudflare tunnels and reports health to the register.
+//! dd-scraper — receives agent list from register and reports health.
+//!
+//! No Cloudflare credentials needed. The register pushes agent shards to
+//! connected scrapers; the scraper scrapes each hostname's /health and
+//! reports results back. On disconnect, the scraper keeps scraping its
+//! cached shard until the register reconnects.
 
 use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite;
 
+#[derive(Debug, Clone, serde::Deserialize)]
+struct ShardAssignment {
+    shard: Vec<AgentEntry>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct AgentEntry {
+    hostname: String,
+    #[allow(dead_code)]
+    agent_id: String,
+}
+
 #[tokio::main]
 async fn main() {
-    let cf = dd_agent::tunnel::CfConfig::from_env().unwrap_or_else(|e| {
-        eprintln!("dd-scraper: CF config required: {e}");
-        std::process::exit(1);
-    });
-
     let register_url = std::env::var("DD_REGISTER_URL").unwrap_or_else(|_| {
         eprintln!("dd-scraper: DD_REGISTER_URL required");
         std::process::exit(1);
     });
 
-    let env_label = std::env::var("DD_ENV").unwrap_or_else(|_| "dev".into());
-    let tunnel_prefix = format!("dd-{env_label}-");
     let scrape_interval = std::time::Duration::from_secs(30);
     let scrape_timeout = std::time::Duration::from_secs(3);
 
     let attestation = dd_agent::attestation::detect();
     eprintln!(
-        "dd-scraper: starting (env={env_label}, attestation={})",
+        "dd-scraper: starting (attestation={})",
         attestation.attestation_type()
     );
 
@@ -33,12 +43,13 @@ async fn main() {
         format!("{ws_url}/scraper")
     };
 
+    let mut cached_shard: Vec<AgentEntry> = Vec::new();
+
     loop {
         eprintln!("dd-scraper: connecting to register at {ws_url}");
         match connect_and_scrape(
             &ws_url,
-            &cf,
-            &tunnel_prefix,
+            &mut cached_shard,
             scrape_interval,
             scrape_timeout,
             attestation.as_ref(),
@@ -46,16 +57,54 @@ async fn main() {
         .await
         {
             Ok(()) => eprintln!("dd-scraper: session ended, reconnecting..."),
-            Err(e) => eprintln!("dd-scraper: error: {e}, reconnecting in 10s..."),
+            Err(e) => {
+                eprintln!("dd-scraper: error: {e}");
+                // Keep scraping cached shard while disconnected
+                if !cached_shard.is_empty() {
+                    eprintln!(
+                        "dd-scraper: scraping {} cached agents while disconnected",
+                        cached_shard.len()
+                    );
+                    scrape_cached(&cached_shard, scrape_timeout).await;
+                }
+                eprintln!("dd-scraper: reconnecting in 10s...");
+            }
         }
         tokio::time::sleep(std::time::Duration::from_secs(10)).await;
     }
 }
 
+async fn scrape_cached(shard: &[AgentEntry], timeout: std::time::Duration) {
+    let http = reqwest::Client::builder().timeout(timeout).build().unwrap();
+
+    let futures: Vec<_> = shard
+        .iter()
+        .map(|agent| {
+            let http = http.clone();
+            let hostname = agent.hostname.clone();
+            async move {
+                let url = format!("https://{hostname}/health");
+                match http.get(&url).send().await {
+                    Ok(resp) if resp.status().is_success() => {
+                        eprintln!("dd-scraper: (cached) {hostname} healthy");
+                    }
+                    Ok(resp) => {
+                        eprintln!("dd-scraper: (cached) {hostname} status {}", resp.status());
+                    }
+                    Err(e) => {
+                        eprintln!("dd-scraper: (cached) {hostname} error: {e}");
+                    }
+                }
+            }
+        })
+        .collect();
+
+    futures_util::future::join_all(futures).await;
+}
+
 async fn connect_and_scrape(
     ws_url: &str,
-    cf: &dd_agent::tunnel::CfConfig,
-    tunnel_prefix: &str,
+    cached_shard: &mut Vec<AgentEntry>,
     interval: std::time::Duration,
     timeout: std::time::Duration,
     backend: &dyn dd_agent::attestation::AttestationBackend,
@@ -115,7 +164,21 @@ async fn connect_and_scrape(
         .into_transport_mode()
         .map_err(|e| format!("transport: {e}"))?;
 
-    eprintln!("dd-scraper: connected to register, starting scrape loop");
+    // Read initial shard assignment from register
+    let shard_msg = match ws_rx.next().await {
+        Some(Ok(tungstenite::Message::Binary(d))) => d.to_vec(),
+        other => return Err(format!("expected shard assignment, got: {other:?}")),
+    };
+    let shard_len = transport
+        .read_message(&shard_msg, &mut buf)
+        .map_err(|e| format!("decrypt shard: {e}"))?;
+    let assignment: ShardAssignment =
+        serde_json::from_slice(&buf[..shard_len]).map_err(|e| format!("parse shard: {e}"))?;
+    *cached_shard = assignment.shard;
+    eprintln!(
+        "dd-scraper: received shard of {} agents from register",
+        cached_shard.len()
+    );
 
     let http = reqwest::Client::builder()
         .timeout(timeout)
@@ -126,35 +189,28 @@ async fn connect_and_scrape(
     loop {
         ticker.tick().await;
 
-        // List CF tunnels
-        let tunnels = list_cf_tunnels(&http, cf, tunnel_prefix).await;
-        eprintln!(
-            "dd-scraper: found {} tunnels matching {tunnel_prefix}*",
-            tunnels.len()
-        );
+        eprintln!("dd-scraper: scraping {} agents", cached_shard.len());
 
-        // Scrape all agents concurrently
-        let scrape_futures: Vec<_> = tunnels
+        // Scrape all agents in the shard concurrently
+        let scrape_futures: Vec<_> = cached_shard
             .iter()
-            .map(|(name, hostname)| {
+            .map(|agent| {
                 let http = http.clone();
-                let hostname = hostname.clone();
-                let name = name.clone();
+                let hostname = agent.hostname.clone();
                 async move {
                     let url = format!("https://{hostname}/health");
                     match http.get(&url).send().await {
                         Ok(resp) if resp.status().is_success() => {
                             let health: serde_json::Value = resp.json().await.unwrap_or_default();
-                            (name, hostname, true, Some(health), None)
+                            (hostname, true, Some(health), None)
                         }
                         Ok(resp) => (
-                            name,
                             hostname,
                             false,
                             None,
                             Some(format!("status {}", resp.status())),
                         ),
-                        Err(e) => (name, hostname, false, None, Some(e.to_string())),
+                        Err(e) => (hostname, false, None, Some(e.to_string())),
                     }
                 }
             })
@@ -164,9 +220,7 @@ async fn connect_and_scrape(
 
         // Build fleet report
         let mut agents = Vec::new();
-        let mut orphan_tunnels = Vec::new();
-
-        for (tunnel_name, hostname, healthy, health, error) in &results {
+        for (hostname, healthy, health, error) in &results {
             if *healthy {
                 if let Some(h) = health {
                     agents.push(serde_json::json!({
@@ -188,29 +242,19 @@ async fn connect_and_scrape(
                     "healthy": false,
                     "error": error,
                 }));
-                if error
-                    .as_ref()
-                    .is_some_and(|e| e.contains("connect") || e.contains("timed out"))
-                {
-                    orphan_tunnels.push(tunnel_name.clone());
-                }
             }
         }
 
-        let report = serde_json::json!({
-            "agents": agents,
-            "orphan_tunnels": orphan_tunnels,
-        });
+        let report = serde_json::json!({ "agents": agents });
 
         eprintln!(
-            "dd-scraper: reporting {} agents ({} healthy, {} unhealthy, {} orphans)",
+            "dd-scraper: reporting {} agents ({} healthy, {} unhealthy)",
             results.len(),
-            results.iter().filter(|r| r.2).count(),
-            results.iter().filter(|r| !r.2).count(),
-            orphan_tunnels.len(),
+            results.iter().filter(|r| r.1).count(),
+            results.iter().filter(|r| !r.1).count(),
         );
 
-        // Send encrypted report to register
+        // Send encrypted report
         let report_json = serde_json::to_vec(&report).unwrap();
         let mut enc = vec![0u8; 65535];
         let len = transport
@@ -221,56 +265,25 @@ async fn connect_and_scrape(
             .await
             .map_err(|e| format!("send: {e}"))?;
 
-        // Wait for ack
+        // Wait for ack (which includes an updated shard)
         match tokio::time::timeout(std::time::Duration::from_secs(10), ws_rx.next()).await {
             Ok(Some(Ok(tungstenite::Message::Binary(data)))) => {
                 let data = data.to_vec();
-                let _ = transport.read_message(&data, &mut buf);
+                let dec_len = match transport.read_message(&data, &mut buf) {
+                    Ok(n) => n,
+                    Err(_) => continue,
+                };
+                // Try to parse updated shard from ack
+                if let Ok(assignment) = serde_json::from_slice::<ShardAssignment>(&buf[..dec_len]) {
+                    if !assignment.shard.is_empty() {
+                        *cached_shard = assignment.shard;
+                    }
+                }
+                // Otherwise it's a plain {"ok":true} ack — keep current shard
             }
             _ => {
                 return Err("no ack from register".into());
             }
         }
     }
-}
-
-async fn list_cf_tunnels(
-    client: &reqwest::Client,
-    cf: &dd_agent::tunnel::CfConfig,
-    prefix: &str,
-) -> Vec<(String, String)> {
-    let url = format!(
-        "https://api.cloudflare.com/client/v4/accounts/{}/cfd_tunnel?is_deleted=false",
-        cf.account_id
-    );
-
-    let resp = match client
-        .get(&url)
-        .header("Authorization", format!("Bearer {}", cf.api_token))
-        .timeout(std::time::Duration::from_secs(10))
-        .send()
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("dd-scraper: CF API error: {e}");
-            return Vec::new();
-        }
-    };
-
-    let body: serde_json::Value = resp.json().await.unwrap_or_default();
-    let mut tunnels = Vec::new();
-
-    if let Some(results) = body["result"].as_array() {
-        for t in results {
-            if let Some(name) = t["name"].as_str() {
-                if name.starts_with(prefix) {
-                    let hostname = format!("{name}.{}", cf.domain);
-                    tunnels.push((name.to_string(), hostname));
-                }
-            }
-        }
-    }
-
-    tunnels
 }

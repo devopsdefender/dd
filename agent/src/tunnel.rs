@@ -294,3 +294,45 @@ async fn find_dns_record_id(
         .and_then(|rec| rec["id"].as_str())
         .map(|s| s.to_string()))
 }
+
+/// List active Cloudflare tunnels matching a name prefix.
+/// Returns `Vec<(tunnel_name, hostname)>`. Used by the register to bootstrap
+/// agent_registry from CF (the durable store) and by scrapers as a fallback.
+pub async fn list_tunnels(
+    client: &reqwest::Client,
+    cf: &CfConfig,
+    prefix: &str,
+) -> Vec<(String, String)> {
+    let resp = match client
+        .get(format!(
+            "{CF_API}/accounts/{}/cfd_tunnel?is_deleted=false",
+            cf.account_id
+        ))
+        .header("Authorization", format!("Bearer {}", cf.api_token))
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("dd: CF tunnel list error: {e}");
+            return Vec::new();
+        }
+    };
+
+    let body: serde_json::Value = resp.json().await.unwrap_or_default();
+    let mut tunnels = Vec::new();
+
+    if let Some(results) = body["result"].as_array() {
+        for t in results {
+            if let Some(name) = t["name"].as_str() {
+                if name.starts_with(prefix) {
+                    let hostname = format!("{name}.{}", cf.domain);
+                    tunnels.push((name.to_string(), hostname));
+                }
+            }
+        }
+    }
+
+    tunnels
+}

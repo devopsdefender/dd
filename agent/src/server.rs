@@ -2186,6 +2186,33 @@ async fn handle_ws_scraper(socket: WebSocket, state: AgentState) {
         Err(_) => return,
     };
 
+    // Send initial shard assignment — the full agent list for now.
+    // With multiple scrapers, the register would partition here.
+    {
+        let registry = state.agent_registry.lock().await;
+        let shard: Vec<serde_json::Value> = registry
+            .values()
+            .map(|a| {
+                serde_json::json!({
+                    "hostname": a.hostname,
+                    "agent_id": a.agent_id,
+                })
+            })
+            .collect();
+        let assignment = serde_json::json!({ "shard": shard });
+        let json = serde_json::to_vec(&assignment).unwrap();
+        let mut enc = vec![0u8; 65535];
+        if let Ok(len) = transport.write_message(&json, &mut enc) {
+            let _ = ws_tx
+                .send(Message::Binary(enc[..len].to_vec().into()))
+                .await;
+        }
+        eprintln!(
+            "dd-register: sent shard of {} agents to scraper",
+            shard.len()
+        );
+    }
+
     // Receive fleet reports in a loop
     while let Some(Ok(Message::Binary(data))) = ws_rx.next().await {
         let data = data.to_vec();
@@ -2320,10 +2347,23 @@ async fn handle_ws_scraper(socket: WebSocket, state: AgentState) {
             healthy_count, stale_count, report.orphan_tunnels.len(), dead.len()
         );
 
-        // Send ack
-        let ack = serde_json::json!({"ok": true}).to_string();
+        // Send ack with updated shard (agent list may have changed)
+        let shard: Vec<serde_json::Value> = {
+            let registry = state.agent_registry.lock().await;
+            registry
+                .values()
+                .map(|a| {
+                    serde_json::json!({
+                        "hostname": a.hostname,
+                        "agent_id": a.agent_id,
+                    })
+                })
+                .collect()
+        };
+        let ack = serde_json::json!({ "ok": true, "shard": shard });
+        let ack_json = serde_json::to_vec(&ack).unwrap();
         let mut enc = vec![0u8; 65535];
-        if let Ok(len) = transport.write_message(ack.as_bytes(), &mut enc) {
+        if let Ok(len) = transport.write_message(&ack_json, &mut enc) {
             let _ = ws_tx
                 .send(Message::Binary(enc[..len].to_vec().into()))
                 .await;

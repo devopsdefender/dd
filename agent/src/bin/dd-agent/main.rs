@@ -606,6 +606,54 @@ async fn run_agent_mode(cfg: AgentRuntimeConfig) {
             },
         );
         eprintln!("dd-agent: registered self in fleet registry");
+
+        // Bootstrap agent_registry from CF tunnels — the durable store.
+        // Any agents that registered with a previous register instance are
+        // discovered here so the dashboard is immediately populated.
+        if let Some(ref cf) = state.cf_config {
+            let env_label = std::env::var("DD_ENV").unwrap_or_else(|_| "dev".into());
+            let prefix = format!("dd-{env_label}-");
+            let client = reqwest::Client::new();
+            let tunnels = dd_agent::tunnel::list_tunnels(&client, cf, &prefix).await;
+            let now = chrono::Utc::now();
+            let mut registry = state.agent_registry.lock().await;
+            let mut discovered = 0usize;
+            for (tunnel_name, hostname) in &tunnels {
+                // Skip if already in registry (self-registration above)
+                if registry.values().any(|a| a.hostname == *hostname) {
+                    continue;
+                }
+                // Extract agent_id from tunnel name: dd-{env}-{agent_id}
+                let agent_id = tunnel_name
+                    .strip_prefix(&prefix)
+                    .unwrap_or(tunnel_name)
+                    .to_string();
+                registry.insert(
+                    agent_id.clone(),
+                    dd_agent::server::RegisteredAgent {
+                        agent_id,
+                        hostname: hostname.clone(),
+                        vm_name: String::new(),
+                        attestation_type: "unknown".into(),
+                        registered_at: now.to_rfc3339(),
+                        last_seen: now,
+                        status: "unknown".into(),
+                        deployment_count: 0,
+                        deployment_names: Vec::new(),
+                        cpu_percent: 0,
+                        memory_used_mb: 0,
+                        memory_total_mb: 0,
+                    },
+                );
+                discovered += 1;
+            }
+            if discovered > 0 {
+                eprintln!(
+                    "dd-agent: bootstrapped {discovered} agents from CF tunnels ({} total)",
+                    registry.len()
+                );
+            }
+        }
     }
 
     // HTTP server
