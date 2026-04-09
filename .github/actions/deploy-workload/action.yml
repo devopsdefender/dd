@@ -106,16 +106,28 @@ runs:
         app_name=$(jq -r '.app_name // "unknown"' "$DEPLOY_SPEC")
         echo "Deploying '${app_name}' from ${DEPLOY_SPEC}"
 
-        response=$(curl -fsS \
-          -H "Authorization: Bearer ${GITHUB_TOKEN_INPUT}" \
-          -H "Content-Type: application/json" \
-          --data @"${DEPLOY_SPEC}" \
-          "${AGENT_URL}/deploy" 2>&1) || {
-          echo "::error::POST /deploy failed: ${response}"
-          exit 1
-        }
+        # Retry the POST — the tunnel can be briefly unstable (530) right
+        # after VM creation even though /health already passed.
+        for attempt in $(seq 1 12); do
+          response=$(curl -sS \
+            -H "Authorization: Bearer ${GITHUB_TOKEN_INPUT}" \
+            -H "Content-Type: application/json" \
+            --data @"${DEPLOY_SPEC}" \
+            -w "\n%{http_code}" \
+            "${AGENT_URL}/deploy" 2>&1)
+          http_code=$(echo "$response" | tail -1)
+          body=$(echo "$response" | sed '$d')
 
-        echo "response=${response}" >> "$GITHUB_OUTPUT"
-        deploy_id=$(echo "$response" | jq -r '.id // "unknown"')
-        deploy_status=$(echo "$response" | jq -r '.status // "unknown"')
-        echo "Deploy submitted: id=${deploy_id} status=${deploy_status}"
+          if [ "$http_code" = "200" ] || [ "$http_code" = "201" ]; then
+            echo "response=${body}" >> "$GITHUB_OUTPUT"
+            deploy_id=$(echo "$body" | jq -r '.id // "unknown"')
+            deploy_status=$(echo "$body" | jq -r '.status // "unknown"')
+            echo "Deploy submitted: id=${deploy_id} status=${deploy_status}"
+            exit 0
+          fi
+
+          echo "  POST /deploy returned HTTP ${http_code}, retrying... (${attempt}/12)"
+          sleep 5
+        done
+        echo "::error::POST /deploy failed after 12 attempts (last HTTP ${http_code}): ${body}"
+        exit 1
