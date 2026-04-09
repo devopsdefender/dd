@@ -3,315 +3,182 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>DevOps Defender - Run Any App, Instantly Secure</title>
-  <meta name="description" content="The cheapest way to run apps and AI models with hardware-level security. Instant boot. No config. Works with Docker.">
+  <title>DevOps Defender - Provably Secure AI Compute</title>
+  <meta name="description" content="Run AI workloads on hardware-sealed Intel TDX VMs with cryptographic attestation. Powered by EasyEnclave.">
   <link rel="stylesheet" href="style.css">
-  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🛡</text></svg>">
 </head>
 <body>
 
-  <!-- Navigation -->
-  <nav class="navbar" id="navbar">
-    <div class="container nav-container">
-      <a href="https://devopsdefender.com" class="nav-logo">
-        <span class="logo-icon">
-          <svg width="32" height="32" viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg">
-            <path d="M16 2L4 8v8c0 7.732 5.12 14.953 12 16.84C22.88 30.953 28 23.732 28 16V8L16 2z" fill="#4f46e5"/>
-            <path d="M16 6L8 10v6c0 5.155 3.413 9.969 8 11.227C20.587 25.969 24 21.155 24 16v-6L16 6z" fill="#0d9488"/>
-            <path d="M14 16l-2-2-1.5 1.5L14 19l6-6-1.5-1.5L14 16z" fill="white"/>
-          </svg>
-        </span>
-        <span class="logo-text">DevOps Defender</span>
-      </a>
-      <button class="nav-toggle" id="nav-toggle" aria-label="Toggle navigation">
-        <span></span>
-        <span></span>
-        <span></span>
-      </button>
-      <ul class="nav-links" id="nav-links">
-        <li><a href="#why">Why DD</a></li>
-        <li><a href="#use-cases">Use Cases</a></li>
-        <li><a href="#how-it-works">How It Works</a></li>
-        <li><a href="#quickstart">Get Started</a></li>
-        <li><a href="https://github.com/devopsdefender/dd" class="nav-cta">GitHub</a></li>
-      </ul>
+  <nav>
+    <a href="/" class="logo">DevOps Defender</a>
+    <div class="links">
+      <a href="#how">How It Works</a>
+      <a href="#features">Features</a>
+      <a href="#arch">Architecture</a>
+      <a href="https://github.com/devopsdefender/dd">GitHub</a>
     </div>
   </nav>
 
-  <!-- Hero -->
-  <header class="hero" id="hero">
-    <div class="hero-bg"></div>
-    <div class="container hero-content">
-      <div class="hero-badge">Open Source Compute Platform</div>
-      <h1>Run anything. <span class="hero-highlight">Boot instantly. Pay less.</span></h1>
-      <p class="hero-subtitle">
-        The cheapest way to run apps and open-source AI models with real security.
-        Your code runs in hardware-encrypted memory that nobody else can read &mdash;
-        not your cloud provider, not us, not anyone.
-      </p>
-      <div class="hero-actions">
-        <a href="#quickstart" class="btn btn-primary btn-lg">Get Started Free</a>
-        <a href="https://github.com/devopsdefender/dd" class="btn btn-outline btn-lg">View Source</a>
-      </div>
-      <div class="hero-stats">
-        <div class="hero-stat">
-          <span class="hero-stat-value">Instant Boot</span>
-          <span class="hero-stat-label">No cold starts</span>
-        </div>
-        <div class="hero-stat-divider"></div>
-        <div class="hero-stat">
-          <span class="hero-stat-value">Hardware Secure</span>
-          <span class="hero-stat-label">Encrypted by the CPU</span>
-        </div>
-        <div class="hero-stat-divider"></div>
-        <div class="hero-stat">
-          <span class="hero-stat-value">Lowest Cost</span>
-          <span class="hero-stat-label">No markup on compute</span>
-        </div>
-      </div>
+  <div class="hero">
+    <h1>Provably secure <span class="accent">AI compute</span></h1>
+    <p>Run OpenClaw, Ollama, and any AI workload on hardware-sealed Intel TDX VMs. Cryptographic attestation proves your code runs unmodified. Nobody can read your data &mdash; not us, not the cloud provider, not anyone.</p>
+    <div class="buttons">
+      <a href="https://app.devopsdefender.com" class="btn btn-primary">Fleet Dashboard</a>
+      <a href="https://github.com/devopsdefender/dd" class="btn btn-outline">View Source</a>
     </div>
-  </header>
-
-  <!-- Why DD -->
-  <section class="pillars" id="why">
-    <div class="container">
-      <div class="section-header">
-        <h2>Why DevOps Defender?</h2>
-        <p>Most cloud platforms charge you extra for security, make you wait for VMs to boot, and hold your secrets hostage. We don't.</p>
-      </div>
-      <div class="pillar-grid">
-        <div class="pillar-card">
-          <div class="pillar-icon">
-            <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="#4f46e5" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon>
-            </svg>
-          </div>
-          <h3>Instant Boot</h3>
-          <p>Your app is live in seconds, not minutes. No waiting for VMs to provision, no cold start penalties. Push your code and it's running.</p>
-        </div>
-        <div class="pillar-card">
-          <div class="pillar-icon">
-            <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="#4f46e5" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect>
-              <path d="M7 11V7a5 5 0 0 1 10 0v4"></path>
-            </svg>
-          </div>
-          <h3>Actually Private</h3>
-          <p>Your app runs in hardware-encrypted memory. The cloud provider can't read it. We can't read it. Only your code can access your data. This isn't a promise &mdash; it's enforced by Intel's CPU.</p>
-        </div>
-        <div class="pillar-card">
-          <div class="pillar-icon">
-            <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="#4f46e5" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <line x1="12" y1="1" x2="12" y2="23"></line>
-              <path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"></path>
-            </svg>
-          </div>
-          <h3>Cheapest Anywhere</h3>
-          <p>No security tax. No platform markup. You get raw compute at the lowest price with hardware security included, not bolted on as an upsell.</p>
-        </div>
-      </div>
+    <div class="stats">
+      <div class="stat"><span class="value">TDX Attested</span><span class="label">Hardware-sealed memory</span></div>
+      <div class="stat"><span class="value">4 Binaries</span><span class="label">dd-client, dd-register, dd-web, easyenclave</span></div>
+      <div class="stat"><span class="value">Open Source</span><span class="label">MIT license</span></div>
     </div>
-  </section>
+  </div>
 
-  <!-- Use Cases -->
-  <section class="use-cases" id="use-cases">
+  <section id="how" class="section-center">
     <div class="container">
-      <div class="section-header">
-        <h2>What People Run on DD</h2>
-        <p>If it runs in Docker, it runs on DevOps Defender. No changes needed.</p>
-      </div>
-
-      <div class="steps-list">
+      <h2>How It Works</h2>
+      <p class="subtitle">Three steps from code to provably secure production.</p>
+      <div class="steps">
         <div class="step">
-          <div class="step-icon">
-            <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="#4f46e5" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path>
-            </svg>
-          </div>
+          <div class="step-num">1</div>
           <div class="step-content">
-            <h3>Open-Source AI Models</h3>
-            <p>Host Llama, Mistral, or any open-weight model privately. Your prompts and data never leave encrypted memory. Perfect for companies that need AI but can't send data to third parties.</p>
+            <h3>Deploy</h3>
+            <p>Push your container image via GitHub Actions. The <code>deploy-workload</code> action POSTs your deploy spec to dd-agent's API through the Cloudflare tunnel. No SSH keys, no raw IPs.</p>
           </div>
         </div>
         <div class="step">
-          <div class="step-icon">
-            <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="#4f46e5" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <polyline points="16 18 22 12 16 6"></polyline>
-              <polyline points="8 6 2 12 8 18"></polyline>
-            </svg>
-          </div>
+          <div class="step-num">2</div>
           <div class="step-content">
-            <h3>Apps from Claude Code</h3>
-            <p>Built something with Claude Code? Deploy it directly with a GitHub Action. Your AI-generated app goes from code to production in one push &mdash; no infrastructure setup required.</p>
+            <h3>Attest</h3>
+            <p>The TDX VM generates a cryptographic quote proving the exact code running inside the enclave. EasyEnclave's attestation API lets you verify the measurement against known-good builds.</p>
           </div>
         </div>
         <div class="step">
-          <div class="step-icon">
-            <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="#4f46e5" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <rect x="2" y="3" width="20" height="14" rx="2" ry="2"></rect>
-              <line x1="8" y1="21" x2="16" y2="21"></line>
-              <line x1="12" y1="17" x2="12" y2="21"></line>
-            </svg>
-          </div>
+          <div class="step-num">3</div>
           <div class="step-content">
-            <h3>Any Docker App</h3>
-            <p>Web apps, APIs, databases, background workers &mdash; anything that runs in a Docker container works out of the box. No SDK, no code changes, no special toolchains.</p>
+            <h3>Run</h3>
+            <p>Your workload runs inside hardware-encrypted memory. The fleet dashboard shows health, metrics, and attestation status across all your agents. Logs stay inside the enclave boundary.</p>
           </div>
         </div>
       </div>
     </div>
   </section>
 
-  <!-- How It Works -->
-  <section class="how-it-works" id="how-it-works">
-    <div class="container">
-      <div class="section-header">
-        <h2>How It Works</h2>
-        <p>Three steps. No DevOps degree required.</p>
-      </div>
-
-      <div class="steps-list">
-        <div class="step">
-          <div class="step-number">1</div>
-          <div class="step-content">
-            <h3>Write Your App</h3>
-            <p>Build it however you want &mdash; with Claude Code, by hand, with any framework. If it runs in Docker, you're good.</p>
-          </div>
+  <section id="features">
+    <div class="container section-center">
+      <h2>Features</h2>
+      <p class="subtitle">Everything you need for confidential AI workloads.</p>
+      <div class="grid-3">
+        <div class="card">
+          <div class="icon">&#x1f510;</div>
+          <h3>TDX Attestation</h3>
+          <p>Intel TDX hardware seals your VM's memory. Cryptographic quotes prove your workload is unmodified. Verify remotely before sending secrets.</p>
         </div>
-        <div class="step">
-          <div class="step-number">2</div>
-          <div class="step-content">
-            <h3>Push to GitHub</h3>
-            <p>Add a one-line GitHub Action to your repo. When you push, DD automatically deploys your app to a secure machine. No keys, no config files, no secrets to manage.</p>
-          </div>
+        <div class="card">
+          <div class="icon">&#x1f4ca;</div>
+          <h3>Fleet Management</h3>
+          <p>dd-web dashboard shows all agents across your infrastructure. Prometheus-style collector scrapes /health. Federation for horizontal scaling.</p>
         </div>
-        <div class="step">
-          <div class="step-number">3</div>
-          <div class="step-content">
-            <h3>You're Live</h3>
-            <p>Your app boots instantly on hardware-encrypted compute. You get a URL, health monitoring, and the guarantee that nobody &mdash; not even the cloud provider &mdash; can peek at your data.</p>
-          </div>
+        <div class="card">
+          <div class="icon">&#x1f680;</div>
+          <h3>API-Driven Deploys</h3>
+          <p>GitHub Actions deploy workloads via POST /deploy. No SSH. GITHUB_TOKEN auth works out of the box. Retry logic handles tunnel instability.</p>
         </div>
-      </div>
-    </div>
-  </section>
-
-  <!-- Quick Start -->
-  <section class="quickstart" id="quickstart">
-    <div class="container">
-      <div class="section-header">
-        <h2>Get Started</h2>
-        <p>Add this to your GitHub repo. That's the whole setup.</p>
-      </div>
-
-      <div class="quickstart-code">
-        <div class="code-block">
-          <div class="code-header">
-            <span class="code-filename">.github/workflows/deploy.yml</span>
-          </div>
-          <pre><code><span class="code-key">name:</span> Deploy
-<span class="code-key">on:</span>
-  <span class="code-key">push:</span>
-    <span class="code-key">branches:</span> [main]
-
-<span class="code-key">permissions:</span>
-  <span class="code-key">id-token:</span> write
-
-<span class="code-key">jobs:</span>
-  <span class="code-key">deploy:</span>
-    <span class="code-key">runs-on:</span> ubuntu-latest
-    <span class="code-key">steps:</span>
-      - <span class="code-key">uses:</span> actions/checkout@v4
-      - <span class="code-key">name:</span> Deploy to DevOps Defender
-        <span class="code-key">uses:</span> devopsdefender/dd@main
-        <span class="code-key">with:</span>
-          <span class="code-key">app-name:</span> my-app
-          <span class="code-key">image:</span> ghcr.io/myorg/myapp:${{ github.sha }}</code></pre>
+        <div class="card">
+          <div class="icon">&#x20bf;</div>
+          <h3>BTC Payments</h3>
+          <p>Pay for compute with Bitcoin via satsforcompute. No credit cards, no KYC, no middlemen. Lightning for instant settlement.</p>
+        </div>
+        <div class="card">
+          <div class="icon">&#x1f6e1;</div>
+          <h3>Enclave Runtime</h3>
+          <p>Powered by EasyEnclave &mdash; the open-source PID 1 that runs inside the sealed VM. Unix socket API. No networking in the runtime. Minimal attack surface.</p>
+        </div>
+        <div class="card">
+          <div class="icon">&#x1f310;</div>
+          <h3>Cloudflare Tunnels</h3>
+          <p>Every agent gets a tunnel hostname. No public IPs, no firewall rules, no port forwarding. dd-register provisions tunnels automatically on registration.</p>
         </div>
       </div>
     </div>
   </section>
 
-  <!-- CTA -->
-  <section class="cta-section">
+  <section id="arch" class="section-center">
     <div class="container">
-      <div class="cta-content">
-        <h2>Ship faster. Pay less. Sleep better.</h2>
-        <p>DevOps Defender is fully open source. Read every line, audit every build, verify every machine.</p>
-        <div class="cta-actions">
-          <a href="https://github.com/devopsdefender/dd" class="btn btn-primary btn-lg">View on GitHub</a>
-          <a href="#quickstart" class="btn btn-outline-light btn-lg">Get Started</a>
-        </div>
+      <h2>Architecture</h2>
+      <p class="subtitle">4 binaries, 2 repos, zero trust.</p>
+      <div class="arch">
+<pre>
+<span class="hl">Customer</span> (browser)
+  |
+  v
+<span class="hl">Cloudflare Edge</span> ──── tunnel ────> <span class="gr">TDX VM</span>
+                                    |
+                            <span class="gr">easyenclave</span> (PID 1)
+                            ├── unix socket API
+                            ├── workload: <span class="hl">dd-client</span>
+                            │   ├── web dashboard + terminal
+                            │   ├── /health, /deploy, /exec
+                            │   └── Noise WS ──> <span class="hl">dd-register</span>
+                            └── workload: <span class="hl">openclaw + ollama</span>
+                                └── gemma4:e2b (CPU inference)
+
+<span class="hl">dd-web</span> (fleet dashboard, N instances)
+  ├── discovers agents via CF tunnels
+  ├── scrapes /health (Prometheus-style)
+  ├── GitHub OAuth + JWT auth
+  └── /federate for horizontal scaling
+</pre>
       </div>
     </div>
   </section>
 
-  <!-- Footer -->
-  <footer class="footer">
+  <section class="section-center">
     <div class="container">
-      <div class="footer-grid">
-        <div class="footer-brand">
-          <a href="https://devopsdefender.com" class="footer-logo">
-            <span class="logo-icon">
-              <svg width="24" height="24" viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg">
-                <path d="M16 2L4 8v8c0 7.732 5.12 14.953 12 16.84C22.88 30.953 28 23.732 28 16V8L16 2z" fill="#4f46e5"/>
-                <path d="M16 6L8 10v6c0 5.155 3.413 9.969 8 11.227C20.587 25.969 24 21.155 24 16v-6L16 6z" fill="#0d9488"/>
-                <path d="M14 16l-2-2-1.5 1.5L14 19l6-6-1.5-1.5L14 16z" fill="white"/>
-              </svg>
-            </span>
-            <span class="logo-text">DevOps Defender</span>
-          </a>
-          <p>The cheapest way to run apps with hardware-level security. Open source.</p>
-        </div>
+      <h2>Deploy with GitHub Actions</h2>
+      <p class="subtitle">One action to deploy. One action to verify.</p>
+      <div class="code-block">
+        <div class="code-header">.github/workflows/deploy.yml</div>
+<pre><span class="k">- uses:</span> <span class="s">devopsdefender/dd/.github/actions/deploy-workload@main</span>
+  <span class="k">with:</span>
+    <span class="k">agent-url:</span> <span class="s">https://app.devopsdefender.com</span>
+    <span class="k">deploy-spec:</span> <span class="s">apps/myapp/deploy.json</span>
 
-        <div class="footer-links-group">
-          <h4>Product</h4>
-          <ul>
-            <li><a href="#why">Why DD</a></li>
-            <li><a href="#use-cases">Use Cases</a></li>
-            <li><a href="#how-it-works">How It Works</a></li>
-          </ul>
-        </div>
-
-        <div class="footer-links-group">
-          <h4>Developers</h4>
-          <ul>
-            <li><a href="https://github.com/devopsdefender/dd">Repository</a></li>
-            <li><a href="https://github.com/devopsdefender/dd/issues">Issues</a></li>
-          </ul>
-        </div>
-      </div>
-
-      <div class="footer-bottom">
-        <p>Copyright 2024-2026 DevOps Defender contributors.</p>
+<span class="k">- uses:</span> <span class="s">devopsdefender/dd/.github/actions/verify-deployment@main</span>
+  <span class="k">with:</span>
+    <span class="k">agent-url:</span> <span class="s">https://app.devopsdefender.com</span>
+    <span class="k">deployment:</span> <span class="s">myapp</span>
+    <span class="k">timeout:</span> <span class="s">300</span></pre>
       </div>
     </div>
+  </section>
+
+  <section>
+    <div class="container">
+      <div class="callout">
+        <h3>Powered by <a href="https://easyenclave.com">EasyEnclave</a></h3>
+        <p>The open-source enclave runtime that makes confidential computing simple. Runs as PID 1 in Intel TDX VMs. Unix socket API. No networking in the runtime.</p>
+        <a href="https://easyenclave.com" class="btn btn-outline">Learn More</a>
+      </div>
+    </div>
+  </section>
+
+  <section class="cta">
+    <h2>Provably secure. Open source. Yours.</h2>
+    <p>Read every line. Audit every build. Verify every machine.</p>
+    <div class="buttons">
+      <a href="https://app.devopsdefender.com" class="btn btn-primary">Get Started</a>
+      <a href="https://github.com/devopsdefender/dd" class="btn btn-outline">View on GitHub</a>
+    </div>
+  </section>
+
+  <footer>
+    <p>
+      <a href="https://github.com/devopsdefender/dd">GitHub</a>
+      <a href="https://easyenclave.com">EasyEnclave</a>
+      <a href="https://app.devopsdefender.com">Dashboard</a>
+    </p>
+    <p style="margin-top:8px">DevOps Defender &mdash; MIT License</p>
   </footer>
 
-  <script>
-    const toggle = document.getElementById('nav-toggle');
-    const links = document.getElementById('nav-links');
-    toggle.addEventListener('click', () => {
-      links.classList.toggle('nav-open');
-      toggle.classList.toggle('active');
-    });
-    document.querySelectorAll('.nav-links a').forEach(link => {
-      link.addEventListener('click', () => {
-        links.classList.remove('nav-open');
-        toggle.classList.remove('active');
-      });
-    });
-    const navbar = document.getElementById('navbar');
-    window.addEventListener('scroll', () => {
-      navbar.classList.toggle('scrolled', window.scrollY > 50);
-    });
-    document.querySelectorAll('a[href^="#"]').forEach(anchor => {
-      anchor.addEventListener('click', function (e) {
-        e.preventDefault();
-        const target = document.querySelector(this.getAttribute('href'));
-        if (target) target.scrollIntoView({ behavior: 'smooth', block: 'start' });
-      });
-    });
-  </script>
 </body>
 </html>
