@@ -12,10 +12,6 @@ name = "dd-agent"
 path = "src/bin/dd-agent/main.rs"
 
 [[bin]]
-name = "dd-register"
-path = "src/bin/dd-register/main.rs"
-
-[[bin]]
 name = "dd-scraper"
 path = "src/bin/dd-scraper/main.rs"
 
