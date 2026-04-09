@@ -65,13 +65,4 @@ gcloud compute instances create "$VM_NAME" \
   --labels=devopsdefender=managed,dd_env="${DD_ENV}" \
   --tags=dd-agent
 
-EXTERNAL_IP=$(gcloud compute instances describe "$VM_NAME" \
-  --project="$GCP_PROJECT_ID" --zone="$GCP_ZONE" \
-  --format="value(networkInterfaces[0].accessConfigs[0].natIP)")
-
-echo "VM: $VM_NAME IP: $EXTERNAL_IP"
-
-# Export for CI
-if [ -n "${GITHUB_ENV:-}" ]; then
-  echo "bootstrap_ip=$EXTERNAL_IP" >> "$GITHUB_ENV"
-fi
+echo "VM: $VM_NAME (hostname=${DD_HOSTNAME})"
