@@ -375,6 +375,18 @@ async fn resolve_auth(
         }
     }
 
+    // 5. GitHub PAT fallback: accept a Bearer token and verify against
+    //    GitHub regardless of auth mode. This lets CI tools (e.g. GitHub
+    //    Actions with a PAT in secrets) authenticate using the same
+    //    verify_github_token the OAuth flow uses. Only reached when steps
+    //    1–4 didn't match — no JWT cookie, no session, and auth mode
+    //    isn't Password (which short-circuits on header mismatch above).
+    if let Some(token) = extract_auth(headers) {
+        if verify_github_token(&token, &state.owner).await.is_ok() {
+            return Ok(Some("github-pat".to_string()));
+        }
+    }
+
     Err(AppError::Unauthorized)
 }
 
