@@ -1,0 +1,208 @@
+# verify-deployment — Example dd-agent API client as a GitHub composite action.
+#
+# Demonstrates the dd-agent HTTP API patterns:
+#
+#   GET /health          (unauthenticated)  Agent liveness + deployment list
+#   GET /deployments     (auth: password)   Full deployment details
+#   POST /exec           (auth: password)   Run a command on the VM
+#
+# The action resolves the VM's IP from libvirt, polls /health until the
+# named deployment reaches `running` status, and on failure uses /exec to
+# dump diagnostic logs from the VM straight into the GH Actions log.
+#
+# Usage:
+#   - uses: ./.github/actions/verify-deployment
+#     with:
+#       vm-name: dd-vm-staging
+#       deployment: openclaw
+#       timeout: 300
+#
+# For full dd-agent API docs see agent/src/server.rs in devopsdefender/dd.
+
+name: 'Verify DD Agent Deployment'
+description: 'Poll a dd-agent until a named deployment is healthy. Example client for the dd-agent HTTP API.'
+
+inputs:
+  vm-name:
+    description: 'Libvirt domain name (e.g. dd-vm-staging)'
+    required: true
+  deployment:
+    description: 'Deployment app_name to wait for (e.g. openclaw)'
+    required: true
+  timeout:
+    description: 'Max seconds to wait for the deployment to reach running (default 300)'
+    required: false
+    default: '300'
+  agent-password:
+    description: 'DD_PASSWORD for authenticated endpoints (/deployments, /exec). Optional but enables richer diagnostics on failure.'
+    required: false
+    default: ''
+
+outputs:
+  vm-ip:
+    description: 'VM IP address on the libvirt bridge'
+    value: ${{ steps.resolve.outputs.vm-ip }}
+  agent-id:
+    description: 'Agent UUID from /health'
+    value: ${{ steps.wait-healthy.outputs.agent-id }}
+  status:
+    description: 'Final deployment status: running | timeout | failed'
+    value: ${{ steps.wait-deployment.outputs.status }}
+
+runs:
+  using: 'composite'
+  steps:
+    # ── Step 1: Resolve VM IP from libvirt DHCP leases ───────────────────
+    - id: resolve
+      name: Resolve VM IP
+      shell: bash
+      env:
+        SSH: "ssh -i /tmp/deploy-key -o StrictHostKeyChecking=no ${{ env.SSH_USER }}@${{ env.SSH_HOST }}"
+        VM_NAME: ${{ inputs.vm-name }}
+      run: |
+        $SSH "sudo virsh dominfo ${VM_NAME}" > /dev/null || {
+          echo "::error::VM ${VM_NAME} is not running"
+          exit 1
+        }
+
+        VM_MAC=$($SSH "sudo virsh domiflist ${VM_NAME} | awk '/virbr0/ {print \$5}'")
+        for attempt in $(seq 1 24); do
+          VM_IP=$($SSH "sudo virsh net-dhcp-leases default | grep '${VM_MAC}' | awk '{print \$5}' | cut -d/ -f1")
+          [ -n "$VM_IP" ] && break
+          echo "  waiting for VM IP... (${attempt}/24)"
+          sleep 5
+        done
+
+        [ -z "$VM_IP" ] && { echo "::error::VM ${VM_NAME} did not get an IP address"; exit 1; }
+        echo "vm-ip=${VM_IP}" >> "$GITHUB_OUTPUT"
+        echo "Resolved ${VM_NAME} → ${VM_IP}"
+
+    # ── Step 2: Wait for dd-agent's HTTP server ──────────────────────────
+    #
+    # dd-agent API: GET /health
+    #   Auth:     none
+    #   Returns:  { ok, agent_id, vm_name, owner, attestation_type,
+    #               deployment_count, deployments: [app_name, ...],
+    #               uptime_seconds, cpu_percent, memory_used_mb,
+    #               memory_total_mb, disk_used_gb, disk_total_gb }
+    #
+    #   `deployments` lists app_names whose status == "running".
+    #   Deployments still in post_deploy or failed are NOT in this list.
+    #
+    - id: wait-healthy
+      name: Wait for agent health
+      shell: bash
+      env:
+        SSH: "ssh -i /tmp/deploy-key -o StrictHostKeyChecking=no ${{ env.SSH_USER }}@${{ env.SSH_HOST }}"
+        VM_IP: ${{ steps.resolve.outputs.vm-ip }}
+      run: |
+        for attempt in $(seq 1 60); do
+          health=$($SSH "curl -fsS http://${VM_IP}:8080/health" 2>/dev/null) || true
+          if [ -n "$health" ]; then
+            agent_id=$(echo "$health" | jq -r '.agent_id')
+            echo "agent-id=${agent_id}" >> "$GITHUB_OUTPUT"
+            echo "Agent healthy (id=${agent_id}, uptime=$(echo "$health" | jq -r '.uptime_seconds')s)"
+            exit 0
+          fi
+          echo "  waiting for agent... (${attempt}/60)"
+          sleep 5
+        done
+        echo "::error::Agent not healthy within 5 minutes"
+        exit 1
+
+    # ── Step 3: Wait for the named deployment to reach running ───────────
+    #
+    # Polls GET /health every 10s. When the deployment's app_name appears
+    # in the `deployments` array, it has passed all post_deploy steps and
+    # status == "running".
+    #
+    # On timeout, if agent-password is provided, the action uses two
+    # authenticated endpoints to surface diagnostics:
+    #
+    # dd-agent API: GET /deployments
+    #   Auth:     Authorization: Bearer <DD_PASSWORD>
+    #   Returns:  [{ id, app_name, image, status, error_message, ... }]
+    #
+    # dd-agent API: POST /exec
+    #   Auth:     Authorization: Bearer <DD_PASSWORD>  (or loopback bypass)
+    #   Body:     { cmd: ["program", "arg1", ...], timeout_secs: 30 }
+    #   Returns:  { exit_code, stdout, stderr }
+    #
+    #   Runs a command directly on the VM (not inside containers).
+    #   For container diagnostics, use ["podman", "exec", "<name>", ...].
+    #
+    - id: wait-deployment
+      name: Wait for deployment
+      shell: bash
+      env:
+        SSH: "ssh -i /tmp/deploy-key -o StrictHostKeyChecking=no ${{ env.SSH_USER }}@${{ env.SSH_HOST }}"
+        VM_IP: ${{ steps.resolve.outputs.vm-ip }}
+        DEPLOYMENT: ${{ inputs.deployment }}
+        TIMEOUT: ${{ inputs.timeout }}
+        AGENT_PASSWORD: ${{ inputs.agent-password }}
+      run: |
+        start=$(date +%s)
+        last_health=""
+
+        while true; do
+          elapsed=$(( $(date +%s) - start ))
+          if [ "$elapsed" -ge "$TIMEOUT" ]; then
+            echo "::error::Deployment '${DEPLOYMENT}' did not reach running within ${TIMEOUT}s"
+            echo "status=timeout" >> "$GITHUB_OUTPUT"
+
+            # Show last /health so we can see what IS running
+            echo "::group::Last /health response"
+            echo "$last_health" | jq . 2>/dev/null || echo "$last_health"
+            echo "::endgroup::"
+
+            # Authenticated diagnostics (optional)
+            if [ -n "$AGENT_PASSWORD" ]; then
+
+              # GET /deployments — full deployment details including error_message
+              echo "::group::GET /deployments (all deployment details)"
+              $SSH "curl -fsS \
+                -H 'Authorization: Bearer ${AGENT_PASSWORD}' \
+                http://${VM_IP}:8080/deployments" 2>/dev/null \
+                | jq . || echo "(request failed — check DD_PASSWORD)"
+              echo "::endgroup::"
+
+              # POST /exec — dump dd-agent log from the VM
+              echo "::group::dd-agent.log (last 60 lines via POST /exec)"
+              $SSH "curl -fsS \
+                -H 'Authorization: Bearer ${AGENT_PASSWORD}' \
+                -H 'Content-Type: application/json' \
+                -d '{\"cmd\":[\"tail\",\"-n\",\"60\",\"/var/log/dd-agent.log\"],\"timeout_secs\":10}' \
+                http://${VM_IP}:8080/exec" 2>/dev/null \
+                | jq -r '.stdout // .stderr // "no output"' || echo "(exec failed)"
+              echo "::endgroup::"
+
+              # POST /exec — container logs for the deployment
+              echo "::group::podman logs ${DEPLOYMENT} (via POST /exec)"
+              $SSH "curl -fsS \
+                -H 'Authorization: Bearer ${AGENT_PASSWORD}' \
+                -H 'Content-Type: application/json' \
+                -d '{\"cmd\":[\"podman\",\"logs\",\"--tail\",\"40\",\"${DEPLOYMENT}\"],\"timeout_secs\":10}' \
+                http://${VM_IP}:8080/exec" 2>/dev/null \
+                | jq -r '.stdout // .stderr // "no output"' || echo "(exec failed)"
+              echo "::endgroup::"
+            else
+              echo "Tip: set agent-password input for richer failure diagnostics via /deployments and /exec"
+            fi
+
+            exit 1
+          fi
+
+          last_health=$($SSH "curl -fsS http://${VM_IP}:8080/health" 2>/dev/null) || true
+          if echo "$last_health" | jq -e --arg d "$DEPLOYMENT" '.deployments | index($d)' > /dev/null 2>&1; then
+            echo "status=running" >> "$GITHUB_OUTPUT"
+            echo ""
+            echo "═══════════════════════════════════════"
+            echo "  ${{ inputs.vm-name }}: ${DEPLOYMENT} deployed (${elapsed}s)"
+            echo "═══════════════════════════════════════"
+            echo "$last_health" | jq '{deployment_count, deployments, memory_total_mb, uptime_seconds}'
+            exit 0
+          fi
+
+          echo "  waiting for '${DEPLOYMENT}'... (${elapsed}s / ${TIMEOUT}s)"
+          sleep 10
+        done
