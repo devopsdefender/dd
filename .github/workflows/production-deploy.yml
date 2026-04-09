@@ -97,12 +97,43 @@ jobs:
         run: scripts/gcp-deploy.sh
 
       - name: Wait for agent health
+        id: health
         run: |
           for i in $(seq 1 60); do
-            curl -fsS "http://${bootstrap_ip}:8080/health" >/dev/null 2>&1 && echo "Agent healthy!" && exit 0
+            health=$(curl -fsS "http://${bootstrap_ip}:8080/health" 2>/dev/null) || true
+            if [ -n "$health" ]; then
+              hostname=$(echo "$health" | jq -r '.hostname // empty')
+              echo "Agent healthy! hostname=${hostname}"
+              echo "agent-url=https://${hostname}" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
             echo "  attempt ${i}/60..." && sleep 5
           done
           echo "::error::Agent not healthy within 5 minutes"
           exit 1
 
+      # ── Integration test: deploy scraper via the tunnel ────────────────
 
+      - name: Deploy scraper (integration test)
+        uses: ./.github/actions/deploy-workload
+        with:
+          agent-url: ${{ steps.health.outputs.agent-url }}
+          deploy-spec: apps/scraper/deploy.json
+          github-token: ${{ secrets.DD_AGENT_PAT }}
+
+      - name: Verify scraper deployment
+        uses: ./.github/actions/verify-deployment
+        with:
+          agent-url: ${{ steps.health.outputs.agent-url }}
+          deployment: scraper
+          timeout: 120
+          github-token: ${{ secrets.DD_AGENT_PAT }}
+
+      - name: Verify fleet dashboard
+        run: |
+          dashboard=$(curl -fsS "${{ steps.health.outputs.agent-url }}/" 2>/dev/null) || true
+          if echo "$dashboard" | grep -qi "scraper"; then
+            echo "Fleet dashboard shows scraper workload"
+          else
+            echo "::warning::Scraper not visible on fleet dashboard HTML"
+          fi
