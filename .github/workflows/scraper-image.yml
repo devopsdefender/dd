@@ -1,4 +1,4 @@
-name: Build Scraper Image
+name: Build & Deploy Scraper
 
 on:
   push:
@@ -6,10 +6,14 @@ on:
     paths:
       - "agent/src/bin/dd-scraper/**"
       - "Dockerfile.scraper"
+      - "apps/scraper/**"
   workflow_dispatch:
 
 permissions:
   packages: write
+
+env:
+  DD_DOMAIN: ${{ vars.DD_CF_DOMAIN || 'devopsdefender.com' }}
 
 jobs:
   build:
@@ -29,3 +33,32 @@ jobs:
           tags: |
             ghcr.io/devopsdefender/dd-scraper:${{ github.sha }}
             ghcr.io/devopsdefender/dd-scraper:latest
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        env: [staging, production]
+        include:
+          - env: staging
+            url_prefix: app-staging
+          - env: production
+            url_prefix: app
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy scraper
+        uses: ./.github/actions/deploy-workload
+        with:
+          agent-url: https://${{ matrix.url_prefix }}.${{ env.DD_DOMAIN }}
+          deploy-spec: apps/scraper/deploy.json
+          github-token: ${{ secrets.DD_AGENT_PAT }}
+
+      - name: Verify scraper
+        uses: ./.github/actions/verify-deployment
+        with:
+          agent-url: https://${{ matrix.url_prefix }}.${{ env.DD_DOMAIN }}
+          deployment: scraper
+          timeout: 120
+          github-token: ${{ secrets.DD_AGENT_PAT }}
