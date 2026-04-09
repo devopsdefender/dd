@@ -1,0 +1,133 @@
+# deploy-workload — Deploy a workload to a dd-agent via POST /deploy.
+#
+# Example dd-agent API client for the deployment lifecycle:
+#
+#   POST /deploy    (auth: Bearer PAT)   Submit a workload deploy spec
+#   GET  /health    (unauthenticated)    Poll agent readiness
+#
+# The action waits for the agent at the given hostname to be healthy,
+# then POSTs the deploy spec JSON. It does NOT wait for the deployment
+# to finish — use verify-deployment for that.
+#
+# Usage:
+#   - uses: devopsdefender/dd/.github/actions/deploy-workload@main
+#     with:
+#       agent-url: https://dd-staging-xxx.devopsdefender.com
+#       deploy-spec: apps/openclaw/deploy.json
+#       github-token: ${{ secrets.DD_AGENT_PAT }}
+#
+# For full dd-agent API docs see agent/src/server.rs in devopsdefender/dd.
+
+name: 'Deploy Workload to DD Agent'
+description: 'POST a deploy spec to a dd-agent. Example client for POST /deploy.'
+
+inputs:
+  agent-url:
+    description: 'Base URL of the dd-agent (e.g. https://dd-staging-xxx.devopsdefender.com)'
+    required: true
+  deploy-spec:
+    description: 'Path to deploy spec JSON file (relative to repo root). Sent as the POST /deploy body.'
+    required: true
+  github-token:
+    description: 'GitHub token for dd-agent auth. Works with GITHUB_TOKEN (for repos in the DD_OWNER org) or a PAT.'
+    required: false
+    default: ${{ github.token }}
+
+outputs:
+  agent-id:
+    description: 'Agent UUID from /health'
+    value: ${{ steps.wait-healthy.outputs.agent-id }}
+  deploy-response:
+    description: 'Raw JSON response from POST /deploy'
+    value: ${{ steps.deploy.outputs.response }}
+
+runs:
+  using: 'composite'
+  steps:
+    # ── Step 1: Wait for dd-agent health ─────────────────────────────────
+    #
+    # dd-agent API: GET /health
+    #   Auth:     none
+    #   Returns:  { ok, agent_id, vm_name, owner, deployment_count,
+    #               deployments: [app_name, ...], ... }
+    #
+    - id: wait-healthy
+      name: Wait for agent health
+      shell: bash
+      env:
+        AGENT_URL: ${{ inputs.agent-url }}
+      run: |
+        for attempt in $(seq 1 60); do
+          health=$(curl -fsS "${AGENT_URL}/health" 2>/dev/null) || true
+          if [ -n "$health" ]; then
+            agent_id=$(echo "$health" | jq -r '.agent_id')
+            echo "agent-id=${agent_id}" >> "$GITHUB_OUTPUT"
+            echo "Agent healthy (id=${agent_id})"
+            exit 0
+          fi
+          echo "  waiting for agent... (${attempt}/60)"
+          sleep 5
+        done
+        echo "::error::Agent not healthy within 5 minutes"
+        exit 1
+
+    # ── Step 2: POST /deploy ─────────────────────────────────────────────
+    #
+    # dd-agent API: POST /deploy
+    #   Auth:     Authorization: Bearer <github-pat>
+    #   Body:     DeployRequest JSON:
+    #             {
+    #               "image": "docker.io/ollama/ollama@sha256:...",
+    #               "app_name": "openclaw",
+    #               "env": ["KEY=value"],
+    #               "volumes": ["name:/path"],
+    #               "post_deploy": [["sh","-c","cmd1"], ["sh","-c","cmd2"]]
+    #             }
+    #   Returns:  { "id": "<deployment-uuid>", "status": "deploying" }
+    #
+    #   The deploy runs asynchronously — post_deploy commands execute
+    #   sequentially inside the container after it starts. Any non-zero
+    #   exit fails the deploy. Use verify-deployment to poll until
+    #   status=running.
+    #
+    - id: deploy
+      name: Deploy workload
+      shell: bash
+      env:
+        AGENT_URL: ${{ inputs.agent-url }}
+        GITHUB_TOKEN_INPUT: ${{ inputs.github-token }}
+        DEPLOY_SPEC: ${{ inputs.deploy-spec }}
+      run: |
+        if [ ! -f "$DEPLOY_SPEC" ]; then
+          echo "::error::Deploy spec not found: ${DEPLOY_SPEC}"
+          exit 1
+        fi
+
+        app_name=$(jq -r '.app_name // "unknown"' "$DEPLOY_SPEC")
+        echo "Deploying '${app_name}' from ${DEPLOY_SPEC}"
+
+        # Retry the POST — the tunnel can be briefly unstable (530) right
+        # after VM creation even though /health already passed.
+        for attempt in $(seq 1 12); do
+          response=$(curl -sS \
+            -H "Authorization: Bearer ${GITHUB_TOKEN_INPUT}" \
+            -H "Content-Type: application/json" \
+            --data @"${DEPLOY_SPEC}" \
+            -w "\n%{http_code}" \
+            "${AGENT_URL}/deploy" 2>&1)
+          http_code=$(echo "$response" | tail -1)
+          body=$(echo "$response" | sed '$d')
+
+          if [ "$http_code" = "200" ] || [ "$http_code" = "201" ]; then
+            echo "response=${body}" >> "$GITHUB_OUTPUT"
+            deploy_id=$(echo "$body" | jq -r '.id // "unknown"')
+            deploy_status=$(echo "$body" | jq -r '.status // "unknown"')
+            echo "Deploy submitted: id=${deploy_id} status=${deploy_status}"
+            exit 0
+          fi
+
+          echo "  POST /deploy returned HTTP ${http_code}, retrying... (${attempt}/12)"
+          sleep 5
+        done
+        echo "::error::POST /deploy failed after 12 attempts (last HTTP ${http_code}): ${body}"
+        exit 1

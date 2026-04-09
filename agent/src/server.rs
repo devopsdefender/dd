@@ -77,6 +77,7 @@ pub struct HealthResponse {
     pub ok: bool,
     pub agent_id: String,
     pub vm_name: String,
+    pub hostname: String,
     pub owner: String,
     pub attestation_type: String,
     pub deployment_count: usize,
@@ -454,6 +455,7 @@ async fn health(State(state): State<AgentState>) -> Json<HealthResponse> {
         ok: true,
         agent_id: state.agent_id.clone(),
         vm_name: state.vm_name.clone(),
+        hostname: std::env::var("DD_HOSTNAME").unwrap_or_default(),
         owner: state.owner.clone(),
         attestation_type: state.attestation_type.clone(),
         deployment_count,
@@ -1113,6 +1115,23 @@ async fn verify_github_token(token: &str, owner: &str) -> Result<(), AppError> {
             }
         }
     }
+
+    // GitHub Actions GITHUB_TOKEN (installation token) doesn't have a /user
+    // identity, but it CAN access repos in the org it was issued for. Check
+    // if the token can read a known repo under the owner — if so, the token
+    // belongs to a workflow running in the owner's org.
+    let repo_resp = client
+        .get(format!("https://api.github.com/repos/{owner}/dd"))
+        .header("Authorization", format!("Bearer {token}"))
+        .header("User-Agent", "dd-agent")
+        .send()
+        .await;
+    if let Ok(resp) = repo_resp {
+        if resp.status().is_success() {
+            return Ok(());
+        }
+    }
+
     Err(AppError::Unauthorized)
 }
 
