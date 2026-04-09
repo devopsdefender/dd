@@ -34,9 +34,9 @@ inputs:
     required: false
     default: '300'
   github-token:
-    description: 'GitHub PAT for dd-agent auth (user must be in DD_OWNER org). Enables richer diagnostics on failure via /deployments and /exec.'
+    description: 'GitHub token for dd-agent auth. Works with GITHUB_TOKEN (for repos in the DD_OWNER org) or a PAT. Enables richer diagnostics on failure.'
     required: false
-    default: ''
+    default: ${{ github.token }}
 
 outputs:
   agent-id:

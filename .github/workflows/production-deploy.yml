@@ -118,7 +118,7 @@ jobs:
         with:
           agent-url: https://app.${{ env.DD_DOMAIN }}
           deploy-spec: apps/scraper/deploy.json
-          github-token: ${{ secrets.DD_AGENT_PAT }}
+          github-token: ${{ github.token }}
 
       - name: Verify scraper deployment
         uses: ./.github/actions/verify-deployment
@@ -126,7 +126,7 @@ jobs:
           agent-url: https://app.${{ env.DD_DOMAIN }}
           deployment: scraper
           timeout: 120
-          github-token: ${{ secrets.DD_AGENT_PAT }}
+          github-token: ${{ github.token }}
 
       - name: Verify fleet dashboard
         run: |

@@ -29,8 +29,9 @@ inputs:
     description: 'Path to deploy spec JSON file (relative to repo root). Sent as the POST /deploy body.'
     required: true
   github-token:
-    description: 'GitHub PAT for dd-agent auth (user must be in DD_OWNER org).'
-    required: true
+    description: 'GitHub token for dd-agent auth. Works with GITHUB_TOKEN (for repos in the DD_OWNER org) or a PAT.'
+    required: false
+    default: ${{ github.token }}
 
 outputs:
   agent-id:
