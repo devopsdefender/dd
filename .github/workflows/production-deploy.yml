@@ -4,7 +4,7 @@ on:
   push:
     branches: [main]
     paths:
-      - "agent/**"
+      - "crates/**"
       - "scripts/**"
       - ".github/workflows/production-deploy.yml"
   workflow_dispatch:
@@ -48,8 +48,10 @@ jobs:
             --title "prod-${sha12}" \
             --notes "Production build from ${{ github.sha }}" \
             --prerelease \
-            target/release/dd-agent
-          url=$(gh release view "$tag" --json assets --jq '.assets[] | select(.name=="dd-agent") | .url')
+            target/release/dd-client \
+            target/release/dd-register \
+            target/release/dd-web
+          url=$(gh release view "$tag" --json assets --jq '.assets[] | select(.name=="dd-client") | .url')
           echo "url=${url}" >> "$GITHUB_OUTPUT"
 
   cleanup:
