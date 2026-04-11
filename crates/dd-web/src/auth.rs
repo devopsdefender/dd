@@ -149,14 +149,24 @@ async fn resolve_auth(state: &WebState, headers: &HeaderMap) -> Result<Option<St
         return Ok(Some("session".to_string()));
     }
 
-    // 3. GitHub PAT / installation-token fallback: accept a Bearer token
-    //    and verify it against GitHub. Lets CI tools (GitHub Actions with
-    //    ${{ github.token }} or a user PAT) authenticate using the same
-    //    verify_github_token that the OAuth flow uses. Installation tokens
-    //    fall through to the repo-access probe inside verify_github_token.
-    //    Originally added in #68 to the old dd-agent; re-wired here after
-    //    the workspace rewrite dropped it from resolve_auth.
+    // 3-4. Bearer token: try GitHub Actions OIDC first (canonical CI
+    //      auth, zero secrets, claims-based), fall back to PAT/OAuth
+    //      token via verify_github_token for manual scripting with a
+    //      real user PAT (e.g. `curl -H "Bearer $(gh auth token)"`).
     if let Some(token) = bearer_from_header(headers) {
+        // Structural check: GitHub OIDC tokens are 3-segment RS256 JWTs.
+        // PATs and github.token are opaque strings. Skip the JWKS fetch
+        // for non-JWT-shaped tokens.
+        let looks_like_jwt = token.matches('.').count() == 2;
+
+        if looks_like_jwt {
+            if let Some(audience) = state.config.oidc_audience.as_deref() {
+                if let Ok(repo) = verify_github_oidc(&token, &state.config.owner, audience).await {
+                    return Ok(Some(format!("github-oidc:{repo}")));
+                }
+            }
+        }
+
         if verify_github_token(&token, &state.config.owner)
             .await
             .is_ok()
@@ -232,6 +242,54 @@ async fn verify_github_token(token: &str, owner: &str) -> Result<(), AppError> {
     }
 
     Err(AppError::Unauthorized)
+}
+
+// ── GitHub Actions OIDC token verification ──────────────────────────────
+//
+// Canonical "auth from a GitHub Action" pattern: the workflow mints an
+// OIDC JWT via $ACTIONS_ID_TOKEN_REQUEST_URL with a custom audience,
+// dd-web verifies the signature against GitHub's JWKS and checks claims.
+// No secrets, no API calls to github.com/user, no rate limits.
+
+const GH_OIDC_ISSUER: &str = "https://token.actions.githubusercontent.com";
+const GH_OIDC_JWKS_URL: &str = "https://token.actions.githubusercontent.com/.well-known/jwks";
+
+#[derive(serde::Deserialize)]
+struct GithubOidcClaims {
+    repository: String,
+    repository_owner: String,
+}
+
+/// Verify a GitHub Actions OIDC token. Returns the `repository` claim
+/// on success. Enforces signature (RS256 via JWKS), issuer, audience,
+/// exp/nbf (via Validation defaults), and `repository_owner == owner`.
+async fn verify_github_oidc(token: &str, owner: &str, audience: &str) -> Result<String, AppError> {
+    // TODO(perf): cache JWKS with a ~10 min TTL. Fetch-per-request is
+    // fine for low CI volume (a handful of auth checks per deploy).
+    let jwks: jsonwebtoken::jwk::JwkSet = reqwest::get(GH_OIDC_JWKS_URL)
+        .await
+        .map_err(|_| AppError::Unauthorized)?
+        .json()
+        .await
+        .map_err(|_| AppError::Unauthorized)?;
+
+    let header = jsonwebtoken::decode_header(token).map_err(|_| AppError::Unauthorized)?;
+    let kid = header.kid.ok_or(AppError::Unauthorized)?;
+    let jwk = jwks.find(&kid).ok_or(AppError::Unauthorized)?;
+    let key = jsonwebtoken::DecodingKey::from_jwk(jwk).map_err(|_| AppError::Unauthorized)?;
+
+    let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::RS256);
+    validation.set_issuer(&[GH_OIDC_ISSUER]);
+    validation.set_audience(&[audience]);
+
+    let data = jsonwebtoken::decode::<GithubOidcClaims>(token, &key, &validation)
+        .map_err(|_| AppError::Unauthorized)?;
+
+    if data.claims.repository_owner != owner {
+        return Err(AppError::Unauthorized);
+    }
+
+    Ok(data.claims.repository)
 }
 
 // ── Route handlers ───────────────────────────────────────────────────────

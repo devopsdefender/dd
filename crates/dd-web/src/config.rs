@@ -13,6 +13,10 @@ pub struct Config {
     pub env_label: String,
     pub peers: Vec<String>,
     pub scrape_interval_secs: u64,
+    /// If set, enable GitHub Actions OIDC auth with this audience.
+    /// When the workflow mints its ID token it must pass the same
+    /// audience: `&audience=<value>`. Unset → OIDC branch disabled.
+    pub oidc_audience: Option<String>,
 }
 
 impl Config {
@@ -66,6 +70,10 @@ impl Config {
             .and_then(|s| s.parse().ok())
             .unwrap_or(30);
 
+        let oidc_audience = std::env::var("DD_OIDC_AUDIENCE")
+            .ok()
+            .filter(|s| !s.is_empty());
+
         Self {
             cf,
             github_client_id,
@@ -78,6 +86,7 @@ impl Config {
             env_label,
             peers,
             scrape_interval_secs,
+            oidc_audience,
         }
     }
 }

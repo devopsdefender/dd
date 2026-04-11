@@ -44,6 +44,8 @@ DD_PORT=8081 \
 nohup /usr/local/bin/dd-register > /var/log/dd-register.log 2>&1 &
 
 # ── Start dd-web (fleet dashboard + collector) ───────────────────────────
+# DD_OIDC_AUDIENCE enables GitHub Actions OIDC auth — workflows mint a
+# token with &audience=dd-web and hit the dashboard with Bearer.
 DD_CF_API_TOKEN="${CLOUDFLARE_API_TOKEN}" \
 DD_CF_ACCOUNT_ID="${CLOUDFLARE_ACCOUNT_ID}" \
 DD_CF_ZONE_ID="${CLOUDFLARE_ZONE_ID}" \
@@ -54,6 +56,7 @@ DD_OWNER=devopsdefender \
 DD_GITHUB_CLIENT_ID="${DD_GITHUB_CLIENT_ID}" \
 DD_GITHUB_CLIENT_SECRET="${DD_GITHUB_CLIENT_SECRET}" \
 DD_GITHUB_CALLBACK_URL="${DD_GITHUB_CALLBACK_URL}" \
+DD_OIDC_AUDIENCE=dd-web \
 DD_PORT=8080 \
 nohup /usr/local/bin/dd-web > /var/log/dd-web.log 2>&1 &
 
