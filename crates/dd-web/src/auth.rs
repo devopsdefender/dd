@@ -1,7 +1,7 @@
 use std::time::{Duration, Instant};
 
 use axum::extract::State;
-use axum::http::header::{COOKIE, SET_COOKIE};
+use axum::http::header::{AUTHORIZATION, COOKIE, SET_COOKIE};
 use axum::http::{HeaderMap, HeaderValue, Uri};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use serde::Deserialize;
@@ -122,6 +122,16 @@ async fn session_token_from_cookie(state: &WebState, headers: &HeaderMap) -> Opt
         .map(|session| session.token.clone())
 }
 
+/// Extract a bearer token from the Authorization header.
+fn bearer_from_header(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(AUTHORIZATION)
+        .and_then(|h| h.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 /// Resolve authentication -- returns Ok(Some(login)) if authenticated, Err if rejected.
 async fn resolve_auth(state: &WebState, headers: &HeaderMap) -> Result<Option<String>, AppError> {
     // No owner configured: allow all
@@ -137,6 +147,22 @@ async fn resolve_auth(state: &WebState, headers: &HeaderMap) -> Result<Option<St
     // 2. Check local session cookie
     if let Some(_token) = session_token_from_cookie(state, headers).await {
         return Ok(Some("session".to_string()));
+    }
+
+    // 3. GitHub PAT / installation-token fallback: accept a Bearer token
+    //    and verify it against GitHub. Lets CI tools (GitHub Actions with
+    //    ${{ github.token }} or a user PAT) authenticate using the same
+    //    verify_github_token that the OAuth flow uses. Installation tokens
+    //    fall through to the repo-access probe inside verify_github_token.
+    //    Originally added in #68 to the old dd-agent; re-wired here after
+    //    the workspace rewrite dropped it from resolve_auth.
+    if let Some(token) = bearer_from_header(headers) {
+        if verify_github_token(&token, &state.config.owner)
+            .await
+            .is_ok()
+        {
+            return Ok(Some("github-pat".to_string()));
+        }
     }
 
     Err(AppError::Unauthorized)

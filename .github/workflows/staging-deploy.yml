@@ -123,12 +123,17 @@ jobs:
       - name: Verify dashboard renders
         env:
           AGENT_URL: https://app-staging.${{ env.DD_DOMAIN }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          # dd-web's fleet dashboard at /. Retry on 530 — the cloudflared
-          # tunnel can be briefly unstable right after /health first
-          # responds, even though the bind is fine.
+          # dd-web's fleet dashboard at /. Auth-gated: we pass the
+          # workflow's github.token as a Bearer so resolve_auth takes
+          # the PAT-as-Bearer branch (#68) — installation tokens then
+          # fall through to the repo-access probe in verify_github_token.
+          # Retry on cloudflared 530 (tunnel flake right after /health).
           for attempt in $(seq 1 12); do
-            code=$(curl -s -o /dev/null -w '%{http_code}' "${AGENT_URL}/" || echo 000)
+            code=$(curl -s -o /dev/null -w '%{http_code}' \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              "${AGENT_URL}/" || echo 000)
             if [ "$code" = "200" ]; then
               echo "Dashboard renders (HTTP 200, attempt ${attempt})"
               exit 0
