@@ -38,7 +38,11 @@ set -euo pipefail
 # ── Pinned image SHAs ─────────────────────────────────────────────────────
 # Bump these to rotate to newer sealed builds. Keep them pinned (not
 # :latest) so a rebuild of main doesn't silently change what's deployed.
-EE_IMAGE="${EE_IMAGE:-easyenclave-75e0b30fa162}"
+#
+# easyenclave-9ff1a1fca190: first image with the Rust-native container
+# runtime (libcontainer) + libseccomp.so.2 in the rootfs. easyenclave-
+# 75e0b30fa162 and earlier couldn't actually run OCI workloads.
+EE_IMAGE="${EE_IMAGE:-easyenclave-9ff1a1fca190}"
 EE_IMAGE_PROJECT="${EE_IMAGE_PROJECT:-easyenclave}"
 DD_REGISTER_IMAGE="${DD_REGISTER_IMAGE:-ghcr.io/devopsdefender/dd-register:31ff718b169b}"
 DD_WEB_IMAGE="${DD_WEB_IMAGE:-ghcr.io/devopsdefender/dd-web:31ff718b169b}"
