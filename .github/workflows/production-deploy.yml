@@ -117,11 +117,17 @@ jobs:
         env:
           AGENT_URL: https://app.${{ env.DD_DOMAIN }}
         run: |
-          # dd-web's fleet dashboard at /. /health already passed, so
-          # tunnel + bind are fine — this catches render regressions.
-          code=$(curl -fsS -o /dev/null -w '%{http_code}' "${AGENT_URL}/")
-          if [ "$code" != "200" ]; then
-            echo "::error::dashboard / returned HTTP ${code}"
-            exit 1
-          fi
-          echo "Dashboard renders (HTTP 200)"
+          # dd-web's fleet dashboard at /. Retry on 530 — the cloudflared
+          # tunnel can be briefly unstable right after /health first
+          # responds, even though the bind is fine.
+          for attempt in $(seq 1 12); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' "${AGENT_URL}/" || echo 000)
+            if [ "$code" = "200" ]; then
+              echo "Dashboard renders (HTTP 200, attempt ${attempt})"
+              exit 0
+            fi
+            echo "  dashboard returned HTTP ${code}, retrying... (${attempt}/12)"
+            sleep 5
+          done
+          echo "::error::dashboard / never returned 200 (last HTTP ${code})"
+          exit 1
