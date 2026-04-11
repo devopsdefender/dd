@@ -22,25 +22,6 @@ cargo build --workspace --release
 # Produces: target/release/dd-client, dd-register, dd-web
 ```
 
-## GitHub Actions
-
-Reusable composite actions for CI/CD:
-
-```yaml
-- uses: devopsdefender/dd/.github/actions/deploy-workload@main
-  with:
-    agent-url: https://app.devopsdefender.com
-    deploy-spec: apps/myapp/deploy.json
-
-- uses: devopsdefender/dd/.github/actions/verify-deployment@main
-  with:
-    agent-url: https://app.devopsdefender.com
-    deployment: myapp
-    timeout: 300
-```
-
-`GITHUB_TOKEN` auth works out of the box for repos in the DD_OWNER org.
-
 ## License
 
 MIT
