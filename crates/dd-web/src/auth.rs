@@ -134,10 +134,10 @@ fn bearer_from_header(headers: &HeaderMap) -> Option<String> {
 
 /// Resolve authentication -- returns Ok(Some(login)) if authenticated, Err if rejected.
 async fn resolve_auth(state: &WebState, headers: &HeaderMap) -> Result<Option<String>, AppError> {
-    // No owner configured: allow all
-    if state.config.owner.is_empty() {
-        return Ok(None);
-    }
+    // DD_OWNER is now required in Config::from_env — if we reach here
+    // it's always non-empty. (Previously an empty owner silently
+    // disabled all auth, which was a fail-open bug.)
+    debug_assert!(!state.config.owner.is_empty());
 
     // 1. Check dd_auth JWT (domain-scoped cookie)
     if let Some(claims) = validate_auth_jwt(state, headers) {

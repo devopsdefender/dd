@@ -46,14 +46,26 @@ impl Config {
         let github_callback_url = std::env::var("DD_GITHUB_CALLBACK_URL")
             .unwrap_or_else(|_| format!("https://{hostname}/auth/github/callback"));
 
-        let owner = std::env::var("DD_OWNER").unwrap_or_default();
+        // DD_OWNER is required. Previously defaulted to empty, and
+        // resolve_auth short-circuited to Ok(None) on an empty owner,
+        // which silently disabled all authentication. Fail fast.
+        let owner = std::env::var("DD_OWNER").unwrap_or_else(|_| {
+            eprintln!("dd-web: DD_OWNER required (GitHub user or org that may access the fleet)");
+            std::process::exit(1);
+        });
 
         let port: u16 = std::env::var("DD_PORT")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(8080);
 
-        let env_label = std::env::var("DD_ENV").unwrap_or_else(|_| "dev".into());
+        // DD_ENV is required. Previously defaulted to "dev", which in
+        // production silently made the collector look for dd-dev-*
+        // tunnels and find nothing — empty fleet, no error.
+        let env_label = std::env::var("DD_ENV").unwrap_or_else(|_| {
+            eprintln!("dd-web: DD_ENV required (staging / production / dev)");
+            std::process::exit(1);
+        });
 
         let peers: Vec<String> = std::env::var("DD_PEERS")
             .ok()

@@ -324,9 +324,8 @@ pub async fn ws_session(
 
 /// Proxy WebSocket I/O to easyenclave exec.
 ///
-/// Unlike the old dd-agent which attached directly to process stdin/stdout,
-/// dd-client proxies everything through the easyenclave unix socket.
-/// For interactive sessions, we use the easyenclave exec API.
+/// dd-client never touches the workload process directly; interactive
+/// sessions go through the easyenclave exec API on /var/lib/easyenclave/agent.sock.
 async fn handle_ws_session(socket: WebSocket, state: AppState, app_name: String) {
     let (mut ws_tx, mut ws_rx) = socket.split();
 
