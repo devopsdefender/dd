@@ -17,7 +17,7 @@ The enclave runtime itself is [EasyEnclave](https://github.com/easyenclave/easye
 
 ## How it's deployed
 
-Both management VMs (`app.devopsdefender.com`, `app-staging.devopsdefender.com`) and worker VMs **boot from a sealed easyenclave image**. No cloud-init, no stock Ubuntu, no runtime `apt-get install`. The TDX VM's rootfs is the published `easyenclave-<sha>` image from [easyenclave/easyenclave releases](https://github.com/easyenclave/easyenclave/releases), attestable against a single UKI SHA256.
+Both management VMs (`app.devopsdefender.com`, `app-staging.devopsdefender.com`) and worker VMs **boot from a sealed easyenclave image**. No cloud-init, no stock Ubuntu, no runtime `apt-get install`. The TDX VM's rootfs is the latest image in the `easyenclave-staging` family published by [easyenclave/easyenclave](https://github.com/easyenclave/easyenclave/releases), attestable against a single UKI SHA256.
 
 dd's three binaries ship as OCI container images on ghcr.io:
 
@@ -27,7 +27,7 @@ dd's three binaries ship as OCI container images on ghcr.io:
 
 Image builds: `.github/workflows/push-management-images.yml` (on push to main).
 
-Per-VM configuration (CF credentials, GitHub OAuth, the workload spec itself) is passed to easyenclave at boot via **GCE instance metadata** — the `ee-config` attribute, a JSON object read by `easyenclave::init::fetch_gce_metadata_config()` and applied as env vars. `scripts/gcp-deploy.sh` builds the spec and invokes `gcloud compute instances create --image=easyenclave-<sha> --metadata-from-file=ee-config=...`.
+Per-VM configuration (CF credentials, GitHub OAuth, the workload spec itself) is passed to easyenclave at boot via **GCE instance metadata** — the `ee-config` attribute, a JSON object read by `easyenclave::init::fetch_gce_metadata_config()` and applied as env vars. `scripts/gcp-deploy.sh` builds the spec and invokes `gcloud compute instances create --image-family=easyenclave-staging --metadata-from-file=ee-config=...` — no sha12 pin to maintain.
 
 ## Build
 
