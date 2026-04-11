@@ -1,0 +1,80 @@
+name: Push Management Images
+
+# Builds container images for dd-register and dd-web and pushes to
+# ghcr.io. These images are deployed as workloads inside easyenclave-
+# sealed TDX VMs that serve as dd management VMs
+# (app-staging.devopsdefender.com, app.devopsdefender.com).
+#
+# On PRs: builds both images (validates Dockerfile + compiles),
+#         but does NOT push — only main pushes publish.
+# On push to main: builds and pushes both to ghcr.io with tags
+#                  :<sha12> and :latest.
+# workflow_dispatch: manual trigger.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/push-management-images.yml"
+  pull_request:
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/push-management-images.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: push-management-images-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write   # push to ghcr.io
+
+jobs:
+  push:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          - name: dd-register
+            dockerfile: crates/dd-register/Dockerfile
+          - name: dd-web
+            dockerfile: crates/dd-web/Dockerfile
+          - name: dd-client
+            dockerfile: crates/dd-client/Dockerfile
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute short sha
+        id: meta
+        run: echo "sha12=$(echo ${{ github.sha }} | cut -c1-12)" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to ghcr.io
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push ${{ matrix.image.name }}
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.image.dockerfile }}
+          push: ${{ github.event_name != 'pull_request' }}
+          platforms: linux/amd64
+          tags: |
+            ghcr.io/devopsdefender/${{ matrix.image.name }}:${{ steps.meta.outputs.sha12 }}
+            ghcr.io/devopsdefender/${{ matrix.image.name }}:latest
+          cache-from: type=gha,scope=${{ matrix.image.name }}
+          cache-to: type=gha,scope=${{ matrix.image.name }},mode=max
