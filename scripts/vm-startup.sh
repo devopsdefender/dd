@@ -1,9 +1,9 @@
 #!/bin/bash
 # vm-startup.sh — Runs inside the GCP TDX VM at boot via startup-script metadata.
-# Installs podman, cloudflared, dd-agent, and starts the register + scraper.
+# Installs dd-register + dd-web and starts both.
 #
-# Required env vars (set by the deploy script):
-#   BINARY_URL              — dd-agent binary download URL
+# Required env vars (set by gcp-deploy.sh):
+#   BINARY_URL              — dd-client binary download URL (release has all 3)
 #   DD_ENV                  — staging or production
 #   DD_DOMAIN               — Domain (e.g. devopsdefender.com)
 #   DD_HOSTNAME             — Public hostname for this register
@@ -26,43 +26,38 @@ curl -fsSL -o /usr/local/bin/cloudflared \
   https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
 chmod +x /usr/local/bin/cloudflared
 
-curl -fsSL -o /usr/local/bin/dd-agent "${BINARY_URL}" -H "Accept: application/octet-stream"
-chmod +x /usr/local/bin/dd-agent
+# The release URL points to dd-client; derive dd-register and dd-web URLs from the same release
+RELEASE_BASE="${BINARY_URL%/dd-client}"
+for bin in dd-client dd-register dd-web; do
+  curl -fsSL -o "/usr/local/bin/${bin}" "${RELEASE_BASE}/${bin}" -H "Accept: application/octet-stream"
+  chmod +x "/usr/local/bin/${bin}"
+done
 
-# ── Start dd-agent (register mode) ──────────────────────────────────────
-DD_OWNER=devopsdefender \
-DD_AGENT_MODE=register \
-DD_ENV="${DD_ENV}" \
+# ── Start dd-register (tunnel provisioning) ──────────────────────────────
 DD_CF_API_TOKEN="${CLOUDFLARE_API_TOKEN}" \
 DD_CF_ACCOUNT_ID="${CLOUDFLARE_ACCOUNT_ID}" \
 DD_CF_ZONE_ID="${CLOUDFLARE_ZONE_ID}" \
 DD_CF_DOMAIN="${DD_DOMAIN}" \
 DD_HOSTNAME="${DD_HOSTNAME}" \
+DD_ENV="${DD_ENV}" \
+DD_PORT=8081 \
+nohup /usr/local/bin/dd-register > /var/log/dd-register.log 2>&1 &
+
+# ── Start dd-web (fleet dashboard + collector) ───────────────────────────
+# DD_OIDC_AUDIENCE enables GitHub Actions OIDC auth — workflows mint a
+# token with &audience=dd-web and hit the dashboard with Bearer.
+DD_CF_API_TOKEN="${CLOUDFLARE_API_TOKEN}" \
+DD_CF_ACCOUNT_ID="${CLOUDFLARE_ACCOUNT_ID}" \
+DD_CF_ZONE_ID="${CLOUDFLARE_ZONE_ID}" \
+DD_CF_DOMAIN="${DD_DOMAIN}" \
+DD_HOSTNAME="${DD_HOSTNAME}" \
+DD_ENV="${DD_ENV}" \
+DD_OWNER=devopsdefender \
 DD_GITHUB_CLIENT_ID="${DD_GITHUB_CLIENT_ID}" \
 DD_GITHUB_CLIENT_SECRET="${DD_GITHUB_CLIENT_SECRET}" \
 DD_GITHUB_CALLBACK_URL="${DD_GITHUB_CALLBACK_URL}" \
-DD_BOOT_CMD=bash \
-DD_BOOT_APP=demo \
-nohup /usr/local/bin/dd-agent > /var/log/dd-agent.log 2>&1 &
+DD_OIDC_AUDIENCE=dd-web \
+DD_PORT=8080 \
+nohup /usr/local/bin/dd-web > /var/log/dd-web.log 2>&1 &
 
-# ── Deploy scraper container via localhost API ────────────────────────────
-(
-  for i in $(seq 1 30); do
-    curl -fsS http://localhost:8080/health >/dev/null 2>&1 && break
-    sleep 2
-  done
-  curl -sS -X POST http://localhost:8080/deploy \
-    -H "Content-Type: application/json" \
-    -d "{
-      \"image\": \"ghcr.io/devopsdefender/dd-scraper:latest\",
-      \"app_name\": \"scraper\",
-      \"env\": [
-        \"DD_CF_API_TOKEN=${CLOUDFLARE_API_TOKEN}\",
-        \"DD_CF_ACCOUNT_ID=${CLOUDFLARE_ACCOUNT_ID}\",
-        \"DD_CF_ZONE_ID=${CLOUDFLARE_ZONE_ID}\",
-        \"DD_CF_DOMAIN=${DD_DOMAIN}\",
-        \"DD_ENV=${DD_ENV}\",
-        \"DD_REGISTER_URL=ws://localhost:8080/scraper\"
-      ]
-    }" && echo "scraper deployed" || echo "scraper deploy failed"
-) &
+echo "dd-register on :8081, dd-web on :8080"

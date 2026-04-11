@@ -1,4 +1,0 @@
-{
-  "image": "ghcr.io/devopsdefender/dd-scraper:latest",
-  "app_name": "scraper"
-}
