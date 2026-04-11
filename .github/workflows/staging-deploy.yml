@@ -1,11 +1,10 @@
 name: Staging Deploy
 
 on:
-  pull_request:
+  push:
     branches: [main]
     paths:
-      - "crates/**"
-      - "scripts/**"
+      - "scripts/gcp-deploy.sh"
       - ".github/workflows/staging-deploy.yml"
   workflow_dispatch:
 
@@ -14,49 +13,14 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  RUSTFLAGS: "-Dwarnings"
   GCP_ZONE: us-central1-c
   DD_ENV: staging
   DD_DOMAIN: ${{ vars.DD_CF_DOMAIN || 'devopsdefender.com' }}
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  build:
-    runs-on: ubuntu-latest
-    environment: staging
-    outputs:
-      binary_url: ${{ steps.upload.outputs.url }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Build release binaries
-        run: cargo build --workspace --release
-      - name: Upload as release asset
-        id: upload
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          sha12="$(echo "${{ github.sha }}" | cut -c1-12)"
-          tag="staging-${sha12}"
-
-          gh release list --limit 20 | grep "^staging-" | awk '{print $1}' | while read -r old; do
-            gh release delete "$old" --yes --cleanup-tag 2>/dev/null || true
-          done
-
-          gh release create "$tag" \
-            --title "staging-${sha12}" \
-            --notes "Staging build from ${{ github.sha }}" \
-            --prerelease \
-            target/release/dd-client \
-            target/release/dd-register \
-            target/release/dd-web
-
-          url=$(gh release view "$tag" --json assets --jq '.assets[] | select(.name=="dd-client") | .url')
-          echo "url=${url}" >> "$GITHUB_OUTPUT"
-
   cleanup:
     runs-on: ubuntu-latest
     environment: staging
@@ -87,7 +51,7 @@ jobs:
           done
 
   deploy:
-    needs: [build, cleanup]
+    needs: [cleanup]
     runs-on: ubuntu-latest
     environment: staging
     permissions:
@@ -101,7 +65,7 @@ jobs:
           service_account: 'easyenclave-staging-ci@eestaging.iam.gserviceaccount.com'
       - uses: google-github-actions/setup-gcloud@v2
 
-      - name: Create TDX VM
+      - name: Create TDX VM (boots from easyenclave, runs dd-register + dd-web as workloads)
         env:
           GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.DD_CP_CF_API_TOKEN }}
@@ -110,7 +74,6 @@ jobs:
           DD_GITHUB_CLIENT_ID: ${{ vars.DD_GITHUB_CLIENT_ID || secrets.DD_GITHUB_CLIENT_ID }}
           DD_GITHUB_CALLBACK_URL: ${{ vars.DD_GITHUB_CALLBACK_URL }}
           DD_GITHUB_CLIENT_SECRET: ${{ secrets.DD_GITHUB_CLIENT_SECRET }}
-          BINARY_URL: ${{ needs.build.outputs.binary_url }}
         run: scripts/gcp-deploy.sh
 
       # ── Verify agent via tunnel (no raw IP needed) ────────────────────
