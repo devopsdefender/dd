@@ -60,10 +60,18 @@ jobs:
   cleanup:
     runs-on: ubuntu-latest
     environment: staging
+    permissions:
+      contents: read
+      id-token: write   # mint GitHub OIDC token for GCP WIF
     steps:
+      # GCP Workload Identity Federation (no stored SA key). Pool +
+      # provider in the eestaging project (dd staging's GCP), attribute
+      # condition is `assertion.repository == 'devopsdefender/dd'`, SA
+      # binding is scoped to the same principal set.
       - uses: google-github-actions/auth@v2
         with:
-          credentials_json: ${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}
+          workload_identity_provider: 'projects/654815109728/locations/global/workloadIdentityPools/github-actions-pool/providers/github-provider'
+          service_account: 'easyenclave-staging-ci@eestaging.iam.gserviceaccount.com'
       - uses: google-github-actions/setup-gcloud@v2
       - name: Delete managed VMs
         env:
@@ -84,12 +92,13 @@ jobs:
     environment: staging
     permissions:
       contents: read
-      id-token: write   # for minting the GitHub Actions OIDC token
+      id-token: write   # mint GitHub OIDC token for GCP WIF + dd-web OIDC
     steps:
       - uses: actions/checkout@v4
       - uses: google-github-actions/auth@v2
         with:
-          credentials_json: ${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}
+          workload_identity_provider: 'projects/654815109728/locations/global/workloadIdentityPools/github-actions-pool/providers/github-provider'
+          service_account: 'easyenclave-staging-ci@eestaging.iam.gserviceaccount.com'
       - uses: google-github-actions/setup-gcloud@v2
 
       - name: Create TDX VM
