@@ -80,19 +80,59 @@ jobs:
       # DD_HOSTNAME is set by gcp-deploy.sh to app-staging.${DD_DOMAIN},
       # which is the tunnel hostname. CI polls it directly.
 
-      - name: Wait for agent health
+      - name: Wait for agent health (streams serial console)
         env:
           AGENT_URL: https://app-staging.${{ env.DD_DOMAIN }}
+          GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+          GCP_ZONE: ${{ env.GCP_ZONE }}
         run: |
+          # Resolve the VM that gcp-deploy.sh just created. dd-staging-$(date +%s)
+          # naming means the newest matching VM is the right one.
+          VM_NAME=$(gcloud compute instances list \
+            --project="$GCP_PROJECT_ID" \
+            --filter="labels.devopsdefender=managed AND labels.dd_env=staging" \
+            --format="value(name)" --sort-by=~creationTimestamp | head -1)
+          if [ -z "$VM_NAME" ]; then
+            echo "::error::no dd-staging VM found — gcp-deploy.sh must have failed"
+            exit 1
+          fi
+          echo "Watching VM: $VM_NAME (zone: $GCP_ZONE)"
+
+          LAST_LINES=0
           for i in $(seq 1 60); do
-            curl -fsS "${AGENT_URL}/health" >/dev/null 2>&1 && {
+            # Pull full serial log; print only new lines since last iter.
+            # This gives a live-streaming boot console in the Action log
+            # so failures (fast-fail in initrd, DHCP hang, libcontainer
+            # pull error, etc.) are visible without shelling into GCP.
+            gcloud compute instances get-serial-port-output "$VM_NAME" \
+              --project="$GCP_PROJECT_ID" --zone="$GCP_ZONE" 2>/dev/null \
+              > /tmp/serial.log || true
+            TOTAL_LINES=$(wc -l < /tmp/serial.log)
+            if [ "$TOTAL_LINES" -gt "$LAST_LINES" ]; then
+              tail -n +$((LAST_LINES + 1)) /tmp/serial.log \
+                | sed 's/^/[serial] /'
+              LAST_LINES=$TOTAL_LINES
+            fi
+
+            # Fatal patterns — early-fail instead of waiting the full 5 min.
+            if grep -qE "FATAL|Kernel panic|Invalid ELF header|/bin/sh: can't access tty" /tmp/serial.log; then
+              echo "::error::boot failed — serial log shows fatal pattern"
+              exit 1
+            fi
+
+            # Success: /health returns 200 via the Cloudflare tunnel.
+            # That tests the full chain: VM boot → easyenclave init →
+            # libcontainer pulls dd-register/dd-web → cloudflared tunnel up.
+            if curl -fsS "${AGENT_URL}/health" >/dev/null 2>&1; then
               echo "Agent healthy at ${AGENT_URL}"
               exit 0
-            }
+            fi
             echo "  waiting for tunnel... (${i}/60)"
             sleep 5
           done
           echo "::error::Agent not healthy within 5 minutes"
+          echo "--- final serial tail ---"
+          tail -80 /tmp/serial.log | sed 's/^/[serial] /'
           exit 1
 
       - name: Verify dashboard renders (OIDC)
