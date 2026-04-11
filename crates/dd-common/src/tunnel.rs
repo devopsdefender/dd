@@ -53,7 +53,12 @@ pub async fn create_agent_tunnel(
     _vm_name: &str,
     hostname_override: Option<&str>,
 ) -> Result<TunnelInfo, String> {
-    let env_label = std::env::var("DD_ENV").unwrap_or_else(|_| "dev".into());
+    // DD_ENV is required. Callers (dd-register, dd-web) fail fast at
+    // startup if it's not set, so by the time we're here it's always
+    // defined. Previously defaulted to "dev" silently, which in a prod
+    // VM would mint tunnels named `dd-dev-*` and never match the
+    // `dd-{prod_env}-*` filter in dd-web's collector.
+    let env_label = std::env::var("DD_ENV").expect("DD_ENV must be set before tunnel ops");
     let tunnel_name = format!("dd-{env_label}-{agent_id}");
     let tunnel_secret = uuid::Uuid::new_v4().to_string().replace('-', "");
     let hostname = hostname_override
@@ -185,7 +190,8 @@ pub async fn remove_agent(
     agent_id: &str,
     hostname: &str,
 ) -> Result<(), String> {
-    let env_label = std::env::var("DD_ENV").unwrap_or_else(|_| "dev".into());
+    // DD_ENV: see provision_tunnel above.
+    let env_label = std::env::var("DD_ENV").expect("DD_ENV must be set before tunnel ops");
     let tunnel_name = format!("dd-{env_label}-{agent_id}");
     delete_tunnel_by_name(client, cf, &tunnel_name).await?;
     delete_dns_record(client, cf, hostname).await?;

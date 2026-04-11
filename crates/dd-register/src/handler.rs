@@ -1,7 +1,9 @@
 //! WebSocket registration handler and fleet registry types.
 //!
-//! Ported from agent/src/server.rs handle_ws_register. Uses dd_common::noise
-//! for the Noise XX handshake and dd_common::tunnel for CF tunnel operations.
+//! Implements `/register`: dd-client calls this over a WebSocket,
+//! performs a Noise XX handshake (dd_common::noise) with an attestation
+//! payload, and dd-register provisions a Cloudflare tunnel + DNS record
+//! for the agent via dd_common::tunnel.
 
 use axum::extract::ws::WebSocket;
 use dd_common::noise;
@@ -112,7 +114,7 @@ pub async fn handle_ws_register(
     let client = reqwest::Client::new();
 
     // Stale cleanup: remove old entries with same vm_name + delete their CF tunnels.
-    // Without this the fleet accumulates stale entries on every dd-agent redeploy.
+    // Without this the fleet accumulates stale entries on every VM redeploy.
     let stale: Vec<(String, String)> = {
         let registry = registry.lock().await;
         registry

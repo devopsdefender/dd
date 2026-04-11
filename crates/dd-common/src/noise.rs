@@ -1,8 +1,9 @@
 //! Noise XX handshake helpers for WebSocket channels.
 //!
-//! Consolidates the repeated handshake code from agent server.rs and
-//! dd-agent main.rs into two reusable async functions: one for the
-//! responder (register side) and one for the initiator (agent/scraper side).
+//! Two reusable async functions: one for the responder (dd-register)
+//! and one for the initiator (dd-client). Both use the same
+//! Noise_XX_25519_ChaChaPoly_SHA256 pattern with an attestation payload
+//! exchanged in msg3.
 
 use axum::extract::ws::{Message, WebSocket};
 use futures_util::stream::{SplitSink, SplitStream};
@@ -112,7 +113,7 @@ pub async fn noise_xx_responder_ws(
     Ok((transport, peer_payload))
 }
 
-/// Noise XX initiator (agent / scraper / client side).
+/// Noise XX initiator (dd-client side).
 ///
 /// Performs the three-message XX handshake:
 ///   1. Write msg1 (ephemeral key, empty payload).

@@ -18,10 +18,14 @@ pub async fn query_peers(state: &WebState) -> Vec<AgentSnapshot> {
         return Vec::new();
     }
 
+    // Builder failure is a programming bug, not a runtime condition.
+    // Previously fell back to a client without the 5s timeout, which
+    // would mask the real bug AND potentially hang federated requests
+    // forever.
     let http = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
         .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
+        .expect("reqwest client builder");
 
     let futures: Vec<_> = state
         .config
