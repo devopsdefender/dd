@@ -24,7 +24,7 @@
 #   DD_GITHUB_CLIENT_SECRET — GitHub OAuth client secret
 #
 # Optional env vars (override the pinned defaults):
-#   EE_IMAGE                — easyenclave sealed image name
+#   EE_IMAGE_FAMILY         — easyenclave GCP image family
 #   EE_IMAGE_PROJECT        — project hosting the image
 #   DD_REGISTER_IMAGE       — ghcr.io/devopsdefender/dd-register:<tag>
 #   DD_WEB_IMAGE            — ghcr.io/devopsdefender/dd-web:<tag>
@@ -35,15 +35,17 @@
 
 set -euo pipefail
 
-# ── Pinned image SHAs ─────────────────────────────────────────────────────
-# Bump these to rotate to newer sealed builds. Keep them pinned (not
-# :latest) so a rebuild of main doesn't silently change what's deployed.
+# ── easyenclave image family ──────────────────────────────────────────────
+# Resolved at deploy time via GCE's image-family selector — picks the
+# newest non-deprecated image in the family. No sha12 to hand-bump.
 #
-# easyenclave-9ff1a1fca190: first image with the Rust-native container
-# runtime (libcontainer) + libseccomp.so.2 in the rootfs. easyenclave-
-# 75e0b30fa162 and earlier couldn't actually run OCI workloads.
-EE_IMAGE="${EE_IMAGE:-easyenclave-9ff1a1fca190}"
+#   easyenclave-staging → rolling main, rotates on every push (5 kept)
+#   easyenclave-stable  → v* tags, kept forever
+#
+# For DD production, override to easyenclave-stable once a v-tag exists.
+EE_IMAGE_FAMILY="${EE_IMAGE_FAMILY:-easyenclave-staging}"
 EE_IMAGE_PROJECT="${EE_IMAGE_PROJECT:-easyenclave}"
+# dd container images are still sha-pinned (bump when you cut a release).
 DD_REGISTER_IMAGE="${DD_REGISTER_IMAGE:-ghcr.io/devopsdefender/dd-register:31ff718b169b}"
 DD_WEB_IMAGE="${DD_WEB_IMAGE:-ghcr.io/devopsdefender/dd-web:31ff718b169b}"
 
@@ -134,13 +136,13 @@ gcloud compute instances create "$VM_NAME" \
   --confidential-compute-type=TDX \
   --maintenance-policy=TERMINATE \
   --boot-disk-size="$VM_DISK_SIZE" \
-  --image="$EE_IMAGE" \
+  --image-family="$EE_IMAGE_FAMILY" \
   --image-project="$EE_IMAGE_PROJECT" \
   --metadata-from-file=ee-config=/tmp/ee-config.json \
   --labels=devopsdefender=managed,dd_env="${DD_ENV}" \
   --tags=dd-management
 
 echo "VM: $VM_NAME"
-echo "  image:    $EE_IMAGE ($EE_IMAGE_PROJECT)"
+echo "  image:    family $EE_IMAGE_FAMILY ($EE_IMAGE_PROJECT)"
 echo "  hostname: $DD_HOSTNAME"
 echo "  workloads: dd-register, dd-web"
