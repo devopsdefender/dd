@@ -46,6 +46,8 @@ jobs:
             dockerfile: crates/dd-register/Dockerfile
           - name: dd-web
             dockerfile: crates/dd-web/Dockerfile
+          - name: dd-client
+            dockerfile: crates/dd-client/Dockerfile
     steps:
       - uses: actions/checkout@v4
 
