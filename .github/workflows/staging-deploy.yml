@@ -76,7 +76,7 @@ jobs:
       - name: Compute image tag
         id: img
         run: |
-          SHA12=$(echo "${{ github.event.pull_request.head.sha || github.sha }}" | cut -c1-12)
+          SHA12=$(echo "${{ github.sha }}" | cut -c1-12)
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             echo "tag=${SHA12}" >> "$GITHUB_OUTPUT"
           else
