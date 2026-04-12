@@ -6,6 +6,12 @@ on:
     paths:
       - "scripts/gcp-deploy.sh"
       - ".github/workflows/staging-deploy.yml"
+  pull_request:
+    paths:
+      - "crates/**"
+      - "scripts/gcp-deploy.sh"
+      - ".github/workflows/staging-deploy.yml"
+      - ".github/workflows/push-management-images.yml"
   # Auto-deploy after container images are pushed to ghcr.io
   workflow_run:
     workflows: ["Push Management Images"]
@@ -66,6 +72,35 @@ jobs:
       id-token: write   # mint GitHub OIDC token for GCP WIF + dd-web OIDC
     steps:
       - uses: actions/checkout@v4
+
+      - name: Compute image tag
+        id: img
+        run: |
+          SHA12=$(echo "${{ github.event.pull_request.head.sha || github.sha }}" | cut -c1-12)
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "tag=${SHA12}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=latest" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Wait for container images
+        if: github.event_name == 'pull_request'
+        env:
+          TAG: ${{ steps.img.outputs.tag }}
+        run: |
+          echo "Waiting for ghcr.io/devopsdefender/dd-register:${TAG}..."
+          for i in $(seq 1 30); do
+            TOKEN=$(curl -sS "https://ghcr.io/token?service=ghcr.io&scope=repository:devopsdefender/dd-register:pull" | jq -r .token)
+            if curl -fsS "https://ghcr.io/v2/devopsdefender/dd-register/manifests/${TAG}" \
+              -H "Authorization: Bearer $TOKEN" \
+              -H "Accept: application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.v2+json" >/dev/null 2>&1; then
+              echo "Images available"
+              break
+            fi
+            echo "  waiting... (${i}/30)"
+            sleep 10
+          done
+
       - uses: google-github-actions/auth@v2
         with:
           workload_identity_provider: 'projects/654815109728/locations/global/workloadIdentityPools/github-actions-pool/providers/github-provider'
@@ -81,6 +116,10 @@ jobs:
           DD_GITHUB_CLIENT_ID: ${{ vars.DD_GITHUB_CLIENT_ID || secrets.DD_GITHUB_CLIENT_ID }}
           DD_GITHUB_CALLBACK_URL: ${{ vars.DD_GITHUB_CALLBACK_URL }}
           DD_GITHUB_CLIENT_SECRET: ${{ secrets.DD_GITHUB_CLIENT_SECRET }}
+          # On PRs: sha-tagged images from push-management-images.
+          # On merge: :latest (gcp-deploy.sh default).
+          DD_REGISTER_IMAGE: ghcr.io/devopsdefender/dd-register:${{ steps.img.outputs.tag }}
+          DD_WEB_IMAGE: ghcr.io/devopsdefender/dd-web:${{ steps.img.outputs.tag }}
         run: scripts/gcp-deploy.sh
 
       # ── Verify agent via tunnel (no raw IP needed) ────────────────────
