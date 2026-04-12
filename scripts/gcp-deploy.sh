@@ -46,8 +46,8 @@ set -euo pipefail
 EE_IMAGE_FAMILY="${EE_IMAGE_FAMILY:-easyenclave-staging}"
 EE_IMAGE_PROJECT="${EE_IMAGE_PROJECT:-easyenclave}"
 # dd container images are still sha-pinned (bump when you cut a release).
-DD_REGISTER_IMAGE="${DD_REGISTER_IMAGE:-ghcr.io/devopsdefender/dd-register:31ff718b169b}"
-DD_WEB_IMAGE="${DD_WEB_IMAGE:-ghcr.io/devopsdefender/dd-web:31ff718b169b}"
+DD_REGISTER_IMAGE="${DD_REGISTER_IMAGE:-ghcr.io/devopsdefender/dd-register:latest}"
+DD_WEB_IMAGE="${DD_WEB_IMAGE:-ghcr.io/devopsdefender/dd-web:latest}"
 
 VM_NAME="dd-${DD_ENV}-$(date +%s)"
 VM_MACHINE_TYPE="${VM_MACHINE_TYPE:-c3-standard-4}"
