@@ -81,7 +81,14 @@ async fn main() {
     tokio::spawn(async move {
         eprintln!("dd-register: starting cloudflared");
         let mut child = tokio::process::Command::new("cloudflared")
-            .args(["tunnel", "--no-autoupdate", "run", "--token", &token])
+            .args([
+                "tunnel",
+                "--no-autoupdate",
+                "--metrics=",
+                "run",
+                "--token",
+                &token,
+            ])
             .spawn()
             .expect("failed to spawn cloudflared");
         let status = child.wait().await;

@@ -129,16 +129,32 @@ async fn main() {
 
     eprintln!("dd-web: tunnel created -- {}", tunnel_info.hostname);
 
-    // Spawn cloudflared
+    // Spawn cloudflared (if available — dd-web's container may not
+    // have it, in which case dd-register handles the tunnel).
     let token = tunnel_info.tunnel_token.clone();
     tokio::spawn(async move {
         eprintln!("dd-web: starting cloudflared");
-        let mut child = tokio::process::Command::new("cloudflared")
-            .args(["tunnel", "--no-autoupdate", "run", "--token", &token])
+        match tokio::process::Command::new("cloudflared")
+            .args([
+                "tunnel",
+                "--no-autoupdate",
+                "--metrics=",
+                "run",
+                "--token",
+                &token,
+            ])
             .spawn()
-            .expect("failed to spawn cloudflared");
-        let _ = child.wait().await;
-        eprintln!("dd-web: cloudflared exited");
+        {
+            Ok(mut child) => {
+                let _ = child.wait().await;
+                eprintln!("dd-web: cloudflared exited");
+            }
+            Err(e) => {
+                eprintln!(
+                    "dd-web: cloudflared not available ({e}), relying on dd-register's tunnel"
+                );
+            }
+        }
     });
 
     // Build router and start HTTP server

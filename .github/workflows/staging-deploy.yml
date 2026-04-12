@@ -6,6 +6,11 @@ on:
     paths:
       - "scripts/gcp-deploy.sh"
       - ".github/workflows/staging-deploy.yml"
+  # Auto-deploy after container images are pushed to ghcr.io
+  workflow_run:
+    workflows: ["Push Management Images"]
+    types: [completed]
+    branches: [main]
   workflow_dispatch:
 
 concurrency:
@@ -22,6 +27,8 @@ permissions:
 
 jobs:
   cleanup:
+    # Skip if triggered by a failed workflow_run (image push failed)
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     environment: staging
     permissions:
