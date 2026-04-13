@@ -89,17 +89,23 @@ jobs:
           TAG: ${{ steps.img.outputs.tag }}
         run: |
           echo "Waiting for ghcr.io/devopsdefender/dd-register:${TAG}..."
+          FOUND=false
           for i in $(seq 1 30); do
             TOKEN=$(curl -sS "https://ghcr.io/token?service=ghcr.io&scope=repository:devopsdefender/dd-register:pull" | jq -r .token)
             if curl -fsS "https://ghcr.io/v2/devopsdefender/dd-register/manifests/${TAG}" \
               -H "Authorization: Bearer $TOKEN" \
               -H "Accept: application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.v2+json" >/dev/null 2>&1; then
               echo "Images available"
+              FOUND=true
               break
             fi
             echo "  waiting... (${i}/30)"
             sleep 10
           done
+          if ! $FOUND; then
+            echo "::error::Container images not found after 5 min (tag: ${TAG})"
+            exit 1
+          fi
 
       - uses: google-github-actions/auth@v2
         with:
