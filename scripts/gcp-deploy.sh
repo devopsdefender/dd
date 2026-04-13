@@ -61,7 +61,7 @@ fi
 DD_GITHUB_CALLBACK_URL="${DD_GITHUB_CALLBACK_URL:-https://${DD_HOSTNAME}/auth/github/callback}"
 
 # ── Build the workload spec ──────────────────────────────────────────────
-# Two workloads deployed at boot by easyenclave:
+# Three workloads deployed at boot by easyenclave:
 #
 #   dd-register — provisions the Cloudflare tunnel + DNS for DD_HOSTNAME
 #                 and serves the Noise-XX /register endpoint for agents
@@ -70,11 +70,17 @@ DD_GITHUB_CALLBACK_URL="${DD_GITHUB_CALLBACK_URL:-https://${DD_HOSTNAME}/auth/gi
 #   dd-web      — the fleet dashboard that operators see at DD_HOSTNAME.
 #                 Auth-gated with GitHub OAuth (+ PAT Bearer + OIDC for CI).
 #
-# Both run with host networking (easyenclave's default) so they bind
-# the VM's network namespace directly, just like the pre-rewrite setup.
+#   dd-client   — the agent that runs on every easyenclave VM (including
+#                 the control plane). Registers itself with dd-register
+#                 so the management VM shows up in its own fleet dashboard.
+#
+# All run with host networking (easyenclave's default) so they bind
+# the VM's network namespace directly.
+DD_CLIENT_IMAGE="${DD_CLIENT_IMAGE:-ghcr.io/devopsdefender/dd-client:latest}"
 EE_BOOT_WORKLOADS=$(jq -c -n \
   --arg reg_image      "$DD_REGISTER_IMAGE" \
   --arg web_image      "$DD_WEB_IMAGE" \
+  --arg client_image   "$DD_CLIENT_IMAGE" \
   --arg cf_token       "$CLOUDFLARE_API_TOKEN" \
   --arg cf_account     "$CLOUDFLARE_ACCOUNT_ID" \
   --arg cf_zone        "$CLOUDFLARE_ZONE_ID" \
@@ -114,6 +120,15 @@ EE_BOOT_WORKLOADS=$(jq -c -n \
         ("DD_GITHUB_CALLBACK_URL="  + $gh_callback),
         "DD_OIDC_AUDIENCE=dd-web",
         "DD_PORT=8080"
+      ]
+    },
+    {
+      "image": $client_image,
+      "app_name": "dd-client",
+      "env": [
+        ("DD_HOSTNAME=" + $hostname),
+        ("DD_ENV=" + $env),
+        "DD_PORT=8082"
       ]
     }
   ]')
