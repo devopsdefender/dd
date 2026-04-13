@@ -76,35 +76,19 @@ jobs:
       - name: Compute image tag
         id: img
         run: |
+          # Use sha-tagged images if they exist (PR that changed crates/),
+          # otherwise fall back to :latest. Don't block the deploy waiting
+          # for images that were never built.
           SHA12=$(echo "${{ github.sha }}" | cut -c1-12)
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
+          TOKEN=$(curl -sS "https://ghcr.io/token?service=ghcr.io&scope=repository:devopsdefender/dd-register:pull" | jq -r .token)
+          if curl -fsS "https://ghcr.io/v2/devopsdefender/dd-register/manifests/${SHA12}" \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Accept: application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.v2+json" >/dev/null 2>&1; then
             echo "tag=${SHA12}" >> "$GITHUB_OUTPUT"
+            echo "Using sha-tagged images: ${SHA12}"
           else
             echo "tag=latest" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Wait for container images
-        if: github.event_name == 'pull_request'
-        env:
-          TAG: ${{ steps.img.outputs.tag }}
-        run: |
-          echo "Waiting for ghcr.io/devopsdefender/dd-register:${TAG}..."
-          FOUND=false
-          for i in $(seq 1 30); do
-            TOKEN=$(curl -sS "https://ghcr.io/token?service=ghcr.io&scope=repository:devopsdefender/dd-register:pull" | jq -r .token)
-            if curl -fsS "https://ghcr.io/v2/devopsdefender/dd-register/manifests/${TAG}" \
-              -H "Authorization: Bearer $TOKEN" \
-              -H "Accept: application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.v2+json" >/dev/null 2>&1; then
-              echo "Images available"
-              FOUND=true
-              break
-            fi
-            echo "  waiting... (${i}/30)"
-            sleep 10
-          done
-          if ! $FOUND; then
-            echo "::error::Container images not found after 5 min (tag: ${TAG})"
-            exit 1
+            echo "SHA images not found, using :latest"
           fi
 
       - uses: google-github-actions/auth@v2
