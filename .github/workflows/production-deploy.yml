@@ -4,8 +4,11 @@ on:
   push:
     branches: [main]
     paths:
+      - "crates/**"
       - "scripts/gcp-deploy.sh"
+      - "Dockerfile"
       - ".github/workflows/production-deploy.yml"
+      - ".github/workflows/push-management-images.yml"
   workflow_dispatch:
 
 concurrency:
