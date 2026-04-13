@@ -4,23 +4,19 @@ on:
   push:
     branches: [main]
     paths:
-      - "scripts/gcp-deploy.sh"
-      - ".github/workflows/staging-deploy.yml"
-  pull_request:
-    paths:
       - "crates/**"
       - "scripts/gcp-deploy.sh"
       - ".github/workflows/staging-deploy.yml"
       - ".github/workflows/push-management-images.yml"
-  # Auto-deploy after container images are pushed to ghcr.io
-  workflow_run:
-    workflows: ["Push Management Images"]
-    types: [completed]
-    branches: [main]
   workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'Container image tag (default: latest)'
+        required: false
+        default: 'latest'
 
 concurrency:
-  group: dd-staging-${{ github.event.pull_request.number || 'main' }}
+  group: dd-staging
   cancel-in-progress: true
 
 env:
@@ -33,8 +29,6 @@ permissions:
 
 jobs:
   cleanup:
-    # Skip if triggered by a failed workflow_run (image push failed)
-    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     environment: staging
     permissions:
@@ -73,24 +67,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Compute image tag
-        id: img
-        run: |
-          # Use sha-tagged images if they exist (PR that changed crates/),
-          # otherwise fall back to :latest. Don't block the deploy waiting
-          # for images that were never built.
-          SHA12=$(echo "${{ github.sha }}" | cut -c1-12)
-          TOKEN=$(curl -sS "https://ghcr.io/token?service=ghcr.io&scope=repository:devopsdefender/dd-register:pull" | jq -r .token)
-          if curl -fsS "https://ghcr.io/v2/devopsdefender/dd-register/manifests/${SHA12}" \
-            -H "Authorization: Bearer $TOKEN" \
-            -H "Accept: application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.v2+json" >/dev/null 2>&1; then
-            echo "tag=${SHA12}" >> "$GITHUB_OUTPUT"
-            echo "Using sha-tagged images: ${SHA12}"
-          else
-            echo "tag=latest" >> "$GITHUB_OUTPUT"
-            echo "SHA images not found, using :latest"
-          fi
-
       - uses: google-github-actions/auth@v2
         with:
           workload_identity_provider: 'projects/654815109728/locations/global/workloadIdentityPools/github-actions-pool/providers/github-provider'
@@ -106,10 +82,9 @@ jobs:
           DD_GITHUB_CLIENT_ID: ${{ vars.DD_GITHUB_CLIENT_ID || secrets.DD_GITHUB_CLIENT_ID }}
           DD_GITHUB_CALLBACK_URL: ${{ vars.DD_GITHUB_CALLBACK_URL }}
           DD_GITHUB_CLIENT_SECRET: ${{ secrets.DD_GITHUB_CLIENT_SECRET }}
-          # On PRs: sha-tagged images from push-management-images.
-          # On merge: :latest (gcp-deploy.sh default).
-          DD_REGISTER_IMAGE: ghcr.io/devopsdefender/dd-register:${{ steps.img.outputs.tag }}
-          DD_WEB_IMAGE: ghcr.io/devopsdefender/dd-web:${{ steps.img.outputs.tag }}
+          DD_REGISTER_IMAGE: ghcr.io/devopsdefender/dd-register:${{ inputs.image_tag || 'latest' }}
+          DD_WEB_IMAGE: ghcr.io/devopsdefender/dd-web:${{ inputs.image_tag || 'latest' }}
+          DD_CLIENT_IMAGE: ghcr.io/devopsdefender/dd-client:${{ inputs.image_tag || 'latest' }}
         run: scripts/gcp-deploy.sh
 
       # ── Verify agent via tunnel (no raw IP needed) ────────────────────
