@@ -185,10 +185,10 @@ pub async fn run_collector(state: WebState) {
         let (deployment_names, deployment_count, attestation_type) =
             match state.ee_client.list().await {
                 Ok(deps) => {
-                    let names: Vec<String> = deps
-                        .as_object()
-                        .map(|m| {
-                            m.values()
+                    let names: Vec<String> = deps["deployments"]
+                        .as_array()
+                        .map(|arr| {
+                            arr.iter()
                                 .filter_map(|v| v["app_name"].as_str().map(String::from))
                                 .collect()
                         })

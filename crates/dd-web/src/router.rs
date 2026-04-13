@@ -49,8 +49,9 @@ async fn cp_deployments(
     let nav = nav_bar(&[("Fleet", "/", false)]);
 
     let mut rows = String::new();
-    if let Some(deps) = deployments.as_object() {
-        for (id, info) in deps {
+    if let Some(deps) = deployments["deployments"].as_array() {
+        for info in deps {
+            let id = info["id"].as_str().unwrap_or("unknown");
             let app_name = info["app_name"].as_str().unwrap_or("unknown");
             let status = info["status"].as_str().unwrap_or("unknown");
             let image = info["image"].as_str().unwrap_or("-");
