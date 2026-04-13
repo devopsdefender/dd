@@ -1,0 +1,14 @@
+[package]
+name = "dd"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "dd"
+path = "src/main.rs"
+
+[dependencies]
+dd-register = { path = "../dd-register" }
+dd-web = { path = "../dd-web" }
+dd-client = { path = "../dd-client" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

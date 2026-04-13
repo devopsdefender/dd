@@ -73,7 +73,7 @@ jobs:
           service_account: 'easyenclave-staging-ci@eestaging.iam.gserviceaccount.com'
       - uses: google-github-actions/setup-gcloud@v2
 
-      - name: Create TDX VM (boots from easyenclave, runs dd-register + dd-web as workloads)
+      - name: Create TDX VM (boots from easyenclave, runs dd management as workload)
         env:
           GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.DD_CP_CF_API_TOKEN }}
@@ -82,9 +82,7 @@ jobs:
           DD_GITHUB_CLIENT_ID: ${{ vars.DD_GITHUB_CLIENT_ID || secrets.DD_GITHUB_CLIENT_ID }}
           DD_GITHUB_CALLBACK_URL: ${{ vars.DD_GITHUB_CALLBACK_URL }}
           DD_GITHUB_CLIENT_SECRET: ${{ secrets.DD_GITHUB_CLIENT_SECRET }}
-          DD_REGISTER_IMAGE: ghcr.io/devopsdefender/dd-register:${{ inputs.image_tag || 'latest' }}
-          DD_WEB_IMAGE: ghcr.io/devopsdefender/dd-web:${{ inputs.image_tag || 'latest' }}
-          DD_CLIENT_IMAGE: ghcr.io/devopsdefender/dd-client:${{ inputs.image_tag || 'latest' }}
+          DD_IMAGE: ghcr.io/devopsdefender/dd:${{ inputs.image_tag || 'latest' }}
         run: scripts/gcp-deploy.sh
 
       # ── Verify agent via tunnel (no raw IP needed) ────────────────────

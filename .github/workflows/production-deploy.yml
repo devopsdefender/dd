@@ -65,7 +65,7 @@ jobs:
           service_account: 'easyenclave-production-ci@easyenclave.iam.gserviceaccount.com'
       - uses: google-github-actions/setup-gcloud@v2
 
-      - name: Create TDX VM (boots from easyenclave, runs dd-register + dd-web as workloads)
+      - name: Create TDX VM (boots from easyenclave, runs dd management as workload)
         env:
           GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.DD_CP_CF_API_TOKEN }}

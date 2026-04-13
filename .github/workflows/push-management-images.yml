@@ -1,14 +1,12 @@
-name: Push Management Images
+name: Push Management Image
 
-# Builds container images for dd-register and dd-web and pushes to
-# ghcr.io. These images are deployed as workloads inside easyenclave-
-# sealed TDX VMs that serve as dd management VMs
-# (app-staging.devopsdefender.com, app.devopsdefender.com).
+# Builds the unified dd container image and pushes to ghcr.io.
+# This image is deployed as a workload inside easyenclave-sealed
+# TDX VMs (app-staging.devopsdefender.com, app.devopsdefender.com).
 #
-# On PRs: builds both images (validates Dockerfile + compiles),
+# On PRs: builds the image (validates Dockerfile + compiles),
 #         but does NOT push — only main pushes publish.
-# On push to main: builds and pushes both to ghcr.io with tags
-#                  :<sha12> and :latest.
+# On push to main: builds and pushes to ghcr.io with :latest tag.
 # workflow_dispatch: manual trigger.
 
 on:
@@ -18,12 +16,14 @@ on:
       - "crates/**"
       - "Cargo.toml"
       - "Cargo.lock"
+      - "Dockerfile"
       - ".github/workflows/push-management-images.yml"
   pull_request:
     paths:
       - "crates/**"
       - "Cargo.toml"
       - "Cargo.lock"
+      - "Dockerfile"
       - ".github/workflows/push-management-images.yml"
   workflow_dispatch:
 
@@ -38,22 +38,8 @@ permissions:
 jobs:
   push:
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        image:
-          - name: dd-register
-            dockerfile: crates/dd-register/Dockerfile
-          - name: dd-web
-            dockerfile: crates/dd-web/Dockerfile
-          - name: dd-client
-            dockerfile: crates/dd-client/Dockerfile
     steps:
       - uses: actions/checkout@v4
-
-      - name: Compute short sha
-        id: meta
-        run: echo "sha12=$(echo ${{ github.sha }} | cut -c1-12)" >> "$GITHUB_OUTPUT"
 
       - name: Log in to ghcr.io
         uses: docker/login-action@v3
@@ -65,15 +51,13 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build and push ${{ matrix.image.name }}
+      - name: Build and push dd
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: ${{ matrix.image.dockerfile }}
-          push: true
+          file: Dockerfile
+          push: ${{ github.event_name != 'pull_request' }}
           platforms: linux/amd64
-          tags: |
-            ghcr.io/devopsdefender/${{ matrix.image.name }}:${{ steps.meta.outputs.sha12 }}
-            ${{ github.event_name != 'pull_request' && format('ghcr.io/devopsdefender/{0}:latest', matrix.image.name) || '' }}
-          cache-from: type=gha,scope=${{ matrix.image.name }}
-          cache-to: type=gha,scope=${{ matrix.image.name }},mode=max
+          tags: ghcr.io/devopsdefender/dd:latest
+          cache-from: type=gha,scope=dd
+          cache-to: type=gha,scope=dd,mode=max

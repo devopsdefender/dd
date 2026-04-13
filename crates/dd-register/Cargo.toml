@@ -3,6 +3,10 @@ name = "dd-register"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+name = "dd_register"
+path = "src/lib.rs"
+
 [[bin]]
 name = "dd-register"
 path = "src/main.rs"
