@@ -22,6 +22,8 @@ struct AppState {
     hostname: String,
     registry: AgentRegistry,
     cf: tunnel::CfConfig,
+    /// Our own tunnel ID (used by STONITH to avoid killing ourselves).
+    self_tunnel_id: String,
     /// Base64-encoded HMAC secret for agent JWT verification.
     auth_public_key_b64: Option<String>,
     /// Auth issuer URL (https://<hostname>).
@@ -78,7 +80,9 @@ pub async fn run() {
 
     eprintln!("dd-register: tunnel created -- {}", tunnel_info.hostname);
 
-    // Start cloudflared with the tunnel token
+    // Start cloudflared with the tunnel token.
+    // If cloudflared exits (e.g. tunnel deleted by a new register's STONITH),
+    // power off the VM — this is the STONITH kill mechanism.
     let token = tunnel_info.tunnel_token.clone();
     tokio::spawn(async move {
         eprintln!("dd-register: starting cloudflared");
@@ -95,6 +99,8 @@ pub async fn run() {
             .expect("failed to spawn cloudflared");
         let status = child.wait().await;
         eprintln!("dd-register: cloudflared exited: {status:?}");
+        eprintln!("dd-register: tunnel lost — powering off (STONITH kill)");
+        let _ = tokio::process::Command::new("poweroff").spawn();
     });
 
     // Bootstrap registry from existing CF tunnels
@@ -151,15 +157,26 @@ pub async fn run() {
         hostname: hostname.clone(),
         registry,
         cf,
+        self_tunnel_id: tunnel_info.tunnel_id.clone(),
         auth_public_key_b64,
         auth_issuer,
     };
 
-    // Axum router: 3 endpoints
+    // STONITH: signal old register instances to shut down.
+    // After we've self-registered (our tunnel is live), find any OTHER
+    // tunnel serving the same hostname and tell it to power off.
+    let stonith_state = state.clone();
+    tokio::spawn(async move {
+        // Give cloudflared a moment to connect before we STONITH.
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        stonith_old_registers(&stonith_state).await;
+    });
+
     let app = Router::new()
         .route("/register", get(ws_register))
         .route("/deregister", post(post_deregister))
         .route("/health", get(get_health))
+        .route("/stonith", post(post_stonith))
         .with_state(state);
 
     let addr = format!("0.0.0.0:{port}");
@@ -216,6 +233,7 @@ async fn post_deregister(
 
 async fn get_health(State(state): State<AppState>) -> impl IntoResponse {
     let agents = state.registry.lock().await;
+    let registered_count = agents.values().filter(|a| a.status == "healthy").count();
     let agent_list: Vec<serde_json::Value> = agents
         .values()
         .map(|a| {
@@ -232,6 +250,91 @@ async fn get_health(State(state): State<AppState>) -> impl IntoResponse {
         "ok": true,
         "hostname": state.hostname,
         "agent_count": agents.len(),
+        "registered_count": registered_count,
         "agents": agent_list,
     }))
+}
+
+// ── Route: /stonith (POST) ─────────────────────────────────────────────
+// Accepts a shutdown signal from a new register instance. Validates the
+// CF API token as a shared secret, then powers off the VM.
+
+async fn post_stonith(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    // Validate: Authorization header must contain our CF API token.
+    let auth = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    let expected = format!("Bearer {}", state.cf.api_token);
+    if auth != expected {
+        return (
+            axum::http::StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"ok": false, "error": "unauthorized"})),
+        );
+    }
+
+    eprintln!("dd-register: STONITH received — powering off");
+
+    // Spawn poweroff in background so we can return the response first.
+    tokio::spawn(async {
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        eprintln!("dd-register: executing poweroff");
+        let _ = tokio::process::Command::new("poweroff")
+            .spawn()
+            .map_err(|e| eprintln!("dd-register: poweroff failed: {e}"));
+    });
+
+    (
+        axum::http::StatusCode::OK,
+        Json(serde_json::json!({"ok": true, "message": "shutting down"})),
+    )
+}
+
+// ── STONITH: delete old register tunnels to trigger poweroff ────────────
+// When we delete an old register's CF tunnel, its cloudflared exits, which
+// triggers `poweroff` (see the cloudflared spawn above). This is the kill
+// mechanism — no HTTP signal needed, just pull the tunnel out from under it.
+
+async fn stonith_old_registers(state: &AppState) {
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+
+    let tunnels = match tunnel::list_tunnels(&http, &state.cf).await {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("dd-register: STONITH: failed to list tunnels: {e}");
+            return;
+        }
+    };
+
+    let our_tunnel_id = &state.self_tunnel_id;
+
+    for t in &tunnels {
+        let name = t["name"].as_str().unwrap_or_default();
+        let id = t["id"].as_str().unwrap_or_default();
+        if id.is_empty() || id == our_tunnel_id {
+            continue;
+        }
+
+        // Check if this tunnel serves our hostname (same DNS CNAME target).
+        let tun_hostname = format!("{name}.{}", state.cf.domain);
+        if tun_hostname != state.hostname {
+            continue;
+        }
+
+        eprintln!("dd-register: STONITH: deleting old tunnel {name} ({id})");
+        if let Err(e) = tunnel::delete_tunnel_by_name(&http, &state.cf, name).await {
+            eprintln!("dd-register: STONITH: delete failed for {name}: {e}");
+        } else {
+            eprintln!("dd-register: STONITH: killed old tunnel {name}");
+        }
+
+        // Also clean up the DNS record if it still points to the old tunnel.
+        let _ = tunnel::delete_dns_record(&http, &state.cf, &tun_hostname).await;
+    }
 }

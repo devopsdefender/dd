@@ -21,37 +21,10 @@ permissions:
   contents: read
 
 jobs:
-  cleanup:
-    runs-on: ubuntu-latest
-    environment: production
-    permissions:
-      contents: read
-      id-token: write   # mint GitHub OIDC token for GCP WIF
-    steps:
-      # GCP Workload Identity Federation (no stored SA key). Pool +
-      # provider in the easyenclave project (dd production's GCP),
-      # attribute condition covers 'devopsdefender/dd', SA binding
-      # is scoped to the same principal set.
-      - uses: google-github-actions/auth@v2
-        with:
-          workload_identity_provider: 'projects/779946350556/locations/global/workloadIdentityPools/github-actions-pool/providers/github-provider'
-          service_account: 'easyenclave-production-ci@easyenclave.iam.gserviceaccount.com'
-      - uses: google-github-actions/setup-gcloud@v2
-      - name: Delete managed VMs
-        env:
-          GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
-        run: |
-          gcloud compute instances list \
-            --project="$GCP_PROJECT_ID" \
-            --filter="labels.devopsdefender=managed AND labels.dd_env=production" \
-            --format="value(name,zone.basename())" | while read -r name zone; do
-            [ -z "$name" ] && continue
-            echo "Deleting VM: $name ($zone)"
-            gcloud compute instances delete "$name" --project="$GCP_PROJECT_ID" --zone="$zone" --quiet || true
-          done
-
+  # No cleanup job — dd-register STONITHs the old VM on startup by
+  # deleting its CF tunnel, which causes cloudflared to exit and
+  # triggers poweroff on the old VM.
   deploy:
-    needs: [cleanup]
     runs-on: ubuntu-latest
     environment: production
     permissions:

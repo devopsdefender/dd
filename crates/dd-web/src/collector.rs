@@ -172,6 +172,30 @@ pub async fn run_collector(state: WebState) {
             }
         }
 
+        // Re-register sweep: for agents bootstrapped from CF tunnels that
+        // haven't registered with the current dd-register (status "discovered"),
+        // trigger re-registration so they migrate to the new register instance.
+        {
+            let store = state.agents.lock().await;
+            let discovered: Vec<String> = store
+                .values()
+                .filter(|a| a.status == "discovered" || a.status == "stale")
+                .filter(|a| a.agent_id != "control-plane")
+                .map(|a| a.hostname.clone())
+                .collect();
+            drop(store);
+
+            for hostname in &discovered {
+                let url = format!("https://{hostname}/re-register");
+                match http.post(&url).send().await {
+                    Ok(resp) if resp.status().is_success() => {
+                        eprintln!("dd-web: collector triggered re-register on {hostname}");
+                    }
+                    _ => {} // Agent may not support re-register yet; ignore errors.
+                }
+            }
+        }
+
         // Self-check: query local easyenclave + localhost health to register
         // the control plane in the fleet dashboard.
         let self_healthy = matches!(
