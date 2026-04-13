@@ -148,10 +148,22 @@ pub async fn agent_detail(
         "-".into()
     };
 
+    let is_cp = a.agent_id == "control-plane";
     let workloads = if a.deployment_names.is_empty() {
         format!(
             r#"<span class="dim">{} deployment(s)</span>"#,
             a.deployment_count
+        )
+    } else if is_cp {
+        // CP workloads link to local easyenclave routes, not external tunnels
+        let items: Vec<String> = a
+            .deployment_names
+            .iter()
+            .map(|d| format!(r#"<li>{d}</li>"#))
+            .collect();
+        format!(
+            r#"{}<li style="margin-top:0.5em"><a href="/cp/deployments">view all &amp; logs &rarr;</a></li>"#,
+            items.join("\n")
         )
     } else {
         a.deployment_names

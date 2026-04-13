@@ -1,7 +1,7 @@
 #!/bin/bash
 # gcp-deploy.sh — Create a TDX management VM on GCP that boots from a
-# sealed easyenclave image and runs dd-register + dd-web as easyenclave
-# workloads (OCI containers pulled from ghcr.io).
+# sealed easyenclave image and runs the dd unified binary as an
+# easyenclave workload (OCI container pulled from ghcr.io).
 #
 # Called by .github/workflows/{staging,production}-deploy.yml. Requires
 # gcloud CLI authenticated via Workload Identity Federation (see the
@@ -10,7 +10,7 @@
 # Per-VM configuration is passed via GCE instance metadata (`ee-config`
 # attribute), which easyenclave's init.rs reads at PID 1 boot and
 # applies as env vars — in particular EE_BOOT_WORKLOADS, which is the
-# JSON workload spec that launches dd-register and dd-web.
+# JSON workload spec that launches `dd management`.
 #
 # Required env vars (set by the workflow):
 #   GCP_PROJECT_ID          — GCP project where the VM lives
@@ -26,8 +26,7 @@
 # Optional env vars (override the pinned defaults):
 #   EE_IMAGE_FAMILY         — easyenclave GCP image family
 #   EE_IMAGE_PROJECT        — project hosting the image
-#   DD_REGISTER_IMAGE       — ghcr.io/devopsdefender/dd-register:<tag>
-#   DD_WEB_IMAGE            — ghcr.io/devopsdefender/dd-web:<tag>
+#   DD_IMAGE                — ghcr.io/devopsdefender/dd:<tag>
 #   VM_MACHINE_TYPE         — default c3-standard-4
 #   VM_DISK_SIZE            — default 10GB (no big rootfs; workload state
 #                             lives in /var/lib/easyenclave tmpfs)
@@ -45,9 +44,7 @@ set -euo pipefail
 # For DD production, override to easyenclave-stable once a v-tag exists.
 EE_IMAGE_FAMILY="${EE_IMAGE_FAMILY:-easyenclave-staging}"
 EE_IMAGE_PROJECT="${EE_IMAGE_PROJECT:-easyenclave}"
-# dd container images are still sha-pinned (bump when you cut a release).
-DD_REGISTER_IMAGE="${DD_REGISTER_IMAGE:-ghcr.io/devopsdefender/dd-register:latest}"
-DD_WEB_IMAGE="${DD_WEB_IMAGE:-ghcr.io/devopsdefender/dd-web:latest}"
+DD_IMAGE="${DD_IMAGE:-ghcr.io/devopsdefender/dd:latest}"
 
 VM_NAME="dd-${DD_ENV}-$(date +%s)"
 VM_MACHINE_TYPE="${VM_MACHINE_TYPE:-c3-standard-4}"
@@ -61,21 +58,15 @@ fi
 DD_GITHUB_CALLBACK_URL="${DD_GITHUB_CALLBACK_URL:-https://${DD_HOSTNAME}/auth/github/callback}"
 
 # ── Build the workload spec ──────────────────────────────────────────────
-# Three workloads deployed at boot by easyenclave:
+# Single workload: `dd management` runs dd-register + dd-web concurrently
+# inside one container. Both bind the VM's network namespace directly
+# (easyenclave default = host networking).
 #
-#   dd-register — provisions the Cloudflare tunnel + DNS for DD_HOSTNAME
-#                 and serves the Noise-XX /register endpoint for agents
-#                 to join the fleet. Spawns cloudflared as a subprocess.
-#
-#   dd-web      — the fleet dashboard that operators see at DD_HOSTNAME.
-#                 Auth-gated with GitHub OAuth (+ PAT Bearer + OIDC for CI).
-#
-# Both run with host networking (easyenclave's default) so they bind
-# the VM's network namespace directly. The control plane self-registers
-# in dd-web's collector (no dd-client container needed on the CP).
+# dd-register listens on :8081 (tunnel provisioning, agent registration)
+# dd-web listens on :8080 (fleet dashboard, OAuth, collector)
+# dd-web's collector self-monitors the control plane via localhost.
 EE_BOOT_WORKLOADS=$(jq -c -n \
-  --arg reg_image      "$DD_REGISTER_IMAGE" \
-  --arg web_image      "$DD_WEB_IMAGE" \
+  --arg image          "$DD_IMAGE" \
   --arg cf_token       "$CLOUDFLARE_API_TOKEN" \
   --arg cf_account     "$CLOUDFLARE_ACCOUNT_ID" \
   --arg cf_zone        "$CLOUDFLARE_ZONE_ID" \
@@ -87,22 +78,10 @@ EE_BOOT_WORKLOADS=$(jq -c -n \
   --arg gh_callback    "$DD_GITHUB_CALLBACK_URL" \
   '[
     {
-      "image": $reg_image,
-      "app_name": "dd-register",
+      "image": $image,
+      "app_name": "dd-management",
       "env": [
-        ("DD_CF_API_TOKEN="   + $cf_token),
-        ("DD_CF_ACCOUNT_ID="  + $cf_account),
-        ("DD_CF_ZONE_ID="     + $cf_zone),
-        ("DD_CF_DOMAIN="      + $domain),
-        ("DD_HOSTNAME="       + $hostname),
-        ("DD_ENV="            + $env),
-        "DD_PORT=8081"
-      ]
-    },
-    {
-      "image": $web_image,
-      "app_name": "dd-web",
-      "env": [
+        "DD_MODE=management",
         ("DD_CF_API_TOKEN="   + $cf_token),
         ("DD_CF_ACCOUNT_ID="  + $cf_account),
         ("DD_CF_ZONE_ID="     + $cf_zone),
@@ -113,6 +92,7 @@ EE_BOOT_WORKLOADS=$(jq -c -n \
         ("DD_GITHUB_CLIENT_ID="     + $gh_client_id),
         ("DD_GITHUB_CLIENT_SECRET=" + $gh_client_secret),
         ("DD_GITHUB_CALLBACK_URL="  + $gh_callback),
+        "DD_REGISTER_PORT=8081",
         "DD_OIDC_AUDIENCE=dd-web",
         "DD_PORT=8080"
       ]
@@ -146,4 +126,4 @@ gcloud compute instances create "$VM_NAME" \
 echo "VM: $VM_NAME"
 echo "  image:    family $EE_IMAGE_FAMILY ($EE_IMAGE_PROJECT)"
 echo "  hostname: $DD_HOSTNAME"
-echo "  workloads: dd-register, dd-web"
+echo "  workload: dd management"

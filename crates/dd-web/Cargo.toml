@@ -3,6 +3,10 @@ name = "dd-web"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+name = "dd_web"
+path = "src/lib.rs"
+
 [[bin]]
 name = "dd-web"
 path = "src/main.rs"

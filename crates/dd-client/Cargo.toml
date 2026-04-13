@@ -3,6 +3,10 @@ name = "dd-client"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+name = "dd_client"
+path = "src/lib.rs"
+
 [[bin]]
 name = "dd-client"
 path = "src/main.rs"
