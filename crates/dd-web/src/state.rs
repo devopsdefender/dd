@@ -5,6 +5,8 @@ use std::time::Instant;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
+use dd_common::ee_client::EeClient;
+
 use crate::config::Config;
 
 /// Point-in-time snapshot of a single agent, populated by the collector.
@@ -53,4 +55,7 @@ pub struct WebState {
     pub signing_key: jsonwebtoken::EncodingKey,
     pub decoding_key: jsonwebtoken::DecodingKey,
     pub started_at: Instant,
+    /// Local easyenclave socket client — used by the CP agent detail page
+    /// to show workload logs and info for the management VM itself.
+    pub ee_client: Arc<EeClient>,
 }

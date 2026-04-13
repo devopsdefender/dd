@@ -22,6 +22,7 @@ use std::time::Instant;
 
 use tokio::sync::Mutex;
 
+use dd_common::ee_client::EeClient;
 use dd_common::tunnel;
 
 pub async fn run() {
@@ -43,6 +44,11 @@ pub async fn run() {
 
     let agents: state::AgentStore = Arc::new(Mutex::new(HashMap::new()));
 
+    // Connect to local easyenclave socket (for CP self-inspection).
+    let ee_socket = std::env::var("EE_SOCKET_PATH")
+        .unwrap_or_else(|_| "/var/lib/easyenclave/agent.sock".into());
+    let ee_client = Arc::new(EeClient::new(&ee_socket));
+
     let web_state = state::WebState {
         config: Arc::new(config),
         agents: agents.clone(),
@@ -51,6 +57,7 @@ pub async fn run() {
         signing_key,
         decoding_key,
         started_at: Instant::now(),
+        ee_client,
     };
 
     // Bootstrap: discover existing agents from CF tunnels

@@ -172,14 +172,41 @@ pub async fn run_collector(state: WebState) {
             }
         }
 
-        // Self-check: scrape localhost to register the control plane itself.
-        // No dd-client container needed — the CP monitors itself.
+        // Self-check: query local easyenclave + localhost health to register
+        // the control plane in the fleet dashboard.
         let self_healthy = matches!(
             http.get(format!("http://localhost:{}/health", state.config.port))
                 .send()
                 .await,
             Ok(resp) if resp.status().is_success()
         );
+
+        // Pull real workload info from the local easyenclave socket.
+        let (deployment_names, deployment_count, attestation_type) =
+            match state.ee_client.list().await {
+                Ok(deps) => {
+                    let names: Vec<String> = deps
+                        .as_object()
+                        .map(|m| {
+                            m.values()
+                                .filter_map(|v| v["app_name"].as_str().map(String::from))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let count = names.len();
+                    // Also grab attestation from easyenclave health
+                    let att = state
+                        .ee_client
+                        .health()
+                        .await
+                        .ok()
+                        .and_then(|h| h["attestation_type"].as_str().map(String::from))
+                        .unwrap_or_else(|| "tdx".into());
+                    (names, count, att)
+                }
+                Err(_) => (vec!["dd-management".into()], 1, "tdx".into()),
+            };
+
         {
             let mut store = state.agents.lock().await;
             store.insert(
@@ -188,15 +215,11 @@ pub async fn run_collector(state: WebState) {
                     agent_id: "control-plane".to_string(),
                     hostname: state.config.hostname.clone(),
                     vm_name: format!("dd-{env_label}-cp"),
-                    attestation_type: "tdx".to_string(),
+                    attestation_type,
                     status: if self_healthy { "healthy" } else { "stale" }.to_string(),
                     last_seen: now,
-                    deployment_count: 3,
-                    deployment_names: vec![
-                        "dd-register".into(),
-                        "dd-web".into(),
-                        "dd-client".into(),
-                    ],
+                    deployment_count,
+                    deployment_names,
                     cpu_percent: 0,
                     memory_used_mb: 0,
                     memory_total_mb: 0,
