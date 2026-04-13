@@ -70,17 +70,12 @@ DD_GITHUB_CALLBACK_URL="${DD_GITHUB_CALLBACK_URL:-https://${DD_HOSTNAME}/auth/gi
 #   dd-web      — the fleet dashboard that operators see at DD_HOSTNAME.
 #                 Auth-gated with GitHub OAuth (+ PAT Bearer + OIDC for CI).
 #
-#   dd-client   — the agent that runs on every easyenclave VM (including
-#                 the control plane). Registers itself with dd-register
-#                 so the management VM shows up in its own fleet dashboard.
-#
-# All run with host networking (easyenclave's default) so they bind
-# the VM's network namespace directly.
-DD_CLIENT_IMAGE="${DD_CLIENT_IMAGE:-ghcr.io/devopsdefender/dd-client:latest}"
+# Both run with host networking (easyenclave's default) so they bind
+# the VM's network namespace directly. The control plane self-registers
+# in dd-web's collector (no dd-client container needed on the CP).
 EE_BOOT_WORKLOADS=$(jq -c -n \
   --arg reg_image      "$DD_REGISTER_IMAGE" \
   --arg web_image      "$DD_WEB_IMAGE" \
-  --arg client_image   "$DD_CLIENT_IMAGE" \
   --arg cf_token       "$CLOUDFLARE_API_TOKEN" \
   --arg cf_account     "$CLOUDFLARE_ACCOUNT_ID" \
   --arg cf_zone        "$CLOUDFLARE_ZONE_ID" \
@@ -120,16 +115,6 @@ EE_BOOT_WORKLOADS=$(jq -c -n \
         ("DD_GITHUB_CALLBACK_URL="  + $gh_callback),
         "DD_OIDC_AUDIENCE=dd-web",
         "DD_PORT=8080"
-      ]
-    },
-    {
-      "image": $client_image,
-      "app_name": "dd-client",
-      "env": [
-        ("DD_REGISTER_URL=wss://" + $hostname + "/register"),
-        ("DD_HOSTNAME=" + $hostname),
-        ("DD_ENV=" + $env),
-        "DD_PORT=8082"
       ]
     }
   ]')
