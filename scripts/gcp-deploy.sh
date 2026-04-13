@@ -126,6 +126,7 @@ EE_BOOT_WORKLOADS=$(jq -c -n \
       "image": $client_image,
       "app_name": "dd-client",
       "env": [
+        ("DD_REGISTER_URL=wss://" + $hostname + "/register"),
         ("DD_HOSTNAME=" + $hostname),
         ("DD_ENV=" + $env),
         "DD_PORT=8082"
