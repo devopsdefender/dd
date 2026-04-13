@@ -31,8 +31,8 @@ async fn main() {
             dd_client::run().await;
         }
         _ => {
-            eprintln!("usage: dd <management|agent>");
-            eprintln!("   or: DD_MODE=management dd");
+            eprintln!("usage: devopsdefender <management|agent>");
+            eprintln!("   or: DD_MODE=management devopsdefender");
             eprintln!();
             eprintln!("  management  Run the control plane (register + dashboard)");
             eprintln!("  agent       Run the in-VM agent");

@@ -1,20 +1,22 @@
-# dd — unified binary for DevOps Defender fleet management.
+# devopsdefender — unified binary for fleet management.
+#
+# Statically linked (musl), runs natively on easyenclave VMs
+# without a container runtime. The OCI image is used as a
+# distribution format — easyenclave pulls it, unpacks the layers,
+# and runs the binary directly on the host.
 #
 # Subcommands:
-#   dd management  — control plane (dd-register + dd-web)
-#   dd agent       — in-VM agent (dd-client)
-#
-# Build context MUST be the repo root (workspace root) so that
-# path deps resolve. The push-management-images workflow sets
-# context: . and file: Dockerfile.
+#   devopsdefender management  — control plane (register + dashboard)
+#   devopsdefender agent       — in-VM agent
 
 FROM rust:1-bookworm AS builder
+RUN rustup target add x86_64-unknown-linux-musl && \
+    apt-get update && apt-get install -y --no-install-recommends musl-tools && \
+    rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY . .
-RUN cargo build --release -p dd
+RUN cargo build --release -p devopsdefender --target x86_64-unknown-linux-musl
 
-# Runtime: debian-slim + cloudflared. Both `dd management` and
-# `dd agent` spawn cloudflared as a subprocess for CF tunnels.
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates curl \
@@ -24,5 +26,5 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get purge -y curl \
     && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/*
-COPY --from=builder /src/target/release/dd /usr/local/bin/dd
-ENTRYPOINT ["/usr/local/bin/dd"]
+COPY --from=builder /src/target/x86_64-unknown-linux-musl/release/devopsdefender /usr/local/bin/devopsdefender
+ENTRYPOINT ["/usr/local/bin/devopsdefender"]

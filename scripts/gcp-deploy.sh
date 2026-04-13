@@ -45,6 +45,8 @@ set -euo pipefail
 EE_IMAGE_FAMILY="${EE_IMAGE_FAMILY:-easyenclave-staging}"
 EE_IMAGE_PROJECT="${EE_IMAGE_PROJECT:-easyenclave}"
 DD_IMAGE="${DD_IMAGE:-ghcr.io/devopsdefender/dd:latest}"
+# cloudflared is bundled in the OCI image; native mode extracts and runs
+# the binary directly on the host (no container runtime needed).
 
 VM_NAME="dd-${DD_ENV}-$(date +%s)"
 VM_MACHINE_TYPE="${VM_MACHINE_TYPE:-c3-standard-4}"
@@ -79,6 +81,7 @@ EE_BOOT_WORKLOADS=$(jq -c -n \
   '[
     {
       "image": $image,
+      "native": true,
       "app_name": "dd-management",
       "env": [
         "DD_MODE=management",
