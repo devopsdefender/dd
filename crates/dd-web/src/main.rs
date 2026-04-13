@@ -106,62 +106,18 @@ async fn main() {
         collector::run_collector(collector_state).await;
     });
 
-    // Create own CF tunnel
-    let hostname = web_state.config.hostname.clone();
-    let web_id = uuid::Uuid::new_v4().to_string();
-    eprintln!("dd-web: creating tunnel for {hostname}");
-
-    let tunnel_info = match tunnel::create_agent_tunnel(
-        &http_client,
-        &web_state.config.cf,
-        &web_id,
-        "dd-web",
-        Some(&hostname),
-    )
-    .await
-    {
-        Ok(info) => info,
-        Err(e) => {
-            eprintln!("dd-web: tunnel creation failed: {e}");
-            std::process::exit(1);
-        }
-    };
-
-    eprintln!("dd-web: tunnel created -- {}", tunnel_info.hostname);
-
-    // Spawn cloudflared (if available — dd-web's container may not
-    // have it, in which case dd-register handles the tunnel).
-    let token = tunnel_info.tunnel_token.clone();
-    tokio::spawn(async move {
-        eprintln!("dd-web: starting cloudflared");
-        match tokio::process::Command::new("cloudflared")
-            .args([
-                "tunnel",
-                "--no-autoupdate",
-                "--metrics=",
-                "run",
-                "--token",
-                &token,
-            ])
-            .spawn()
-        {
-            Ok(mut child) => {
-                let _ = child.wait().await;
-                eprintln!("dd-web: cloudflared exited");
-            }
-            Err(e) => {
-                eprintln!(
-                    "dd-web: cloudflared not available ({e}), relying on dd-register's tunnel"
-                );
-            }
-        }
-    });
+    // dd-web does NOT create its own Cloudflare tunnel. dd-register
+    // owns the tunnel for this hostname — it creates it, runs
+    // cloudflared, and forwards traffic to localhost:8080 where
+    // dd-web listens. Having both services create tunnels for the
+    // same hostname races the DNS CNAME, causing error 1033.
 
     // Build router and start HTTP server
     let app = router::build_router(web_state.clone());
     let port = web_state.config.port;
     let addr = format!("0.0.0.0:{port}");
 
+    let hostname = &web_state.config.hostname;
     eprintln!("dd-web: listening on {addr}");
     eprintln!("dd-web: dashboard at https://{hostname}/");
 
