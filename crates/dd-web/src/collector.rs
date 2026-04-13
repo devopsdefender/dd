@@ -174,14 +174,12 @@ pub async fn run_collector(state: WebState) {
 
         // Self-check: scrape localhost to register the control plane itself.
         // No dd-client container needed — the CP monitors itself.
-        let self_healthy = match http
-            .get(format!("http://localhost:{}/health", state.config.port))
-            .send()
-            .await
-        {
-            Ok(resp) if resp.status().is_success() => true,
-            _ => false,
-        };
+        let self_healthy = matches!(
+            http.get(format!("http://localhost:{}/health", state.config.port))
+                .send()
+                .await,
+            Ok(resp) if resp.status().is_success()
+        );
         {
             let mut store = state.agents.lock().await;
             store.insert(
