@@ -172,6 +172,38 @@ pub async fn run_collector(state: WebState) {
             }
         }
 
+        // Self-check: scrape localhost to register the control plane itself.
+        // No dd-client container needed — the CP monitors itself.
+        let self_healthy = matches!(
+            http.get(format!("http://localhost:{}/health", state.config.port))
+                .send()
+                .await,
+            Ok(resp) if resp.status().is_success()
+        );
+        {
+            let mut store = state.agents.lock().await;
+            store.insert(
+                "control-plane".to_string(),
+                AgentSnapshot {
+                    agent_id: "control-plane".to_string(),
+                    hostname: state.config.hostname.clone(),
+                    vm_name: format!("dd-{env_label}-cp"),
+                    attestation_type: "tdx".to_string(),
+                    status: if self_healthy { "healthy" } else { "stale" }.to_string(),
+                    last_seen: now,
+                    deployment_count: 3,
+                    deployment_names: vec![
+                        "dd-register".into(),
+                        "dd-web".into(),
+                        "dd-client".into(),
+                    ],
+                    cpu_percent: 0,
+                    memory_used_mb: 0,
+                    memory_total_mb: 0,
+                },
+            );
+        }
+
         let healthy_count = results.iter().filter(|r| r.2).count();
         let unhealthy_count = results.iter().filter(|r| !r.2).count();
         eprintln!(
