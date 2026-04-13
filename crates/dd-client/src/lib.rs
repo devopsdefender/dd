@@ -136,6 +136,45 @@ async fn post_exec(
     Ok(Json(resp).into_response())
 }
 
+// ── Route: /re-register (POST) ──────────────────────────────────────────
+// Triggers re-registration with dd-register. Used by the collector to
+// migrate agents to a new register instance after a zero-downtime deploy.
+
+async fn post_re_register(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Response, AppError> {
+    auth::verify_owner(&state, &headers).await?;
+
+    let register_url = state
+        .config
+        .register_url
+        .as_deref()
+        .ok_or_else(|| AppError::InvalidInput("no register URL configured".into()))?;
+
+    eprintln!("dd-client: re-registering with {register_url}");
+    match register_with_noise(register_url, &state.config.vm_name, &state.config.owner).await {
+        Ok(bootstrap) => {
+            eprintln!("dd-client: re-registered — hostname={}", bootstrap.hostname);
+
+            // Start new cloudflared if tunnel token changed.
+            if let Err(e) = start_cloudflared(&bootstrap.tunnel_token).await {
+                eprintln!("dd-client: cloudflared restart failed: {e}");
+            }
+
+            Ok(Json(serde_json::json!({
+                "ok": true,
+                "hostname": bootstrap.hostname,
+            }))
+            .into_response())
+        }
+        Err(e) => {
+            eprintln!("dd-client: re-registration failed: {e}");
+            Err(AppError::External(e))
+        }
+    }
+}
+
 // ── Registration via Noise WS ───────────────────────────────────────────
 
 async fn register_with_noise(
@@ -367,6 +406,7 @@ pub async fn run() {
             get(auth::login_page).post(auth::login_submit),
         )
         .route("/auth/logout", get(auth::logout))
+        .route("/re-register", post(post_re_register))
         .with_state(state);
 
     let addr = format!("0.0.0.0:{port}");
