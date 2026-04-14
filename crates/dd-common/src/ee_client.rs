@@ -18,7 +18,8 @@ impl EeClient {
         }
     }
 
-    /// Send a JSON request and read one JSON response line.
+    /// Send a JSON request and read one JSON response line. The socket
+    /// dispatches on a `method` field, not `action`.
     async fn request(&self, req: serde_json::Value) -> Result<serde_json::Value, String> {
         let stream = UnixStream::connect(&self.socket_path)
             .await
@@ -49,26 +50,26 @@ impl EeClient {
 
     /// Health check.
     pub async fn health(&self) -> Result<serde_json::Value, String> {
-        self.request(serde_json::json!({ "action": "health" }))
+        self.request(serde_json::json!({ "method": "health" }))
             .await
     }
 
     /// Request a TDX attestation quote with the given nonce.
     pub async fn attest(&self, nonce: &str) -> Result<serde_json::Value, String> {
-        self.request(serde_json::json!({ "action": "attest", "nonce": nonce }))
+        self.request(serde_json::json!({ "method": "attest", "nonce": nonce }))
             .await
     }
 
     /// Deploy a workload.
     pub async fn deploy(&self, req: serde_json::Value) -> Result<serde_json::Value, String> {
         let mut payload = req;
-        payload["action"] = serde_json::json!("deploy");
+        payload["method"] = serde_json::json!("deploy");
         self.request(payload).await
     }
 
     /// Stop a workload by id.
     pub async fn stop(&self, id: &str) -> Result<serde_json::Value, String> {
-        self.request(serde_json::json!({ "action": "stop", "id": id }))
+        self.request(serde_json::json!({ "method": "stop", "id": id }))
             .await
     }
 
@@ -79,7 +80,7 @@ impl EeClient {
         timeout_secs: u64,
     ) -> Result<serde_json::Value, String> {
         self.request(serde_json::json!({
-            "action": "exec",
+            "method": "exec",
             "cmd": cmd,
             "timeout_secs": timeout_secs,
         }))
@@ -88,12 +89,12 @@ impl EeClient {
 
     /// List running workloads.
     pub async fn list(&self) -> Result<serde_json::Value, String> {
-        self.request(serde_json::json!({ "action": "list" })).await
+        self.request(serde_json::json!({ "method": "list" })).await
     }
 
     /// Get logs for a workload by id.
     pub async fn logs(&self, id: &str) -> Result<serde_json::Value, String> {
-        self.request(serde_json::json!({ "action": "logs", "id": id }))
+        self.request(serde_json::json!({ "method": "logs", "id": id }))
             .await
     }
 }

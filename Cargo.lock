@@ -306,16 +306,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d7a1e2f27636f116493b8b860f5546edb47c8d8f8ea73e1d2a20be88e28d1fea"
 
 [[package]]
-name = "dd"
-version = "0.1.0"
-dependencies = [
- "dd-client",
- "dd-register",
- "dd-web",
- "tokio",
-]
-
-[[package]]
 name = "dd-client"
 version = "0.1.0"
 dependencies = [
@@ -393,6 +383,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7cd812cc2bc1d69d4764bd80df88b4317eaef9e773c75226407d9bc0876b211c"
 dependencies = [
  "powerfmt",
+]
+
+[[package]]
+name = "devopsdefender"
+version = "0.1.0"
+dependencies = [
+ "dd-client",
+ "dd-register",
+ "dd-web",
+ "tokio",
 ]
 
 [[package]]
