@@ -321,9 +321,18 @@ async fn stonith_old_registers(state: &AppState) {
             continue;
         }
 
-        // Check if this tunnel serves our hostname (same DNS CNAME target).
-        let tun_hostname = format!("{name}.{}", state.cf.domain);
-        if tun_hostname != state.hostname {
+        // Previously: reconstruct `{name}.{domain}` and compare to
+        // state.hostname. That breaks for CP tunnels, whose hostname
+        // is overridden to `app-{env}.{domain}` and doesn't match the
+        // tunnel name. Ask CF what this tunnel actually serves.
+        let serves_our_host = match tunnel::tunnel_ingress_hostnames(&http, &state.cf, id).await {
+            Ok(hosts) => hosts.iter().any(|h| h == &state.hostname),
+            Err(e) => {
+                eprintln!("dd-register: STONITH: config fetch failed for {name}: {e}");
+                false
+            }
+        };
+        if !serves_our_host {
             continue;
         }
 
@@ -333,8 +342,10 @@ async fn stonith_old_registers(state: &AppState) {
         } else {
             eprintln!("dd-register: STONITH: killed old tunnel {name}");
         }
-
-        // Also clean up the DNS record if it still points to the old tunnel.
-        let _ = tunnel::delete_dns_record(&http, &state.cf, &tun_hostname).await;
     }
+
+    // DNS record now points at our new tunnel (create_agent_tunnel
+    // overwrote it). The old-tunnel DNS cleanup the previous code did
+    // here was a no-op because the record name matched ours; leaving
+    // it out so we don't risk deleting our own record.
 }
