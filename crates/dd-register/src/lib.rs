@@ -100,7 +100,7 @@ pub async fn run() {
         let status = child.wait().await;
         eprintln!("dd-register: cloudflared exited: {status:?}");
         eprintln!("dd-register: tunnel lost — powering off (STONITH kill)");
-        let _ = tokio::process::Command::new("poweroff").spawn();
+        kernel_poweroff();
     });
 
     // Self-STONITH watchdog. cloudflared is known to retry indefinitely
@@ -121,7 +121,7 @@ pub async fn run() {
         loop {
             if !tunnel::tunnel_exists(&http, &wd_cf, &wd_tunnel_id).await {
                 eprintln!("dd-register: own tunnel {wd_tunnel_id} gone — self-STONITH poweroff");
-                let _ = tokio::process::Command::new("poweroff").spawn();
+                kernel_poweroff();
                 return;
             }
             tokio::time::sleep(std::time::Duration::from_secs(30)).await;
@@ -303,13 +303,11 @@ async fn post_stonith(
 
     eprintln!("dd-register: STONITH received — powering off");
 
-    // Spawn poweroff in background so we can return the response first.
+    // Run kernel poweroff after responding so the requester sees an OK.
     tokio::spawn(async {
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         eprintln!("dd-register: executing poweroff");
-        let _ = tokio::process::Command::new("poweroff")
-            .spawn()
-            .map_err(|e| eprintln!("dd-register: poweroff failed: {e}"));
+        kernel_poweroff();
     });
 
     (
@@ -318,10 +316,32 @@ async fn post_stonith(
     )
 }
 
+// ── Kernel poweroff via reboot(2) syscall ───────────────────────────────
+// The `poweroff` subprocess proved unreliable on the sealed image:
+// busybox poweroff tries to signal a systemd-style PID 1 first and
+// silently no-ops when easyenclave (not systemd) doesn't respond.
+// Calling reboot(2) directly bypasses all of that — kernel halts the
+// VM regardless of who PID 1 is. Requires CAP_SYS_BOOT (we're root).
+fn kernel_poweroff() {
+    // Best-effort sync before halt so any pending writes to the tmpfs
+    // log dir flush to the serial console.
+    unsafe {
+        libc::sync();
+        let rc = libc::reboot(libc::LINUX_REBOOT_CMD_POWER_OFF);
+        // reboot(2) doesn't return on success. If we get here, it failed.
+        eprintln!(
+            "dd-register: reboot(POWER_OFF) returned {rc}, errno {}",
+            *libc::__errno_location()
+        );
+    }
+}
+
 // ── STONITH: delete old register tunnels to trigger poweroff ────────────
-// When we delete an old register's CF tunnel, its cloudflared exits, which
-// triggers `poweroff` (see the cloudflared spawn above). This is the kill
-// mechanism — no HTTP signal needed, just pull the tunnel out from under it.
+// When we delete an old register's CF tunnel, the new VM's STONITH path
+// removes the tunnel; the old VM then notices via either (a) cloudflared
+// exiting on tunnel-gone (fast path, often unreliable), or (b) the
+// self-watchdog polling CF API and triggering kernel_poweroff() (slow
+// path, deterministic upper bound 30s).
 
 async fn stonith_old_registers(state: &AppState) {
     let http = reqwest::Client::builder()
