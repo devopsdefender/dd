@@ -82,7 +82,7 @@ pub async fn run() {
 
     // Start cloudflared with the tunnel token.
     // If cloudflared exits (e.g. tunnel deleted by a new register's STONITH),
-    // power off the VM — this is the STONITH kill mechanism.
+    // power off the VM — fast kill path when cloudflared cooperates.
     let token = tunnel_info.tunnel_token.clone();
     tokio::spawn(async move {
         eprintln!("dd-register: starting cloudflared");
@@ -101,6 +101,31 @@ pub async fn run() {
         eprintln!("dd-register: cloudflared exited: {status:?}");
         eprintln!("dd-register: tunnel lost — powering off (STONITH kill)");
         let _ = tokio::process::Command::new("poweroff").spawn();
+    });
+
+    // Self-STONITH watchdog. cloudflared is known to retry indefinitely
+    // when its tunnel is deleted remotely instead of exiting, which
+    // breaks the cloudflared-child-exit → poweroff path above. Poll
+    // CF API every 30s; when we confirm our own tunnel is gone,
+    // poweroff directly — no dependency on cloudflared's behaviour.
+    let wd_cf = cf.clone();
+    let wd_tunnel_id = tunnel_info.tunnel_id.clone();
+    tokio::spawn(async move {
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+        // Give the freshly-created tunnel a moment to propagate in CF's
+        // eventual-consistency layer before the first check.
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        loop {
+            if !tunnel::tunnel_exists(&http, &wd_cf, &wd_tunnel_id).await {
+                eprintln!("dd-register: own tunnel {wd_tunnel_id} gone — self-STONITH poweroff");
+                let _ = tokio::process::Command::new("poweroff").spawn();
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        }
     });
 
     // Bootstrap registry from existing CF tunnels
