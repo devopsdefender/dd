@@ -39,7 +39,12 @@ VCPU="2"
 EE_REPO="easyenclave/easyenclave"
 DD_REPO="devopsdefender/dd"
 STATE_DIR="/var/lib/dd-agent"
-OVMF_CODE="/usr/share/OVMF/OVMF_CODE.fd"
+# OVMF firmware path. Auto-probed below in priority order:
+#   1) explicit OVMF_CODE env var override
+#   2) Intel-TDX-enlightened firmware (real TDX boot)
+#   3) generic OVMF (no attestation; useful only as a fallback for
+#      non-TDX dev machines, but easyenclave will refuse to start)
+OVMF_CODE_OVERRIDE="${OVMF_CODE:-}"
 
 # ── Args ────────────────────────────────────────────────────────────────
 usage() {
@@ -84,7 +89,7 @@ done
 
 [[ -n "$REGISTER_URL" ]] || { echo "--register-url required" >&2; usage; }
 [[ -n "$OWNER" ]] || { echo "--owner required" >&2; usage; }
-[[ -n "$VM_NAME" ]] || VM_NAME="$(hostname)-$(tr -dc a-z0-9 </dev/urandom | head -c 6)"
+[[ -n "$VM_NAME" ]] || VM_NAME="$(hostname)-$(printf '%04x%02x' "$RANDOM" "$((RANDOM % 256))")"
 
 # ── Preflight ───────────────────────────────────────────────────────────
 [[ "$(id -u)" -eq 0 ]] || { echo "must run as root (try: sudo $0 …)" >&2; exit 1; }
@@ -101,7 +106,7 @@ echo "==> install-agent: vm=$VM_NAME register=$REGISTER_URL owner=$OWNER"
 need_pkg() { ! dpkg -s "$1" >/dev/null 2>&1; }
 PKGS=()
 need_pkg qemu-system-x86 && PKGS+=(qemu-system-x86)
-need_pkg ovmf            && PKGS+=(ovmf)
+need_pkg ovmf-inteltdx   && PKGS+=(ovmf-inteltdx)
 need_pkg genisoimage     && PKGS+=(genisoimage)
 need_pkg jq              && PKGS+=(jq)
 need_pkg curl            && PKGS+=(curl)
@@ -110,7 +115,36 @@ if [[ ${#PKGS[@]} -gt 0 ]]; then
     DEBIAN_FRONTEND=noninteractive apt-get update -qq
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${PKGS[@]}"
 fi
-[[ -f "$OVMF_CODE" ]] || { echo "OVMF firmware missing at $OVMF_CODE after install" >&2; exit 1; }
+
+# Probe OVMF firmware. Prefer the Intel-TDX-enlightened build — it's
+# the only firmware that exposes the TDX features `confidential-guest-
+# support=tdx` requires. The generic `OVMF.fd` accepts the qemu flag
+# but throws #UD inside its own EFI drivers when TDX features are
+# touched.
+#
+# CAVEAT: Ubuntu's `ovmf-inteltdx` package ships only the
+# `.inteltdx.ms.fd` variant — Microsoft-keys-enrolled Secure Boot,
+# which rejects unsigned EFI binaries. EasyEnclave's UKI is currently
+# unsigned, so on hosts where this is the only TDX firmware the VM
+# will fail to boot ("Access Denied -- rejected probably by Secure
+# Boot"). Tracked: https://github.com/easyenclave/easyenclave/issues/74
+# Workaround per host: $OVMF_CODE override pointing at a non-MS TDVF.
+OVMF_CANDIDATES=(
+    "$OVMF_CODE_OVERRIDE"
+    "/usr/share/ovmf/OVMF.inteltdx.fd"
+    "/usr/share/ovmf/OVMF.inteltdx.ms.fd"
+)
+OVMF_CODE=""
+for cand in "${OVMF_CANDIDATES[@]}"; do
+    [[ -z "$cand" ]] && continue
+    [[ -f "$cand" ]] && { OVMF_CODE="$cand"; break; }
+done
+[[ -n "$OVMF_CODE" ]] || {
+    echo "FATAL: no OVMF firmware found. Checked:" >&2
+    printf '  %s\n' "${OVMF_CANDIDATES[@]}" >&2
+    exit 1
+}
+echo "    ovmf:  $OVMF_CODE"
 
 # ── 2. Resolve + cache easyenclave qcow2 ────────────────────────────────
 mkdir -p "$STATE_DIR" "$STATE_DIR/$VM_NAME"
@@ -128,7 +162,8 @@ if [[ -z "$EE_TAG" ]]; then
 fi
 echo "    ee tag: $EE_TAG"
 
-# Asset name pattern: easyenclave-{sha12}.qcow2
+# Asset name pattern: easyenclave-{sha12}.qcow2. The qcow2 has a UKI
+# in its ESP partition; OVMF.fd (non-Secure-Boot) loads it directly.
 QCOW_NAME="$(curl -fsSL "https://api.github.com/repos/$EE_REPO/releases/tags/$EE_TAG" \
     | jq -r '.assets[].name' | grep -E '\.qcow2$' | head -1)"
 [[ -n "$QCOW_NAME" ]] || { echo "no .qcow2 asset in $EE_TAG" >&2; exit 1; }
@@ -179,10 +214,11 @@ genisoimage -quiet -o "$CONFIG_ISO" -V CONFIG -r -J "$ENV_FILE"
 
 # ── 5. systemd unit ─────────────────────────────────────────────────────
 # One unit file (template, %i = vm-name). Per-instance state lives under
-# /var/lib/dd-agent/<vm-name>/.
+# /var/lib/dd-agent/<vm-name>/. Always rewrite — installer updates need
+# to refresh the unit, otherwise old instances stay pinned to the old
+# ExecStart line.
 UNIT_PATH="/etc/systemd/system/dd-agent@.service"
-if [[ ! -f "$UNIT_PATH" ]]; then
-    cat > "$UNIT_PATH" <<'EOF'
+cat > "$UNIT_PATH" <<'EOF'
 [Unit]
 Description=DD fleet agent (TDX VM): %i
 After=network-online.target
@@ -195,14 +231,17 @@ EnvironmentFile=/var/lib/dd-agent/%i/launch.env
 # default port-forwards. No host inbound is required — agent talks
 # outbound to dd-register over WSS.
 ExecStart=/usr/bin/qemu-system-x86_64 \
-    -enable-kvm -cpu host -m ${MEM} -smp ${VCPU} \
-    -machine q35,kernel-irqchip=split,confidential-guest-support=tdx \
+    -accel kvm -cpu host -smp ${VCPU} \
     -object tdx-guest,id=tdx \
-    -drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE.fd \
-    -drive file=${QCOW},if=virtio,format=qcow2,snapshot=on \
-    -drive file=${CONFIG_ISO},if=virtio,format=raw,media=cdrom,readonly=on \
+    -object memory-backend-ram,id=mem0,size=${MEM}M \
+    -machine q35,kernel_irqchip=split,confidential-guest-support=tdx,memory-backend=mem0 \
+    -bios ${OVMF_CODE} \
+    -nodefaults -vga none -nographic \
+    -drive file=${QCOW},if=none,id=disk0,format=qcow2,snapshot=on \
+    -device virtio-blk-pci,drive=disk0 \
+    -drive file=${CONFIG_ISO},if=none,id=cfg0,format=raw,readonly=on \
+    -device virtio-blk-pci,drive=cfg0 \
     -netdev user,id=n0 -device virtio-net-pci,netdev=n0 \
-    -nographic \
     -serial file:/var/log/dd-agent-%i.log
 Restart=on-failure
 RestartSec=5
@@ -213,7 +252,6 @@ SuccessExitStatus=0
 [Install]
 WantedBy=multi-user.target
 EOF
-fi
 
 LAUNCH_ENV="$STATE_DIR/$VM_NAME/launch.env"
 cat > "$LAUNCH_ENV" <<EOF
@@ -221,6 +259,7 @@ MEM=$MEM
 VCPU=$VCPU
 QCOW=$QCOW
 CONFIG_ISO=$CONFIG_ISO
+OVMF_CODE=$OVMF_CODE
 EOF
 chmod 600 "$LAUNCH_ENV"
 

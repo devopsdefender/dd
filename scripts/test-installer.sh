@@ -20,8 +20,11 @@ INSTALLER="$SCRIPT_DIR/install-agent.sh"
 
 OWNER="${OWNER:-devopsdefender}"
 HOST_TAG="$(echo "$SSH_TARGET" | tr '@.' '--' | tr -dc 'a-z0-9-')"
-STAGING_NAME="${HOST_TAG}-staging-$(tr -dc a-z0-9 </dev/urandom | head -c 4)"
-PRODUCTION_NAME="${HOST_TAG}-prod-$(tr -dc a-z0-9 </dev/urandom | head -c 4)"
+# printf instead of `tr ... | head` because head closing the pipe
+# early triggers SIGPIPE under `pipefail`.
+RAND_TAG="$(printf '%04x%04x' "$RANDOM" "$RANDOM")"
+STAGING_NAME="${HOST_TAG}-staging-${RAND_TAG:0:4}"
+PRODUCTION_NAME="${HOST_TAG}-prod-${RAND_TAG:4:4}"
 
 ssh_run() {
     # Stream stdout, surface non-zero exit.
