@@ -214,6 +214,42 @@ pub async fn list_tunnels(
     Ok(body["result"].as_array().cloned().unwrap_or_default())
 }
 
+/// Fetch the list of hostnames a tunnel's ingress config routes to.
+///
+/// Used by STONITH to identify stale tunnels by the hostname they serve
+/// rather than by reconstructing `{name}.{domain}` — which breaks when
+/// the tunnel's hostname was overridden at creation (e.g. CP tunnels
+/// all serve `app-{env}.{domain}` regardless of tunnel name).
+pub async fn tunnel_ingress_hostnames(
+    client: &reqwest::Client,
+    cf: &CfConfig,
+    tunnel_id: &str,
+) -> Result<Vec<String>, String> {
+    let resp = client
+        .get(format!(
+            "{CF_API}/accounts/{}/cfd_tunnel/{tunnel_id}/configurations",
+            cf.account_id
+        ))
+        .header("Authorization", format!("Bearer {}", cf.api_token))
+        .send()
+        .await
+        .map_err(|e| format!("tunnel config fetch: {e}"))?;
+
+    if !resp.status().is_success() {
+        return Ok(Vec::new());
+    }
+
+    let body: serde_json::Value = resp.json().await.map_err(|e| format!("parse: {e}"))?;
+    Ok(body["result"]["config"]["ingress"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|r| r["hostname"].as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
 // -- Internal helpers ---------------------------------------------------------
 
 pub async fn configure_ingress(
