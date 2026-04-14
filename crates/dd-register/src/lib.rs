@@ -117,14 +117,18 @@ pub async fn run() {
             .unwrap_or_else(|_| reqwest::Client::new());
         // Give the freshly-created tunnel a moment to propagate in CF's
         // eventual-consistency layer before the first check.
-        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+        // 10s poll. CF API call is sub-second; cost is negligible.
+        // Worst-case detection after a STONITH delete: 10s (next poll
+        // tick) + reboot syscall + GCP state transition. Keeps the
+        // verify-step window in release.yml tight.
         loop {
             if !tunnel::tunnel_exists(&http, &wd_cf, &wd_tunnel_id).await {
                 eprintln!("dd-register: own tunnel {wd_tunnel_id} gone — self-STONITH poweroff");
                 kernel_poweroff();
                 return;
             }
-            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
         }
     });
 
