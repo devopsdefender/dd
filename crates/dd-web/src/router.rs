@@ -25,6 +25,8 @@ pub fn build_router(state: WebState) -> Router {
         .route("/cp/deployments", get(cp_deployments))
         .route("/cp/deployments/{id}/logs", get(cp_deployment_logs))
         .route("/cp/attest", get(cp_attest))
+        .route("/cp/shell", get(crate::terminal::shell_page))
+        .route("/cp/ws/shell", get(crate::terminal::ws_shell))
         .route("/federate", get(federate::federate))
         .route("/auth/github/start", get(auth::github_start))
         .route("/auth/github/callback", get(auth::github_callback))

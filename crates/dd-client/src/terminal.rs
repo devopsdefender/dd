@@ -322,47 +322,38 @@ pub async fn ws_session(
     Ok(ws.on_upgrade(move |socket| handle_ws_session(socket, state, app_name)))
 }
 
-/// Proxy WebSocket I/O to easyenclave exec.
+/// Proxy WebSocket I/O to a PTY-backed shell on easyenclave.
 ///
-/// dd-client never touches the workload process directly; interactive
-/// sessions go through the easyenclave exec API on /var/lib/easyenclave/agent.sock.
+/// `app_name` is kept in the URL for the existing client API and shown
+/// in the connect banner, but the shell itself is always `/bin/sh` on
+/// the host — easyenclave's `attach` socket method spawns a fresh PTY
+/// rather than touching any specific workload's stdio. The `app_name`
+/// path parameter is now scoping/UI rather than a backend selector.
 async fn handle_ws_session(socket: WebSocket, state: AppState, app_name: String) {
-    let (mut ws_tx, mut ws_rx) = socket.split();
+    let (mut ws_tx, ws_rx) = socket.split();
 
-    // Get attestation info from easyenclave health
+    // Banner: attestation info so the UI can display "TDX-attested" badges.
     let ee_health = state.ee_client.health().await.unwrap_or_default();
     let attestation_type = ee_health["attestation_type"].as_str().unwrap_or("unknown");
-
-    let attestation_msg = serde_json::json!({
+    let banner = serde_json::json!({
         "type": "attestation",
         "attestation_type": attestation_type,
         "vm_name": state.config.vm_name,
         "owner": state.config.owner,
     });
-    let _ = ws_tx
-        .send(Message::Text(attestation_msg.to_string().into()))
-        .await;
+    let _ = ws_tx.send(Message::Text(banner.to_string().into())).await;
 
-    // Check if the workload exists by listing deployments
-    let list_resp = state.ee_client.list().await.unwrap_or_default();
-    let deployments: Vec<&serde_json::Value> = list_resp["deployments"]
-        .as_array()
-        .map(|a| a.iter().collect())
-        .unwrap_or_default();
-    let exists = deployments.iter().any(|d| {
-        d["app_name"].as_str() == Some(app_name.as_str()) && d["status"].as_str() == Some("running")
-    });
+    // Open the attach session. easyenclave defaults to /bin/sh when cmd
+    // is empty.
+    let attach_stream = match state.ee_client.attach(&[]).await {
+        Ok(s) => s,
+        Err(e) => {
+            let err = serde_json::json!({"type": "error", "message": format!("attach: {e}")});
+            let _ = ws_tx.send(Message::Text(err.to_string().into())).await;
+            return;
+        }
+    };
 
-    if !exists {
-        let err = serde_json::json!({
-            "type": "error",
-            "message": format!("no running workload named '{app_name}'")
-        });
-        let _ = ws_tx.send(Message::Text(err.to_string().into())).await;
-        return;
-    }
-
-    // Send ok status
     let ok = serde_json::json!({
         "type": "ok",
         "status": format!("attached to {app_name}"),
@@ -370,94 +361,72 @@ async fn handle_ws_session(socket: WebSocket, state: AppState, app_name: String)
     });
     let _ = ws_tx.send(Message::Text(ok.to_string().into())).await;
 
-    // Proxy loop: stdin from WebSocket -> easyenclave exec,
-    // easyenclave stdout -> WebSocket.
-    //
-    // For interactive sessions, we open a persistent connection to
-    // easyenclave and relay data bidirectionally. Since the easyenclave
-    // unix socket uses request-response (not streaming), we use polling
-    // to get new log output while forwarding stdin as exec commands.
-    //
-    // The exec-based approach: each keystroke batch is sent as a write
-    // to the process stdin file descriptor. Log output is polled.
+    bridge_ws_to_attach(ws_tx, ws_rx, attach_stream).await;
+}
 
-    let ee_client = state.ee_client.clone();
-    let app_name_clone = app_name.clone();
+/// Pump bytes between the WebSocket and the attach UnixStream.
+///
+/// Wire format on the WS side stays as it was — JSON envelopes
+/// `{"type":"stdin","data":[bytes]}` from client and
+/// `{"type":"stdout","data":"<utf8>"}` to client — so the existing
+/// xterm.js page doesn't need to change.
+async fn bridge_ws_to_attach(
+    mut ws_tx: futures_util::stream::SplitSink<axum::extract::ws::WebSocket, Message>,
+    mut ws_rx: futures_util::stream::SplitStream<axum::extract::ws::WebSocket>,
+    attach: tokio::net::UnixStream,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    // Start a log-polling task that sends stdout to the WebSocket
-    let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
-    let (stdout_tx, mut stdout_rx) = tokio::sync::mpsc::channel::<String>(256);
+    let (mut sock_rd, mut sock_wr) = attach.into_split();
 
-    // Poll logs periodically
-    let poll_ee = ee_client.clone();
-    let poll_id = {
-        let deps = deployments
-            .iter()
-            .find(|d| d["app_name"].as_str() == Some(app_name_clone.as_str()));
-        deps.and_then(|d| d["id"].as_str())
-            .unwrap_or("")
-            .to_string()
-    };
-
-    let poll_handle = tokio::spawn(async move {
-        let mut last_line_count = 0usize;
-        let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
+    // sock → ws
+    let read_task = tokio::spawn(async move {
+        let mut buf = [0u8; 4096];
         loop {
-            tokio::select! {
-                _ = &mut stop_rx => break,
-                _ = interval.tick() => {
-                    let resp = poll_ee.logs(&poll_id).await.unwrap_or_default();
-                    if let Some(lines) = resp["lines"].as_array() {
-                        if lines.len() > last_line_count {
-                            for line in &lines[last_line_count..] {
-                                if let Some(text) = line.as_str() {
-                                    let _ = stdout_tx.send(format!("{text}\r\n")).await;
-                                }
-                            }
-                            last_line_count = lines.len();
-                        }
+            match sock_rd.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    let chunk = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let msg = serde_json::json!({ "type": "stdout", "data": chunk });
+                    if ws_tx
+                        .send(Message::Text(msg.to_string().into()))
+                        .await
+                        .is_err()
+                    {
+                        break;
                     }
                 }
             }
         }
+        // Close the WS cleanly.
+        let _ = ws_tx.close().await;
     });
 
-    // Bidirectional relay
-    loop {
-        tokio::select! {
-            Some(text) = stdout_rx.recv() => {
-                let msg = serde_json::json!({ "type": "stdout", "data": text });
-                if ws_tx.send(Message::Text(msg.to_string().into())).await.is_err() {
-                    break;
-                }
-            }
-            msg = ws_rx.next() => {
-                match msg {
-                    Some(Ok(Message::Text(text))) => {
-                        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&text) {
-                            if parsed["type"] == "stdin" {
-                                if let Some(data) = parsed["data"].as_array() {
-                                    let bytes: Vec<u8> = data
-                                        .iter()
-                                        .filter_map(|v| v.as_u64().map(|b| b as u8))
-                                        .collect();
-                                    let input = String::from_utf8_lossy(&bytes).to_string();
-                                    // Execute the input as a command through easyenclave
-                                    // For a shell session, this writes to the process stdin
-                                    let _ = ee_client
-                                        .exec(&[input], 5)
-                                        .await;
-                                }
+    // ws → sock
+    while let Some(Ok(msg)) = ws_rx.next().await {
+        match msg {
+            Message::Text(text) => {
+                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&text) {
+                    if parsed["type"] == "stdin" {
+                        if let Some(data) = parsed["data"].as_array() {
+                            let bytes: Vec<u8> = data
+                                .iter()
+                                .filter_map(|v| v.as_u64().map(|b| b as u8))
+                                .collect();
+                            if sock_wr.write_all(&bytes).await.is_err() {
+                                break;
                             }
                         }
                     }
-                    Some(Ok(Message::Close(_))) | None => break,
-                    _ => {}
                 }
             }
+            Message::Close(_) => break,
+            _ => {}
         }
     }
 
-    let _ = stop_tx.send(());
-    poll_handle.abort();
+    // Dropping sock_wr signals EOF to the child via easyenclave; the
+    // read_task will exit when the child output stops.
+    drop(sock_wr);
+    let _ = read_task.await;
 }

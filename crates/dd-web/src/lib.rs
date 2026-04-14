@@ -15,6 +15,7 @@ pub mod fleet;
 pub mod html;
 pub mod router;
 pub mod state;
+pub mod terminal;
 
 use std::collections::HashMap;
 use std::sync::Arc;
