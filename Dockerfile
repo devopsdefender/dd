@@ -1,9 +1,9 @@
 # devopsdefender — unified binary for fleet management.
 #
-# Statically linked (musl), runs natively on easyenclave VMs
-# without a container runtime. The OCI image is used as a
-# distribution format — easyenclave pulls it, unpacks the layers,
-# and runs the binary directly on the host.
+# DEVELOPMENT ONLY. CI/CD does not use this — easyenclave fetches the
+# devopsdefender binary directly from this repo's GitHub releases via
+# its github_release workload source. See .github/workflows/release.yml.
+# This Dockerfile is kept for local development and ad-hoc image builds.
 #
 # Subcommands:
 #   devopsdefender management  — control plane (register + dashboard)

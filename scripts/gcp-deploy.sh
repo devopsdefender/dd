@@ -1,16 +1,15 @@
 #!/bin/bash
 # gcp-deploy.sh — Create a TDX management VM on GCP that boots from a
-# sealed easyenclave image and runs the dd unified binary as an
-# easyenclave workload (OCI container pulled from ghcr.io).
+# sealed easyenclave image and runs dd management as a native process.
+#
+# Both the devopsdefender binary and cloudflared are fetched straight
+# from their GitHub releases by easyenclave's github_release workload
+# source — no OCI registry, no Dockerfile. Cloudflared is a fetch-only
+# boot workload: its binary lands in /var/lib/easyenclave/bin (now on
+# PATH) so dd-register can shell out to `cloudflared` by name.
 #
 # Called by .github/workflows/{staging,production}-deploy.yml. Requires
-# gcloud CLI authenticated via Workload Identity Federation (see the
-# workflow's `google-github-actions/auth@v2` step).
-#
-# Per-VM configuration is passed via GCE instance metadata (`ee-config`
-# attribute), which easyenclave's init.rs reads at PID 1 boot and
-# applies as env vars — in particular EE_BOOT_WORKLOADS, which is the
-# JSON workload spec that launches `dd management`.
+# gcloud CLI authenticated via Workload Identity Federation.
 #
 # Required env vars (set by the workflow):
 #   GCP_PROJECT_ID          — GCP project where the VM lives
@@ -23,30 +22,23 @@
 #   DD_GITHUB_CLIENT_ID     — GitHub OAuth client ID (dd-web uses it)
 #   DD_GITHUB_CLIENT_SECRET — GitHub OAuth client secret
 #
-# Optional env vars (override the pinned defaults):
+# Optional env vars:
 #   EE_IMAGE_FAMILY         — easyenclave GCP image family
 #   EE_IMAGE_PROJECT        — project hosting the image
-#   DD_IMAGE                — ghcr.io/devopsdefender/dd:<tag>
+#   DD_RELEASE_TAG          — GitHub release tag on devopsdefender/dd
+#                             (defaults to 'latest'; PRs override with pr-{sha12})
 #   VM_MACHINE_TYPE         — default c3-standard-4
-#   VM_DISK_SIZE            — default 10GB (no big rootfs; workload state
-#                             lives in /var/lib/easyenclave tmpfs)
+#   VM_DISK_SIZE            — default 10GB
 #   DD_GITHUB_CALLBACK_URL  — default https://{hostname}/auth/github/callback
 
 set -euo pipefail
 
 # ── easyenclave image family ──────────────────────────────────────────────
-# Resolved at deploy time via GCE's image-family selector — picks the
-# newest non-deprecated image in the family. No sha12 to hand-bump.
-#
 #   easyenclave-staging → rolling main, rotates on every push (5 kept)
 #   easyenclave-stable  → v* tags, kept forever
-#
-# For DD production, override to easyenclave-stable once a v-tag exists.
 EE_IMAGE_FAMILY="${EE_IMAGE_FAMILY:-easyenclave-staging}"
 EE_IMAGE_PROJECT="${EE_IMAGE_PROJECT:-easyenclave}"
-DD_IMAGE="${DD_IMAGE:-ghcr.io/devopsdefender/dd:latest}"
-# cloudflared is bundled in the OCI image; native mode extracts and runs
-# the binary directly on the host (no container runtime needed).
+DD_RELEASE_TAG="${DD_RELEASE_TAG:-latest}"
 
 VM_NAME="dd-${DD_ENV}-$(date +%s)"
 VM_MACHINE_TYPE="${VM_MACHINE_TYPE:-c3-standard-4}"
@@ -60,15 +52,16 @@ fi
 DD_GITHUB_CALLBACK_URL="${DD_GITHUB_CALLBACK_URL:-https://${DD_HOSTNAME}/auth/github/callback}"
 
 # ── Build the workload spec ──────────────────────────────────────────────
-# Single workload: `dd management` runs dd-register + dd-web concurrently
-# inside one container. Both bind the VM's network namespace directly
-# (easyenclave default = host networking).
-#
-# dd-register listens on :8081 (tunnel provisioning, agent registration)
-# dd-web listens on :8080 (fleet dashboard, OAuth, collector)
-# dd-web's collector self-monitors the control plane via localhost.
+# Two boot workloads:
+#   1. cloudflared — fetch-only. easyenclave downloads cloudflare's
+#      static binary from their GitHub release, symlinks it as
+#      `cloudflared`, and exits the deploy as "completed". The binary
+#      sits on PATH for dd-register to spawn.
+#   2. dd-management — fetches the devopsdefender binary from our own
+#      release and runs it. dd-register + dd-web both live in this
+#      single process (DD_MODE=management).
 EE_BOOT_WORKLOADS=$(jq -c -n \
-  --arg image          "$DD_IMAGE" \
+  --arg dd_tag         "$DD_RELEASE_TAG" \
   --arg cf_token       "$CLOUDFLARE_API_TOKEN" \
   --arg cf_account     "$CLOUDFLARE_ACCOUNT_ID" \
   --arg cf_zone        "$CLOUDFLARE_ZONE_ID" \
@@ -80,8 +73,20 @@ EE_BOOT_WORKLOADS=$(jq -c -n \
   --arg gh_callback    "$DD_GITHUB_CALLBACK_URL" \
   '[
     {
-      "image": $image,
-      "native": true,
+      "github_release": {
+        "repo": "cloudflare/cloudflared",
+        "asset": "cloudflared-linux-amd64",
+        "rename": "cloudflared"
+      },
+      "app_name": "cloudflared"
+    },
+    {
+      "github_release": {
+        "repo": "devopsdefender/dd",
+        "asset": "devopsdefender",
+        "tag": $dd_tag
+      },
+      "cmd": ["devopsdefender"],
       "app_name": "dd-management",
       "env": [
         "DD_MODE=management",
@@ -103,8 +108,6 @@ EE_BOOT_WORKLOADS=$(jq -c -n \
   ]')
 
 # ── Wrap into ee-config ───────────────────────────────────────────────────
-# Flat JSON map of KEY=VALUE. Each entry becomes an env var inside
-# easyenclave at init. EE_BOOT_WORKLOADS is the stringified spec above.
 jq -c -n \
   --arg workloads "$EE_BOOT_WORKLOADS" \
   '{ "EE_BOOT_WORKLOADS": $workloads, "EE_OWNER": "devopsdefender" }' \
@@ -129,4 +132,5 @@ gcloud compute instances create "$VM_NAME" \
 echo "VM: $VM_NAME"
 echo "  image:    family $EE_IMAGE_FAMILY ($EE_IMAGE_PROJECT)"
 echo "  hostname: $DD_HOSTNAME"
+echo "  dd release: $DD_RELEASE_TAG"
 echo "  workload: dd management"

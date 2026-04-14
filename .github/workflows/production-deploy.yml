@@ -1,15 +1,17 @@
 name: Production Deploy
 
+# Manual production promotion. A push to main publishes a `latest`
+# release via release.yml but does NOT auto-deploy — an operator runs
+# this workflow when they're ready to promote the staging-verified
+# build to production.
+
 on:
-  push:
-    branches: [main]
-    paths:
-      - "crates/**"
-      - "scripts/gcp-deploy.sh"
-      - "Dockerfile"
-      - ".github/workflows/production-deploy.yml"
-      - ".github/workflows/push-management-images.yml"
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Release tag to deploy (e.g. latest, v0.2.0)'
+        required: false
+        default: 'latest'
 
 concurrency:
   group: dd-production
@@ -24,15 +26,14 @@ permissions:
   contents: read
 
 jobs:
-  # No cleanup job — dd-register STONITHs the old VM on startup by
-  # deleting its CF tunnel, which causes cloudflared to exit and
-  # triggers poweroff on the old VM.
+  # dd-register STONITHs the old VM on startup by deleting its CF
+  # tunnel, so no explicit teardown here.
   deploy:
     runs-on: ubuntu-latest
     environment: production
     permissions:
       contents: read
-      id-token: write   # mint GitHub OIDC token for GCP WIF + dd-web OIDC
+      id-token: write
     steps:
       - uses: actions/checkout@v4
       - uses: google-github-actions/auth@v2
@@ -41,7 +42,7 @@ jobs:
           service_account: 'easyenclave-production-ci@easyenclave.iam.gserviceaccount.com'
       - uses: google-github-actions/setup-gcloud@v2
 
-      - name: Create TDX VM (boots from easyenclave, runs dd management as workload)
+      - name: Create TDX VM (boots from easyenclave, fetches dd from GitHub releases)
         env:
           GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.DD_CP_CF_API_TOKEN }}
@@ -50,6 +51,7 @@ jobs:
           DD_GITHUB_CLIENT_ID: ${{ vars.DD_GITHUB_CLIENT_ID || secrets.DD_GITHUB_CLIENT_ID }}
           DD_GITHUB_CALLBACK_URL: ${{ vars.DD_GITHUB_CALLBACK_URL }}
           DD_GITHUB_CLIENT_SECRET: ${{ secrets.DD_GITHUB_CLIENT_SECRET }}
+          DD_RELEASE_TAG: ${{ inputs.release_tag }}
         run: scripts/gcp-deploy.sh
 
       - name: Wait for agent health
@@ -71,11 +73,6 @@ jobs:
         env:
           AGENT_URL: https://app.${{ env.DD_DOMAIN }}
         run: |
-          # Canonical "auth from a GitHub Action" pattern: mint an
-          # OIDC JWT with audience=dd-web, hit the dashboard as Bearer.
-          # dd-web verifies the signature via GitHub's JWKS, enforces
-          # iss/aud/exp, and checks repository_owner claim == DD_OWNER.
-          # Requires permissions: id-token: write on this job.
           ID_TOKEN=$(curl -sSL \
             -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
             -H "Accept: application/json; api-version=2.0" \
@@ -87,7 +84,6 @@ jobs:
             exit 1
           fi
 
-          # Retry on cloudflared 530 (tunnel settle right after /health).
           for attempt in $(seq 1 12); do
             code=$(curl -s -o /dev/null -w '%{http_code}' \
               -H "Authorization: Bearer ${ID_TOKEN}" \

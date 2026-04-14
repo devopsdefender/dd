@@ -1,0 +1,254 @@
+name: Release
+
+# Build the static musl binary, publish it as a GitHub release asset,
+# and (on PRs) deploy it to staging. Replaces the Docker build+push
+# pipeline — easyenclave fetches the asset directly via its
+# github_release workload source.
+#
+# PR:             pre-release tagged pr-{sha12}, then full staging deploy.
+# push to main:   rolling `latest` release (no deploy — that's production)
+# push v* tag:    versioned release (no deploy)
+# workflow_dispatch: manual trigger, defaults to latest
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "scripts/gcp-deploy.sh"
+      - ".github/workflows/release.yml"
+  pull_request:
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "scripts/gcp-deploy.sh"
+      - ".github/workflows/release.yml"
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Existing release tag to (re)deploy to staging'
+        required: false
+        default: 'latest'
+
+concurrency:
+  group: dd-release-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+env:
+  DD_ENV: staging
+  DD_DOMAIN: ${{ vars.DD_CF_DOMAIN || 'devopsdefender.com' }}
+  GCP_ZONE: us-central1-c
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      sha12: ${{ steps.meta.outputs.sha12 }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install musl tools
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build static binary
+        run: cargo build --release -p devopsdefender --target x86_64-unknown-linux-musl
+
+      - name: Resolve release tag
+        id: meta
+        run: |
+          SHA12=$(echo "${{ github.sha }}" | cut -c1-12)
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            TAG="${GITHUB_REF#refs/tags/}"
+            PRERELEASE=""
+          elif [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            TAG="pr-${SHA12}"
+            PRERELEASE="--prerelease"
+          else
+            TAG="latest"
+            PRERELEASE=""
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "prerelease=${PRERELEASE}" >> "$GITHUB_OUTPUT"
+          echo "sha12=${SHA12}" >> "$GITHUB_OUTPUT"
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          PRERELEASE: ${{ steps.meta.outputs.prerelease }}
+        run: |
+          BINARY=target/x86_64-unknown-linux-musl/release/devopsdefender
+          # Rolling tags (latest, pr-*) get recreated each run. Versioned
+          # v* tags are immutable.
+          if [[ "$TAG" == "latest" || "$TAG" == pr-* ]]; then
+            gh release delete "$TAG" --yes --cleanup-tag 2>/dev/null || true
+          fi
+          gh release create "$TAG" $PRERELEASE \
+            --title "$TAG" \
+            --notes "Built from ${GITHUB_SHA}" \
+            "$BINARY"
+
+      - name: Rotate old PR pre-releases
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release list --limit 200 --json tagName,isPrerelease,createdAt \
+            | jq -r '.[] | select(.isPrerelease and (.tagName | startswith("pr-"))) | .tagName' \
+            | tail -n +12 \
+            | xargs -rI{} gh release delete {} --yes --cleanup-tag
+
+  # Deploy the freshly-built binary to staging. Only runs on PRs and
+  # manual dispatches — main/v* produce releases that production-deploy
+  # picks up separately.
+  deploy-staging:
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    needs: build
+    runs-on: ubuntu-latest
+    environment: staging
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: 'projects/654815109728/locations/global/workloadIdentityPools/github-actions-pool/providers/github-provider'
+          service_account: 'easyenclave-staging-ci@eestaging.iam.gserviceaccount.com'
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Create TDX VM (boots from easyenclave, fetches dd from GitHub releases)
+        env:
+          GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.DD_CP_CF_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.DD_CP_CF_ACCOUNT_ID }}
+          CLOUDFLARE_ZONE_ID: ${{ secrets.DD_CP_CF_ZONE_ID }}
+          DD_GITHUB_CLIENT_ID: ${{ vars.DD_GITHUB_CLIENT_ID || secrets.DD_GITHUB_CLIENT_ID }}
+          DD_GITHUB_CALLBACK_URL: ${{ vars.DD_GITHUB_CALLBACK_URL }}
+          DD_GITHUB_CLIENT_SECRET: ${{ secrets.DD_GITHUB_CLIENT_SECRET }}
+          DD_RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || needs.build.outputs.tag }}
+        run: scripts/gcp-deploy.sh
+
+      - name: Wait for agent health (streams serial console)
+        env:
+          AGENT_URL: https://app-staging.${{ env.DD_DOMAIN }}
+          GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+          GCP_ZONE: ${{ env.GCP_ZONE }}
+        run: |
+          VM_NAME=$(gcloud compute instances list \
+            --project="$GCP_PROJECT_ID" \
+            --filter="labels.devopsdefender=managed AND labels.dd_env=staging" \
+            --format="value(name)" --sort-by=~creationTimestamp | head -1)
+          if [ -z "$VM_NAME" ]; then
+            echo "::error::no dd-staging VM found — gcp-deploy.sh must have failed"
+            exit 1
+          fi
+          echo "Watching VM: $VM_NAME (zone: $GCP_ZONE)"
+
+          LAST_LINES=0
+          for i in $(seq 1 60); do
+            # Stream serial console so boot failures (DHCP hang, GitHub
+            # release fetch error, cloudflared exit, etc.) are visible
+            # without shelling into GCP.
+            gcloud compute instances get-serial-port-output "$VM_NAME" \
+              --project="$GCP_PROJECT_ID" --zone="$GCP_ZONE" 2>/dev/null \
+              > /tmp/serial.log || true
+            TOTAL_LINES=$(wc -l < /tmp/serial.log)
+            if [ "$TOTAL_LINES" -gt "$LAST_LINES" ]; then
+              tail -n +$((LAST_LINES + 1)) /tmp/serial.log \
+                | sed 's/^/[serial] /'
+              LAST_LINES=$TOTAL_LINES
+            fi
+
+            if grep -qE "FATAL|Kernel panic|Invalid ELF header|/bin/sh: can't access tty" /tmp/serial.log; then
+              echo "::error::boot failed — serial log shows fatal pattern"
+              exit 1
+            fi
+
+            # /health via the Cloudflare tunnel tests the full chain:
+            # VM boot → easyenclave init → github_release fetch of dd +
+            # cloudflared → cloudflared tunnel up.
+            if curl -fsS "${AGENT_URL}/health" >/dev/null 2>&1; then
+              echo "Agent healthy at ${AGENT_URL}"
+              exit 0
+            fi
+            echo "  waiting for tunnel... (${i}/60)"
+            sleep 5
+          done
+          echo "::error::Agent not healthy within 5 minutes"
+          echo "--- final serial tail ---"
+          tail -80 /tmp/serial.log | sed 's/^/[serial] /'
+          exit 1
+
+      - name: Verify NEW VM via TDX attestation (OIDC)
+        env:
+          AGENT_URL: https://app-staging.${{ env.DD_DOMAIN }}
+        run: |
+          # The /cp/attest endpoint is new in this refactor. Old staging
+          # VMs return 404 from it — so a 200 with a non-zero MRTD is
+          # cryptographic proof we're hitting the freshly-deployed VM
+          # running the new code, not a stale tunnel pointing at the
+          # previous deploy.
+          ID_TOKEN=$(curl -sSL \
+            -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            -H "Accept: application/json; api-version=2.0" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=dd-web" \
+            | jq -r '.value')
+
+          if [ -z "$ID_TOKEN" ] || [ "$ID_TOKEN" = "null" ]; then
+            echo "::error::failed to mint OIDC token (is id-token:write set?)"
+            exit 1
+          fi
+
+          # Random nonce — proves this quote is fresh, not replayed.
+          # Easyenclave's attest socket method expects a base64 nonce.
+          NONCE=$(openssl rand -base64 16)
+
+          # 60 × 10s = 10 min. New VM has to boot, fetch cloudflared
+          # from cloudflare/cloudflared, fetch dd from our release,
+          # start dd-management, STONITH the old tunnel, and bring its
+          # own cloudflared up. ~3-5 min in practice.
+          for attempt in $(seq 1 60); do
+            BODY=$(curl -sG -w '\n%{http_code}' \
+              -H "Authorization: Bearer ${ID_TOKEN}" \
+              --data-urlencode "nonce=${NONCE}" \
+              "${AGENT_URL}/cp/attest" || echo $'\n000')
+            CODE=$(echo "$BODY" | tail -n1)
+            JSON=$(echo "$BODY" | sed '$d')
+            if [ "$CODE" = "200" ]; then
+              QUOTE_B64=$(echo "$JSON" | jq -r '.quote_b64 // empty')
+              if [ -n "$QUOTE_B64" ] && [ "$QUOTE_B64" != "null" ]; then
+                # MRTD = 48 bytes at offset 184 in TDX quote v4.
+                # If it's non-zero, attestation actually worked.
+                MRTD=$(echo "$QUOTE_B64" | base64 -d \
+                  | dd bs=1 skip=184 count=48 status=none | xxd -p -c 48)
+                if [ -n "$MRTD" ] && [ "$MRTD" != "$(printf '00%.0s' {1..48})" ]; then
+                  echo "NEW VM verified — MRTD: $MRTD"
+                  exit 0
+                fi
+                echo "  /cp/attest 200 but MRTD empty/zero, retrying... (${attempt}/60)"
+              else
+                echo "  /cp/attest 200 but no quote_b64, retrying... (${attempt}/60)"
+              fi
+            else
+              echo "  /cp/attest returned HTTP ${CODE}, retrying... (${attempt}/60)"
+            fi
+            sleep 10
+          done
+          echo "::error::/cp/attest never returned a valid quote — stale tunnel or new VM never came up"
+          exit 1
