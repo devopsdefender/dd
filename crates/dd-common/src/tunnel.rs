@@ -214,6 +214,37 @@ pub async fn list_tunnels(
     Ok(body["result"].as_array().cloned().unwrap_or_default())
 }
 
+/// Check whether a tunnel still exists (and isn't soft-deleted).
+///
+/// Used by the dd-register self-STONITH watchdog. When the new CP's
+/// STONITH deletes our tunnel via CF API, cloudflared doesn't reliably
+/// exit — it can retry indefinitely. We can't depend on cloudflared's
+/// exit behaviour, so we self-poll the CF API and trigger `poweroff`
+/// when our own tunnel is confirmed gone.
+///
+/// Returns `false` on 404, non-success, parse error, or a non-null
+/// `deleted_at` field (CF soft-deletes). Treat unknown as gone —
+/// we'd rather self-poweroff a healthy VM (rare: transient CF API
+/// flake) than leak a zombie.
+pub async fn tunnel_exists(client: &reqwest::Client, cf: &CfConfig, tunnel_id: &str) -> bool {
+    let url = format!("{CF_API}/accounts/{}/cfd_tunnel/{tunnel_id}", cf.account_id);
+    match client
+        .get(&url)
+        .header("Authorization", format!("Bearer {}", cf.api_token))
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => {
+            let body: serde_json::Value = match resp.json().await {
+                Ok(b) => b,
+                Err(_) => return false,
+            };
+            body["result"]["deleted_at"].is_null()
+        }
+        _ => false,
+    }
+}
+
 /// Fetch the list of hostnames a tunnel's ingress config routes to.
 ///
 /// Used by STONITH to identify stale tunnels by the hostname they serve

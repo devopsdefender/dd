@@ -273,7 +273,11 @@ jobs:
             --format="value(name)" --sort-by=~creationTimestamp | head -1)
           echo "new VM: $NEW_VM"
 
-          for i in $(seq 1 12); do
+          # 24 × 5s = 120s. Watchdog poll is 10s with a 15s initial
+          # delay (dd-register/src/lib.rs); kernel reboot + GCP state
+          # transition adds a few seconds. 120s gives comfortable
+          # headroom over a worst-case ~30s detect.
+          for i in $(seq 1 24); do
             SURVIVORS=$(gcloud compute instances list \
               --project="$GCP_PROJECT_ID" \
               --filter="labels.devopsdefender=managed AND labels.dd_env=staging AND status=RUNNING" \
@@ -284,7 +288,7 @@ jobs:
               exit 0
             fi
             echo "  still running besides $NEW_VM: $(echo "$SURVIVORS" | tr '\n' ' ')"
-            echo "  waiting for STONITH poweroff... (${i}/12)"
+            echo "  waiting for STONITH poweroff... (${i}/24)"
             sleep 5
           done
           echo "::error::STONITH failed — old dd-staging VM(s) still RUNNING:"
