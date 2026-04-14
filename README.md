@@ -4,41 +4,74 @@ Confidential computing marketplace. Run AI workloads on hardware-sealed Intel TD
 
 ## Architecture
 
-4 crates in a Cargo workspace:
+A Cargo workspace with one deployable binary and a set of internal crates:
 
-| Crate | Binary | Purpose |
-|-------|--------|---------|
-| `dd-common` | (library) | Shared: Noise XX handshake, CF tunnel CRUD, error types, EeClient |
-| `dd-client` | `dd-client` | Agent web UI on a worker VM — proxies to easyenclave via unix socket |
-| `dd-register` | `dd-register` | Tunnel provisioning + Noise-XX /register endpoint for agents joining the fleet |
-| `dd-web` | `dd-web` | Fleet dashboard, GitHub OAuth, collector, federation |
+| Crate | Kind | Purpose |
+|-------|------|---------|
+| `devopsdefender` | binary | Unified entrypoint. `DD_MODE=management` runs the control plane (register + web); default runs the in-VM agent (dd-client). |
+| `dd-common` | library | Shared: Noise XX handshake, Cloudflare tunnel CRUD, error types, EeClient for easyenclave's unix socket. |
+| `dd-client` | library | Per-VM dashboard, terminal sessions, deploy/exec proxy — runs on every fleet VM. |
+| `dd-register` | library | Tunnel provisioning, agent `/register` endpoint (Noise XX over WebSocket), STONITH for old control-plane VMs. |
+| `dd-web` | library | Fleet dashboard, GitHub OAuth + Actions OIDC, collector, federation. |
 
-The enclave runtime itself is [EasyEnclave](https://github.com/easyenclave/easyenclave) — a separate project.
+One static musl binary, switched by `DD_MODE` at startup. Management VMs run `dd-web + dd-register + dd-client` concurrently in that single process.
 
-## How it's deployed
+The sealed enclave runtime is [EasyEnclave](https://github.com/easyenclave/easyenclave) — a separate project.
 
-Both management VMs (`app.devopsdefender.com`, `app-staging.devopsdefender.com`) and worker VMs **boot from a sealed easyenclave image**. No cloud-init, no stock Ubuntu, no runtime `apt-get install`. The TDX VM's rootfs is the latest image in the `easyenclave-staging` family published by [easyenclave/easyenclave](https://github.com/easyenclave/easyenclave/releases), attestable against a single UKI SHA256.
+## Deployment
 
-dd's three binaries ship as OCI container images on ghcr.io:
+Every fleet VM boots from a sealed easyenclave image published by [easyenclave/easyenclave](https://github.com/easyenclave/easyenclave/releases). No cloud-init, no stock Ubuntu, no runtime `apt-get install`. The TDX VM's rootfs is the latest image in the `easyenclave-staging` (or `-stable`) family, attestable against a single UKI SHA256.
 
-- `ghcr.io/devopsdefender/dd-register` — runs as an easyenclave workload on management VMs
-- `ghcr.io/devopsdefender/dd-web` — runs as an easyenclave workload on management VMs
-- `ghcr.io/devopsdefender/dd-client` — runs as an easyenclave workload on worker VMs
+The `devopsdefender` binary ships as a **GitHub release asset** — not an OCI image. Easyenclave fetches it directly via its `github_release` boot workload source:
 
-Image builds: `.github/workflows/push-management-images.yml` (on push to main).
+```json
+{
+  "github_release": {
+    "repo": "devopsdefender/dd",
+    "asset": "devopsdefender",
+    "tag": "latest"
+  },
+  "cmd": ["devopsdefender"],
+  "app_name": "dd-management",
+  "env": ["DD_MODE=management", ...]
+}
+```
 
-Per-VM configuration (CF credentials, GitHub OAuth, the workload spec itself) is passed to easyenclave at boot via **GCE instance metadata** — the `ee-config` attribute, a JSON object read by `easyenclave::init::fetch_gce_metadata_config()` and applied as env vars. `scripts/gcp-deploy.sh` builds the spec and invokes `gcloud compute instances create --image-family=easyenclave-staging --metadata-from-file=ee-config=...` — no sha12 pin to maintain.
+`cloudflared` is also pulled directly from `cloudflare/cloudflared`'s GitHub releases as a fetch-only boot workload — no bundling in our image, no Dockerfile step.
+
+Per-VM configuration (CF credentials, GitHub OAuth, the workload spec itself) is passed to easyenclave at boot via **GCE instance metadata** (`ee-config` attribute), read by `easyenclave::init::fetch_gce_metadata_config()` and applied as env vars. `scripts/gcp-deploy.sh` builds the spec and invokes `gcloud compute instances create --image-family=easyenclave-staging --metadata-from-file=ee-config=...`.
+
+## CI/CD
+
+```
+PR              → pre-release tagged pr-{sha12}, then full staging deploy
+push to main    → rolling `latest` release (no auto-deploy)
+push v* tag     → versioned release (no auto-deploy)
+manual          → production-deploy.yml promotes any existing tag
+```
+
+`.github/workflows/release.yml` builds the static musl binary, publishes it as a GitHub release asset, and on PRs deploys it to staging. The staging VM is verified via:
+
+1. `/health` via the Cloudflare tunnel
+2. `/cp/attest` returning a real TDX MRTD (cryptographic proof the freshly-deployed VM is running — old VMs don't have the endpoint and return 404)
+3. No other `dd-staging` VM is RUNNING after deploy (STONITH must have halted the previous instance)
+
+## STONITH
+
+When a new management VM boots, `dd-register` needs to kick out the old one. It does this by deleting the old tunnel via the Cloudflare API — when the old `cloudflared` loses its tunnel, it exits, and the old `dd-register` observes the exit and calls `poweroff`. The old VM shuts down, GCP marks it TERMINATED.
+
+Old tunnels are identified by their **ingress configuration** (which hostname they serve), not by reconstructing a hostname from the tunnel name. This is the correct identifier because CP tunnels all serve `app-{env}.{domain}` regardless of their individual tunnel name.
+
+If STONITH fails, `release.yml` detects the surviving VM and fails the deploy — loud signal, no silent accumulation.
 
 ## Build
 
 ```bash
 cargo build --workspace --release
-# Produces: target/release/dd-client, dd-register, dd-web
+# Produces: target/release/devopsdefender
 ```
 
-Container images (for deployment) are built by the
-`push-management-images.yml` workflow; local `docker build -f crates/dd-register/Dockerfile .`
-works too.
+For local dev you can also build the Dockerfile (`docker build -t dd .`) but CI/CD does not — production deploys consume the GitHub release asset directly.
 
 ## License
 
