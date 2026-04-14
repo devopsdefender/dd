@@ -1,0 +1,93 @@
+name: Cleanup
+
+# Reap TERMINATED dd-{env}-* VMs. STONITH self-poweroff leaves the VM
+# in TERMINATED state — it uses no compute but clutters the inventory
+# and a long enough chain of deploys turns into pages of dead VMs.
+#
+# Two jobs run in parallel, one per environment, so a regression in
+# either auth/zone/project doesn't block the other. The cleanup is
+# idempotent: skip if nothing to reap.
+#
+# Triggers:
+#   - workflow_dispatch (operator-initiated cleanup)
+#   - workflow_run completion of Release / Production Deploy (catch
+#     post-deploy zombies opportunistically)
+#   - schedule, every 6 hours (background safety net)
+
+on:
+  workflow_dispatch:
+  workflow_run:
+    workflows: ["Release", "Production Deploy"]
+    types: [completed]
+  schedule:
+    - cron: '0 */6 * * *'
+
+# Don't pile up identical reaps when several deploys land in quick
+# succession — one in-flight reap is enough.
+concurrency:
+  group: dd-cleanup
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  reap-staging:
+    runs-on: ubuntu-latest
+    environment: staging
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: 'projects/654815109728/locations/global/workloadIdentityPools/github-actions-pool/providers/github-provider'
+          service_account: 'easyenclave-staging-ci@eestaging.iam.gserviceaccount.com'
+      - uses: google-github-actions/setup-gcloud@v2
+      - name: Reap TERMINATED dd-staging VMs
+        env:
+          GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+          GCP_ZONE: us-central1-c
+        run: |
+          DEAD=$(gcloud compute instances list \
+            --project="$GCP_PROJECT_ID" \
+            --filter="labels.devopsdefender=managed AND labels.dd_env=staging AND status=TERMINATED" \
+            --format="value(name)")
+          if [ -z "$DEAD" ]; then
+            echo "No TERMINATED dd-staging VMs to reap."
+            exit 0
+          fi
+          echo "Reaping: $(echo "$DEAD" | tr '\n' ' ')"
+          # shellcheck disable=SC2086
+          gcloud compute instances delete $DEAD \
+            --project="$GCP_PROJECT_ID" --zone="$GCP_ZONE" --quiet
+
+  reap-production:
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: 'projects/779946350556/locations/global/workloadIdentityPools/github-actions-pool/providers/github-provider'
+          service_account: 'easyenclave-production-ci@easyenclave.iam.gserviceaccount.com'
+      - uses: google-github-actions/setup-gcloud@v2
+      - name: Reap TERMINATED dd-production VMs
+        env:
+          GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+          GCP_ZONE: us-central1-c
+        run: |
+          DEAD=$(gcloud compute instances list \
+            --project="$GCP_PROJECT_ID" \
+            --filter="labels.devopsdefender=managed AND labels.dd_env=production AND status=TERMINATED" \
+            --format="value(name)")
+          if [ -z "$DEAD" ]; then
+            echo "No TERMINATED dd-production VMs to reap."
+            exit 0
+          fi
+          echo "Reaping: $(echo "$DEAD" | tr '\n' ' ')"
+          # shellcheck disable=SC2086
+          gcloud compute instances delete $DEAD \
+            --project="$GCP_PROJECT_ID" --zone="$GCP_ZONE" --quiet
