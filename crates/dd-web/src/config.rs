@@ -3,9 +3,13 @@ use dd_common::tunnel::CfConfig;
 /// Configuration for the dd-web fleet dashboard.
 pub struct Config {
     pub cf: CfConfig,
-    pub github_client_id: String,
-    pub github_client_secret: String,
-    pub github_callback_url: String,
+    /// GitHub OAuth app credentials. Either all three are `Some`
+    /// (production, shared staging) or all three are `None` (ephemeral
+    /// per-PR envs, which use the `/auth/pat` form for browser access
+    /// instead of OAuth). OAuth routes are inactive when None.
+    pub github_client_id: Option<String>,
+    pub github_client_secret: Option<String>,
+    pub github_callback_url: Option<String>,
     pub owner: String,
     pub domain: String,
     pub hostname: String,
@@ -33,18 +37,26 @@ impl Config {
             std::process::exit(1);
         });
 
-        let github_client_id = std::env::var("DD_GITHUB_CLIENT_ID").unwrap_or_else(|_| {
-            eprintln!("dd-web: DD_GITHUB_CLIENT_ID required");
+        // OAuth is optional. Production and shared-staging set all three;
+        // per-PR ephemeral envs leave them unset and rely on the PAT form.
+        // If client_id is set, secret must be set too — half-configured
+        // OAuth is always a mistake.
+        let github_client_id = std::env::var("DD_GITHUB_CLIENT_ID")
+            .ok()
+            .filter(|s| !s.is_empty());
+        let github_client_secret = std::env::var("DD_GITHUB_CLIENT_SECRET")
+            .ok()
+            .filter(|s| !s.is_empty());
+        if github_client_id.is_some() != github_client_secret.is_some() {
+            eprintln!(
+                "dd-web: DD_GITHUB_CLIENT_ID and DD_GITHUB_CLIENT_SECRET must be set together"
+            );
             std::process::exit(1);
+        }
+        let github_callback_url = github_client_id.as_ref().map(|_| {
+            std::env::var("DD_GITHUB_CALLBACK_URL")
+                .unwrap_or_else(|_| format!("https://{hostname}/auth/github/callback"))
         });
-
-        let github_client_secret = std::env::var("DD_GITHUB_CLIENT_SECRET").unwrap_or_else(|_| {
-            eprintln!("dd-web: DD_GITHUB_CLIENT_SECRET required");
-            std::process::exit(1);
-        });
-
-        let github_callback_url = std::env::var("DD_GITHUB_CALLBACK_URL")
-            .unwrap_or_else(|_| format!("https://{hostname}/auth/github/callback"));
 
         // DD_OWNER is required. Previously defaulted to empty, and
         // resolve_auth short-circuited to Ok(None) on an empty owner,

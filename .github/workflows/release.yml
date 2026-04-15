@@ -42,7 +42,6 @@ permissions:
   contents: write
 
 env:
-  DD_ENV: staging
   DD_DOMAIN: ${{ vars.DD_CF_DOMAIN || 'devopsdefender.com' }}
   GCP_ZONE: us-central1-c
 
@@ -112,10 +111,12 @@ jobs:
             | tail -n +12 \
             | xargs -rI{} gh release delete {} --yes --cleanup-tag
 
-  # Deploy the freshly-built binary to staging. Only runs on PRs and
-  # manual dispatches — main/v* produce releases that production-deploy
-  # picks up separately.
-  deploy-staging:
+  # Deploy the freshly-built binary to a preview env. PRs get their own
+  # ephemeral env at pr-{N}.{domain} with DD_ENV=pr-{N} (hostname-isolated,
+  # no OAuth — browser access via /auth/pat). Manual dispatches redeploy
+  # the shared staging env. main/v* produce releases that
+  # production-deploy picks up separately.
+  deploy-preview:
     if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
     needs: build
     runs-on: ubuntu-latest
@@ -123,6 +124,13 @@ jobs:
     permissions:
       contents: read
       id-token: write
+      pull-requests: write
+    env:
+      DD_ENV: ${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.number) || 'staging' }}
+      # `env.DD_DOMAIN` can't be read at job-env evaluation time — only
+      # `vars`, `secrets`, `inputs`, `github`, `runner`, `needs`, `matrix`
+      # are available. Inline the default instead of referencing env.
+      DD_HOSTNAME: ${{ github.event_name == 'pull_request' && format('pr-{0}.{1}', github.event.number, vars.DD_CF_DOMAIN || 'devopsdefender.com') || format('app-staging.{0}', vars.DD_CF_DOMAIN || 'devopsdefender.com') }}
     steps:
       - uses: actions/checkout@v4
 
@@ -138,24 +146,27 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.DD_CP_CF_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.DD_CP_CF_ACCOUNT_ID }}
           CLOUDFLARE_ZONE_ID: ${{ secrets.DD_CP_CF_ZONE_ID }}
-          DD_GITHUB_CLIENT_ID: ${{ vars.DD_GITHUB_CLIENT_ID || secrets.DD_GITHUB_CLIENT_ID }}
-          DD_GITHUB_CALLBACK_URL: ${{ vars.DD_GITHUB_CALLBACK_URL }}
-          DD_GITHUB_CLIENT_SECRET: ${{ secrets.DD_GITHUB_CLIENT_SECRET }}
+          # OAuth is only wired for the shared staging env. PR previews
+          # leave these unset; dd-web disables /auth/github/* and serves
+          # /auth/pat for browser access instead.
+          DD_GITHUB_CLIENT_ID: ${{ github.event_name == 'workflow_dispatch' && (vars.DD_GITHUB_CLIENT_ID || secrets.DD_GITHUB_CLIENT_ID) || '' }}
+          DD_GITHUB_CALLBACK_URL: ${{ github.event_name == 'workflow_dispatch' && vars.DD_GITHUB_CALLBACK_URL || '' }}
+          DD_GITHUB_CLIENT_SECRET: ${{ github.event_name == 'workflow_dispatch' && secrets.DD_GITHUB_CLIENT_SECRET || '' }}
           DD_RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || needs.build.outputs.tag }}
         run: scripts/gcp-deploy.sh
 
       - name: Wait for agent health (streams serial console)
         env:
-          AGENT_URL: https://app-staging.${{ env.DD_DOMAIN }}
+          AGENT_URL: https://${{ env.DD_HOSTNAME }}
           GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
           GCP_ZONE: ${{ env.GCP_ZONE }}
         run: |
           VM_NAME=$(gcloud compute instances list \
             --project="$GCP_PROJECT_ID" \
-            --filter="labels.devopsdefender=managed AND labels.dd_env=staging" \
+            --filter="labels.devopsdefender=managed AND labels.dd_env=${DD_ENV}" \
             --format="value(name)" --sort-by=~creationTimestamp | head -1)
           if [ -z "$VM_NAME" ]; then
-            echo "::error::no dd-staging VM found — gcp-deploy.sh must have failed"
+            echo "::error::no dd-${DD_ENV} VM found — gcp-deploy.sh must have failed"
             exit 1
           fi
           echo "Watching VM: $VM_NAME (zone: $GCP_ZONE)"
@@ -197,7 +208,7 @@ jobs:
 
       - name: Verify NEW VM via TDX attestation (OIDC)
         env:
-          AGENT_URL: https://app-staging.${{ env.DD_DOMAIN }}
+          AGENT_URL: https://${{ env.DD_HOSTNAME }}
         run: |
           # The /cp/attest endpoint is new in this refactor. Old staging
           # VMs return 404 from it — so a 200 with a non-zero MRTD is
@@ -253,44 +264,78 @@ jobs:
           echo "::error::/cp/attest never returned a valid quote — stale tunnel or new VM never came up"
           exit 1
 
-      - name: Verify STONITH halted prior staging VM(s)
+      - name: Verify STONITH halted prior VM(s) in this env
         env:
           GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
           GCP_ZONE: ${{ env.GCP_ZONE }}
         run: |
           # STONITH (dd-register deletes the old tunnel → old cloudflared
           # exits → old dd-register poweroffs the VM) is the ONLY cleanup
-          # mechanism. If it fails, we want the deploy to fail too so the
-          # regression is loud — don't paper over it with a belt-and-
-          # suspenders GCP delete.
-          #
-          # Give STONITH up to 60s to propagate (tunnel delete → cf
-          # edge drops connection → cloudflared reconnect retries time
-          # out → process exits → dd-register runs `poweroff`).
+          # mechanism. Scoped to this env (staging or pr-N) — PR previews
+          # are hostname-isolated from each other, so this only reaps
+          # prior deploys of the same PR (re-pushes) or the shared staging.
           NEW_VM=$(gcloud compute instances list \
             --project="$GCP_PROJECT_ID" \
-            --filter="labels.devopsdefender=managed AND labels.dd_env=staging" \
+            --filter="labels.devopsdefender=managed AND labels.dd_env=${DD_ENV}" \
             --format="value(name)" --sort-by=~creationTimestamp | head -1)
           echo "new VM: $NEW_VM"
 
-          # 24 × 5s = 120s. Watchdog poll is 10s with a 15s initial
-          # delay (dd-register/src/lib.rs); kernel reboot + GCP state
-          # transition adds a few seconds. 120s gives comfortable
-          # headroom over a worst-case ~30s detect.
           for i in $(seq 1 24); do
             SURVIVORS=$(gcloud compute instances list \
               --project="$GCP_PROJECT_ID" \
-              --filter="labels.devopsdefender=managed AND labels.dd_env=staging AND status=RUNNING" \
+              --filter="labels.devopsdefender=managed AND labels.dd_env=${DD_ENV} AND status=RUNNING" \
               --format="value(name)" \
               | grep -vx "$NEW_VM" || true)
             if [ -z "$SURVIVORS" ]; then
-              echo "STONITH verified — only $NEW_VM running"
+              echo "STONITH verified — only $NEW_VM running in dd_env=${DD_ENV}"
               exit 0
             fi
             echo "  still running besides $NEW_VM: $(echo "$SURVIVORS" | tr '\n' ' ')"
             echo "  waiting for STONITH poweroff... (${i}/24)"
             sleep 5
           done
-          echo "::error::STONITH failed — old dd-staging VM(s) still RUNNING:"
+          echo "::error::STONITH failed — old dd-${DD_ENV} VM(s) still RUNNING:"
           echo "$SURVIVORS"
           exit 1
+
+      - name: Comment preview URL on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const url = `https://${process.env.DD_HOSTNAME}`;
+            const body = [
+              `### DD preview ready`,
+              ``,
+              `**URL:** ${url}`,
+              ``,
+              `Browser login: paste \`gh auth token\` output at ${url}/auth/pat`,
+              ``,
+              `CLI / curl: \`curl -H "Authorization: Bearer $(gh auth token)" ${url}/\``,
+              ``,
+              `Register endpoint for a local agent: \`wss://${process.env.DD_HOSTNAME}/register\``,
+            ].join('\n');
+
+            // Update existing bot comment if present, else create.
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            const marker = '### DD preview ready';
+            const existing = comments.find(c => c.user.type === 'Bot' && c.body && c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }

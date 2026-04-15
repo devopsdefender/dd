@@ -14,22 +14,28 @@
 # Required env vars (set by the workflow):
 #   GCP_PROJECT_ID          — GCP project where the VM lives
 #   GCP_ZONE                — GCP zone (e.g. us-central1-c)
-#   DD_ENV                  — staging or production
+#   DD_ENV                  — staging, production, or pr-{num} (ephemeral per-PR)
 #   DD_DOMAIN               — Public domain (e.g. devopsdefender.com)
 #   CLOUDFLARE_API_TOKEN    — CF API token (dd-register uses it)
 #   CLOUDFLARE_ACCOUNT_ID   — CF account ID
 #   CLOUDFLARE_ZONE_ID      — CF zone ID
-#   DD_GITHUB_CLIENT_ID     — GitHub OAuth client ID (dd-web uses it)
-#   DD_GITHUB_CLIENT_SECRET — GitHub OAuth client secret
 #
 # Optional env vars:
+#   DD_HOSTNAME             — public hostname override. If unset, derived
+#                             from DD_ENV (production → app.$DOMAIN,
+#                             anything else → app-staging.$DOMAIN). Set
+#                             explicitly for per-PR envs (pr-42.$DOMAIN).
+#   DD_GITHUB_CLIENT_ID     — GitHub OAuth client ID. If unset, dd-web
+#                             disables OAuth login and only PAT auth works.
+#                             Per-PR envs leave this unset.
+#   DD_GITHUB_CLIENT_SECRET — GitHub OAuth client secret (paired with above)
+#   DD_GITHUB_CALLBACK_URL  — OAuth callback, default https://{hostname}/auth/github/callback
 #   EE_IMAGE_FAMILY         — easyenclave GCP image family
 #   EE_IMAGE_PROJECT        — project hosting the image
 #   DD_RELEASE_TAG          — GitHub release tag on devopsdefender/dd
 #                             (defaults to 'latest'; PRs override with pr-{sha12})
 #   VM_MACHINE_TYPE         — default c3-standard-4
 #   VM_DISK_SIZE            — default 10GB
-#   DD_GITHUB_CALLBACK_URL  — default https://{hostname}/auth/github/callback
 
 set -euo pipefail
 
@@ -44,11 +50,15 @@ VM_NAME="dd-${DD_ENV}-$(date +%s)"
 VM_MACHINE_TYPE="${VM_MACHINE_TYPE:-c3-standard-4}"
 VM_DISK_SIZE="${VM_DISK_SIZE:-10GB}"
 
-if [ "${DD_ENV}" = "production" ]; then
-  DD_HOSTNAME="app.${DD_DOMAIN}"
-else
-  DD_HOSTNAME="app-staging.${DD_DOMAIN}"
+if [ -z "${DD_HOSTNAME:-}" ]; then
+  if [ "${DD_ENV}" = "production" ]; then
+    DD_HOSTNAME="app.${DD_DOMAIN}"
+  else
+    DD_HOSTNAME="app-staging.${DD_DOMAIN}"
+  fi
 fi
+DD_GITHUB_CLIENT_ID="${DD_GITHUB_CLIENT_ID:-}"
+DD_GITHUB_CLIENT_SECRET="${DD_GITHUB_CLIENT_SECRET:-}"
 DD_GITHUB_CALLBACK_URL="${DD_GITHUB_CALLBACK_URL:-https://${DD_HOSTNAME}/auth/github/callback}"
 
 # ── Build the workload spec ──────────────────────────────────────────────
@@ -88,22 +98,26 @@ EE_BOOT_WORKLOADS=$(jq -c -n \
       },
       "cmd": ["devopsdefender"],
       "app_name": "dd-management",
-      "env": [
-        "DD_MODE=management",
-        ("DD_CF_API_TOKEN="   + $cf_token),
-        ("DD_CF_ACCOUNT_ID="  + $cf_account),
-        ("DD_CF_ZONE_ID="     + $cf_zone),
-        ("DD_CF_DOMAIN="      + $domain),
-        ("DD_HOSTNAME="       + $hostname),
-        ("DD_ENV="            + $env),
-        "DD_OWNER=devopsdefender",
-        ("DD_GITHUB_CLIENT_ID="     + $gh_client_id),
-        ("DD_GITHUB_CLIENT_SECRET=" + $gh_client_secret),
-        ("DD_GITHUB_CALLBACK_URL="  + $gh_callback),
-        "DD_REGISTER_PORT=8081",
-        "DD_OIDC_AUDIENCE=dd-web",
-        "DD_PORT=8080"
-      ]
+      "env": (
+        [
+          "DD_MODE=management",
+          ("DD_CF_API_TOKEN="   + $cf_token),
+          ("DD_CF_ACCOUNT_ID="  + $cf_account),
+          ("DD_CF_ZONE_ID="     + $cf_zone),
+          ("DD_CF_DOMAIN="      + $domain),
+          ("DD_HOSTNAME="       + $hostname),
+          ("DD_ENV="            + $env),
+          "DD_OWNER=devopsdefender",
+          "DD_REGISTER_PORT=8081",
+          "DD_OIDC_AUDIENCE=dd-web",
+          "DD_PORT=8080"
+        ]
+        + (if $gh_client_id == "" then [] else [
+          ("DD_GITHUB_CLIENT_ID="     + $gh_client_id),
+          ("DD_GITHUB_CLIENT_SECRET=" + $gh_client_secret),
+          ("DD_GITHUB_CALLBACK_URL="  + $gh_callback)
+        ] end)
+      )
     }
   ]')
 

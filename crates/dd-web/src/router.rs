@@ -30,6 +30,10 @@ pub fn build_router(state: WebState) -> Router {
         .route("/federate", get(federate::federate))
         .route("/auth/github/start", get(auth::github_start))
         .route("/auth/github/callback", get(auth::github_callback))
+        .route(
+            "/auth/pat",
+            get(auth::pat_login_page).post(auth::pat_submit),
+        )
         .route("/auth/logout", get(auth::logout))
         .route("/logged-out", get(auth::logged_out_page))
         .with_state(state)

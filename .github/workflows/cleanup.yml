@@ -32,6 +32,43 @@ permissions:
   contents: read
 
 jobs:
+  # PR preview envs (dd_env=pr-*) accumulate during active PRs — every
+  # push STONITHs the old VM into TERMINATED. PR close runs
+  # pr-teardown.yml which deletes them, but between pushes they stack
+  # up. This job reaps them in place.
+  reap-pr-previews:
+    runs-on: ubuntu-latest
+    environment: staging
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: 'projects/654815109728/locations/global/workloadIdentityPools/github-actions-pool/providers/github-provider'
+          service_account: 'easyenclave-staging-ci@eestaging.iam.gserviceaccount.com'
+      - uses: google-github-actions/setup-gcloud@v2
+      - name: Reap TERMINATED dd-pr-* VMs
+        env:
+          GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+          GCP_ZONE: us-central1-c
+        run: |
+          # gcloud filter regex: `~` matches against the value. Anchor
+          # to start so we don't accidentally match an env like
+          # "foo-pr-bar" in the future.
+          DEAD=$(gcloud compute instances list \
+            --project="$GCP_PROJECT_ID" \
+            --filter='labels.devopsdefender=managed AND labels.dd_env~"^pr-" AND status=TERMINATED' \
+            --format="value(name)")
+          if [ -z "$DEAD" ]; then
+            echo "No TERMINATED dd-pr-* VMs to reap."
+            exit 0
+          fi
+          echo "Reaping: $(echo "$DEAD" | tr '\n' ' ')"
+          # shellcheck disable=SC2086
+          gcloud compute instances delete $DEAD \
+            --project="$GCP_PROJECT_ID" --zone="$GCP_ZONE" --quiet
+
   reap-staging:
     runs-on: ubuntu-latest
     environment: staging
