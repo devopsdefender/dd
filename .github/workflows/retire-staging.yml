@@ -1,0 +1,98 @@
+name: Retire Staging
+
+# One-shot cleanup of the shared `app-staging.{domain}` env.
+# Per-PR preview envs (deploy-preview in release.yml) fully replace
+# the old shared staging, so this workflow reaps whatever's left:
+#   - any `dd_env=staging` VMs (RUNNING or TERMINATED)
+#   - any CF tunnels named `dd-staging-*`
+#   - the CF CNAME for `app-staging.{domain}`
+#
+# Idempotent — skips silently if nothing to delete. Run manually once
+# via the Actions UI, then this workflow can be deleted.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  DD_DOMAIN: ${{ vars.DD_CF_DOMAIN || 'devopsdefender.com' }}
+  GCP_ZONE: us-central1-c
+
+jobs:
+  retire:
+    runs-on: ubuntu-latest
+    environment: staging
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: 'projects/654815109728/locations/global/workloadIdentityPools/github-actions-pool/providers/github-provider'
+          service_account: 'easyenclave-staging-ci@eestaging.iam.gserviceaccount.com'
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Delete staging VMs
+        env:
+          GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+        run: |
+          VMS=$(gcloud compute instances list \
+            --project="$GCP_PROJECT_ID" \
+            --filter="labels.devopsdefender=managed AND labels.dd_env=staging" \
+            --format="value(name)")
+          if [ -z "$VMS" ]; then
+            echo "No dd-staging VMs to delete."
+          else
+            echo "Deleting: $(echo "$VMS" | tr '\n' ' ')"
+            # shellcheck disable=SC2086
+            gcloud compute instances delete $VMS \
+              --project="$GCP_PROJECT_ID" --zone="$GCP_ZONE" --quiet
+          fi
+
+      - name: Delete CF tunnels with dd-staging- prefix
+        env:
+          CF_API_TOKEN: ${{ secrets.DD_CP_CF_API_TOKEN }}
+          CF_ACCOUNT_ID: ${{ secrets.DD_CP_CF_ACCOUNT_ID }}
+        run: |
+          resp=$(curl -fsS \
+            -H "Authorization: Bearer ${CF_API_TOKEN}" \
+            "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/cfd_tunnel?is_deleted=false&per_page=200")
+          ids=$(echo "$resp" | jq -r \
+            '.result[] | select(.name | startswith("dd-staging-")) | .id')
+          if [ -z "$ids" ]; then
+            echo "No CF tunnels with prefix dd-staging-"
+          else
+            for id in $ids; do
+              echo "Deleting tunnel $id"
+              curl -fsS -X DELETE \
+                -H "Authorization: Bearer ${CF_API_TOKEN}" \
+                "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/cfd_tunnel/${id}/connections" \
+                >/dev/null || true
+              curl -fsS -X DELETE \
+                -H "Authorization: Bearer ${CF_API_TOKEN}" \
+                "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/cfd_tunnel/${id}" \
+                >/dev/null || echo "::warning::tunnel $id delete failed"
+            done
+          fi
+
+      - name: Delete CNAME for app-staging
+        env:
+          CF_API_TOKEN: ${{ secrets.DD_CP_CF_API_TOKEN }}
+          CF_ZONE_ID: ${{ secrets.DD_CP_CF_ZONE_ID }}
+        run: |
+          host="app-staging.${DD_DOMAIN}"
+          record_id=$(curl -fsS \
+            -H "Authorization: Bearer ${CF_API_TOKEN}" \
+            "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records?type=CNAME&name=${host}" \
+            | jq -r '.result[0].id // empty')
+          if [ -z "$record_id" ]; then
+            echo "No CNAME for ${host}"
+          else
+            echo "Deleting CNAME record $record_id (${host})"
+            curl -fsS -X DELETE \
+              -H "Authorization: Bearer ${CF_API_TOKEN}" \
+              "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records/${record_id}" \
+              >/dev/null
+          fi
