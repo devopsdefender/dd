@@ -4,43 +4,76 @@ name: PR Teardown
 # delete the VM, the Cloudflare tunnel, and the DNS CNAME for
 # pr-{N}.{domain}. Idempotent — skips silently if nothing to reap.
 #
-# STONITH normally poweroffs the VM when its tunnel is deleted, but
-# closing a PR doesn't trigger STONITH on its own. This workflow does
-# the equivalent cleanup from outside the VM.
+# Triggers on branch delete (not PR close): closing a PR without
+# deleting the branch keeps the preview up in case the PR is
+# reopened. When the branch is deleted — either manually or by
+# GitHub's "delete branch on merge" setting — we know the dev is
+# done and the preview can go.
+#
+# The `delete` event payload doesn't include the PR number, so we
+# look it up from the branch name. If no PR ever existed for the
+# branch, there's nothing to tear down.
 
 on:
-  pull_request:
-    types: [closed]
-
-concurrency:
-  group: dd-pr-teardown-${{ github.event.number }}
-  cancel-in-progress: false
+  delete:
 
 permissions:
   contents: read
 
 env:
-  DD_ENV: pr-${{ github.event.number }}
-  DD_HOSTNAME: pr-${{ github.event.number }}.${{ vars.DD_CF_DOMAIN || 'devopsdefender.com' }}
   GCP_ZONE: us-central1-c
 
 jobs:
   teardown:
+    # Skip tag deletions — we only care about branches.
+    if: github.event.ref_type == 'branch'
     runs-on: ubuntu-latest
     environment: staging
     permissions:
       contents: read
       id-token: write
+      pull-requests: read
     steps:
+      - name: Resolve PR number from deleted branch
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ github.event.ref }}
+        run: |
+          # `gh pr list` returns PRs whose head branch matches. Search
+          # all states — a merged PR's head branch is the usual
+          # trigger for this workflow. `--limit 1` + newest wins if
+          # the branch was ever reused across multiple PRs.
+          PR_NUMBER=$(gh pr list \
+            --repo "${{ github.repository }}" \
+            --head "$BRANCH" \
+            --state all \
+            --limit 1 \
+            --json number \
+            --jq '.[0].number // empty')
+          if [ -z "$PR_NUMBER" ]; then
+            echo "No PR found for deleted branch $BRANCH — nothing to tear down."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Tearing down preview for PR #$PR_NUMBER (branch $BRANCH)"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "dd_env=pr-$PR_NUMBER" >> "$GITHUB_OUTPUT"
+            echo "dd_hostname=pr-$PR_NUMBER.${{ vars.DD_CF_DOMAIN || 'devopsdefender.com' }}" >> "$GITHUB_OUTPUT"
+          fi
+
       - uses: google-github-actions/auth@v2
+        if: steps.pr.outputs.skip != 'true'
         with:
           workload_identity_provider: 'projects/654815109728/locations/global/workloadIdentityPools/github-actions-pool/providers/github-provider'
           service_account: 'easyenclave-staging-ci@eestaging.iam.gserviceaccount.com'
       - uses: google-github-actions/setup-gcloud@v2
+        if: steps.pr.outputs.skip != 'true'
 
       - name: Delete PR VMs
+        if: steps.pr.outputs.skip != 'true'
         env:
           GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+          DD_ENV: ${{ steps.pr.outputs.dd_env }}
         run: |
           VMS=$(gcloud compute instances list \
             --project="$GCP_PROJECT_ID" \
@@ -56,9 +89,11 @@ jobs:
           fi
 
       - name: Delete CF tunnels for this PR
+        if: steps.pr.outputs.skip != 'true'
         env:
           CF_API_TOKEN: ${{ secrets.DD_CP_CF_API_TOKEN }}
           CF_ACCOUNT_ID: ${{ secrets.DD_CP_CF_ACCOUNT_ID }}
+          DD_ENV: ${{ steps.pr.outputs.dd_env }}
         run: |
           # Tunnels are named `dd-{DD_ENV}-{uuid}` (see
           # dd-common/src/tunnel.rs::create_agent_tunnel). List all
@@ -86,9 +121,11 @@ jobs:
           fi
 
       - name: Delete DNS CNAME for PR hostname
+        if: steps.pr.outputs.skip != 'true'
         env:
           CF_API_TOKEN: ${{ secrets.DD_CP_CF_API_TOKEN }}
           CF_ZONE_ID: ${{ secrets.DD_CP_CF_ZONE_ID }}
+          DD_HOSTNAME: ${{ steps.pr.outputs.dd_hostname }}
         run: |
           record_id=$(curl -fsS \
             -H "Authorization: Bearer ${CF_API_TOKEN}" \
