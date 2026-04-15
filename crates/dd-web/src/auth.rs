@@ -1,8 +1,8 @@
 use std::time::{Duration, Instant};
 
-use axum::extract::State;
+use axum::extract::{Form, State};
 use axum::http::header::{AUTHORIZATION, COOKIE, SET_COOKIE};
-use axum::http::{HeaderMap, HeaderValue, Uri};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use serde::Deserialize;
 
@@ -84,8 +84,16 @@ fn response_with_cookie(response: impl IntoResponse, cookie: String) -> Response
     response
 }
 
-fn github_oauth_redirect(next: &Uri) -> Redirect {
-    let mut url = reqwest::Url::parse("http://localhost/auth/github/start").unwrap();
+/// Redirect unauthenticated browsers to the right login page.
+/// OAuth-enabled envs (production, shared staging) go through
+/// `/auth/github/start`; ephemeral PR envs go to the PAT form.
+fn login_redirect(state: &WebState, next: &Uri) -> Redirect {
+    let target = if state.config.github_client_id.is_some() {
+        "/auth/github/start"
+    } else {
+        "/auth/pat"
+    };
+    let mut url = reqwest::Url::parse(&format!("http://localhost{target}")).unwrap();
     let next_path = next
         .path_and_query()
         .map(|value| value.as_str())
@@ -186,7 +194,7 @@ pub async fn require_browser_auth(
 ) -> Result<Option<String>, Response> {
     match resolve_auth(state, headers).await {
         Ok(login) => Ok(login),
-        Err(AppError::Unauthorized) => Err(github_oauth_redirect(uri).into_response()),
+        Err(AppError::Unauthorized) => Err(login_redirect(state, uri).into_response()),
         Err(e) => Err(e.into_response()),
     }
 }
@@ -299,6 +307,14 @@ pub async fn github_start(
     State(state): State<WebState>,
     query: axum::extract::Query<AuthStartQuery>,
 ) -> Result<Redirect, AppError> {
+    let (client_id, callback_url) = match (
+        state.config.github_client_id.as_deref(),
+        state.config.github_callback_url.as_deref(),
+    ) {
+        (Some(id), Some(cb)) => (id, cb),
+        _ => return Err(AppError::NotFound),
+    };
+
     let next_path = sanitize_next_path(query.next.as_deref());
     let state_id = uuid::Uuid::new_v4().simple().to_string();
 
@@ -312,8 +328,8 @@ pub async fn github_start(
 
     let mut url = reqwest::Url::parse("https://github.com/login/oauth/authorize").unwrap();
     url.query_pairs_mut()
-        .append_pair("client_id", &state.config.github_client_id)
-        .append_pair("redirect_uri", &state.config.github_callback_url)
+        .append_pair("client_id", client_id)
+        .append_pair("redirect_uri", callback_url)
         .append_pair("scope", "read:user read:org")
         .append_pair("state", &state_id);
     Ok(Redirect::to(url.as_str()))
@@ -324,6 +340,15 @@ pub async fn github_callback(
     State(state): State<WebState>,
     query: axum::extract::Query<GithubCallbackQuery>,
 ) -> Result<Response, AppError> {
+    let (client_id, client_secret, callback_url) = match (
+        state.config.github_client_id.as_deref(),
+        state.config.github_client_secret.as_deref(),
+        state.config.github_callback_url.as_deref(),
+    ) {
+        (Some(id), Some(secret), Some(cb)) => (id, secret, cb),
+        _ => return Err(AppError::NotFound),
+    };
+
     if let Some(error) = query.error.as_deref() {
         let description = query.error_description.as_deref().unwrap_or(error);
         return Err(AppError::External(description.into()));
@@ -355,10 +380,10 @@ pub async fn github_callback(
         .header("Accept", "application/json")
         .header("User-Agent", "dd-web")
         .form(&[
-            ("client_id", state.config.github_client_id.as_str()),
-            ("client_secret", state.config.github_client_secret.as_str()),
+            ("client_id", client_id),
+            ("client_secret", client_secret),
             ("code", code),
-            ("redirect_uri", state.config.github_callback_url.as_str()),
+            ("redirect_uri", callback_url),
             ("state", state_id),
         ])
         .send()
@@ -434,6 +459,87 @@ pub async fn github_callback(
     Ok(response)
 }
 
+// ── PAT login (for ephemeral per-PR envs without an OAuth app) ──────────
+
+#[derive(Debug, Deserialize)]
+pub struct PatLoginForm {
+    pat: String,
+    next: Option<String>,
+}
+
+/// GET /auth/pat -- HTML form that accepts a GitHub PAT.
+/// The dev runs `gh auth token` locally and pastes the output.
+pub async fn pat_login_page(query: axum::extract::Query<AuthStartQuery>) -> Html<String> {
+    let next = sanitize_next_path(query.next.as_deref());
+    let content = format!(
+        r#"<h1>DD preview — PAT login</h1>
+<div class="sub">This is a per-PR preview environment. Browser access uses a GitHub Personal Access Token.</div>
+<p style="margin:16px 0;color:#a6adc8;font-size:13px">Run <code>gh auth token</code> locally and paste the output below. The token is checked against GitHub and a session cookie is set.</p>
+<form method="POST" action="/auth/pat" style="margin-top:16px">
+  <input type="hidden" name="next" value="{next}">
+  <input type="password" name="pat" placeholder="ghp_... or gho_..." autocomplete="off" autofocus
+         style="width:100%;padding:10px;background:#181825;border:1px solid #313244;border-radius:6px;color:#cdd6f4;font-family:inherit;font-size:13px">
+  <button type="submit"
+          style="margin-top:12px;padding:10px 20px;background:#89b4fa;color:#1e1e2e;border:0;border-radius:6px;font-weight:700;cursor:pointer">
+    Log in
+  </button>
+</form>"#,
+        next = html_escape(&next),
+    );
+    Html(page_shell("Log in — DD preview", "", &content))
+}
+
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+/// POST /auth/pat -- validate the PAT via GitHub API, set session cookie, redirect.
+pub async fn pat_submit(
+    State(state): State<WebState>,
+    Form(form): Form<PatLoginForm>,
+) -> Result<Response, Response> {
+    let next = sanitize_next_path(form.next.as_deref());
+    let pat = form.pat.trim();
+
+    if pat.is_empty() {
+        return Err(pat_error_page("Missing token."));
+    }
+
+    if verify_github_token(pat, &state.config.owner).await.is_err() {
+        return Err(pat_error_page(&format!(
+            "Token rejected. It must belong to a GitHub user or member of `{}`.",
+            html_escape(&state.config.owner)
+        )));
+    }
+
+    let session_id = uuid::Uuid::new_v4().simple().to_string();
+    state.sessions.lock().await.insert(
+        session_id.clone(),
+        BrowserSession {
+            token: pat.to_string(),
+            expires_at: Instant::now() + SESSION_TTL,
+        },
+    );
+
+    Ok(response_with_cookie(
+        Redirect::to(&next),
+        build_session_cookie(&session_id, SESSION_TTL.as_secs()),
+    ))
+}
+
+fn pat_error_page(msg: &str) -> Response {
+    let content = format!(
+        r#"<h1>Log in failed</h1>
+<div class="sub" style="color:#f38ba8">{msg}</div>
+<p style="margin-top:16px"><a href="/auth/pat">Try again</a></p>"#
+    );
+    let html = Html(page_shell("Log in — DD preview", "", &content));
+    (StatusCode::UNAUTHORIZED, html).into_response()
+}
+
 /// GET /auth/logout -- clear session + dd_auth cookies
 pub async fn logout(State(state): State<WebState>, headers: HeaderMap) -> Response {
     if let Some(session_id) = extract_cookie(&headers, SESSION_COOKIE) {
@@ -454,10 +560,16 @@ pub async fn logout(State(state): State<WebState>, headers: HeaderMap) -> Respon
 }
 
 /// GET /logged-out -- simple confirmation page
-pub async fn logged_out_page() -> Html<String> {
-    let content = r#"<h1>Logged out</h1>
+pub async fn logged_out_page(State(state): State<WebState>) -> Html<String> {
+    let login_path = if state.config.github_client_id.is_some() {
+        "/auth/github/start?next=/"
+    } else {
+        "/auth/pat?next=/"
+    };
+    let content = format!(
+        r#"<h1>Logged out</h1>
 <div class="sub">Session cleared.</div>
-<p><a href="/auth/github/start?next=/">Log in again</a></p>"#;
-    let nav = "";
-    Html(page_shell("Logged out -- DD Fleet", nav, content))
+<p><a href="{login_path}">Log in again</a></p>"#
+    );
+    Html(page_shell("Logged out -- DD Fleet", "", &content))
 }
