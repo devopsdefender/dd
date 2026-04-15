@@ -45,7 +45,7 @@ Per-VM configuration (CF credentials, GitHub OAuth, the workload spec itself) is
 
 ```
 PR              → pre-release tagged pr-{sha12}, then full staging deploy
-push to main    → rolling `latest` release (no auto-deploy)
+push to main    → rolling `latest` release, then auto-deploy to production
 push v* tag     → versioned release (no auto-deploy)
 manual          → production-deploy.yml promotes any existing tag
 ```
