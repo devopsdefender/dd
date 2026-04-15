@@ -127,7 +127,10 @@ jobs:
       pull-requests: write
     env:
       DD_ENV: ${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.number) || 'staging' }}
-      DD_HOSTNAME: ${{ github.event_name == 'pull_request' && format('pr-{0}.{1}', github.event.number, env.DD_DOMAIN) || format('app-staging.{0}', env.DD_DOMAIN) }}
+      # `env.DD_DOMAIN` can't be read at job-env evaluation time — only
+      # `vars`, `secrets`, `inputs`, `github`, `runner`, `needs`, `matrix`
+      # are available. Inline the default instead of referencing env.
+      DD_HOSTNAME: ${{ github.event_name == 'pull_request' && format('pr-{0}.{1}', github.event.number, vars.DD_CF_DOMAIN || 'devopsdefender.com') || format('app-staging.{0}', vars.DD_CF_DOMAIN || 'devopsdefender.com') }}
     steps:
       - uses: actions/checkout@v4
 
