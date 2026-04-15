@@ -1,11 +1,18 @@
 name: Production Deploy
 
-# Manual production promotion. A push to main publishes a `latest`
-# release via release.yml but does NOT auto-deploy — an operator runs
-# this workflow when they're ready to promote the staging-verified
-# build to production.
+# Two triggers:
+#   - workflow_run: fires automatically after a successful Release run
+#     on main. Release publishes the `latest` tag, then this workflow
+#     deploys it to production. Sequential by design — if Release fails,
+#     we don't promote.
+#   - workflow_dispatch: manual re-deploy of any existing tag (e.g. a
+#     known-good v0.2.0 after a bad main push).
 
 on:
+  workflow_run:
+    workflows: ["Release"]
+    types: [completed]
+    branches: [main]
   workflow_dispatch:
     inputs:
       release_tag:
@@ -29,6 +36,9 @@ jobs:
   # dd-register STONITHs the old VM on startup by deleting its CF
   # tunnel, so no explicit teardown here.
   deploy:
+    # workflow_run fires on every Release completion, including
+    # failures. Only promote on success.
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     environment: production
     permissions:
@@ -51,7 +61,9 @@ jobs:
           DD_GITHUB_CLIENT_ID: ${{ vars.DD_GITHUB_CLIENT_ID || secrets.DD_GITHUB_CLIENT_ID }}
           DD_GITHUB_CALLBACK_URL: ${{ vars.DD_GITHUB_CALLBACK_URL }}
           DD_GITHUB_CLIENT_SECRET: ${{ secrets.DD_GITHUB_CLIENT_SECRET }}
-          DD_RELEASE_TAG: ${{ inputs.release_tag }}
+          # workflow_run has no `inputs`; fall back to `latest`, which
+          # release.yml just (re)published on push to main.
+          DD_RELEASE_TAG: ${{ inputs.release_tag || 'latest' }}
         run: scripts/gcp-deploy.sh
 
       - name: Wait for agent health
