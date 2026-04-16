@@ -91,8 +91,8 @@ jobs:
       - name: Delete CF tunnels for this PR
         if: steps.pr.outputs.skip != 'true'
         env:
-          CF_API_TOKEN: ${{ secrets.DD_CP_CF_API_TOKEN }}
-          CF_ACCOUNT_ID: ${{ secrets.DD_CP_CF_ACCOUNT_ID }}
+          CF_API_TOKEN: ${{ secrets.STAGING_CF_API_TOKEN }}
+          CF_ACCOUNT_ID: ${{ secrets.STAGING_CF_ACCOUNT_ID }}
           DD_ENV: ${{ steps.pr.outputs.dd_env }}
         run: |
           # Tunnels are named `dd-{DD_ENV}-{uuid}` (see
@@ -123,8 +123,8 @@ jobs:
       - name: Delete DNS CNAME for PR hostname
         if: steps.pr.outputs.skip != 'true'
         env:
-          CF_API_TOKEN: ${{ secrets.DD_CP_CF_API_TOKEN }}
-          CF_ZONE_ID: ${{ secrets.DD_CP_CF_ZONE_ID }}
+          CF_API_TOKEN: ${{ secrets.STAGING_CF_API_TOKEN }}
+          CF_ZONE_ID: ${{ secrets.STAGING_CF_ZONE_ID }}
           DD_HOSTNAME: ${{ steps.pr.outputs.dd_hostname }}
         run: |
           record_id=$(curl -fsS \

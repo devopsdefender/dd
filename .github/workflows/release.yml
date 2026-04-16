@@ -143,9 +143,9 @@ jobs:
       - name: Create TDX VM (boots from easyenclave, fetches dd from GitHub releases)
         env:
           GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
-          CLOUDFLARE_API_TOKEN: ${{ secrets.DD_CP_CF_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.DD_CP_CF_ACCOUNT_ID }}
-          CLOUDFLARE_ZONE_ID: ${{ secrets.DD_CP_CF_ZONE_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.STAGING_CF_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.STAGING_CF_ACCOUNT_ID }}
+          CLOUDFLARE_ZONE_ID: ${{ secrets.STAGING_CF_ZONE_ID }}
           # OAuth is only wired for the shared staging env. PR previews
           # leave these unset; dd-web disables /auth/github/* and serves
           # /auth/pat for browser access instead.
