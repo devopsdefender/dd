@@ -81,27 +81,20 @@ jobs:
           echo "::error::Agent not healthy within 5 minutes"
           exit 1
 
-      - name: Verify dashboard renders (OIDC)
+      - name: Verify dashboard renders
         env:
           AGENT_URL: https://app.${{ env.DD_DOMAIN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          ID_TOKEN=$(curl -sSL \
-            -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
-            -H "Accept: application/json; api-version=2.0" \
-            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=dd-web" \
-            | jq -r '.value')
-
-          if [ -z "$ID_TOKEN" ] || [ "$ID_TOKEN" = "null" ]; then
-            echo "::error::failed to mint OIDC token (is id-token:write set?)"
-            exit 1
-          fi
-
+          # New auth model: dashboard expects a GitHub PAT/GITHUB_TOKEN with
+          # access to the dd repo; the CP verifies against DD_OWNER via the
+          # standard /user + /repos/{owner}/dd fallback. No OIDC audience wiring.
           for attempt in $(seq 1 12); do
             code=$(curl -s -o /dev/null -w '%{http_code}' \
-              -H "Authorization: Bearer ${ID_TOKEN}" \
+              -H "Authorization: Bearer ${GITHUB_TOKEN}" \
               "${AGENT_URL}/" || echo 000)
             if [ "$code" = "200" ]; then
-              echo "Dashboard renders (HTTP 200, attempt ${attempt}, OIDC)"
+              echo "Dashboard renders (HTTP 200, attempt ${attempt})"
               exit 0
             fi
             echo "  dashboard returned HTTP ${code}, retrying... (${attempt}/12)"

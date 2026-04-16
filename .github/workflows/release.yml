@@ -14,14 +14,14 @@ on:
     branches: [main]
     tags: ['v*']
     paths:
-      - "crates/**"
+      - "src/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - "scripts/gcp-deploy.sh"
       - ".github/workflows/release.yml"
   pull_request:
     paths:
-      - "crates/**"
+      - "src/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - "scripts/gcp-deploy.sh"
@@ -193,37 +193,22 @@ jobs:
           tail -80 /tmp/serial.log | sed 's/^/[serial] /'
           exit 1
 
-      - name: Verify NEW VM via TDX attestation (OIDC)
+      - name: Verify NEW VM via TDX attestation
         env:
           AGENT_URL: https://${{ env.DD_HOSTNAME }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # The /cp/attest endpoint is new in this refactor. Old staging
-          # VMs return 404 from it — so a 200 with a non-zero MRTD is
-          # cryptographic proof we're hitting the freshly-deployed VM
-          # running the new code, not a stale tunnel pointing at the
-          # previous deploy.
-          ID_TOKEN=$(curl -sSL \
-            -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
-            -H "Accept: application/json; api-version=2.0" \
-            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=dd-web" \
-            | jq -r '.value')
-
-          if [ -z "$ID_TOKEN" ] || [ "$ID_TOKEN" = "null" ]; then
-            echo "::error::failed to mint OIDC token (is id-token:write set?)"
-            exit 1
-          fi
-
-          # Random nonce — proves this quote is fresh, not replayed.
-          # Easyenclave's attest socket method expects a base64 nonce.
+          # /cp/attest proves the freshly-deployed VM is serving the tunnel
+          # (stale tunnels point at old VMs that 404 on this endpoint).
+          # Auth: GITHUB_TOKEN via Bearer — the CP's /repos/{owner}/dd probe
+          # accepts any token with repo access. No OIDC audience wiring.
           NONCE=$(openssl rand -base64 16)
 
           # 60 × 10s = 10 min. New VM has to boot, fetch cloudflared
-          # from cloudflare/cloudflared, fetch dd from our release,
-          # start dd-management, STONITH the old tunnel, and bring its
-          # own cloudflared up. ~3-5 min in practice.
+          # and dd from GitHub releases, start, and bring its tunnel up.
           for attempt in $(seq 1 60); do
             BODY=$(curl -sG -w '\n%{http_code}' \
-              -H "Authorization: Bearer ${ID_TOKEN}" \
+              -H "Authorization: Bearer ${GITHUB_TOKEN}" \
               --data-urlencode "nonce=${NONCE}" \
               "${AGENT_URL}/cp/attest" || echo $'\n000')
             CODE=$(echo "$BODY" | tail -n1)
@@ -271,7 +256,7 @@ jobs:
           # old VMs (their cloudflared exits → dd-register poweroffs).
           # After that, force-delete any remaining survivors: they're
           # zombies whose dd-register failed before creating a tunnel
-          # (e.g. CF auth error at boot — see crates/dd-register/src/lib.rs
+          # (e.g. CF auth error at boot — see src/cp.rs
           # which now kernel_poweroff's on init failure, so this is a
           # safety net for pre-fix zombies and any future init failure
           # modes we haven't handled).
