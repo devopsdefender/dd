@@ -1,14 +1,13 @@
 name: Release
 
 # Build the static musl binary, publish it as a GitHub release asset,
-# and (on PRs) deploy it to staging. Replaces the Docker build+push
-# pipeline — easyenclave fetches the asset directly via its
-# github_release workload source.
+# and (on PRs) deploy it to an ephemeral per-PR preview. Replaces the
+# Docker build+push pipeline — easyenclave fetches the asset directly
+# via its github_release workload source.
 #
-# PR:             pre-release tagged pr-{sha12}, then full staging deploy.
+# PR:             pre-release tagged pr-{sha12}, then full PR-preview deploy.
 # push to main:   rolling `latest` release (no deploy — that's production)
 # push v* tag:    versioned release (no deploy)
-# workflow_dispatch: manual trigger, defaults to latest
 
 on:
   push:
@@ -27,12 +26,6 @@ on:
       - "Cargo.lock"
       - "scripts/gcp-deploy.sh"
       - ".github/workflows/release.yml"
-  workflow_dispatch:
-    inputs:
-      release_tag:
-        description: 'Existing release tag to (re)deploy to staging'
-        required: false
-        default: 'latest'
 
 concurrency:
   group: dd-release-${{ github.ref }}
@@ -111,13 +104,12 @@ jobs:
             | tail -n +12 \
             | xargs -rI{} gh release delete {} --yes --cleanup-tag
 
-  # Deploy the freshly-built binary to a preview env. PRs get their own
-  # ephemeral env at pr-{N}.{domain} with DD_ENV=pr-{N} (hostname-isolated,
-  # no OAuth — browser access via /auth/pat). Manual dispatches redeploy
-  # the shared staging env. main/v* produce releases that
-  # production-deploy picks up separately.
+  # Deploy the freshly-built binary to the PR's ephemeral preview.
+  # Each PR gets its own env at pr-{N}.{domain} with DD_ENV=pr-{N}
+  # (hostname-isolated, no OAuth — browser access via /auth/pat).
+  # main/v* produce releases that production-deploy picks up separately.
   deploy-preview:
-    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'pull_request'
     needs: build
     runs-on: ubuntu-latest
     environment: staging
@@ -126,11 +118,8 @@ jobs:
       id-token: write
       pull-requests: write
     env:
-      DD_ENV: ${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.number) || 'staging' }}
-      # `env.DD_DOMAIN` can't be read at job-env evaluation time — only
-      # `vars`, `secrets`, `inputs`, `github`, `runner`, `needs`, `matrix`
-      # are available. Inline the default instead of referencing env.
-      DD_HOSTNAME: ${{ github.event_name == 'pull_request' && format('pr-{0}.{1}', github.event.number, vars.DD_CF_DOMAIN || 'devopsdefender.com') || format('app-staging.{0}', vars.DD_CF_DOMAIN || 'devopsdefender.com') }}
+      DD_ENV: pr-${{ github.event.number }}
+      DD_HOSTNAME: pr-${{ github.event.number }}.${{ vars.DD_CF_DOMAIN || 'devopsdefender.com' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -146,13 +135,11 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.DD_CP_CF_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.DD_CP_CF_ACCOUNT_ID }}
           CLOUDFLARE_ZONE_ID: ${{ secrets.DD_CP_CF_ZONE_ID }}
-          # OAuth is only wired for the shared staging env. PR previews
-          # leave these unset; dd-web disables /auth/github/* and serves
-          # /auth/pat for browser access instead.
-          DD_GITHUB_CLIENT_ID: ${{ github.event_name == 'workflow_dispatch' && (vars.DD_GITHUB_CLIENT_ID || secrets.DD_GITHUB_CLIENT_ID) || '' }}
-          DD_GITHUB_CALLBACK_URL: ${{ github.event_name == 'workflow_dispatch' && vars.DD_GITHUB_CALLBACK_URL || '' }}
-          DD_GITHUB_CLIENT_SECRET: ${{ github.event_name == 'workflow_dispatch' && secrets.DD_GITHUB_CLIENT_SECRET || '' }}
-          DD_RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || needs.build.outputs.tag }}
+          # OAuth env vars intentionally omitted — gcp-deploy.sh sees
+          # empty DD_GITHUB_CLIENT_ID and skips them in the workload
+          # spec. dd-web then disables /auth/github/* and serves
+          # /auth/pat for browser access.
+          DD_RELEASE_TAG: ${{ needs.build.outputs.tag }}
         run: scripts/gcp-deploy.sh
 
       - name: Wait for agent health (streams serial console)
@@ -271,9 +258,9 @@ jobs:
         run: |
           # STONITH (dd-register deletes the old tunnel → old cloudflared
           # exits → old dd-register poweroffs the VM) is the ONLY cleanup
-          # mechanism. Scoped to this env (staging or pr-N) — PR previews
-          # are hostname-isolated from each other, so this only reaps
-          # prior deploys of the same PR (re-pushes) or the shared staging.
+          # mechanism. Scoped to this PR's env — previews are
+          # hostname-isolated from each other, so this only reaps prior
+          # deploys of the same PR (re-pushes).
           NEW_VM=$(gcloud compute instances list \
             --project="$GCP_PROJECT_ID" \
             --filter="labels.devopsdefender=managed AND labels.dd_env=${DD_ENV}" \
@@ -299,7 +286,6 @@ jobs:
           exit 1
 
       - name: Comment preview URL on PR
-        if: github.event_name == 'pull_request'
         uses: actions/github-script@v7
         with:
           script: |
