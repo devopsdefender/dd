@@ -14,18 +14,31 @@ async fn main() {
 
     match mode.as_deref() {
         Some("management") => {
-            // Run dd-register and dd-web concurrently — both are
-            // long-lived servers that should run for the VM lifetime.
-            // dd-register binds DD_REGISTER_PORT (default 8081),
-            // dd-web binds DD_PORT (default 8080).
-            tokio::select! {
-                _ = dd_register::run() => {
-                    eprintln!("dd: dd-register exited unexpectedly");
-                }
-                _ = dd_web::run() => {
-                    eprintln!("dd: dd-web exited unexpectedly");
-                }
-            }
+            // Merge dd-register's and dd-web's routers onto a single
+            // HTTP server on DD_PORT (default 8080). This is what the
+            // CF tunnel routes to — previously dd-register ran on 8081
+            // and wasn't externally reachable, so /register 404'd for
+            // remote fleet agents trying to register.
+            //
+            // `prepare()` on each crate does the async state setup and
+            // spawns background tasks (self-register tunnel, cloudflared
+            // child, STONITH watchdogs, agent collector, etc.) before
+            // returning a stateful Router.
+            let register_router = dd_register::prepare().await;
+            let web_router = dd_web::prepare().await;
+            let merged = web_router.merge(register_router);
+
+            let port: u16 = std::env::var("DD_PORT")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(8080);
+            let addr = format!("0.0.0.0:{port}");
+            eprintln!("dd: management listening on {addr} (dd-web + dd-register routes merged)");
+
+            let listener = tokio::net::TcpListener::bind(&addr)
+                .await
+                .expect("failed to bind");
+            axum::serve(listener, merged).await.expect("server error");
         }
         Some("agent") => {
             dd_client::run().await;
