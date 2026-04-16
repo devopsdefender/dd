@@ -112,29 +112,72 @@ pub async fn prepare() -> Router {
     // Self-STONITH watchdog. cloudflared is known to retry indefinitely
     // when its tunnel is deleted remotely instead of exiting, which
     // breaks the cloudflared-child-exit → poweroff path above. Poll
-    // CF API every 30s; when we confirm our own tunnel is gone,
+    // CF API every 10s; when we confirm our own tunnel is gone,
     // poweroff directly — no dependency on cloudflared's behaviour.
+    //
+    // Require N consecutive "gone" readings before acting. `tunnel_exists`
+    // returns false on ANY error (network flake, CF 5xx, auth hiccup),
+    // not just on "tunnel deleted", so a single reading would let one
+    // CF API blip kill a healthy VM. We saw this happen on 2026-04-16
+    // around 21:01 UTC: prod VM self-STONITHed 7 minutes after a clean
+    // deploy when CF transiently failed the check during high API load
+    // (agent registration burst). Three consecutive failures at 10s
+    // apart = 30s of real outage before we act — still well under
+    // release.yml's STONITH verify budget.
+    // Poll cadence is jittered so many fleet VMs don't all hit the CF
+    // API at the same wall-clock ticks (which would make transient
+    // rate-limit / 5xx events correlate across the fleet). Full-jitter
+    // backoff on the initial sleep spreads startup-aligned VMs; small
+    // per-cycle jitter keeps them desynced.
+    const WATCHDOG_POLL_BASE_SECS: u64 = 10;
+    const WATCHDOG_POLL_JITTER_SECS: u64 = 4; // effective range 8-12s
+    const WATCHDOG_INITIAL_MIN_SECS: u64 = 10; // never check before CF propagation
+    const WATCHDOG_INITIAL_MAX_SECS: u64 = 25; // spread startup across 15s window
+    const WATCHDOG_REQUIRED_CONSECUTIVE_GONE: u32 = 3;
     let wd_cf = cf.clone();
     let wd_tunnel_id = tunnel_info.tunnel_id.clone();
     tokio::spawn(async move {
+        use rand::Rng;
         let http = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
-        // Give the freshly-created tunnel a moment to propagate in CF's
-        // eventual-consistency layer before the first check.
-        tokio::time::sleep(std::time::Duration::from_secs(15)).await;
-        // 10s poll. CF API call is sub-second; cost is negligible.
-        // Worst-case detection after a STONITH delete: 10s (next poll
-        // tick) + reboot syscall + GCP state transition. Keeps the
-        // verify-step window in release.yml tight.
+        // Randomised initial delay spreads fleet startups; the rest of
+        // the CF propagation window is covered by tolerating the first
+        // few checks via the consecutive-gone threshold.
+        let initial_delay = {
+            let mut rng = rand::thread_rng();
+            rng.gen_range(WATCHDOG_INITIAL_MIN_SECS..=WATCHDOG_INITIAL_MAX_SECS)
+        };
+        tokio::time::sleep(std::time::Duration::from_secs(initial_delay)).await;
+        let mut consecutive_gone: u32 = 0;
         loop {
-            if !tunnel::tunnel_exists(&http, &wd_cf, &wd_tunnel_id).await {
-                eprintln!("dd-register: own tunnel {wd_tunnel_id} gone — self-STONITH poweroff");
-                kernel_poweroff();
-                return;
+            if tunnel::tunnel_exists(&http, &wd_cf, &wd_tunnel_id).await {
+                if consecutive_gone > 0 {
+                    eprintln!(
+                        "dd-register: watchdog recovered — tunnel {wd_tunnel_id} reappeared after {consecutive_gone} missed check(s)"
+                    );
+                }
+                consecutive_gone = 0;
+            } else {
+                consecutive_gone += 1;
+                eprintln!(
+                    "dd-register: watchdog: tunnel {wd_tunnel_id} check failed ({consecutive_gone}/{WATCHDOG_REQUIRED_CONSECUTIVE_GONE})"
+                );
+                if consecutive_gone >= WATCHDOG_REQUIRED_CONSECUTIVE_GONE {
+                    eprintln!(
+                        "dd-register: own tunnel {wd_tunnel_id} gone (confirmed by {consecutive_gone} consecutive checks) — self-STONITH poweroff"
+                    );
+                    kernel_poweroff();
+                    return;
+                }
             }
-            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            let sleep_secs = {
+                let mut rng = rand::thread_rng();
+                let jitter = rng.gen_range(0..=WATCHDOG_POLL_JITTER_SECS);
+                WATCHDOG_POLL_BASE_SECS + jitter - WATCHDOG_POLL_JITTER_SECS / 2
+            };
+            tokio::time::sleep(std::time::Duration::from_secs(sleep_secs)).await;
         }
     });
 
