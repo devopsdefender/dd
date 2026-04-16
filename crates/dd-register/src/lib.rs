@@ -32,15 +32,18 @@ struct AppState {
 
 // ── Entry point ─────────────────────────────────────────────────────────
 
-pub async fn run() {
-    // DD_REGISTER_PORT takes precedence (used by unified `dd management`
-    // binary where dd-web owns DD_PORT=8080).
-    let port: u16 = std::env::var("DD_REGISTER_PORT")
-        .or_else(|_| std::env::var("DD_PORT"))
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(8081);
-
+/// Build the register router with its state, and spawn all background
+/// tasks (self-register CF tunnel, cloudflared child, STONITH watchdog,
+/// STONITH of old registers, registry bootstrap).
+///
+/// Returns a Router ready to be merged with dd-web's router in the
+/// unified `dd management` binary, or used standalone via `run()`.
+pub async fn prepare() -> Router {
+    // Any failure during one-shot self-registration kernel_poweroff's the VM
+    // instead of exit(1)ing. Leaving the VM RUNNING-but-tunnel-less turns
+    // it into a zombie: the next deploy's STONITH-by-tunnel-delete has
+    // nothing to target, and release.yml's verify step fails forever.
+    // Halting early lets cleanup.yml's TERMINATED reap handle it cleanly.
     let cf = match tunnel::CfConfig::from_env() {
         Ok(c) => c,
         Err(e) => {
@@ -48,13 +51,15 @@ pub async fn run() {
             eprintln!(
                 "dd-register: set DD_CF_API_TOKEN, DD_CF_ACCOUNT_ID, DD_CF_ZONE_ID, DD_CF_DOMAIN"
             );
-            std::process::exit(1);
+            kernel_poweroff();
+            unreachable!();
         }
     };
 
     let hostname = std::env::var("DD_HOSTNAME").unwrap_or_else(|_| {
         eprintln!("dd-register: DD_HOSTNAME not set");
-        std::process::exit(1);
+        kernel_poweroff();
+        unreachable!();
     });
 
     // Self-register: create our own CF tunnel so we're reachable
@@ -74,7 +79,8 @@ pub async fn run() {
         Ok(info) => info,
         Err(e) => {
             eprintln!("dd-register: self-registration failed: {e}");
-            std::process::exit(1);
+            kernel_poweroff();
+            unreachable!();
         }
     };
 
@@ -201,16 +207,33 @@ pub async fn run() {
         stonith_old_registers(&stonith_state).await;
     });
 
-    let app = Router::new()
+    eprintln!("dd-register: agents register at wss://{hostname}/register");
+
+    Router::new()
         .route("/register", get(ws_register))
         .route("/deregister", post(post_deregister))
-        .route("/health", get(get_health))
+        .route("/register/health", get(get_health))
         .route("/stonith", post(post_stonith))
-        .with_state(state);
+        .with_state(state)
+}
+
+/// Standalone entry point — used when dd-register is run as its own
+/// service (not merged into dd-web). Binds DD_REGISTER_PORT (default
+/// 8081) and serves the prepared router.
+pub async fn run() {
+    // DD_REGISTER_PORT takes precedence (used when standalone; the
+    // unified `dd management` binary merges the router into dd-web on
+    // DD_PORT instead of using a separate port here).
+    let port: u16 = std::env::var("DD_REGISTER_PORT")
+        .or_else(|_| std::env::var("DD_PORT"))
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8081);
+
+    let app = prepare().await;
 
     let addr = format!("0.0.0.0:{port}");
     eprintln!("dd-register: listening on {addr}");
-    eprintln!("dd-register: agents register at wss://{hostname}/register");
 
     let listener = tokio::net::TcpListener::bind(&addr)
         .await

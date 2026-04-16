@@ -163,8 +163,8 @@ async fn collect_metrics() -> SystemMetrics {
             if vals.len() >= 4 {
                 let total: u64 = vals.iter().sum();
                 let idle = vals[3];
-                if total > 0 {
-                    metrics.cpu_pct = 100u64.saturating_sub((idle * 100) / total);
+                if let Some(idle_pct) = (idle * 100).checked_div(total) {
+                    metrics.cpu_pct = 100u64.saturating_sub(idle_pct);
                 }
             }
         }

@@ -26,7 +26,11 @@ use tokio::sync::Mutex;
 use dd_common::ee_client::EeClient;
 use dd_common::tunnel;
 
-pub async fn run() {
+/// Build the dd-web router with its state, spawn the agent collector
+/// background task, and bootstrap the initial agent list from CF
+/// tunnels. Returns a Router ready to be merged with dd-register's
+/// router in the unified binary, or served standalone via `run()`.
+pub async fn prepare() -> axum::Router {
     let config = config::Config::from_env();
 
     eprintln!(
@@ -119,14 +123,25 @@ pub async fn run() {
     // dd-web listens. Having both services create tunnels for the
     // same hostname races the DNS CNAME, causing error 1033.
 
-    // Build router and start HTTP server
-    let app = router::build_router(web_state.clone());
-    let port = web_state.config.port;
+    let hostname = &web_state.config.hostname;
+    eprintln!("dd-web: dashboard at https://{hostname}/");
+
+    router::build_router(web_state.clone())
+}
+
+/// Standalone entry point — binds DD_PORT (default 8080) and serves
+/// the prepared router. The unified `dd management` binary uses
+/// `prepare()` instead and merges in dd-register's routes.
+pub async fn run() {
+    let app = prepare().await;
+
+    let port: u16 = std::env::var("DD_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8080);
     let addr = format!("0.0.0.0:{port}");
 
-    let hostname = &web_state.config.hostname;
     eprintln!("dd-web: listening on {addr}");
-    eprintln!("dd-web: dashboard at https://{hostname}/");
 
     let listener = tokio::net::TcpListener::bind(&addr)
         .await

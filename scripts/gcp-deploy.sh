@@ -8,6 +8,12 @@
 # boot workload: its binary lands in /var/lib/easyenclave/bin (now on
 # PATH) so dd-register can shell out to `cloudflared` by name.
 #
+# Agent-side mirror: a local TDX guest with a vfio-pci-passed GPU can
+# register against the CP this script deploys by using the same
+# easyenclave `github_release` workload source for the devopsdefender
+# binary, with `DD_REGISTER_URL=wss://{hostname}/register`. See the
+# local-GPU demo notes in the commit trail.
+#
 # Called by .github/workflows/{staging,production}-deploy.yml. Requires
 # gcloud CLI authenticated via Workload Identity Federation.
 #

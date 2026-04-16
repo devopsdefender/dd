@@ -11,4 +11,5 @@ path = "src/main.rs"
 dd-register = { path = "../dd-register" }
 dd-web = { path = "../dd-web" }
 dd-client = { path = "../dd-client" }
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+axum = { version = "0.8", features = ["ws", "macros"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }
