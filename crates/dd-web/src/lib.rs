@@ -77,32 +77,62 @@ pub async fn prepare() -> axum::Router {
             let now = chrono::Utc::now();
             let mut count = 0;
             for t in &tunnel_list {
-                if let Some(name) = t["name"].as_str() {
-                    if name.starts_with(&tunnel_prefix) {
-                        let hostname = format!("{name}.{}", web_state.config.cf.domain);
-                        let agent_id = name
-                            .strip_prefix(&tunnel_prefix)
-                            .unwrap_or(name)
-                            .to_string();
-                        store.insert(
-                            agent_id.clone(),
-                            state::AgentSnapshot {
-                                agent_id,
-                                hostname,
-                                vm_name: "unknown".to_string(),
-                                attestation_type: "unknown".to_string(),
-                                status: "stale".to_string(),
-                                last_seen: now,
-                                deployment_count: 0,
-                                deployment_names: Vec::new(),
-                                cpu_percent: 0,
-                                memory_used_mb: 0,
-                                memory_total_mb: 0,
-                            },
-                        );
-                        count += 1;
-                    }
+                let Some(name) = t["name"].as_str() else {
+                    continue;
+                };
+                if !name.starts_with(&tunnel_prefix) {
+                    continue;
                 }
+                let Some(tunnel_id) = t["id"].as_str() else {
+                    continue;
+                };
+                // Use the tunnel's real ingress hostname, not `{name}.{domain}`.
+                // See collector.rs::list_agent_tunnels for the rationale — if
+                // the CP's own tunnel got bootstrapped under a synthesised
+                // hostname, the collector would later orphan-delete it.
+                let hostnames = match tunnel::tunnel_ingress_hostnames(
+                    &http_client,
+                    &web_state.config.cf,
+                    tunnel_id,
+                )
+                .await
+                {
+                    Ok(h) => h,
+                    Err(e) => {
+                        eprintln!("dd-web: bootstrap ingress lookup failed for {name}: {e}");
+                        continue;
+                    }
+                };
+                if hostnames.is_empty() {
+                    continue;
+                }
+                if hostnames.iter().any(|h| h == &web_state.config.hostname) {
+                    continue; // our own tunnel
+                }
+                let Some(hostname) = hostnames.into_iter().next() else {
+                    continue;
+                };
+                let agent_id = name
+                    .strip_prefix(&tunnel_prefix)
+                    .unwrap_or(name)
+                    .to_string();
+                store.insert(
+                    agent_id.clone(),
+                    state::AgentSnapshot {
+                        agent_id,
+                        hostname,
+                        vm_name: "unknown".to_string(),
+                        attestation_type: "unknown".to_string(),
+                        status: "stale".to_string(),
+                        last_seen: now,
+                        deployment_count: 0,
+                        deployment_names: Vec::new(),
+                        cpu_percent: 0,
+                        memory_used_mb: 0,
+                        memory_total_mb: 0,
+                    },
+                );
+                count += 1;
             }
             eprintln!("dd-web: bootstrapped {count} agents from CF tunnels");
         }

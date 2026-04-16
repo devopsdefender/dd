@@ -33,8 +33,14 @@ pub async fn run_collector(state: WebState) {
     loop {
         ticker.tick().await;
 
-        // List CF tunnels
-        let tunnels = list_agent_tunnels(&http, &state.config.cf, &tunnel_prefix).await;
+        // List CF tunnels (excludes this CP's own tunnel via ingress-hostname match)
+        let tunnels = list_agent_tunnels(
+            &http,
+            &state.config.cf,
+            &tunnel_prefix,
+            &state.config.hostname,
+        )
+        .await;
         eprintln!(
             "dd-web: collector found {} tunnels matching {tunnel_prefix}*",
             tunnels.len()
@@ -266,6 +272,7 @@ async fn list_agent_tunnels(
     client: &reqwest::Client,
     cf: &tunnel::CfConfig,
     prefix: &str,
+    cp_hostname: &str,
 ) -> Vec<(String, String)> {
     let url = format!(
         "https://api.cloudflare.com/client/v4/accounts/{}/cfd_tunnel?is_deleted=false",
@@ -289,15 +296,44 @@ async fn list_agent_tunnels(
     let body: serde_json::Value = resp.json().await.unwrap_or_default();
     let mut tunnels = Vec::new();
 
-    if let Some(results) = body["result"].as_array() {
-        for t in results {
-            if let Some(name) = t["name"].as_str() {
-                if name.starts_with(prefix) {
-                    let hostname = format!("{name}.{}", cf.domain);
-                    tunnels.push((name.to_string(), hostname));
-                }
-            }
+    let Some(results) = body["result"].as_array() else {
+        return tunnels;
+    };
+    for t in results {
+        let Some(name) = t["name"].as_str() else {
+            continue;
+        };
+        if !name.starts_with(prefix) {
+            continue;
         }
+        let Some(tunnel_id) = t["id"].as_str() else {
+            continue;
+        };
+
+        // Resolve the tunnel's real ingress hostname instead of synthesising
+        // `{name}.{domain}`. Agent tunnels' names do match their hostnames,
+        // but the CP's own tunnel is named `dd-{env}-{vm-id}` while its real
+        // ingress is `app.{domain}` — synthesising would make the collector
+        // treat itself as an unreachable agent and orphan-delete its own
+        // tunnel (~5 min → self-STONITH). Fail closed on lookup error or
+        // empty ingress so a CF flake can't resurrect that bug.
+        let hostnames = match tunnel::tunnel_ingress_hostnames(client, cf, tunnel_id).await {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("dd-web: ingress lookup failed for {name}: {e} — skipping this cycle");
+                continue;
+            }
+        };
+        if hostnames.is_empty() {
+            continue;
+        }
+        if hostnames.iter().any(|h| h == cp_hostname) {
+            continue; // our own tunnel — never scrape or orphan-delete
+        }
+        let Some(hostname) = hostnames.into_iter().next() else {
+            continue;
+        };
+        tunnels.push((name.to_string(), hostname));
     }
 
     tunnels
