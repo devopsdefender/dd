@@ -39,6 +39,11 @@ struct AppState {
 /// Returns a Router ready to be merged with dd-web's router in the
 /// unified `dd management` binary, or used standalone via `run()`.
 pub async fn prepare() -> Router {
+    // Any failure during one-shot self-registration kernel_poweroff's the VM
+    // instead of exit(1)ing. Leaving the VM RUNNING-but-tunnel-less turns
+    // it into a zombie: the next deploy's STONITH-by-tunnel-delete has
+    // nothing to target, and release.yml's verify step fails forever.
+    // Halting early lets cleanup.yml's TERMINATED reap handle it cleanly.
     let cf = match tunnel::CfConfig::from_env() {
         Ok(c) => c,
         Err(e) => {
@@ -46,13 +51,15 @@ pub async fn prepare() -> Router {
             eprintln!(
                 "dd-register: set DD_CF_API_TOKEN, DD_CF_ACCOUNT_ID, DD_CF_ZONE_ID, DD_CF_DOMAIN"
             );
-            std::process::exit(1);
+            kernel_poweroff();
+            unreachable!();
         }
     };
 
     let hostname = std::env::var("DD_HOSTNAME").unwrap_or_else(|_| {
         eprintln!("dd-register: DD_HOSTNAME not set");
-        std::process::exit(1);
+        kernel_poweroff();
+        unreachable!();
     });
 
     // Self-register: create our own CF tunnel so we're reachable
@@ -72,7 +79,8 @@ pub async fn prepare() -> Router {
         Ok(info) => info,
         Err(e) => {
             eprintln!("dd-register: self-registration failed: {e}");
-            std::process::exit(1);
+            kernel_poweroff();
+            unreachable!();
         }
     };
 
