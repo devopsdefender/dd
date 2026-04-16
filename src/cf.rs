@@ -1,0 +1,249 @@
+//! Cloudflare tunnel + DNS client.
+//!
+//! Naming convention (enforced here): CP tunnels are `dd-{env}-cp-{uuid}`,
+//! agent tunnels are `dd-{env}-agent-{uuid}`. The suffix is how the
+//! collector knows which tunnels to scrape and STONITH knows which to
+//! target, without ever fetching the ingress config.
+
+use base64::Engine;
+use reqwest::{Client, Method};
+use serde::{Deserialize, Serialize};
+
+use crate::config::CfCreds;
+use crate::error::{Error, Result};
+
+const API: &str = "https://api.cloudflare.com/client/v4";
+
+pub fn cp_tunnel_name(env: &str) -> String {
+    format!("dd-{env}-cp-{}", uuid::Uuid::new_v4())
+}
+pub fn agent_tunnel_name(env: &str) -> String {
+    format!("dd-{env}-agent-{}", uuid::Uuid::new_v4())
+}
+pub fn cp_prefix(env: &str) -> String {
+    format!("dd-{env}-cp-")
+}
+pub fn agent_prefix(env: &str) -> String {
+    format!("dd-{env}-agent-")
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Tunnel {
+    pub id: String,
+    pub token: String,
+    pub hostname: String,
+}
+
+/// One-liner HTTP wrapper: all CF calls go through this. Returns the
+/// parsed JSON body on any 2xx, turns anything else into `Error::Upstream`
+/// carrying the response text.
+async fn call(
+    http: &Client,
+    cf: &CfCreds,
+    method: Method,
+    path: &str,
+    body: Option<serde_json::Value>,
+) -> Result<serde_json::Value> {
+    let mut req = http
+        .request(method.clone(), format!("{API}{path}"))
+        .bearer_auth(&cf.api_token);
+    if let Some(b) = body {
+        req = req.json(&b);
+    }
+    let resp = req.send().await?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(Error::Upstream(format!(
+            "CF {method} {path} → {status}: {body}"
+        )));
+    }
+    Ok(resp.json().await?)
+}
+
+/// Create (or recreate) a CF tunnel with ingress pointing at the local
+/// service on port 8080, and a proxied CNAME for `hostname`.
+pub async fn create(http: &Client, cf: &CfCreds, name: &str, hostname: &str) -> Result<Tunnel> {
+    delete_by_name(http, cf, name).await;
+
+    let secret = base64::engine::general_purpose::STANDARD.encode(uuid::Uuid::new_v4().as_bytes());
+    let resp = call(
+        http,
+        cf,
+        Method::POST,
+        &format!("/accounts/{}/cfd_tunnel", cf.account_id),
+        Some(serde_json::json!({"name": name, "tunnel_secret": secret})),
+    )
+    .await?;
+
+    let id = resp["result"]["id"]
+        .as_str()
+        .ok_or_else(|| Error::Upstream("tunnel create: missing id".into()))?
+        .to_string();
+    let token = resp["result"]["token"]
+        .as_str()
+        .ok_or_else(|| Error::Upstream("tunnel create: missing token".into()))?
+        .to_string();
+
+    call(
+        http,
+        cf,
+        Method::PUT,
+        &format!("/accounts/{}/cfd_tunnel/{id}/configurations", cf.account_id),
+        Some(serde_json::json!({
+            "config": {
+                "ingress": [
+                    {"hostname": hostname, "service": "http://localhost:8080"},
+                    {"service": "http_status:404"},
+                ],
+            },
+        })),
+    )
+    .await?;
+
+    upsert_cname(http, cf, &id, hostname).await?;
+
+    Ok(Tunnel {
+        id,
+        token,
+        hostname: hostname.to_string(),
+    })
+}
+
+async fn upsert_cname(http: &Client, cf: &CfCreds, tunnel_id: &str, hostname: &str) -> Result<()> {
+    let content = format!("{tunnel_id}.cfargotunnel.com");
+    let body = serde_json::json!({
+        "type": "CNAME", "name": hostname, "content": content, "proxied": true,
+    });
+    match find_record_id(http, cf, hostname).await? {
+        Some(rec) => {
+            call(
+                http,
+                cf,
+                Method::PUT,
+                &format!("/zones/{}/dns_records/{rec}", cf.zone_id),
+                Some(body),
+            )
+            .await?;
+        }
+        None => {
+            call(
+                http,
+                cf,
+                Method::POST,
+                &format!("/zones/{}/dns_records", cf.zone_id),
+                Some(body),
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+pub async fn find_record_id(http: &Client, cf: &CfCreds, hostname: &str) -> Result<Option<String>> {
+    // Best-effort lookup: CF returns 200 with an empty array on miss.
+    let resp = call(
+        http,
+        cf,
+        Method::GET,
+        &format!(
+            "/zones/{}/dns_records?type=CNAME&name={hostname}",
+            cf.zone_id
+        ),
+        None,
+    )
+    .await
+    .unwrap_or(serde_json::Value::Null);
+    Ok(resp["result"]
+        .as_array()
+        .and_then(|a| a.first())
+        .and_then(|r| r["id"].as_str())
+        .map(String::from))
+}
+
+pub async fn delete_cname(http: &Client, cf: &CfCreds, hostname: &str) -> Result<()> {
+    if let Some(id) = find_record_id(http, cf, hostname).await? {
+        let _ = call(
+            http,
+            cf,
+            Method::DELETE,
+            &format!("/zones/{}/dns_records/{id}", cf.zone_id),
+            None,
+        )
+        .await;
+    }
+    Ok(())
+}
+
+/// Best-effort delete by name. Used for STONITH + idempotent re-create;
+/// callers can't act usefully on failure.
+pub async fn delete_by_name(http: &Client, cf: &CfCreds, name: &str) {
+    let Ok(resp) = call(
+        http,
+        cf,
+        Method::GET,
+        &format!("/accounts/{}/cfd_tunnel?name={name}", cf.account_id),
+        None,
+    )
+    .await
+    else {
+        return;
+    };
+    let Some(items) = resp["result"].as_array() else {
+        return;
+    };
+    for t in items {
+        let Some(id) = t["id"].as_str() else { continue };
+        let _ = call(
+            http,
+            cf,
+            Method::DELETE,
+            &format!("/accounts/{}/cfd_tunnel/{id}/connections", cf.account_id),
+            None,
+        )
+        .await;
+        let _ = call(
+            http,
+            cf,
+            Method::DELETE,
+            &format!("/accounts/{}/cfd_tunnel/{id}", cf.account_id),
+            None,
+        )
+        .await;
+    }
+}
+
+pub async fn list(http: &Client, cf: &CfCreds) -> Result<Vec<serde_json::Value>> {
+    let resp = call(
+        http,
+        cf,
+        Method::GET,
+        &format!("/accounts/{}/cfd_tunnel?is_deleted=false", cf.account_id),
+        None,
+    )
+    .await?;
+    Ok(resp["result"].as_array().cloned().unwrap_or_default())
+}
+
+/// `Some(true)` if present, `Some(false)` if confirmed deleted, `None`
+/// on ambiguous transport error — the watchdog uses `None` to mean
+/// "don't count as gone" and avoid flaky kernel_poweroffs.
+pub async fn exists(http: &Client, cf: &CfCreds, tunnel_id: &str) -> Option<bool> {
+    let resp = http
+        .get(format!(
+            "{API}/accounts/{}/cfd_tunnel/{tunnel_id}",
+            cf.account_id
+        ))
+        .bearer_auth(&cf.api_token)
+        .send()
+        .await
+        .ok()?;
+    match resp.status().as_u16() {
+        404 => Some(false),
+        s if (200..300).contains(&s) => {
+            let body: serde_json::Value = resp.json().await.ok()?;
+            Some(body["result"]["deleted_at"].is_null())
+        }
+        _ => None,
+    }
+}
