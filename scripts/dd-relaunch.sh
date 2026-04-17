@@ -49,6 +49,8 @@ esac
 virsh start "$vm"
 echo "relaunched $vm against $CP"
 
-# Workload lifecycle (ollama deploy/pull/query) runs in a separate
-# workflow step over HTTPS — it doesn't need to hold this SSH
-# session for the minutes it can take.
+# Post-boot: deploy ollama as the example workload + pull a model +
+# run a sample query. Inherits DD_PAT + DD_ITA_API_KEY from env.
+# Fail loud (set -e) — the workflow turns red if this doesn't work.
+export CP_URL="$CP"
+./scripts/ollama-deploy.sh "$KIND"

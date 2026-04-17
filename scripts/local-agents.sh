@@ -160,6 +160,10 @@ render_domain_xml() {
   # Rewrite disk paths to this agent's overlay + config.
   sed -i "s|$IMG_DIR/$BASE_DOMAIN.qcow2|$IMG_DIR/dd-local-$name.qcow2|g" "$out"
   sed -i "s|$IMG_DIR/$BASE_DOMAIN-config.iso|$IMG_DIR/dd-local-$name-config.iso|g" "$out"
+  # Rewrite the serial/console log file — base XML points at
+  # /var/log/ee-local.log, which libvirt opens exclusively. Two VMs
+  # sharing the same path collide with "Device or resource busy".
+  sed -i "s|/var/log/ee-local\\.log|/var/log/ee-local-$name.log|g" "$out"
 
   # Wire QEMU's tdx-guest to the host's QGS unix socket so the guest's
   # TDVMCALL for a quote actually reaches Intel's quote-generation
