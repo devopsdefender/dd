@@ -21,12 +21,13 @@
 
 set -euo pipefail
 
-KIND="${1?usage: ollama-deploy.sh <prod|preview>}"
-: "${DD_PAT?}" "${DD_ITA_API_KEY?}"
+KIND="${1?usage: ollama-deploy.sh <prod|preview> <cp_url>}"
+CP_URL="${2?cp_url required}"
+: "${DD_PAT?}"
 
 case "$KIND" in
-  prod)    MODEL="llama3.1:8b"    CP_URL="https://app.devopsdefender.com" ;;
-  preview) MODEL="qwen2.5:0.5b"   CP_URL="${CP_URL:?need CP_URL for preview}" ;;
+  prod)    MODEL="llama3.1:8b" ;;
+  preview) MODEL="qwen2.5:0.5b" ;;
   *) echo "unknown kind: $KIND" >&2; exit 2 ;;
 esac
 
@@ -60,10 +61,12 @@ echo "  agent: https://$agent_host"
 
 agent() { curl -fsS --max-time 120 "${AUTH[@]}" "https://$agent_host$1" "${@:2}"; }
 
-# 2. Deploy ollama workload. EE returns a workload id.
+# 2. Deploy ollama workload. EE returns a workload id. Pin to v0.2.8 —
+# last release with a bare-binary asset (later versions ship tar.zst
+# which EE's github_release source doesn't decompress).
 SPEC=$(jq -c -n '{
   app_name:"ollama",
-  github_release:{repo:"ollama/ollama",asset:"ollama-linux-amd64",rename:"ollama"},
+  github_release:{repo:"ollama/ollama",asset:"ollama-linux-amd64",rename:"ollama",tag:"v0.2.8"},
   cmd:["ollama","serve"],
   env:[
     "OLLAMA_HOST=127.0.0.1:11434",
