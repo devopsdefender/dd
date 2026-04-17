@@ -24,6 +24,7 @@ use crate::config::Cp as Cfg;
 use crate::ee::Ee;
 use crate::error::{Error, Result};
 use crate::html::{self, shell};
+use crate::ita;
 use crate::stonith;
 use crate::terminal;
 
@@ -34,6 +35,9 @@ struct St {
     keys: Arc<Keys>,
     store: Store,
     started: Instant,
+    verifier: Arc<ita::Verifier>,
+    /// The CP's own ITA token, minted at startup.
+    cp_ita_token: String,
 }
 
 pub async fn run() -> Result<()> {
@@ -68,22 +72,75 @@ pub async fn run() -> Result<()> {
     tokio::spawn(stonith::self_watchdog(cfg.cf.clone(), tunnel.id.clone()));
 
     let store: Store = Arc::new(Mutex::new(HashMap::new()));
+
+    let keys = Arc::new(Keys::fresh(&cfg.hostname));
+
+    // ITA verifier — required.
+    let verifier = ita::Verifier::new(cfg.ita.jwks_url.clone(), cfg.ita.issuer.clone());
+    eprintln!("cp: ITA verifier enabled (issuer={})", cfg.ita.issuer);
+
+    // Mint + verify our own ITA token. Any failure is fatal —
+    // attestation is mandatory.
+    let cp_ita_token = match mint_cp_ita(&cfg, &ee).await {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("cp: ITA mint failed: {e}");
+            stonith::poweroff();
+        }
+    };
+    let cp_claims = match verifier.verify(&cp_ita_token).await {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("cp: ITA self-verify failed: {e}");
+            stonith::poweroff();
+        }
+    };
+    eprintln!(
+        "cp: own ITA verified mrtd={} tcb={}",
+        cp_claims.mrtd.as_deref().unwrap_or("?"),
+        cp_claims.tcb_status.as_deref().unwrap_or("?")
+    );
+
+    // Seed the CP into the store before the collector starts ticking.
+    store.lock().await.insert(
+        "control-plane".into(),
+        collector::Agent {
+            agent_id: "control-plane".into(),
+            hostname: cfg.hostname.clone(),
+            vm_name: format!("dd-{}-cp", cfg.common.env_label),
+            attestation_type: "tdx".into(),
+            status: "healthy".into(),
+            last_seen: chrono::Utc::now(),
+            deployment_count: 0,
+            deployment_names: Vec::new(),
+            cpu_percent: 0,
+            memory_used_mb: 0,
+            memory_total_mb: 0,
+            ita: cp_claims,
+        },
+    );
+
+    // Start the collector with the verifier. It re-verifies each
+    // scraped agent's ita_token, so expired / revoked / unsigned
+    // agents drop off the dashboard automatically.
     tokio::spawn(collector::run(
         store.clone(),
         cfg.cf.clone(),
         cfg.common.env_label.clone(),
         cfg.hostname.clone(),
         ee.clone(),
+        verifier.clone(),
         Duration::from_secs(cfg.scrape_interval_secs),
     ));
 
-    let keys = Arc::new(Keys::fresh(&cfg.hostname));
     let state = St {
         cfg: cfg.clone(),
         ee,
         keys,
         store,
         started: Instant::now(),
+        verifier,
+        cp_ita_token,
     };
 
     let app = Router::new()
@@ -93,6 +150,7 @@ pub async fn run() -> Result<()> {
         .route("/agent/{id}", get(agent_detail))
         .route("/agent/{id}/logs/{app}", get(agent_logs))
         .route("/cp/attest", get(cp_attest))
+        .route("/cp/ita", get(cp_ita))
         .route("/cp/shell", get(shell_page))
         .route("/cp/ws/shell", get(shell_ws))
         .route("/auth/pat", get(pat_form).post(pat_submit))
@@ -154,11 +212,13 @@ struct RegisterReq {
     vm_name: String,
     env_label: String,
     owner: String,
+    ita_token: String,
 }
 
 /// POST /register — agent presents a GitHub PAT belonging to DD_OWNER;
-/// we verify, create an agent tunnel, return the tunnel token + the
-/// JWT signing secret (so the agent can verify CP-issued cookies).
+/// we verify, optionally verify its ITA token, create an agent tunnel,
+/// and return the tunnel token + the JWT signing secret (so the agent
+/// can verify CP-issued cookies).
 async fn register(
     State(s): State<St>,
     headers: HeaderMap,
@@ -180,10 +240,40 @@ async fn register(
         )));
     }
 
+    // ITA is mandatory. Any failure → 401.
+    let ita_claims = s.verifier.verify(&req.ita_token).await?;
+    eprintln!(
+        "cp: ITA verified for {} mrtd={} tcb={}",
+        req.vm_name,
+        ita_claims.mrtd.as_deref().unwrap_or("?"),
+        ita_claims.tcb_status.as_deref().unwrap_or("?")
+    );
+
     let http = reqwest::Client::new();
     let name = cf::agent_tunnel_name(&s.cfg.common.env_label);
     let agent_hostname = format!("{name}.{}", s.cfg.cf.domain);
     let tunnel = cf::create(&http, &s.cfg.cf, &name, &agent_hostname).await?;
+
+    // Seed the store so the dashboard shows the agent before the first
+    // collector tick.
+    let now = chrono::Utc::now();
+    s.store.lock().await.insert(
+        name.clone(),
+        collector::Agent {
+            agent_id: name.clone(),
+            hostname: tunnel.hostname.clone(),
+            vm_name: req.vm_name.clone(),
+            attestation_type: "tdx".into(),
+            status: "registered".into(),
+            last_seen: now,
+            deployment_count: 0,
+            deployment_names: Vec::new(),
+            cpu_percent: 0,
+            memory_used_mb: 0,
+            memory_total_mb: 0,
+            ita: ita_claims,
+        },
+    );
 
     eprintln!(
         "cp: registered {} as {} (login={login})",
@@ -197,6 +287,18 @@ async fn register(
         "jwt_secret_b64": s.keys.secret_b64,
         "cp_hostname": s.cfg.hostname,
     })))
+}
+
+/// Mint the CP's own ITA token at startup. Fatal on any failure —
+/// the CP refuses to start without proving its own TDX measurement.
+async fn mint_cp_ita(cfg: &Cfg, ee: &Ee) -> Result<String> {
+    use base64::Engine;
+    let nonce = base64::engine::general_purpose::STANDARD.encode(uuid::Uuid::new_v4().as_bytes());
+    let quote_b64 = ee.attest(&nonce).await?["quote_b64"]
+        .as_str()
+        .ok_or_else(|| Error::Upstream("EE attest returned no quote_b64".into()))?
+        .to_string();
+    ita::mint(&cfg.ita.base_url, &cfg.ita.api_key, &quote_b64).await
 }
 
 // ── Fleet dashboard ──────────────────────────────────────────────────────
@@ -297,8 +399,44 @@ async fn agent_detail(
         format!(r#"<table><tr><th>workload</th><th></th></tr>{workloads}</table>"#)
     };
 
+    let ita_card = {
+        let c = &a.ita;
+        let tcb = c.tcb_status.as_deref().unwrap_or("?");
+        let tcb_cls = match tcb {
+            "UpToDate" | "OK" => "running",
+            "OutOfDate" | "SWHardeningNeeded" | "ConfigurationNeeded" => "deploying",
+            "Revoked" | "Invalid" => "failed",
+            _ => "idle",
+        };
+        let mrtd_short = c
+            .mrtd
+            .as_deref()
+            .map(|m| if m.len() > 16 { &m[..16] } else { m })
+            .unwrap_or("?");
+        let delta = c.exp - chrono::Utc::now().timestamp();
+        let expiry = if delta > 0 {
+            format!("in {}m", delta / 60)
+        } else {
+            "expired".to_string()
+        };
+        format!(
+            r#"<div class="section">Intel Trust Authority</div>
+<div class="card">
+  <div class="row"><span>TCB status</span><span class="pill {cls}">{tcb}</span></div>
+  <div class="row"><span>MRTD</span><span class="dim">{mrtd}…</span></div>
+  <div class="row"><span>Attester type</span><span>{typ}</span></div>
+  <div class="row"><span>Expires</span><span>{exp}</span></div>
+</div>"#,
+            cls = tcb_cls,
+            tcb = html::escape(tcb),
+            mrtd = html::escape(mrtd_short),
+            typ = html::escape(c.attester_type.as_deref().unwrap_or("?")),
+            exp = expiry,
+        )
+    };
+
     let extra = if is_cp {
-        r#"<p><a href="/cp/shell">open CP shell</a> · <a href="/cp/attest">attestation</a></p>"#
+        r#"<p><a href="/cp/shell">open CP shell</a> · <a href="/cp/attest">raw quote</a> · <a href="/cp/ita">ITA token</a></p>"#
             .to_string()
     } else {
         format!(
@@ -320,6 +458,7 @@ async fn agent_detail(
   <div class="row"><span>CPU</span><span>{cpu}%</span></div>
   <div class="row"><span>Memory</span><span>{mu}/{mt} MB</span></div>
 </div>
+{ita_card}
 <div class="section">Workloads</div>{wl_table}
 {extra}"#,
             vm = html::escape(&a.vm_name),
@@ -331,6 +470,7 @@ async fn agent_detail(
             cpu = a.cpu_percent,
             mu = a.memory_used_mb,
             mt = a.memory_total_mb,
+            ita_card = ita_card,
         ),
     ))
     .into_response()
@@ -406,6 +546,24 @@ async fn cp_attest(
             base64::engine::general_purpose::STANDARD.encode(uuid::Uuid::new_v4().as_bytes())
         });
     Ok(Json(s.ee.attest(&nonce).await?))
+}
+
+/// GET /cp/ita — the CP's own ITA token, minted + self-verified at
+/// startup. External verifiers can confirm the CP VM's TDX measurement
+/// by decoding it against Intel's JWKS.
+async fn cp_ita(
+    State(s): State<St>,
+    headers: HeaderMap,
+    axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
+) -> Result<Json<serde_json::Value>> {
+    if require_auth(&s, &headers, &uri).await.is_err() {
+        return Err(Error::Unauthorized);
+    }
+    let claims = s.verifier.verify(&s.cp_ita_token).await?;
+    Ok(Json(serde_json::json!({
+        "token": s.cp_ita_token,
+        "claims": claims,
+    })))
 }
 
 async fn shell_page(

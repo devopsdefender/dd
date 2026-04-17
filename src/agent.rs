@@ -23,6 +23,7 @@ use crate::config::Agent as Cfg;
 use crate::ee::Ee;
 use crate::error::{Error, Result};
 use crate::html::{self, shell};
+use crate::ita;
 use crate::metrics;
 use crate::terminal;
 
@@ -34,22 +35,26 @@ struct St {
     hostname: String,
     cp_hostname: String,
     started: Instant,
+    /// Intel-signed JWT for this VM's TDX measurement, minted at startup.
+    /// Mandatory — the agent fails to start if minting fails.
+    ita_token: String,
 }
 
 pub async fn run() -> Result<()> {
     let cfg = Arc::new(Cfg::from_env()?);
     let ee = Arc::new(Ee::new(&cfg.ee_socket));
 
-    match ee.health().await {
-        Ok(h) => eprintln!(
-            "agent: EE connected (attestation={})",
-            h["attestation_type"].as_str().unwrap_or("?")
-        ),
-        Err(e) => eprintln!("agent: warn: EE not reachable: {e}"),
-    }
+    let h = ee.health().await?;
+    eprintln!(
+        "agent: EE connected (attestation={})",
+        h["attestation_type"].as_str().unwrap_or("?")
+    );
+
+    let ita_token = mint_ita(&cfg, &ee).await?;
+    eprintln!("agent: ITA token minted");
 
     eprintln!("agent: registering with {}", cfg.cp_url);
-    let b = register(&cfg).await?;
+    let b = register(&cfg, &ita_token).await?;
     eprintln!("agent: registered as {}", b.hostname);
 
     spawn_cloudflared(b.tunnel_token);
@@ -62,6 +67,7 @@ pub async fn run() -> Result<()> {
         hostname: b.hostname,
         cp_hostname: b.cp_hostname,
         started: Instant::now(),
+        ita_token,
     };
 
     let app = Router::new()
@@ -88,13 +94,14 @@ struct Bootstrap {
     cp_hostname: String,
 }
 
-async fn register(cfg: &Cfg) -> Result<Bootstrap> {
+async fn register(cfg: &Cfg, ita_token: &str) -> Result<Bootstrap> {
     let http = reqwest::Client::new();
     let url = format!("{}/register", cfg.cp_url.trim_end_matches('/'));
     let body = serde_json::json!({
         "vm_name": cfg.common.vm_name,
         "env_label": cfg.common.env_label,
         "owner": cfg.common.owner,
+        "ita_token": ita_token,
     });
     let resp = http
         .post(&url)
@@ -109,6 +116,18 @@ async fn register(cfg: &Cfg) -> Result<Bootstrap> {
         return Err(Error::Upstream(format!("register {url} → {s}: {b}")));
     }
     Ok(resp.json().await?)
+}
+
+/// Mint an Intel-signed TDX attestation JWT. Fatal on any failure —
+/// the agent refuses to start without a valid token.
+async fn mint_ita(cfg: &Cfg, ee: &Ee) -> Result<String> {
+    use base64::Engine;
+    let nonce = base64::engine::general_purpose::STANDARD.encode(uuid::Uuid::new_v4().as_bytes());
+    let quote_b64 = ee.attest(&nonce).await?["quote_b64"]
+        .as_str()
+        .ok_or_else(|| Error::Upstream("EE attest returned no quote_b64".into()))?
+        .to_string();
+    ita::mint(&cfg.ita.base_url, &cfg.ita.api_key, &quote_b64).await
 }
 
 fn spawn_cloudflared(token: String) {
@@ -167,6 +186,7 @@ async fn health(State(s): State<St>) -> Json<serde_json::Value> {
         "memory_used_mb": m.mem_used_mb,
         "memory_total_mb": m.mem_total_mb,
         "uptime_secs": s.started.elapsed().as_secs(),
+        "ita_token": s.ita_token,
     }))
 }
 

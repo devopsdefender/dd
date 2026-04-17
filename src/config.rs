@@ -57,12 +57,44 @@ impl Common {
     }
 }
 
+/// ITA (Intel Trust Authority) configuration. All fields required —
+/// attestation is mandatory in both modes.
+#[derive(Clone)]
+pub struct Ita {
+    /// URL for Intel's ITA mint endpoint, e.g. `https://api.trustauthority.intel.com`.
+    pub base_url: String,
+    /// API key for the mint endpoint.
+    pub api_key: String,
+    /// JWKS endpoint for verifier.
+    pub jwks_url: String,
+    /// Expected `iss` claim.
+    pub issuer: String,
+}
+
+impl Ita {
+    pub fn from_env() -> Result<Self> {
+        let get = |k: &str| {
+            std::env::var(k)
+                .ok()
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| Error::Internal(format!("{k} required")))
+        };
+        Ok(Self {
+            base_url: get("DD_ITA_BASE_URL")?,
+            api_key: get("DD_ITA_API_KEY")?,
+            jwks_url: get("DD_ITA_JWKS_URL")?,
+            issuer: get("DD_ITA_ISSUER")?,
+        })
+    }
+}
+
 /// Control-plane-mode config.
 pub struct Cp {
     pub common: Common,
     pub cf: CfCreds,
     pub hostname: String,
     pub scrape_interval_secs: u64,
+    pub ita: Ita,
 }
 
 impl Cp {
@@ -80,6 +112,7 @@ impl Cp {
             cf,
             hostname,
             scrape_interval_secs,
+            ita: Ita::from_env()?,
         })
     }
 }
@@ -90,6 +123,7 @@ pub struct Agent {
     pub cp_url: String,
     pub pat: String,
     pub ee_socket: String,
+    pub ita: Ita,
 }
 
 impl Agent {
@@ -107,6 +141,7 @@ impl Agent {
             cp_url,
             pat,
             ee_socket,
+            ita: Ita::from_env()?,
         })
     }
 }
