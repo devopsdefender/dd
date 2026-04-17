@@ -15,7 +15,7 @@ use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Form, Json, Router};
 use serde::Deserialize;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 
 use crate::auth::{self, Keys};
 use crate::cf;
@@ -28,6 +28,12 @@ use crate::ita;
 use crate::stonith;
 use crate::terminal;
 
+/// Re-mint interval for the CP's own ITA token. The CP isn't scraped
+/// by its own collector (different tunnel prefix), so a background
+/// task is the only thing keeping the `control-plane` entry's claims
+/// fresh on the dashboard.
+const ITA_REFRESH: Duration = Duration::from_secs(180);
+
 #[derive(Clone)]
 struct St {
     cfg: Arc<Cfg>,
@@ -36,8 +42,8 @@ struct St {
     store: Store,
     started: Instant,
     verifier: Arc<ita::Verifier>,
-    /// The CP's own ITA token, minted at startup.
-    cp_ita_token: String,
+    /// The CP's own ITA token. Refreshed by a background task.
+    cp_ita_token: Arc<RwLock<String>>,
 }
 
 pub async fn run() -> Result<()> {
@@ -81,14 +87,14 @@ pub async fn run() -> Result<()> {
 
     // Mint + verify our own ITA token. Any failure is fatal —
     // attestation is mandatory.
-    let cp_ita_token = match mint_cp_ita(&cfg, &ee).await {
+    let initial_token = match mint_cp_ita(&cfg, &ee).await {
         Ok(t) => t,
         Err(e) => {
             eprintln!("cp: ITA mint failed: {e}");
             stonith::poweroff();
         }
     };
-    let cp_claims = match verifier.verify(&cp_ita_token).await {
+    let cp_claims = match verifier.verify(&initial_token).await {
         Ok(c) => c,
         Err(e) => {
             eprintln!("cp: ITA self-verify failed: {e}");
@@ -100,6 +106,7 @@ pub async fn run() -> Result<()> {
         cp_claims.mrtd.as_deref().unwrap_or("?"),
         cp_claims.tcb_status.as_deref().unwrap_or("?")
     );
+    let cp_ita_token = Arc::new(RwLock::new(initial_token));
 
     // Seed the CP into the store before the collector starts ticking.
     store.lock().await.insert(
@@ -119,6 +126,41 @@ pub async fn run() -> Result<()> {
             ita: cp_claims,
         },
     );
+
+    // Background re-mint of the CP's own ITA token. Also re-verifies
+    // and updates the `control-plane` store entry so the fleet card
+    // doesn't show "Expired".
+    {
+        let cfg = cfg.clone();
+        let ee = ee.clone();
+        let verifier = verifier.clone();
+        let token = cp_ita_token.clone();
+        let store = store.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(ITA_REFRESH).await;
+                let fresh = match mint_cp_ita(&cfg, &ee).await {
+                    Ok(t) => t,
+                    Err(e) => {
+                        eprintln!("cp: own ITA refresh mint failed: {e}");
+                        continue;
+                    }
+                };
+                let claims = match verifier.verify(&fresh).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!("cp: own ITA refresh verify failed: {e}");
+                        continue;
+                    }
+                };
+                *token.write().await = fresh;
+                if let Some(cp) = store.lock().await.get_mut("control-plane") {
+                    cp.ita = claims;
+                }
+                eprintln!("cp: own ITA token refreshed");
+            }
+        });
+    }
 
     // Start the collector with the verifier. It re-verifies each
     // scraped agent's ita_token, so expired / revoked / unsigned
@@ -559,9 +601,10 @@ async fn cp_ita(
     if require_auth(&s, &headers, &uri).await.is_err() {
         return Err(Error::Unauthorized);
     }
-    let claims = s.verifier.verify(&s.cp_ita_token).await?;
+    let token = s.cp_ita_token.read().await.clone();
+    let claims = s.verifier.verify(&token).await?;
     Ok(Json(serde_json::json!({
-        "token": s.cp_ita_token,
+        "token": token,
         "claims": claims,
     })))
 }

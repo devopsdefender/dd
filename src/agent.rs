@@ -10,13 +10,14 @@
 //! with the secret it received at registration.
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::extract::{Path, State, WebSocketUpgrade};
 use axum::http::HeaderMap;
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
+use tokio::sync::RwLock;
 
 use crate::auth::{self, Keys};
 use crate::config::Agent as Cfg;
@@ -27,6 +28,11 @@ use crate::ita;
 use crate::metrics;
 use crate::terminal;
 
+/// Re-mint interval. Intel ITA tokens typically expire in a few
+/// minutes; refresh well before so `/health` always serves a live
+/// token to the CP's collector.
+const ITA_REFRESH: Duration = Duration::from_secs(180);
+
 #[derive(Clone)]
 struct St {
     cfg: Arc<Cfg>,
@@ -35,9 +41,8 @@ struct St {
     hostname: String,
     cp_hostname: String,
     started: Instant,
-    /// Intel-signed JWT for this VM's TDX measurement, minted at startup.
-    /// Mandatory — the agent fails to start if minting fails.
-    ita_token: String,
+    /// Current Intel-signed JWT. Refreshed by a background task.
+    ita_token: Arc<RwLock<String>>,
 }
 
 pub async fn run() -> Result<()> {
@@ -50,16 +55,40 @@ pub async fn run() -> Result<()> {
         h["attestation_type"].as_str().unwrap_or("?")
     );
 
-    let ita_token = mint_ita(&cfg, &ee).await?;
+    let initial_token = mint_ita(&cfg, &ee).await?;
     eprintln!("agent: ITA token minted");
 
     eprintln!("agent: registering with {}", cfg.cp_url);
-    let b = register(&cfg, &ita_token).await?;
+    let b = register(&cfg, &initial_token).await?;
     eprintln!("agent: registered as {}", b.hostname);
 
     spawn_cloudflared(b.tunnel_token);
 
     let keys = Arc::new(Keys::from_b64(&b.jwt_secret_b64, &b.cp_hostname)?);
+    let ita_token = Arc::new(RwLock::new(initial_token));
+
+    // Background re-mint so /health always serves a non-expired token
+    // for the CP's scrape-and-verify loop.
+    {
+        let cfg = cfg.clone();
+        let ee = ee.clone();
+        let token = ita_token.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(ITA_REFRESH).await;
+                match mint_ita(&cfg, &ee).await {
+                    Ok(t) => {
+                        *token.write().await = t;
+                        eprintln!("agent: ITA token refreshed");
+                    }
+                    Err(e) => {
+                        eprintln!("agent: ITA refresh failed (keeping stale token): {e}");
+                    }
+                }
+            }
+        });
+    }
+
     let state = St {
         cfg: cfg.clone(),
         ee,
@@ -171,6 +200,7 @@ async fn health(State(s): State<St>) -> Json<serde_json::Value> {
         })
         .unwrap_or_default();
     let m = metrics::collect().await;
+    let ita_token = s.ita_token.read().await.clone();
 
     Json(serde_json::json!({
         "ok": true,
@@ -186,7 +216,7 @@ async fn health(State(s): State<St>) -> Json<serde_json::Value> {
         "memory_used_mb": m.mem_used_mb,
         "memory_total_mb": m.mem_total_mb,
         "uptime_secs": s.started.elapsed().as_secs(),
-        "ita_token": s.ita_token,
+        "ita_token": ita_token,
     }))
 }
 
