@@ -110,6 +110,10 @@ pub async fn run() -> Result<()> {
     let cp_ita_token = Arc::new(RwLock::new(initial_token));
 
     // Seed the CP into the store before the collector starts ticking.
+    // The refresh loop below will keep these numbers current every
+    // ITA_REFRESH ticks; we fill them once at startup so the first
+    // render isn't all zeros while the refresh loop sleeps.
+    let cp_m = metrics::collect().await;
     store.lock().await.insert(
         "control-plane".into(),
         collector::Agent {
@@ -121,11 +125,11 @@ pub async fn run() -> Result<()> {
             last_seen: chrono::Utc::now(),
             deployment_count: 0,
             deployment_names: Vec::new(),
-            cpu_percent: 0,
-            memory_used_mb: 0,
-            memory_total_mb: 0,
-            nets: Vec::new(),
-            disks: Vec::new(),
+            cpu_percent: cp_m.cpu_pct,
+            memory_used_mb: cp_m.mem_used_mb,
+            memory_total_mb: cp_m.mem_total_mb,
+            nets: cp_m.nets,
+            disks: cp_m.disks,
             ita: cp_claims,
         },
     );
@@ -157,8 +161,19 @@ pub async fn run() -> Result<()> {
                     }
                 };
                 *token.write().await = fresh;
+                // Also refresh live system metrics on the CP's own
+                // store entry — the collector scrapes other tunnels,
+                // not itself, so without this the /agent/control-plane
+                // detail page would show empty disks/nets/cpu forever.
+                let m = crate::metrics::collect().await;
                 if let Some(cp) = store.lock().await.get_mut("control-plane") {
                     cp.ita = claims;
+                    cp.last_seen = chrono::Utc::now();
+                    cp.cpu_percent = m.cpu_pct;
+                    cp.memory_used_mb = m.mem_used_mb;
+                    cp.memory_total_mb = m.mem_total_mb;
+                    cp.nets = m.nets;
+                    cp.disks = m.disks;
                 }
                 eprintln!("cp: own ITA token refreshed");
             }
