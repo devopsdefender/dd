@@ -25,6 +25,7 @@ use crate::ee::Ee;
 use crate::error::{Error, Result};
 use crate::html::{self, shell};
 use crate::ita;
+use crate::metrics;
 use crate::stonith;
 use crate::terminal;
 
@@ -123,6 +124,8 @@ pub async fn run() -> Result<()> {
             cpu_percent: 0,
             memory_used_mb: 0,
             memory_total_mb: 0,
+            nets: Vec::new(),
+            disks: Vec::new(),
             ita: cp_claims,
         },
     );
@@ -328,6 +331,8 @@ async fn register(
                 cpu_percent: 0,
                 memory_used_mb: 0,
                 memory_total_mb: 0,
+                nets: Vec::new(),
+                disks: Vec::new(),
                 ita: ita_claims,
             },
         );
@@ -532,6 +537,41 @@ async fn agent_detail(
         )
     };
 
+    let disks_table = if a.disks.is_empty() {
+        String::new()
+    } else {
+        let mut rows = String::new();
+        for d in &a.disks {
+            rows.push_str(&format!(
+                "<tr><td>{m}</td><td class=\"dim\">{fs}</td><td>{u}/{t} GB</td></tr>",
+                m = html::escape(&d.mount),
+                fs = html::escape(&d.fstype),
+                u = d.used_gb,
+                t = d.total_gb,
+            ));
+        }
+        format!(
+            r#"<div class="section">Disks</div><table><tr><th>mount</th><th>fs</th><th>used</th></tr>{rows}</table>"#
+        )
+    };
+
+    let nets_table = if a.nets.is_empty() {
+        String::new()
+    } else {
+        let mut rows = String::new();
+        for n in &a.nets {
+            rows.push_str(&format!(
+                "<tr><td>{i}</td><td>{rx}</td><td>{tx}</td></tr>",
+                i = html::escape(&n.iface),
+                rx = metrics::format_bytes_si(n.rx_bytes),
+                tx = metrics::format_bytes_si(n.tx_bytes),
+            ));
+        }
+        format!(
+            r#"<div class="section">Network</div><table><tr><th>iface</th><th>rx</th><th>tx</th></tr>{rows}</table>"#
+        )
+    };
+
     Html(shell(
         &format!("DD — {}", a.vm_name),
         &html::nav(&[("Fleet", "/", false)]),
@@ -545,6 +585,8 @@ async fn agent_detail(
   <div class="row"><span>CPU</span><span>{cpu}%</span></div>
   <div class="row"><span>Memory</span><span>{mu}/{mt} MB</span></div>
 </div>
+{disks_table}
+{nets_table}
 {ita_card}
 <div class="section">Workloads</div>{wl_table}
 {extra}"#,
@@ -557,6 +599,8 @@ async fn agent_detail(
             cpu = a.cpu_percent,
             mu = a.memory_used_mb,
             mt = a.memory_total_mb,
+            disks_table = disks_table,
+            nets_table = nets_table,
             ita_card = ita_card,
         ),
     ))
