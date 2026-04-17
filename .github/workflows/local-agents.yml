@@ -12,6 +12,17 @@ on:
   workflow_run:
     workflows: ["Release", "Production Deploy"]
     types: [completed]
+  # Script-only changes to the local-agent pipeline don't rebuild dd or
+  # redeploy the CP, so they don't cascade through Release → Production
+  # Deploy. Trigger here directly against prod so fixes to the relaunch
+  # / deploy scripts actually get exercised.
+  push:
+    branches: [main]
+    paths:
+      - "scripts/dd-relaunch.sh"
+      - "scripts/local-agents.sh"
+      - "scripts/ollama-deploy.sh"
+      - ".github/workflows/local-agents.yml"
   workflow_dispatch:
     inputs:
       kind:
@@ -35,6 +46,7 @@ jobs:
   relaunch:
     if: |
       github.event_name == 'workflow_dispatch'
+      || github.event_name == 'push'
       || github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     steps:
@@ -51,7 +63,9 @@ jobs:
           if [ "$EVENT" = "workflow_dispatch" ]; then
             echo "kind=$DISPATCH_KIND" >> "$GITHUB_OUTPUT"
             echo "url=$DISPATCH_URL"   >> "$GITHUB_OUTPUT"
-          elif [ "$WF" = "Production Deploy" ]; then
+          elif [ "$EVENT" = "push" ] || [ "$WF" = "Production Deploy" ]; then
+            # push-to-main on local-agent scripts, or a prod CP redeploy
+            # → relaunch dd-local-prod against the live prod CP.
             echo "kind=prod" >> "$GITHUB_OUTPUT"
             echo "url=https://app.devopsdefender.com" >> "$GITHUB_OUTPUT"
           else
