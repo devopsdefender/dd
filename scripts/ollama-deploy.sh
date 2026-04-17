@@ -59,6 +59,19 @@ if [ -z "$agent_host" ] || [ "$agent_host" = "null" ]; then
 fi
 echo "  agent: https://$agent_host"
 
+# Wait for Cloudflare's DNS record for this tunnel hostname to
+# propagate to the runner's resolver. The CP's /api/agents returns
+# the hostname as soon as CF's API accepts the CNAME, but global DNS
+# can lag 30–120 s behind. curl (6) here = host not yet resolvable.
+echo "  waiting for DNS on $agent_host..."
+for i in $(seq 1 30); do
+  if getent hosts "$agent_host" >/dev/null 2>&1; then
+    echo "  DNS resolved"
+    break
+  fi
+  sleep 5
+done
+
 agent() { curl -fsS --max-time 120 "${AUTH[@]}" "https://$agent_host$1" "${@:2}"; }
 
 # 2. Deploy ollama workload. EE returns a workload id. Pin to v0.2.8 —
