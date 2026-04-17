@@ -197,16 +197,23 @@ OPENCLAW_SPEC=$(jq -c -n --arg m "$MODEL" '{
 }')
 agent /deploy -H 'Content-Type: application/json' -d "$OPENCLAW_SPEC" | jq -c '.' || true
 
-# ── 9. Confirm openclaw is registered and talking to us ────────────
-# Two probes:
-#   a) EE lists `openclaw` in /health — proves the workload was
-#      accepted (weak — flips on fork, before npm install finishes).
-#   b) `openclaw plugins list` inside the container exits 0 — proves
-#      the gateway daemon is actually responsive. That subcommand
-#      goes through the running gateway, so an unresponsive or
-#      still-installing openclaw fails it. Strongest documented probe
-#      short of an HTTP port (which the docs don't publish).
-echo "  confirming openclaw workload is registered..."
+# ── 9. Confirm openclaw is up ─ three probes, weakest → strongest ──
+# (a) EE lists `openclaw` in /health — proves the workload was
+#     accepted by the in-VM runtime. Flips green on fork, before
+#     npm-install finishes, so on its own it's weak.
+# (b) GET http://127.0.0.1:18789/healthz (the OpenClaw gateway HTTP
+#     endpoint). Docs: https://docs.openclaw.ai/gateway/health.
+#     200 with valid JSON = gateway has bound its port and is
+#     serving. The ollama container runs with --net=host so the
+#     loopback is the VM's loopback; we curl through `podman exec`
+#     so we hit the in-container curl (EE's busybox lacks one).
+# (c) `openclaw agent --message "ping"` — the documented one-shot
+#     CLI. Goes through the running gateway, hands the prompt to
+#     the loaded model, returns the assistant reply. Exit 0 AND
+#     non-empty stdout = the full ollama → openclaw → model path
+#     works end-to-end. The reply gets echoed into the workflow
+#     log as proof of life.
+echo "  confirming openclaw workload is registered with EE..."
 for i in $(seq 1 30); do
   list=$(agent /health 2>/dev/null || true)
   if echo "$list" | jq -e '.deployments // [] | index("openclaw")' >/dev/null 2>&1; then
@@ -216,25 +223,39 @@ for i in $(seq 1 30); do
   sleep 5
 done
 
-# First launch can take a while because of the npm install of
-# @ollama/openclaw + the web-search/fetch plugin. 5 min ceiling.
-echo "  waiting for openclaw gateway to respond to CLI..."
-openclaw_ok=0
+echo "  waiting for openclaw gateway on http://127.0.0.1:18789/healthz..."
+openclaw_live=0
 for i in $(seq 1 60); do
   resp=$(agent /exec -H 'Content-Type: application/json' \
-    -d '{"cmd":["/var/lib/easyenclave/bin/podman","exec","ollama","openclaw","plugins","list"],"timeout_secs":15}' \
+    -d '{"cmd":["/var/lib/easyenclave/bin/podman","exec","ollama","curl","-fsS","http://127.0.0.1:18789/healthz"],"timeout_secs":10}' \
     2>/dev/null || true)
   if echo "$resp" | jq -e '.exit_code == 0' >/dev/null 2>&1; then
-    echo "  openclaw: responding"
-    echo "  plugins:"
-    echo "$resp" | jq -r '.stdout // ""' | sed 's/^/    /'
-    openclaw_ok=1
+    echo "  openclaw: /healthz 200"
+    echo "$resp" | jq -r '.stdout // ""' | head -c 200 | sed 's/^/    /'
+    echo
+    openclaw_live=1
     break
   fi
   sleep 5
 done
-if [ "$openclaw_ok" = "0" ]; then
-  echo "  WARNING: openclaw plugins list never returned — gateway may still be installing"
+
+if [ "$openclaw_live" = "1" ]; then
+  echo "  sending a round-trip prompt: 'ping'"
+  chat=$(agent /exec -H 'Content-Type: application/json' \
+    -d '{"cmd":["/var/lib/easyenclave/bin/podman","exec","ollama","openclaw","agent","--message","ping","--thinking","low"],"timeout_secs":120}' \
+    2>/dev/null || true)
+  reply=$(echo "$chat" | jq -r '.stdout // ""')
+  if [ -n "$reply" ] && echo "$chat" | jq -e '.exit_code == 0' >/dev/null 2>&1; then
+    echo
+    echo "=== openclaw replied ==="
+    echo "$reply"
+    echo "========================"
+  else
+    echo "  WARNING: openclaw agent --message didn't return a reply"
+    echo "  raw: $(echo "$chat" | jq -c '.' | head -c 500)"
+  fi
+else
+  echo "  WARNING: openclaw /healthz never returned 200 — gateway may still be installing (first-run npm)"
   echo "  last /exec response:"
   echo "$resp" | jq -c '.' | head -c 500
 fi
@@ -244,5 +265,5 @@ echo "=== agent fleet summary ==="
 echo "  agent:    https://$agent_host"
 echo "  model:    $MODEL"
 echo "  ollama:   podman container 'ollama' on host net, :11434"
-echo "  openclaw: ollama launch openclaw — plugins listing responded"
+echo "  openclaw: http://127.0.0.1:18789 (gateway), replied to round-trip ping"
 echo "==========================="
