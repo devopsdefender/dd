@@ -124,31 +124,43 @@ done
 #   etc/containers/               containers.conf, policy.json,
 #                                 registries.conf, seccomp.json,
 #                                 storage.conf (tarball defaults)
-# Podman's hardcoded conmon search list includes /usr/libexec/podman/
-# but not /var/lib/easyenclave/bin/, so we symlink conmon to the
-# former. Rootful podman defaults to the systemd cgroup manager,
-# which this guest doesn't have — override to cgroupfs in
-# containers.conf. Use printf (not a heredoc) because busybox sh's
-# `<<EOF` is fragile when piped as a single -c string through jq.
+# EE's guest rootfs has /usr mounted read-only, so we can't drop
+# conmon into podman's default search paths (/usr/libexec/podman/ …).
+# Instead we stage conmon and the podman helpers under our writable
+# /var/lib/easyenclave/bin and point podman there via containers.conf
+# (conmon_path, helper_binaries_dir, [engine.runtimes]).
+#
+# Rootful podman also defaults to the systemd cgroup manager; this
+# guest doesn't have systemd so we override to cgroupfs.
+#
+# Use printf (not a heredoc) because busybox sh's `<<EOF` is fragile
+# when the whole script is passed as a single `-c` string through
+# jq's string encoding.
 echo "  bootstrapping podman (conmon + containers.conf)..."
 bootstrap_sh='set -e
-SRC=/var/lib/easyenclave/bin/podman-linux-amd64
-cp -f $SRC/usr/local/bin/* /var/lib/easyenclave/bin/
-mkdir -p /usr/libexec/podman
-cp -f $SRC/usr/local/lib/podman/conmon /usr/libexec/podman/conmon
-# netavark + aardvark-dns: CNI plugins. We run --net=host so these
-# should be unused, but podman still probes for them during setup.
-cp -f $SRC/usr/local/lib/podman/netavark /var/lib/easyenclave/bin/ 2>/dev/null || true
-cp -f $SRC/usr/local/lib/podman/aardvark-dns /var/lib/easyenclave/bin/ 2>/dev/null || true
+BIN=/var/lib/easyenclave/bin
+SRC=$BIN/podman-linux-amd64
+cp -f $SRC/usr/local/bin/* $BIN/
+cp -f $SRC/usr/local/lib/podman/conmon $BIN/
+cp -f $SRC/usr/local/lib/podman/netavark $BIN/ 2>/dev/null || true
+cp -f $SRC/usr/local/lib/podman/aardvark-dns $BIN/ 2>/dev/null || true
+cp -f $SRC/usr/local/lib/podman/rootlessport $BIN/ 2>/dev/null || true
 mkdir -p /etc/containers
-printf "[engine]\ncgroup_manager = \"cgroupfs\"\nruntime = \"crun\"\n" > /etc/containers/containers.conf
+# /etc is tmpfs-writable on EE; /usr is read-only, hence the
+# explicit conmon_path / helper_binaries_dir pinning below.
+printf "[engine]\nconmon_path = [\"%s/conmon\"]\nhelper_binaries_dir = [\"%s\"]\ncgroup_manager = \"cgroupfs\"\nruntime = \"crun\"\n[engine.runtimes]\ncrun = [\"%s/crun\"]\nrunc = [\"%s/runc\"]\n" $BIN $BIN $BIN $BIN > /etc/containers/containers.conf
 cp -f $SRC/etc/containers/policy.json /etc/containers/ 2>/dev/null || true
 cp -f $SRC/etc/containers/registries.conf /etc/containers/ 2>/dev/null || true
 cp -f $SRC/etc/containers/storage.conf /etc/containers/ 2>/dev/null || true
 echo podman-bootstrap: ok'
 boot_resp=$(agent /exec -H 'Content-Type: application/json' \
   -d "$(jq -c -n --arg s "$bootstrap_sh" '{cmd:["/bin/busybox","sh","-c",$s],timeout_secs:30}')")
-echo "  bootstrap: $(echo "$boot_resp" | jq -r '.stdout // .stderr // ""' | tail -3)"
+if ! echo "$boot_resp" | jq -e '.exit_code == 0' >/dev/null 2>&1; then
+  echo "ERROR: podman bootstrap failed"
+  echo "$boot_resp" | jq .
+  exit 1
+fi
+echo "  bootstrap: $(echo "$boot_resp" | jq -r '.stdout // ""' | tail -1)"
 
 # ── 5. Launch the ollama container (long-running workload) ─────────
 # --net=host  : ollama listens on guest's 127.0.0.1:11434.
@@ -182,16 +194,29 @@ agent /deploy -H 'Content-Type: application/json' -d "$OLLAMA_SPEC" | jq -c '.' 
 # `podman exec ollama ollama list` exits 0 once the server is ready.
 # First run has to pull ~900 MB of container image, so allow plenty.
 echo "  waiting for ollama to be ready (first run pulls the image)..."
+ollama_ready=0
 for i in $(seq 1 120); do
   resp=$(agent /exec -H 'Content-Type: application/json' \
     -d '{"cmd":["/var/lib/easyenclave/bin/podman","exec","ollama","ollama","list"],"timeout_secs":15}' \
     2>/dev/null || true)
   if echo "$resp" | jq -e '.exit_code == 0' >/dev/null 2>&1; then
     echo "  ollama responding"
+    ollama_ready=1
     break
   fi
   sleep 10
 done
+if [ "$ollama_ready" = "0" ]; then
+  echo "ERROR: ollama container never became ready (20 min timeout)"
+  echo "  most recent /exec response:"
+  echo "$resp" | jq .
+  echo "  last 30 lines of 'podman ps -a' + 'podman logs ollama':"
+  agent /exec -H 'Content-Type: application/json' \
+    -d '{"cmd":["/var/lib/easyenclave/bin/podman","ps","-a"],"timeout_secs":10}' | jq -r '.stdout // .stderr // ""'
+  agent /exec -H 'Content-Type: application/json' \
+    -d '{"cmd":["/var/lib/easyenclave/bin/podman","logs","ollama"],"timeout_secs":10}' 2>&1 | jq -r '.stdout // .stderr // ""' | tail -30
+  exit 1
+fi
 
 # ── 7. Pull the model ──────────────────────────────────────────────
 echo "  pulling $MODEL (this can take a few minutes)..."
@@ -200,6 +225,11 @@ pull_resp=$(agent /exec -H 'Content-Type: application/json' \
     cmd:["/var/lib/easyenclave/bin/podman","exec","ollama","ollama","pull",$m],
     timeout_secs:1800
   }')")
+if ! echo "$pull_resp" | jq -e '.exit_code == 0' >/dev/null 2>&1; then
+  echo "ERROR: ollama pull $MODEL failed"
+  echo "$pull_resp" | jq .
+  exit 1
+fi
 echo "  pull: $(echo "$pull_resp" | jq -r '.stdout // "(no stdout)"' | tail -3)"
 
 # ── 8. Launch OpenClaw ─────────────────────────────────────────────
@@ -260,26 +290,27 @@ for i in $(seq 1 60); do
   sleep 5
 done
 
-if [ "$openclaw_live" = "1" ]; then
-  echo "  sending a round-trip prompt: 'ping'"
-  chat=$(agent /exec -H 'Content-Type: application/json' \
-    -d '{"cmd":["/var/lib/easyenclave/bin/podman","exec","ollama","openclaw","agent","--message","ping","--thinking","low"],"timeout_secs":120}' \
-    2>/dev/null || true)
-  reply=$(echo "$chat" | jq -r '.stdout // ""')
-  if [ -n "$reply" ] && echo "$chat" | jq -e '.exit_code == 0' >/dev/null 2>&1; then
-    echo
-    echo "=== openclaw replied ==="
-    echo "$reply"
-    echo "========================"
-  else
-    echo "  WARNING: openclaw agent --message didn't return a reply"
-    echo "  raw: $(echo "$chat" | jq -c '.' | head -c 500)"
-  fi
-else
-  echo "  WARNING: openclaw /healthz never returned 200 — gateway may still be installing (first-run npm)"
+if [ "$openclaw_live" != "1" ]; then
+  echo "ERROR: openclaw /healthz never returned 200 (gateway didn't come up within 5 min)"
   echo "  last /exec response:"
   echo "$resp" | jq -c '.' | head -c 500
+  exit 1
 fi
+
+echo "  sending a round-trip prompt: 'ping'"
+chat=$(agent /exec -H 'Content-Type: application/json' \
+  -d '{"cmd":["/var/lib/easyenclave/bin/podman","exec","ollama","openclaw","agent","--message","ping","--thinking","low"],"timeout_secs":120}' \
+  2>/dev/null || true)
+reply=$(echo "$chat" | jq -r '.stdout // ""')
+if [ -z "$reply" ] || ! echo "$chat" | jq -e '.exit_code == 0' >/dev/null 2>&1; then
+  echo "ERROR: openclaw agent --message didn't return a reply"
+  echo "  raw: $(echo "$chat" | jq -c '.' | head -c 500)"
+  exit 1
+fi
+echo
+echo "=== openclaw replied ==="
+echo "$reply"
+echo "========================"
 
 echo
 echo "=== agent fleet summary ==="
