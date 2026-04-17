@@ -132,6 +132,16 @@ render_domain_xml() {
   sed -i "s|$IMG_DIR/$BASE_DOMAIN.qcow2|$IMG_DIR/dd-local-$name.qcow2|g" "$out"
   sed -i "s|$IMG_DIR/$BASE_DOMAIN-config.iso|$IMG_DIR/dd-local-$name-config.iso|g" "$out"
 
+  # Wire QEMU's tdx-guest to the host's QGS unix socket so the guest's
+  # TDVMCALL for a quote actually reaches Intel's quote-generation
+  # service. Without this, configfs-tsm `outblob` returns 0 bytes →
+  # ITA mint POSTs an empty quote → Intel rejects → agent fails to
+  # register. Idempotent: skips if the launchSecurity element is
+  # already expanded.
+  if grep -q "<launchSecurity type='tdx'/>" "$out"; then
+    sed -i "s|<launchSecurity type='tdx'/>|<launchSecurity type='tdx'><quoteGenerationService path='/var/run/tdx-qgs/qgs.socket'/></launchSecurity>|" "$out"
+  fi
+
   if [ "$with_gpu" != "yes" ]; then
     # Strip the <hostdev ...>…</hostdev> block for the preview VM.
     awk 'BEGIN{skip=0}
