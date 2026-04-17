@@ -28,7 +28,7 @@
     </div>
     <div class="stats">
       <div class="stat"><span class="value">TDX Attested</span><span class="label">Hardware-sealed memory</span></div>
-      <div class="stat"><span class="value">4 Binaries</span><span class="label">dd-client, dd-register, dd-web, easyenclave</span></div>
+      <div class="stat"><span class="value">1 Binary</span><span class="label">devopsdefender (cp + agent modes)</span></div>
       <div class="stat"><span class="value">Open Source</span><span class="label">MIT license</span></div>
     </div>
   </div>
@@ -105,7 +105,7 @@
   <section id="arch" class="section-center">
     <div class="container">
       <h2>Architecture</h2>
-      <p class="subtitle">4 binaries, 2 repos, zero trust.</p>
+      <p class="subtitle">1 binary, 2 modes, zero trust.</p>
       <div class="arch">
 <pre>
 <span class="hl">Customer</span> (browser)
@@ -115,18 +115,19 @@
                                     |
                             <span class="gr">easyenclave</span> (PID 1)
                             ├── unix socket API
-                            ├── workload: <span class="hl">dd-client</span>
-                            │   ├── web dashboard + terminal
+                            ├── workload: <span class="hl">devopsdefender agent</span>
                             │   ├── /health, /deploy, /exec
-                            │   └── Noise WS ──> <span class="hl">dd-register</span>
-                            └── workload: <span class="hl">openclaw + ollama</span>
-                                └── gemma4:e2b (CPU inference)
+                            │   ├── ITA-signed attestation
+                            │   └── registers with devopsdefender cp
+                            └── workload: <span class="hl">openclaw + ollama</span> (podman)
+                                ├── llama3.1:8b (GPU, prod)
+                                └── qwen2.5:0.5b (CPU, preview)
 
-<span class="hl">dd-web</span> (fleet dashboard, N instances)
+<span class="hl">devopsdefender cp</span> (fleet dashboard + management)
   ├── discovers agents via CF tunnels
   ├── scrapes /health (Prometheus-style)
-  ├── GitHub OAuth + JWT auth
-  └── /federate for horizontal scaling
+  ├── verifies agent ITA tokens at /register
+  └── web UI: fleet, per-agent terminal, logs
 </pre>
       </div>
     </div>
@@ -135,13 +136,22 @@
   <section class="section-center">
     <div class="container">
       <h2>Deploy with GitHub Actions</h2>
-      <p class="subtitle">One action to deploy. One action to verify.</p>
+      <p class="subtitle">One action to deploy. One action to verify. Inline spec, no extra files.</p>
       <div class="code-block">
         <div class="code-header">.github/workflows/deploy.yml</div>
 <pre><span class="k">- uses:</span> <span class="s">devopsdefender/dd/.github/actions/deploy-workload@main</span>
   <span class="k">with:</span>
     <span class="k">agent-url:</span> <span class="s">https://app.devopsdefender.com</span>
-    <span class="k">deploy-spec:</span> <span class="s">apps/myapp/deploy.json</span>
+    <span class="c"># deploy-spec: apps/myapp/deploy.json   # or a file path</span>
+    <span class="k">deploy-spec-inline:</span> <span class="s">|</span>
+      <span class="s">{</span>
+        <span class="s">"app_name": "myapp",</span>
+        <span class="s">"github_release": {</span>
+          <span class="s">"repo": "me/myapp",</span>
+          <span class="s">"asset": "myapp-linux-amd64"</span>
+        <span class="s">},</span>
+        <span class="s">"cmd": ["myapp", "serve"]</span>
+      <span class="s">}</span>
 
 <span class="k">- uses:</span> <span class="s">devopsdefender/dd/.github/actions/verify-deployment@main</span>
   <span class="k">with:</span>
