@@ -558,11 +558,11 @@ async fn agent_detail(
         let mut rows = String::new();
         for d in &a.disks {
             rows.push_str(&format!(
-                "<tr><td>{m}</td><td class=\"dim\">{fs}</td><td>{u}/{t} GB</td></tr>",
+                "<tr><td>{m}</td><td class=\"dim\">{fs}</td><td>{u} / {t}</td></tr>",
                 m = html::escape(&d.mount),
                 fs = html::escape(&d.fstype),
-                u = d.used_gb,
-                t = d.total_gb,
+                u = metrics::format_bytes_si(d.used_bytes),
+                t = metrics::format_bytes_si(d.total_bytes),
             ));
         }
         format!(

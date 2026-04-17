@@ -7,8 +7,8 @@ use serde::{Deserialize, Serialize};
 pub struct DiskStats {
     pub mount: String,
     pub fstype: String,
-    pub used_gb: u64,
-    pub total_gb: u64,
+    pub used_bytes: u64,
+    pub total_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -176,12 +176,11 @@ pub async fn collect() -> SysMetrics {
             if blocks == 0 {
                 continue;
             }
-            let gib = 1024u64 * 1024 * 1024;
             m.disks.push(DiskStats {
                 mount: mount.to_string(),
                 fstype: fstype.to_string(),
-                total_gb: frsize.saturating_mul(blocks) / gib,
-                used_gb: frsize.saturating_mul(blocks.saturating_sub(bavail)) / gib,
+                total_bytes: frsize.saturating_mul(blocks),
+                used_bytes: frsize.saturating_mul(blocks.saturating_sub(bavail)),
             });
         }
     }
