@@ -416,9 +416,10 @@ async fn fleet(
     .into_response()
 }
 
-/// GET /api/agents — JSON list of `{agent_id, vm_name, hostname, status}`.
-/// Used by host-side scripts (dd-relaunch.sh) to discover a specific
-/// agent's tunnel hostname after it registers.
+/// GET /api/agents — JSON list of
+/// `{agent_id, vm_name, hostname, status, last_seen}`.
+/// Used by the Local Agents workflow's HTTPS step to discover a
+/// specific agent's tunnel hostname after it re-registers.
 async fn api_agents(
     State(s): State<St>,
     headers: HeaderMap,
