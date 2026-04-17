@@ -298,25 +298,40 @@ async fn register(
     let tunnel = cf::create(&http, &s.cfg.cf, &name, &agent_hostname).await?;
 
     // Seed the store so the dashboard shows the agent before the first
-    // collector tick.
+    // collector tick. Also evict any prior entries with the same
+    // vm_name — a relaunched VM registers a new agent_id/hostname, but
+    // the stale old one hangs around until the collector's dead
+    // threshold (5 min). During that window `/api/agents` returns
+    // duplicates and host-side scripts can pick the dead hostname.
     let now = chrono::Utc::now();
-    s.store.lock().await.insert(
-        name.clone(),
-        collector::Agent {
-            agent_id: name.clone(),
-            hostname: tunnel.hostname.clone(),
-            vm_name: req.vm_name.clone(),
-            attestation_type: "tdx".into(),
-            status: "registered".into(),
-            last_seen: now,
-            deployment_count: 0,
-            deployment_names: Vec::new(),
-            cpu_percent: 0,
-            memory_used_mb: 0,
-            memory_total_mb: 0,
-            ita: ita_claims,
-        },
-    );
+    {
+        let mut store = s.store.lock().await;
+        let stale: Vec<String> = store
+            .iter()
+            .filter(|(id, a)| a.vm_name == req.vm_name && id.as_str() != name)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in stale {
+            store.remove(&id);
+        }
+        store.insert(
+            name.clone(),
+            collector::Agent {
+                agent_id: name.clone(),
+                hostname: tunnel.hostname.clone(),
+                vm_name: req.vm_name.clone(),
+                attestation_type: "tdx".into(),
+                status: "healthy".into(),
+                last_seen: now,
+                deployment_count: 0,
+                deployment_names: Vec::new(),
+                cpu_percent: 0,
+                memory_used_mb: 0,
+                memory_total_mb: 0,
+                ita: ita_claims,
+            },
+        );
+    }
 
     eprintln!(
         "cp: registered {} as {} (login={login})",
