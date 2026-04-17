@@ -51,20 +51,37 @@ env_from_url() {
 }
 
 build_config_iso() {
-  # $1=name, $2=cp_url, $3=env_label
-  local name="$1" cp="$2" env="$3"
+  # $1=name, $2=cp_url, $3=env_label, $4=with_gpu(yes/no)
+  local name="$1" cp="$2" env="$3" with_gpu="$4"
   local out="$IMG_DIR/dd-local-$name-config.iso"
   local tmp
   tmp=$(mktemp -d)
   trap "rm -rf $tmp" RETURN
 
+  # EE reads `agent.env` from the config disk (dotenv: KEY=VALUE per
+  # line). EE_BOOT_WORKLOADS is a JSON-encoded array of workload
+  # specs. The first entry on the GPU VM insmods the nvidia driver
+  # so it's ready by the time the dd-agent comes up.
+  local nv_workload="null"
+  if [ "$with_gpu" = "yes" ]; then
+    nv_workload=$(jq -c -n '{
+      app_name:"nv",
+      cmd:["/bin/busybox","sh","-c",
+           "/sbin/insmod /lib/modules/7.0.0-14-generic/kernel/nvidia-580srv-open/nvidia.ko NVreg_OpenRmEnableUnsupportedGpus=1 2>&1 && echo nv: loaded || echo nv: failed; sleep inf"]
+    }')
+  fi
+
   local workloads
   workloads=$(jq -c -n \
+    --argjson nv "$nv_workload" \
     --arg cp "$cp" --arg pat "$DD_PAT" --arg ita "$DD_ITA_API_KEY" \
     --arg env "$env" --arg vm "dd-local-$name" '[
-      {"github_release":{"repo":"cloudflare/cloudflared","asset":"cloudflared-linux-amd64","rename":"cloudflared"},"app_name":"cloudflared"},
-      {"github_release":{"repo":"devopsdefender/dd","asset":"devopsdefender","tag":"latest"},
-       "cmd":["devopsdefender","agent"],"app_name":"dd-agent",
+      $nv,
+      {"app_name":"cloudflared",
+       "github_release":{"repo":"cloudflare/cloudflared","asset":"cloudflared-linux-amd64","rename":"cloudflared"}},
+      {"app_name":"dd-agent",
+       "github_release":{"repo":"devopsdefender/dd","asset":"devopsdefender","tag":"latest"},
+       "cmd":["devopsdefender","agent"],
        "env":[
          "DD_MODE=agent",
          ("DD_CP_URL=" + $cp), ("DD_PAT=" + $pat), ("DD_ITA_API_KEY=" + $ita),
@@ -74,15 +91,17 @@ build_config_iso() {
          "DD_OWNER=devopsdefender", ("DD_ENV=" + $env), ("DD_VM_NAME=" + $vm),
          "DD_PORT=8080"
        ]}
-    ]')
+    ] | map(select(. != null))')
 
-  jq -c -n --arg wl "$workloads" \
-    '{EE_OWNER:"devopsdefender",EE_BOOT_WORKLOADS:$wl}' > "$tmp/ee-config.json"
+  {
+    echo "EE_OWNER=devopsdefender"
+    echo "EE_BOOT_WORKLOADS=$workloads"
+  } > "$tmp/agent.env"
 
   # ext4 — EE rootfs has no iso9660 module.
   truncate -s 4M "$out"
   mkfs.ext4 -q -d "$tmp" "$out"
-  echo "  wrote $out (env=$env)"
+  echo "  wrote $out (env=$env, gpu=$with_gpu)"
 }
 
 build_overlay() {
@@ -132,7 +151,7 @@ define_agent() {
 
   echo "== dd-local-$name → $cp (env=$env_label, gpu=$with_gpu) =="
   build_overlay "$name"
-  build_config_iso "$name" "$cp" "$env_label"
+  build_config_iso "$name" "$cp" "$env_label" "$with_gpu"
   local xml
   xml=$(render_domain_xml "$name" "$with_gpu")
   virsh destroy "dd-local-$name" 2>/dev/null || true
