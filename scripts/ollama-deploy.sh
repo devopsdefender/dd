@@ -90,13 +90,15 @@ echo "  POST /deploy..."
 deploy_resp=$(agent /deploy -H 'Content-Type: application/json' -d "$SPEC")
 echo "  deploy: $deploy_resp"
 
-# 3. Wait for ollama to listen. Use /exec to probe inside the guest.
-echo "  waiting for ollama on 127.0.0.1:11434..."
+# 3. Wait for ollama to be ready. `ollama list` talks to the local
+# server over 127.0.0.1:11434 and exits 0 once it's up — no need for
+# a separate HTTP client in the guest (EE's busybox has no curl).
+echo "  waiting for ollama to be ready..."
 for i in $(seq 1 60); do
   resp=$(agent /exec -H 'Content-Type: application/json' \
-    -d '{"cmd":["/bin/busybox","sh","-c","curl -fsS http://127.0.0.1:11434/api/tags && echo OK || echo NO"],"timeout_secs":10}' \
+    -d '{"cmd":["/var/lib/easyenclave/bin/ollama","list"],"timeout_secs":10}' \
     2>/dev/null || true)
-  if echo "$resp" | grep -q OK; then
+  if echo "$resp" | jq -e '.exit_code == 0' >/dev/null 2>&1; then
     echo "  ollama responding"
     break
   fi
@@ -112,17 +114,18 @@ pull_resp=$(agent /exec -H 'Content-Type: application/json' \
   }')")
 echo "  pull: $(echo "$pull_resp" | jq -r '.stdout // "(no stdout)"' | tail -5)"
 
-# 5. Sample query.
+# 5. Sample query via `ollama run` — pipes the prompt to the CLI,
+# which talks to the local server and streams the completion to
+# stdout. Keeps the whole pipeline self-contained in the ollama
+# binary (no curl in the EE guest).
 echo "  querying $MODEL..."
 query_resp=$(agent /exec -H 'Content-Type: application/json' \
   -d "$(jq -c -n --arg m "$MODEL" '{
-    cmd:["/bin/busybox","sh","-c",
-      "curl -fsS http://127.0.0.1:11434/api/generate -H '"'"'Content-Type: application/json'"'"' -d "
-        + ("\"{\\\"model\\\":\\\"" + $m + "\\\",\\\"prompt\\\":\\\"write one sentence about trusted execution environments\\\",\\\"stream\\\":false}\"")
-    ],
+    cmd:["/var/lib/easyenclave/bin/ollama","run",$m,
+         "write one sentence about trusted execution environments"],
     timeout_secs:120
   }')")
-response=$(echo "$query_resp" | jq -r '.stdout // "{}"' | jq -r '.response // ""')
+response=$(echo "$query_resp" | jq -r '.stdout // ""')
 if [ -z "$response" ]; then
   echo "ERROR: empty inference response"
   echo "raw: $query_resp" | head -c 500
