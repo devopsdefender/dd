@@ -25,6 +25,11 @@ concurrency:
 
 permissions:
   contents: write
+  # GitHub release attestations (actions/attest-build-provenance).
+  # We sign every published `devopsdefender` binary so the CP can later
+  # verify a registering agent's artifact came from this workflow.
+  id-token: write
+  attestations: write
 
 env:
   DD_DOMAIN: ${{ vars.DD_CF_DOMAIN || 'devopsdefender.com' }}
@@ -68,6 +73,22 @@ jobs:
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
           echo "prerelease=${PRERELEASE}" >> "$GITHUB_OUTPUT"
           echo "sha12=${SHA12}" >> "$GITHUB_OUTPUT"
+
+      # Attest the binary's SHA256 against this workflow's identity
+      # (GitHub's Sigstore-backed signing OIDC'd as
+      #  `https://github.com/devopsdefender/dd/.github/workflows/release.yml@<ref>`).
+      # The attestation is stored on the repo's /attestations endpoint
+      # and retrievable via `gh attestation verify` or the REST API.
+      #
+      # For now we're tracking (not enforcing) — the CP will eventually
+      # use this to verify that a registering agent's artifact came
+      # from this workflow. Skipped on fork PRs (they lack id-token).
+      - name: Attest devopsdefender binary
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: target/x86_64-unknown-linux-musl/release/devopsdefender
+          subject-name: devopsdefender
 
       - name: Publish release
         env:
