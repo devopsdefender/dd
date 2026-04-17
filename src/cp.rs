@@ -437,6 +437,7 @@ async fn api_agents(
                     "vm_name": a.vm_name,
                     "hostname": a.hostname,
                     "status": a.status,
+                    "last_seen": a.last_seen.to_rfc3339(),
                 })
             })
             .collect(),
