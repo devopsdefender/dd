@@ -114,19 +114,37 @@ for i in $(seq 1 60); do
   sleep 5
 done
 
-# ── 4. Bootstrap: flatten bin dir + write containers.conf ──────────
-# Rootful podman defaults to the systemd cgroup manager, which we
-# don't have. Override to cgroupfs. crun is the default runtime in
-# the mgoltzsche tarball; naming it explicitly is belt-and-braces.
-echo "  bootstrapping /etc/containers/containers.conf + flattening /var/lib/easyenclave/bin..."
+# ── 4. Bootstrap: stage podman's helper binaries + containers.conf ─
+# mgoltzsche's tarball layout:
+#   usr/local/bin/                podman, crun, runc, fuse-overlayfs,
+#                                 fusermount3, pasta, pasta.avx2
+#   usr/local/lib/podman/         conmon, netavark, aardvark-dns,
+#                                 rootlessport, catatonit
+#   usr/local/libexec/podman/     quadlet
+#   etc/containers/               containers.conf, policy.json,
+#                                 registries.conf, seccomp.json,
+#                                 storage.conf (tarball defaults)
+# Podman's hardcoded conmon search list includes /usr/libexec/podman/
+# but not /var/lib/easyenclave/bin/, so we symlink conmon to the
+# former. Rootful podman defaults to the systemd cgroup manager,
+# which this guest doesn't have — override to cgroupfs in
+# containers.conf. Use printf (not a heredoc) because busybox sh's
+# `<<EOF` is fragile when piped as a single -c string through jq.
+echo "  bootstrapping podman (conmon + containers.conf)..."
 bootstrap_sh='set -e
-cp -f /var/lib/easyenclave/bin/podman-linux-amd64/usr/local/bin/* /var/lib/easyenclave/bin/
+SRC=/var/lib/easyenclave/bin/podman-linux-amd64
+cp -f $SRC/usr/local/bin/* /var/lib/easyenclave/bin/
+mkdir -p /usr/libexec/podman
+cp -f $SRC/usr/local/lib/podman/conmon /usr/libexec/podman/conmon
+# netavark + aardvark-dns: CNI plugins. We run --net=host so these
+# should be unused, but podman still probes for them during setup.
+cp -f $SRC/usr/local/lib/podman/netavark /var/lib/easyenclave/bin/ 2>/dev/null || true
+cp -f $SRC/usr/local/lib/podman/aardvark-dns /var/lib/easyenclave/bin/ 2>/dev/null || true
 mkdir -p /etc/containers
-cat > /etc/containers/containers.conf <<EOF
-[engine]
-cgroup_manager = "cgroupfs"
-runtime = "crun"
-EOF
+printf "[engine]\ncgroup_manager = \"cgroupfs\"\nruntime = \"crun\"\n" > /etc/containers/containers.conf
+cp -f $SRC/etc/containers/policy.json /etc/containers/ 2>/dev/null || true
+cp -f $SRC/etc/containers/registries.conf /etc/containers/ 2>/dev/null || true
+cp -f $SRC/etc/containers/storage.conf /etc/containers/ 2>/dev/null || true
 echo podman-bootstrap: ok'
 boot_resp=$(agent /exec -H 'Content-Type: application/json' \
   -d "$(jq -c -n --arg s "$bootstrap_sh" '{cmd:["/bin/busybox","sh","-c",$s],timeout_secs:30}')")
