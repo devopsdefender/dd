@@ -79,74 +79,45 @@ DD_ITA_JWKS_URL="${DD_ITA_JWKS_URL:-https://portal.trustauthority.intel.com/cert
 DD_ITA_ISSUER="${DD_ITA_ISSUER:-https://portal.trustauthority.intel.com}"
 
 # ── Build the workload spec ──────────────────────────────────────────────
-# Two boot workloads:
-#   1. cloudflared — fetch-only. easyenclave downloads cloudflare's
-#      static binary from their GitHub release, symlinks it as
-#      `cloudflared`, and exits the deploy as "completed". The binary
-#      sits on PATH for dd-register to spawn.
-#   2. dd-management — fetches the devopsdefender binary from our own
-#      release and runs it. dd-register + dd-web both live in this
-#      single process (DD_MODE=management).
-EE_BOOT_WORKLOADS=$(jq -c -n \
-  --arg dd_tag         "$DD_RELEASE_TAG" \
-  --arg cf_token       "$CLOUDFLARE_API_TOKEN" \
-  --arg cf_account     "$CLOUDFLARE_ACCOUNT_ID" \
-  --arg cf_zone        "$CLOUDFLARE_ZONE_ID" \
-  --arg domain         "$DD_DOMAIN" \
-  --arg hostname       "$DD_HOSTNAME" \
-  --arg env            "$DD_ENV" \
-  --arg gh_client_id   "$DD_GITHUB_CLIENT_ID" \
-  --arg gh_client_secret "$DD_GITHUB_CLIENT_SECRET" \
-  --arg gh_callback    "$DD_GITHUB_CALLBACK_URL" \
-  --arg ita_api_key    "$DD_ITA_API_KEY" \
-  --arg ita_base_url   "$DD_ITA_BASE_URL" \
-  --arg ita_jwks_url   "$DD_ITA_JWKS_URL" \
-  --arg ita_issuer     "$DD_ITA_ISSUER" \
-  '[
-    {
-      "github_release": {
-        "repo": "cloudflare/cloudflared",
-        "asset": "cloudflared-linux-amd64",
-        "rename": "cloudflared"
-      },
-      "app_name": "cloudflared"
-    },
-    {
-      "github_release": {
-        "repo": "devopsdefender/dd",
-        "asset": "devopsdefender",
-        "tag": $dd_tag
-      },
-      "cmd": ["devopsdefender"],
-      "app_name": "dd-management",
-      "env": (
-        [
-          "DD_MODE=management",
-          ("DD_CF_API_TOKEN="   + $cf_token),
-          ("DD_CF_ACCOUNT_ID="  + $cf_account),
-          ("DD_CF_ZONE_ID="     + $cf_zone),
-          ("DD_CF_DOMAIN="      + $domain),
-          ("DD_HOSTNAME="       + $hostname),
-          ("DD_ENV="            + $env),
-          "DD_OWNER=devopsdefender",
-          "DD_REGISTER_PORT=8081",
-          "DD_OIDC_AUDIENCE=dd-web",
-          "DD_PORT=8080"
-        ]
-        + (if $gh_client_id == "" then [] else [
-          ("DD_GITHUB_CLIENT_ID="     + $gh_client_id),
-          ("DD_GITHUB_CLIENT_SECRET=" + $gh_client_secret),
-          ("DD_GITHUB_CALLBACK_URL="  + $gh_callback)
-        ] end)
-        + [
-          ("DD_ITA_API_KEY="          + $ita_api_key),
-          ("DD_ITA_BASE_URL="         + $ita_base_url),
-          ("DD_ITA_JWKS_URL="         + $ita_jwks_url),
-          ("DD_ITA_ISSUER="           + $ita_issuer)
-        ]
-      )
-    }
-  ]')
+# Boot workloads come from apps/<name>/workload.{json,json.tmpl}. Same
+# file per workload whether this CP runs in prod, staging, or a PR
+# preview; only the env-var substitutions differ.
+#
+#   cloudflared    — fetch-only, puts the binary on PATH for DD to spawn.
+#   dd-management  — devopsdefender in DD_MODE=management (CP + dashboard).
+#
+# Empty ${DD_GITHUB_CLIENT_ID} etc produce empty "KEY=" strings; the
+# bake helper strips those so the resulting spec matches the old
+# `if $gh_client_id == "" then [] else [...]` conditional.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+# shellcheck source=./workloads.sh
+source "$SCRIPT_DIR/workloads.sh"
+EE_BOOT_WORKLOADS=$(
+  DD_RELEASE_TAG="$DD_RELEASE_TAG" \
+  CLOUDFLARE_API_TOKEN="$CLOUDFLARE_API_TOKEN" \
+  CLOUDFLARE_ACCOUNT_ID="$CLOUDFLARE_ACCOUNT_ID" \
+  CLOUDFLARE_ZONE_ID="$CLOUDFLARE_ZONE_ID" \
+  DD_DOMAIN="$DD_DOMAIN" \
+  DD_HOSTNAME="$DD_HOSTNAME" \
+  DD_ENV="$DD_ENV" \
+  DD_GITHUB_CLIENT_ID="$DD_GITHUB_CLIENT_ID" \
+  DD_GITHUB_CLIENT_SECRET="$DD_GITHUB_CLIENT_SECRET" \
+  DD_GITHUB_CALLBACK_URL="$DD_GITHUB_CALLBACK_URL" \
+  DD_ITA_API_KEY="$DD_ITA_API_KEY" \
+  DD_ITA_BASE_URL="$DD_ITA_BASE_URL" \
+  DD_ITA_JWKS_URL="$DD_ITA_JWKS_URL" \
+  DD_ITA_ISSUER="$DD_ITA_ISSUER" \
+  join \
+    "$REPO_ROOT/apps/cloudflared/workload.json" \
+    "$REPO_ROOT/apps/dd-management/workload.json.tmpl"
+)
+# ollama + openclaw are NOT baked into the CP preview. EE's tmpfs
+# /var/lib/easyenclave is too small for the 900 MB container image,
+# and attaching a scratch PD here would duplicate what the local
+# dd-local-preview VM already provides via its vdc ext4 disk. The
+# preview CP stays slim; the ollama+openclaw demo registers from
+# dd-local-preview (scripts/local-agents.sh).
 
 # ── Wrap into ee-config ───────────────────────────────────────────────────
 jq -c -n \

@@ -255,3 +255,8 @@ echo
 echo "watch registration (Ctrl-] to exit):"
 [ -n "$PREVIEW_CP" ] && echo "  virsh console dd-local-preview"
 [ -n "$PROD_CP"    ] && echo "  virsh console dd-local-prod"
+
+# Explicit 0 — the tail `[ -n "$PROD_CP" ] && …` returns 1 when
+# PROD_CP="" (preview-only), bubbling up as the script exit status
+# and tripping set -e in dd-relaunch.sh. Force success.
+exit 0

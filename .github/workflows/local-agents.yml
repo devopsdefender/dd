@@ -4,6 +4,9 @@ name: Local Agents
 # corresponding CP gets new code:
 #   - Production Deploy success → reboot dd-local-prod against app.devopsdefender.com
 #   - Release success on a PR    → reboot dd-local-preview against pr-N.devopsdefender.com
+#   - Open PR's push            → reboot dd-local-preview against pr-N, pulling
+#                                  the PR's ref so e2e tests exercise the PR's
+#                                  scripts/apps/ tree, not main's.
 #
 # SSHs in via key auth to a public-IP host, then invokes
 # scripts/dd-relaunch.sh which handles the destroy/recreate cycle.
@@ -12,11 +15,17 @@ on:
   workflow_run:
     workflows: ["Release", "Production Deploy"]
     types: [completed]
-  # Every non-README push to main also fires a prod relaunch directly,
-  # so fixes to the relaunch / deploy scripts get exercised even when
-  # they don't cascade through Release → Production Deploy.
+  # Every non-README push to main fires a prod relaunch directly.
   push:
     branches: [main]
+    paths-ignore:
+      - "README.md"
+  # PR updates fire a preview relaunch on dd-local-preview, using the
+  # PR's own scripts/local-agents.sh + apps/ tree. End-to-end tests
+  # the PR's deployment code (not main's). Races with Release's
+  # deploy-preview that creates the pr-N CP; we poll that CP's /health
+  # before SSHing so the agent registers cleanly.
+  pull_request:
     paths-ignore:
       - "README.md"
   workflow_dispatch:
@@ -35,7 +44,7 @@ permissions:
   pull-requests: read
 
 concurrency:
-  group: local-agents-${{ github.event.workflow_run.name || github.event.inputs.kind }}
+  group: local-agents-${{ github.event.pull_request.number || github.event.workflow_run.name || github.event.inputs.kind || 'prod' }}
   cancel-in-progress: false
 
 jobs:
@@ -43,6 +52,7 @@ jobs:
     if: |
       github.event_name == 'workflow_dispatch'
       || github.event_name == 'push'
+      || github.event_name == 'pull_request'
       || github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     steps:
@@ -55,15 +65,26 @@ jobs:
           BRANCH: ${{ github.event.workflow_run.head_branch }}
           DISPATCH_KIND: ${{ github.event.inputs.kind }}
           DISPATCH_URL: ${{ github.event.inputs.cp_url }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
         run: |
           if [ "$EVENT" = "workflow_dispatch" ]; then
             echo "kind=$DISPATCH_KIND" >> "$GITHUB_OUTPUT"
             echo "url=$DISPATCH_URL"   >> "$GITHUB_OUTPUT"
+            echo "ref=main"            >> "$GITHUB_OUTPUT"
+          elif [ "$EVENT" = "pull_request" ]; then
+            # PR update → test dd-local-preview against the PR's CP
+            # using the PR's own scripts/apps. Exercises the full
+            # containerised boot chain end-to-end.
+            echo "kind=preview" >> "$GITHUB_OUTPUT"
+            echo "url=https://pr-$PR_NUMBER.devopsdefender.com" >> "$GITHUB_OUTPUT"
+            echo "ref=$PR_HEAD_REF" >> "$GITHUB_OUTPUT"
           elif [ "$EVENT" = "push" ] || [ "$WF" = "Production Deploy" ]; then
             # push-to-main on local-agent scripts, or a prod CP redeploy
             # → relaunch dd-local-prod against the live prod CP.
             echo "kind=prod" >> "$GITHUB_OUTPUT"
             echo "url=https://app.devopsdefender.com" >> "$GITHUB_OUTPUT"
+            echo "ref=main"  >> "$GITHUB_OUTPUT"
           else
             # Release on a PR: derive pr-N. Released-on-main returns
             # no open PR → skip (Production Deploy will fire shortly).
@@ -73,14 +94,38 @@ jobs:
             if [ -n "$pr" ]; then
               echo "kind=preview" >> "$GITHUB_OUTPUT"
               echo "url=https://pr-$pr.devopsdefender.com" >> "$GITHUB_OUTPUT"
+              echo "ref=$BRANCH" >> "$GITHUB_OUTPUT"
             else
               echo "kind=skip" >> "$GITHUB_OUTPUT"
             fi
           fi
 
-      # Step 1: SSH in and relaunch the VM (destroy + redefine + start).
-      # Finishes in ~10 s — doesn't need keepalives. Only does the
-      # libvirt operations that require host-level access.
+      # Wait for the target CP to be reachable before relaunching.
+      # On pull_request we fire in parallel with Release's deploy-preview
+      # which takes ~3 min to stand up the pr-N CP; without this wait the
+      # agent would start registering against a CP that doesn't exist yet
+      # and fail with DNS errors. /health is public; no auth needed.
+      - name: Wait for CP to be healthy
+        if: steps.pick.outputs.kind != 'skip'
+        env:
+          URL: ${{ steps.pick.outputs.url }}
+        run: |
+          for i in $(seq 1 60); do
+            if curl -fsS --max-time 5 "$URL/health" >/dev/null 2>&1; then
+              echo "CP $URL healthy after ${i} attempts"
+              exit 0
+            fi
+            echo "  waiting for $URL... (${i}/60)"
+            sleep 10
+          done
+          echo "::error::CP $URL never came up within 10 min"
+          exit 1
+
+      # SSH in and relaunch the VM (destroy + redefine + start). Finishes
+      # in ~10 s — the baked config.iso's EE_BOOT_WORKLOADS now includes
+      # podman + ollama + openclaw + cloudflared + dd-agent, so there's
+      # no separate HTTPS deploy step needed. Workloads self-sequence via
+      # `until` loops in their cmd scripts (see apps/*/workload.json).
       - name: ssh + relaunch VM
         if: steps.pick.outputs.kind != 'skip'
         env:
@@ -90,6 +135,7 @@ jobs:
           DD_ITA_API_KEY: ${{ secrets.DD_ITA_API_KEY }}
           KIND:           ${{ steps.pick.outputs.kind }}
           URL:            ${{ steps.pick.outputs.url }}
+          REF:            ${{ steps.pick.outputs.ref }}
         run: |
           mkdir -p ~/.ssh
           printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
@@ -97,15 +143,83 @@ jobs:
           ssh-keyscan -H "$HOST" >> ~/.ssh/known_hosts 2>/dev/null
           ssh -o BatchMode=yes -o StrictHostKeyChecking=yes \
               -i ~/.ssh/id_ed25519 "tdx2@$HOST" \
-              "DD_PAT='$DD_PAT' DD_ITA_API_KEY='$DD_ITA_API_KEY' /home/tdx2/src/dd/scripts/dd-relaunch.sh '$KIND' '$URL'"
+              "DD_PAT='$DD_PAT' DD_ITA_API_KEY='$DD_ITA_API_KEY' /home/tdx2/src/dd/scripts/dd-relaunch.sh '$KIND' '$URL' '$REF'"
 
-      # Step 2: Deploy ollama / pull model / sample query. Pure HTTPS
-      # against the CP + the newly-registered agent's tunnel. Can take
-      # minutes (model pull) — no SSH to keep alive.
-      - name: deploy ollama (HTTPS)
-        if: steps.pick.outputs.kind != 'skip'
+      # Verify dd-local-preview registered and openclaw is responding.
+      # Only runs on pull_request + workflow_dispatch kind=preview —
+      # those are the flows where we own the VM's full lifecycle in
+      # this workflow run. For prod flows we'd rather not block a CP
+      # redeploy on openclaw readiness.
+      - name: Verify dd-local-preview openclaw round-trip
+        if: |
+          steps.pick.outputs.kind == 'preview'
+          && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
         env:
           DD_PAT: ${{ secrets.GITHUB_TOKEN }}
-          KIND:   ${{ steps.pick.outputs.kind }}
           URL:    ${{ steps.pick.outputs.url }}
-        run: ./scripts/ollama-deploy.sh "$KIND" "$URL"
+        run: |
+          AUTH=(-H "Authorization: Bearer $DD_PAT")
+          # Find the freshly-registered dd-local-preview agent.
+          started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          agent_host=""
+          for i in $(seq 1 60); do
+            agent_host=$(curl -fsS "${AUTH[@]}" "$URL/api/agents" 2>/dev/null \
+              | jq -r --arg since "$started_at" '
+                  [.[] | select(.vm_name=="dd-local-preview" and .status=="healthy" and .last_seen > $since)]
+                  | sort_by(.last_seen) | reverse | .[0].hostname // empty' 2>/dev/null || true)
+            [ -n "$agent_host" ] && [ "$agent_host" != "null" ] && break
+            sleep 10
+          done
+          if [ -z "$agent_host" ] || [ "$agent_host" = "null" ]; then
+            echo "::error::dd-local-preview never registered with $URL within 10 min"
+            exit 1
+          fi
+          echo "  agent: https://$agent_host"
+          # Poll openclaw /healthz via podman exec through the agent's /exec.
+          # First run pulls ~900 MB image + qwen2.5:0.5b (~400 MB) + npm installs
+          # @ollama/openclaw. 15 min ceiling covers a cold cache.
+          # First-boot: ~900 MB image pull + qwen2.5:0.5b (~400 MB) + npm
+          # install of @ollama/openclaw. 30-min ceiling covers a fully
+          # cold vdc. Cached-run completes in <2 min.
+          #
+          # Every 6th tick (1 min) probe what's actually running inside
+          # the ollama container via /exec — gives us live visibility
+          # into where in the ollama → openclaw launch chain we're stuck.
+          probe() {
+            echo "  -- probe t+${1}s:"
+            # Is openclaw process running inside the container?
+            curl -fsS --max-time 15 "${AUTH[@]}" -H 'content-type: application/json' \
+              "https://$agent_host/exec" \
+              -d '{"cmd":["/var/lib/easyenclave/bin/dd-podman","exec","ollama","sh","-c","ps -ef 2>/dev/null | grep -E \"openclaw|ollama\" | grep -v grep | head -10"],"timeout_secs":15}' \
+              2>/dev/null | jq -r '.stdout // ""' | sed 's/^/    /'
+            # What models has ollama seen?
+            curl -fsS --max-time 15 "${AUTH[@]}" -H 'content-type: application/json' \
+              "https://$agent_host/exec" \
+              -d '{"cmd":["/var/lib/easyenclave/bin/dd-podman","exec","ollama","ollama","list"],"timeout_secs":15}' \
+              2>/dev/null | jq -r '.stdout // ""' | sed 's/^/    [ollama list] /'
+          }
+          for i in $(seq 1 180); do
+            resp=$(curl -fsS --max-time 30 "${AUTH[@]}" -H 'content-type: application/json' \
+              "https://$agent_host/exec" \
+              -d '{"cmd":["/var/lib/easyenclave/bin/dd-podman","exec","ollama","curl","-fsS","http://127.0.0.1:18789/healthz"],"timeout_secs":15}' \
+              2>/dev/null || true)
+            if echo "$resp" | jq -e '.exit_code == 0' >/dev/null 2>&1; then
+              echo "  openclaw /healthz 200"
+              echo "$resp" | jq -r '.stdout // ""' | head -c 400
+              echo
+              exit 0
+            fi
+            echo "  waiting for openclaw gateway... (${i}/180)"
+            if [ $((i % 6)) -eq 0 ]; then
+              probe $((i * 10)) || true
+            fi
+            sleep 10
+          done
+          echo "::error::openclaw /healthz never returned 200 within 30 min"
+          # Dump openclaw workload log tail for post-mortem.
+          echo "--- openclaw workload log ---"
+          curl -fsS --max-time 30 "${AUTH[@]}" \
+            "https://$agent_host/exec" \
+            -d '{"cmd":["/var/lib/easyenclave/bin/dd-podman","exec","ollama","sh","-c","ps -ef | grep -i openclaw; ls -la /root/.openclaw 2>&1 | head -20"],"timeout_secs":15}' \
+            2>/dev/null | jq -r '.stdout // .stderr // ""'
+          exit 1

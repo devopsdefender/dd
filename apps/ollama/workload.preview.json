@@ -1,0 +1,7 @@
+{
+  "app_name": "ollama",
+  "cmd": [
+    "/bin/busybox", "sh", "-c",
+    "until [ -x /var/lib/easyenclave/bin/dd-podman ]; do sleep 2; done\nexec /var/lib/easyenclave/bin/dd-podman run --rm --name ollama --network=host -v /var/lib/easyenclave/ollama:/root/.ollama -e OLLAMA_HOST=127.0.0.1:11434 docker.io/ollama/ollama:latest serve"
+  ]
+}

@@ -16,6 +16,7 @@ set -euo pipefail
 
 KIND="${1?usage: dd-relaunch.sh <prod|preview> <cp-url>}"
 CP="${2?cp url required}"
+REF="${3:-main}"
 : "${DD_PAT?DD_PAT must be set}"
 : "${DD_ITA_API_KEY?DD_ITA_API_KEY must be set}"
 
@@ -30,8 +31,11 @@ cd /home/tdx2/src/dd
 # dirty working tree elsewhere doesn't block the deploy. The relaunch
 # script itself has already been read into memory by bash, so the
 # update takes effect on the *next* invocation.
-git fetch --quiet origin main
-git checkout --quiet origin/main -- scripts/local-agents.sh scripts/dd-relaunch.sh
+git fetch --quiet origin "$REF"
+git checkout --quiet "origin/$REF" -- scripts/local-agents.sh scripts/dd-relaunch.sh
+git checkout --quiet "origin/$REF" -- scripts/workloads.sh 2>/dev/null || true
+git checkout --quiet "origin/$REF" -- apps/ 2>/dev/null || true
+echo "dd-relaunch: refreshed scripts + apps/ from origin/$REF"
 
 vm="dd-local-$KIND"
 overlay="/var/lib/libvirt/images/$vm.qcow2"
