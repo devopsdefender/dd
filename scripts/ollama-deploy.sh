@@ -114,29 +114,24 @@ for i in $(seq 1 60); do
   sleep 5
 done
 
-# ── 4. Bootstrap: stage podman's helper binaries + containers.conf ─
+# ── 4. Bootstrap: stage podman's helper binaries ───────────────────
 # mgoltzsche's tarball layout:
 #   usr/local/bin/                podman, crun, runc, fuse-overlayfs,
 #                                 fusermount3, pasta, pasta.avx2
 #   usr/local/lib/podman/         conmon, netavark, aardvark-dns,
 #                                 rootlessport, catatonit
-#   usr/local/libexec/podman/     quadlet
-#   etc/containers/               containers.conf, policy.json,
-#                                 registries.conf, seccomp.json,
-#                                 storage.conf (tarball defaults)
-# EE's guest rootfs has /usr mounted read-only, so we can't drop
-# conmon into podman's default search paths (/usr/libexec/podman/ …).
-# Instead we stage conmon and the podman helpers under our writable
-# /var/lib/easyenclave/bin and point podman there via containers.conf
-# (conmon_path, helper_binaries_dir, [engine.runtimes]).
+# EE's guest rootfs has BOTH /usr AND /etc mounted read-only. The
+# only writable paths are under /var/lib/easyenclave (on the
+# persistent vdc ext4 disk) and /run/tmp-style tmpfs locations. So
+# we cannot write a containers.conf anywhere podman looks for one,
+# and we cannot cp conmon into any of podman's hardcoded search
+# dirs. Every path has to be on the podman CLI directly.
 #
-# Rootful podman also defaults to the systemd cgroup manager; this
-# guest doesn't have systemd so we override to cgroupfs.
-#
-# Use printf (not a heredoc) because busybox sh's `<<EOF` is fragile
-# when the whole script is passed as a single `-c` string through
-# jq's string encoding.
-echo "  bootstrapping podman (conmon + containers.conf)..."
+# We DO stage the helpers into /var/lib/easyenclave/bin so the
+# container workload's `cmd[0]` can reach `podman`, and the
+# --conmon / --runtime / --root / --runroot flags on the `podman`
+# command (see step 5) point podman at the rest.
+echo "  bootstrapping podman (staging binaries to writable dirs)..."
 bootstrap_sh='set -e
 BIN=/var/lib/easyenclave/bin
 SRC=$BIN/podman-linux-amd64
@@ -145,13 +140,7 @@ cp -f $SRC/usr/local/lib/podman/conmon $BIN/
 cp -f $SRC/usr/local/lib/podman/netavark $BIN/ 2>/dev/null || true
 cp -f $SRC/usr/local/lib/podman/aardvark-dns $BIN/ 2>/dev/null || true
 cp -f $SRC/usr/local/lib/podman/rootlessport $BIN/ 2>/dev/null || true
-mkdir -p /etc/containers
-# /etc is tmpfs-writable on EE; /usr is read-only, hence the
-# explicit conmon_path / helper_binaries_dir pinning below.
-printf "[engine]\nconmon_path = [\"%s/conmon\"]\nhelper_binaries_dir = [\"%s\"]\ncgroup_manager = \"cgroupfs\"\nruntime = \"crun\"\n[engine.runtimes]\ncrun = [\"%s/crun\"]\nrunc = [\"%s/runc\"]\n" $BIN $BIN $BIN $BIN > /etc/containers/containers.conf
-cp -f $SRC/etc/containers/policy.json /etc/containers/ 2>/dev/null || true
-cp -f $SRC/etc/containers/registries.conf /etc/containers/ 2>/dev/null || true
-cp -f $SRC/etc/containers/storage.conf /etc/containers/ 2>/dev/null || true
+mkdir -p /var/lib/easyenclave/containers/storage /var/lib/easyenclave/containers/runroot
 echo podman-bootstrap: ok'
 boot_resp=$(agent /exec -H 'Content-Type: application/json' \
   -d "$(jq -c -n --arg s "$bootstrap_sh" '{cmd:["/bin/busybox","sh","-c",$s],timeout_secs:30}')")
@@ -174,13 +163,26 @@ echo "  bootstrap: $(echo "$boot_resp" | jq -r '.stdout // ""' | tail -1)"
 #               in local-agents.sh); doubles as ollama's model cache
 #               and openclaw's npm prefix.
 echo "  POST /deploy ollama container..."
+# Every writable path (--root, --runroot, --conmon, --runtime) is
+# on the CLI because EE's /etc and /usr are read-only — podman
+# can't fall back on /etc/containers/containers.conf the way it
+# normally does. Storage lives on the persistent vdc disk so the
+# 900 MB ollama image pull survives VM relaunches.
+# --cgroup-manager=cgroupfs because there's no systemd in the guest.
+# --network=host so ollama's :11434 binds on the VM's loopback,
+# reachable from other EE workloads (like openclaw) and via /exec.
 OLLAMA_SPEC=$(jq -c -n --argjson gpu "$GPU_FLAGS" '{
   app_name: "ollama",
   cmd: ([
-    "/var/lib/easyenclave/bin/podman", "run",
+    "/var/lib/easyenclave/bin/podman",
+    "--conmon=/var/lib/easyenclave/bin/conmon",
+    "--runtime=/var/lib/easyenclave/bin/crun",
+    "--root=/var/lib/easyenclave/containers/storage",
+    "--runroot=/var/lib/easyenclave/containers/runroot",
+    "--cgroup-manager=cgroupfs",
+    "run",
     "--rm", "--name", "ollama",
-    "--net=host",
-    "--cgroup-manager=cgroupfs"
+    "--network=host"
   ] + $gpu + [
     "-v", "/var/lib/easyenclave/ollama:/root/.ollama",
     "-e", "OLLAMA_HOST=127.0.0.1:11434",
@@ -197,7 +199,7 @@ echo "  waiting for ollama to be ready (first run pulls the image)..."
 ollama_ready=0
 for i in $(seq 1 120); do
   resp=$(agent /exec -H 'Content-Type: application/json' \
-    -d '{"cmd":["/var/lib/easyenclave/bin/podman","exec","ollama","ollama","list"],"timeout_secs":15}' \
+    -d '{"cmd":["/var/lib/easyenclave/bin/podman","--root=/var/lib/easyenclave/containers/storage","--runroot=/var/lib/easyenclave/containers/runroot","--cgroup-manager=cgroupfs","exec","ollama","ollama","list"],"timeout_secs":15}' \
     2>/dev/null || true)
   if echo "$resp" | jq -e '.exit_code == 0' >/dev/null 2>&1; then
     echo "  ollama responding"
@@ -212,9 +214,9 @@ if [ "$ollama_ready" = "0" ]; then
   echo "$resp" | jq .
   echo "  last 30 lines of 'podman ps -a' + 'podman logs ollama':"
   agent /exec -H 'Content-Type: application/json' \
-    -d '{"cmd":["/var/lib/easyenclave/bin/podman","ps","-a"],"timeout_secs":10}' | jq -r '.stdout // .stderr // ""'
+    -d '{"cmd":["/var/lib/easyenclave/bin/podman","--root=/var/lib/easyenclave/containers/storage","--runroot=/var/lib/easyenclave/containers/runroot","ps","-a"],"timeout_secs":10}' | jq -r '.stdout // .stderr // ""'
   agent /exec -H 'Content-Type: application/json' \
-    -d '{"cmd":["/var/lib/easyenclave/bin/podman","logs","ollama"],"timeout_secs":10}' 2>&1 | jq -r '.stdout // .stderr // ""' | tail -30
+    -d '{"cmd":["/var/lib/easyenclave/bin/podman","--root=/var/lib/easyenclave/containers/storage","--runroot=/var/lib/easyenclave/containers/runroot","logs","ollama"],"timeout_secs":10}' 2>&1 | jq -r '.stdout // .stderr // ""' | tail -30
   exit 1
 fi
 
@@ -222,7 +224,7 @@ fi
 echo "  pulling $MODEL (this can take a few minutes)..."
 pull_resp=$(agent /exec -H 'Content-Type: application/json' \
   -d "$(jq -c -n --arg m "$MODEL" '{
-    cmd:["/var/lib/easyenclave/bin/podman","exec","ollama","ollama","pull",$m],
+    cmd:["/var/lib/easyenclave/bin/podman","--root=/var/lib/easyenclave/containers/storage","--runroot=/var/lib/easyenclave/containers/runroot","--cgroup-manager=cgroupfs","exec","ollama","ollama","pull",$m],
     timeout_secs:1800
   }')")
 if ! echo "$pull_resp" | jq -e '.exit_code == 0' >/dev/null 2>&1; then
@@ -240,7 +242,11 @@ echo "  POST /deploy openclaw..."
 OPENCLAW_SPEC=$(jq -c -n --arg m "$MODEL" '{
   app_name: "openclaw",
   cmd: [
-    "/var/lib/easyenclave/bin/podman", "exec", "ollama",
+    "/var/lib/easyenclave/bin/podman",
+    "--root=/var/lib/easyenclave/containers/storage",
+    "--runroot=/var/lib/easyenclave/containers/runroot",
+    "--cgroup-manager=cgroupfs",
+    "exec", "ollama",
     "ollama", "launch", "openclaw",
     "--model", $m,
     "--yes"
@@ -278,7 +284,7 @@ echo "  waiting for openclaw gateway on http://127.0.0.1:18789/healthz..."
 openclaw_live=0
 for i in $(seq 1 60); do
   resp=$(agent /exec -H 'Content-Type: application/json' \
-    -d '{"cmd":["/var/lib/easyenclave/bin/podman","exec","ollama","curl","-fsS","http://127.0.0.1:18789/healthz"],"timeout_secs":10}' \
+    -d '{"cmd":["/var/lib/easyenclave/bin/podman","--root=/var/lib/easyenclave/containers/storage","--runroot=/var/lib/easyenclave/containers/runroot","--cgroup-manager=cgroupfs","exec","ollama","curl","-fsS","http://127.0.0.1:18789/healthz"],"timeout_secs":10}' \
     2>/dev/null || true)
   if echo "$resp" | jq -e '.exit_code == 0' >/dev/null 2>&1; then
     echo "  openclaw: /healthz 200"
@@ -299,7 +305,7 @@ fi
 
 echo "  sending a round-trip prompt: 'ping'"
 chat=$(agent /exec -H 'Content-Type: application/json' \
-  -d '{"cmd":["/var/lib/easyenclave/bin/podman","exec","ollama","openclaw","agent","--message","ping","--thinking","low"],"timeout_secs":120}' \
+  -d '{"cmd":["/var/lib/easyenclave/bin/podman","--root=/var/lib/easyenclave/containers/storage","--runroot=/var/lib/easyenclave/containers/runroot","--cgroup-manager=cgroupfs","exec","ollama","openclaw","agent","--message","ping","--thinking","low"],"timeout_secs":120}' \
   2>/dev/null || true)
 reply=$(echo "$chat" | jq -r '.stdout // ""')
 if [ -z "$reply" ] || ! echo "$chat" | jq -e '.exit_code == 0' >/dev/null 2>&1; then
