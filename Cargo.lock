@@ -351,11 +351,13 @@ dependencies = [
  "chrono",
  "dd-common",
  "futures-util",
+ "jsonwebtoken",
  "libc",
  "reqwest",
  "serde",
  "serde_json",
  "snow",
+ "thiserror 2.0.18",
  "tokio",
  "uuid",
 ]

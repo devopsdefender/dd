@@ -5,7 +5,9 @@
 //! payload, and dd-register provisions a Cloudflare tunnel + DNS record
 //! for the agent via dd_common::tunnel.
 
+use crate::ita::ItaVerifier;
 use axum::extract::ws::WebSocket;
+use base64::Engine;
 use dd_common::noise;
 use dd_common::tunnel;
 use futures_util::StreamExt;
@@ -54,6 +56,7 @@ pub async fn handle_ws_register(
     cf: tunnel::CfConfig,
     auth_public_key_b64: Option<String>,
     auth_issuer: Option<String>,
+    ita: Option<Arc<ItaVerifier>>,
 ) {
     let (mut ws_tx, mut ws_rx) = socket.split();
 
@@ -65,13 +68,22 @@ pub async fn handle_ws_register(
         }
     };
 
-    // Noise XX handshake — we pass an empty responder payload; the agent
-    // sends its attestation as the initiator payload in msg3.
+    // Fresh 32-byte handshake nonce, sent to the agent in Noise msg2.
+    // The agent embeds it in the TDX quote's REPORT_DATA so ITA can
+    // prove freshness — a stolen valid quote can't be replayed against
+    // a different registration.
+    let mut nonce_bytes = [0u8; 32];
+    nonce_bytes[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+    nonce_bytes[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+    let nonce_b64 = base64::engine::general_purpose::STANDARD.encode(nonce_bytes);
+    let msg2_payload = serde_json::to_vec(&serde_json::json!({ "nonce": nonce_b64 }))
+        .expect("nonce json serialization is infallible");
+
     let (mut transport, peer_payload) = match noise::noise_xx_responder_ws(
         &mut ws_tx,
         &mut ws_rx,
         &keypair.private,
-        &[], // register sends no payload in msg2
+        &msg2_payload,
     )
     .await
     {
@@ -94,6 +106,47 @@ pub async fn handle_ws_register(
         "dd-register: agent {} ({})",
         attestation.vm_name, attestation.attestation_type
     );
+
+    // ITA verification (fail closed). If the verifier is configured,
+    // every registration must present a valid TDX quote bound to our
+    // handshake nonce. When the verifier is absent, lib.rs has already
+    // required DD_ALLOW_UNVERIFIED_REGISTRATIONS at startup — so
+    // reaching this branch means the operator opted out explicitly.
+    if let Some(ref verifier) = ita {
+        let Some(quote) = attestation.tdx_quote_b64.as_deref() else {
+            eprintln!(
+                "dd-register: {} rejected — no tdx_quote_b64 in attestation",
+                attestation.vm_name
+            );
+            return;
+        };
+        match verifier.verify(quote, &nonce_b64).await {
+            Ok(claims) => {
+                eprintln!(
+                    "dd-register: {} ITA verified — mrtd={} rtmr0={} rtmr1={} rtmr2={} rtmr3={} tcb={}",
+                    attestation.vm_name,
+                    claims.mrtd.as_deref().unwrap_or("-"),
+                    claims.rtmr0.as_deref().unwrap_or("-"),
+                    claims.rtmr1.as_deref().unwrap_or("-"),
+                    claims.rtmr2.as_deref().unwrap_or("-"),
+                    claims.rtmr3.as_deref().unwrap_or("-"),
+                    claims.tcb_status.as_deref().unwrap_or("-"),
+                );
+            }
+            Err(e) => {
+                eprintln!(
+                    "dd-register: {} rejected — ITA verification failed: {e}",
+                    attestation.vm_name
+                );
+                return;
+            }
+        }
+    } else {
+        eprintln!(
+            "dd-register: WARNING {} registering without ITA verification (DD_ALLOW_UNVERIFIED_REGISTRATIONS set)",
+            attestation.vm_name
+        );
+    }
 
     // Read encrypted registration request
     let req_bytes = match noise::noise_recv_ws(&mut ws_rx, &mut transport).await {

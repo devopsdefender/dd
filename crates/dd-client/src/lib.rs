@@ -153,7 +153,14 @@ async fn post_re_register(
         .ok_or_else(|| AppError::InvalidInput("no register URL configured".into()))?;
 
     eprintln!("dd-client: re-registering with {register_url}");
-    match register_with_noise(register_url, &state.config.vm_name, &state.config.owner).await {
+    match register_with_noise(
+        register_url,
+        &state.config.vm_name,
+        &state.config.owner,
+        &state.ee_client,
+    )
+    .await
+    {
         Ok(bootstrap) => {
             eprintln!("dd-client: re-registered — hostname={}", bootstrap.hostname);
 
@@ -181,15 +188,11 @@ async fn register_with_noise(
     register_url: &str,
     vm_name: &str,
     owner: &str,
+    ee_client: &EeClient,
 ) -> Result<dd_common::noise::BootstrapConfig, String> {
     use futures_util::{SinkExt, StreamExt};
 
     let keypair = dd_common::noise::generate_keypair()?;
-    let attestation = dd_common::noise::AttestationPayload {
-        attestation_type: "tdx".into(),
-        vm_name: vm_name.into(),
-        tdx_quote_b64: None,
-    };
 
     // Connect via WebSocket
     let (ws_stream, _) = tokio_tungstenite::connect_async(register_url)
@@ -219,14 +222,40 @@ async fn register_with_noise(
         .await
         .map_err(|e| format!("send msg1: {e}"))?;
 
-    // msg2
+    // msg2 carries a freshness nonce from the register. Embed it in the
+    // TDX quote's REPORT_DATA so ITA can prove the quote was made *for
+    // this handshake* and isn't a replay.
     let msg2 = match ws_rx.next().await {
         Some(Ok(tokio_tungstenite::tungstenite::Message::Binary(data))) => data.to_vec(),
         other => return Err(format!("expected binary msg2, got: {other:?}")),
     };
-    noise
+    let msg2_payload_len = noise
         .read_message(&msg2, &mut buf)
         .map_err(|e| format!("msg2: {e}"))?;
+    let msg2_payload: serde_json::Value = serde_json::from_slice(&buf[..msg2_payload_len])
+        .map_err(|e| format!("parse msg2 payload: {e}"))?;
+    let nonce_b64 = msg2_payload["nonce"]
+        .as_str()
+        .ok_or_else(|| "msg2 missing nonce".to_string())?
+        .to_string();
+
+    // Ask easyenclave for a quote bound to the nonce. REPORT_DATA in
+    // the quote will contain the nonce bytes so the register can bind
+    // verification to this handshake.
+    let attest_resp = ee_client
+        .attest(&nonce_b64)
+        .await
+        .map_err(|e| format!("ee attest: {e}"))?;
+    let tdx_quote_b64 = attest_resp["quote_b64"]
+        .as_str()
+        .ok_or_else(|| format!("ee attest missing quote_b64: {attest_resp}"))?
+        .to_string();
+
+    let attestation = dd_common::noise::AttestationPayload {
+        attestation_type: "tdx".into(),
+        vm_name: vm_name.into(),
+        tdx_quote_b64: Some(tdx_quote_b64),
+    };
 
     // msg3 with attestation
     let attestation_json = serde_json::to_vec(&attestation).unwrap();
@@ -340,7 +369,7 @@ pub async fn run() {
 
     if let Some(ref register_url) = config.register_url {
         eprintln!("dd-client: registering with {register_url}");
-        match register_with_noise(register_url, &config.vm_name, &config.owner).await {
+        match register_with_noise(register_url, &config.vm_name, &config.owner, &ee_client).await {
             Ok(bootstrap) => {
                 eprintln!(
                     "dd-client: registered — owner={} hostname={}",

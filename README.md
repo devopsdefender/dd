@@ -41,6 +41,20 @@ The `devopsdefender` binary ships as a **GitHub release asset** — not an OCI i
 
 Per-VM configuration (CF credentials, GitHub OAuth, the workload spec itself) is passed to easyenclave at boot via **GCE instance metadata** (`ee-config` attribute), read by `easyenclave::init::fetch_gce_metadata_config()` and applied as env vars. `scripts/gcp-deploy.sh` builds the spec and invokes `gcloud compute instances create --image-family=easyenclave-staging --metadata-from-file=ee-config=...`.
 
+Intel Trust Authority configuration is passed the same way. Set the
+environment-scoped GitHub Actions secret `DD_ITA_API_KEY` for staging and
+production; `scripts/gcp-deploy.sh` injects it into the management workload as
+`DD_ITA_API_KEY` and sets `DD_ITA_URL` to
+`https://api.trustauthority.intel.com` by default.
+
+`dd-register` fails closed: without `DD_ITA_API_KEY` it refuses to start
+unless `DD_ALLOW_UNVERIFIED_REGISTRATIONS=1` is set (local dev / bring-up
+only). When the key is set, every agent registration must present a TDX
+quote that ITA verifies and whose REPORT_DATA echoes a fresh handshake
+nonce. Measurements (MRTD/RTMR0–3) are logged for each accepted
+registration so we can build a pinned policy once a known-good baseline
+is captured.
+
 ## CI/CD
 
 ```

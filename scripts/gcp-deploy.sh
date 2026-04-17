@@ -30,6 +30,10 @@
 #                             Per-PR envs leave this unset.
 #   DD_GITHUB_CLIENT_SECRET — GitHub OAuth client secret (paired with above)
 #   DD_GITHUB_CALLBACK_URL  — OAuth callback, default https://{hostname}/auth/github/callback
+#   DD_ITA_API_KEY          — Intel Trust Authority API key. If unset,
+#                             ITA-backed registration is disabled.
+#   DD_ITA_URL              — Intel Trust Authority base URL
+#                             (default https://api.trustauthority.intel.com)
 #   EE_IMAGE_FAMILY         — easyenclave GCP image family
 #   EE_IMAGE_PROJECT        — project hosting the image
 #   DD_RELEASE_TAG          — GitHub release tag on devopsdefender/dd
@@ -60,6 +64,8 @@ fi
 DD_GITHUB_CLIENT_ID="${DD_GITHUB_CLIENT_ID:-}"
 DD_GITHUB_CLIENT_SECRET="${DD_GITHUB_CLIENT_SECRET:-}"
 DD_GITHUB_CALLBACK_URL="${DD_GITHUB_CALLBACK_URL:-https://${DD_HOSTNAME}/auth/github/callback}"
+DD_ITA_API_KEY="${DD_ITA_API_KEY:-}"
+DD_ITA_URL="${DD_ITA_URL:-https://api.trustauthority.intel.com}"
 
 # ── Build the workload spec ──────────────────────────────────────────────
 # Two boot workloads:
@@ -81,6 +87,8 @@ EE_BOOT_WORKLOADS=$(jq -c -n \
   --arg gh_client_id   "$DD_GITHUB_CLIENT_ID" \
   --arg gh_client_secret "$DD_GITHUB_CLIENT_SECRET" \
   --arg gh_callback    "$DD_GITHUB_CALLBACK_URL" \
+  --arg ita_api_key    "$DD_ITA_API_KEY" \
+  --arg ita_url        "$DD_ITA_URL" \
   '[
     {
       "github_release": {
@@ -116,6 +124,10 @@ EE_BOOT_WORKLOADS=$(jq -c -n \
           ("DD_GITHUB_CLIENT_ID="     + $gh_client_id),
           ("DD_GITHUB_CLIENT_SECRET=" + $gh_client_secret),
           ("DD_GITHUB_CALLBACK_URL="  + $gh_callback)
+        ] end)
+        + (if $ita_api_key == "" then [] else [
+          ("DD_ITA_API_KEY=" + $ita_api_key),
+          ("DD_ITA_URL="     + $ita_url)
         ] end)
       )
     }

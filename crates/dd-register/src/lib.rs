@@ -4,6 +4,7 @@
 //! and fleet health. No dashboard, no OAuth, no scraping -- those are dd-web's job.
 
 pub mod handler;
+pub mod ita;
 
 use axum::extract::{State, WebSocketUpgrade};
 use axum::response::IntoResponse;
@@ -11,6 +12,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use dd_common::tunnel;
 use handler::{AgentRegistry, RegisteredAgent};
+use ita::ItaVerifier;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -28,6 +30,9 @@ struct AppState {
     auth_public_key_b64: Option<String>,
     /// Auth issuer URL (https://<hostname>).
     auth_issuer: Option<String>,
+    /// Intel Trust Authority verifier. `Some` when DD_ITA_API_KEY is set;
+    /// `None` only when DD_ALLOW_UNVERIFIED_REGISTRATIONS=1 (preview envs).
+    ita: Option<Arc<ItaVerifier>>,
 }
 
 // ── Entry point ─────────────────────────────────────────────────────────
@@ -56,6 +61,34 @@ pub async fn run() {
         eprintln!("dd-register: DD_HOSTNAME not set");
         std::process::exit(1);
     });
+
+    // ITA verification config. Fail closed: without DD_ITA_API_KEY,
+    // refuse to start unless the operator explicitly opted out via
+    // DD_ALLOW_UNVERIFIED_REGISTRATIONS=1 (preview/dev envs only).
+    let ita_api_key = std::env::var("DD_ITA_API_KEY").ok().filter(|s| !s.is_empty());
+    let ita_url = std::env::var("DD_ITA_URL")
+        .unwrap_or_else(|_| "https://api.trustauthority.intel.com".to_string());
+    let allow_unverified = std::env::var("DD_ALLOW_UNVERIFIED_REGISTRATIONS")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let ita: Option<Arc<ItaVerifier>> = match (ita_api_key, allow_unverified) {
+        (Some(key), _) => {
+            eprintln!("dd-register: ITA verification enabled — url={ita_url}");
+            Some(Arc::new(ItaVerifier::new(key, ita_url)))
+        }
+        (None, true) => {
+            eprintln!(
+                "dd-register: WARNING ITA verification DISABLED — DD_ALLOW_UNVERIFIED_REGISTRATIONS=1"
+            );
+            None
+        }
+        (None, false) => {
+            eprintln!(
+                "dd-register: refusing to start — DD_ITA_API_KEY unset and DD_ALLOW_UNVERIFIED_REGISTRATIONS not set"
+            );
+            std::process::exit(1);
+        }
+    };
 
     // Self-register: create our own CF tunnel so we're reachable
     let register_id = uuid::Uuid::new_v4().to_string();
@@ -189,6 +222,7 @@ pub async fn run() {
         self_tunnel_id: tunnel_info.tunnel_id.clone(),
         auth_public_key_b64,
         auth_issuer,
+        ita,
     };
 
     // STONITH: signal old register instances to shut down.
@@ -232,8 +266,9 @@ async fn ws_register(State(state): State<AppState>, ws: WebSocketUpgrade) -> imp
     let cf = state.cf.clone();
     let auth_key = state.auth_public_key_b64.clone();
     let auth_issuer = state.auth_issuer.clone();
+    let ita = state.ita.clone();
     ws.on_upgrade(move |socket| {
-        handler::handle_ws_register(socket, registry, cf, auth_key, auth_issuer)
+        handler::handle_ws_register(socket, registry, cf, auth_key, auth_issuer, ita)
     })
 }
 
