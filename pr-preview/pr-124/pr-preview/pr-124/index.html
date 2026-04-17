@@ -136,22 +136,13 @@
   <section class="section-center">
     <div class="container">
       <h2>Deploy with GitHub Actions</h2>
-      <p class="subtitle">One action to deploy. One action to verify. Inline spec, no extra files.</p>
+      <p class="subtitle">One action to deploy. One action to verify.</p>
       <div class="code-block">
         <div class="code-header">.github/workflows/deploy.yml</div>
 <pre><span class="k">- uses:</span> <span class="s">devopsdefender/dd/.github/actions/deploy-workload@main</span>
   <span class="k">with:</span>
     <span class="k">agent-url:</span> <span class="s">https://app.devopsdefender.com</span>
-    <span class="c"># deploy-spec: apps/myapp/deploy.json   # or a file path</span>
-    <span class="k">deploy-spec-inline:</span> <span class="s">|</span>
-      <span class="s">{</span>
-        <span class="s">"app_name": "myapp",</span>
-        <span class="s">"github_release": {</span>
-          <span class="s">"repo": "me/myapp",</span>
-          <span class="s">"asset": "myapp-linux-amd64"</span>
-        <span class="s">},</span>
-        <span class="s">"cmd": ["myapp", "serve"]</span>
-      <span class="s">}</span>
+    <span class="k">deploy-spec:</span> <span class="s">apps/myapp/deploy.json</span>
 
 <span class="k">- uses:</span> <span class="s">devopsdefender/dd/.github/actions/verify-deployment@main</span>
   <span class="k">with:</span>
