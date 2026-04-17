@@ -35,19 +35,21 @@ AUTH=(-H "Authorization: Bearer $DD_PAT")
 
 echo "== ollama-deploy $VM_NAME (model=$MODEL, cp=$CP_URL) =="
 
-# 1. Discover agent hostname via CP's /api/agents. Prefer healthy
-# entries; the store can briefly hold stale duplicates from a prior
-# relaunch whose tunnel is already gone.
+# 1. Discover agent hostname via CP's /api/agents. Require an entry
+# whose last_seen is AFTER this script started — otherwise we'll
+# pick up a stale entry from a prior VM generation whose tunnel we
+# just killed by destroying the VM.
+started_at_iso="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+echo "  waiting for a fresh ${VM_NAME} registration (last_seen > ${started_at_iso})"
 agent_host=""
 for i in $(seq 1 60); do
   agent_host=$(curl -fsS "${AUTH[@]}" "$CP_URL/api/agents" 2>/dev/null \
-    | jq -r --arg vm "$VM_NAME" '
-        [.[] | select(.vm_name==$vm and .status=="healthy")]
-        | sort_by(.agent_id) | reverse | .[0].hostname // empty' 2>/dev/null || true)
+    | jq -r --arg vm "$VM_NAME" --arg since "$started_at_iso" '
+        [.[] | select(.vm_name==$vm and .status=="healthy" and .last_seen > $since)]
+        | sort_by(.last_seen) | reverse | .[0].hostname // empty' 2>/dev/null || true)
   if [ -n "$agent_host" ] && [ "$agent_host" != "null" ]; then
     break
   fi
-  echo "  waiting for healthy $VM_NAME in CP fleet... ($i/60)"
   sleep 10
 done
 if [ -z "$agent_host" ] || [ "$agent_host" = "null" ]; then
