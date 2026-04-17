@@ -7,6 +7,7 @@ pub mod cp;
 pub mod ee;
 pub mod error;
 pub mod html;
+pub mod ita;
 pub mod metrics;
 pub mod stonith;
 pub mod terminal;

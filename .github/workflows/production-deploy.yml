@@ -61,6 +61,10 @@ jobs:
           DD_GITHUB_CLIENT_ID: ${{ vars.DD_GITHUB_CLIENT_ID || secrets.DD_GITHUB_CLIENT_ID }}
           DD_GITHUB_CALLBACK_URL: ${{ vars.DD_GITHUB_CALLBACK_URL }}
           DD_GITHUB_CLIENT_SECRET: ${{ secrets.DD_GITHUB_CLIENT_SECRET }}
+          # Intel Trust Authority — optional. When the secret is set,
+          # the CP mints its own ITA token and verifies incoming agent
+          # registrations. DD_ITA_REQUIRED stays false (default).
+          DD_ITA_API_KEY: ${{ secrets.DD_ITA_API_KEY }}
           # workflow_run has no `inputs`; fall back to `latest`, which
           # release.yml just (re)published on push to main.
           DD_RELEASE_TAG: ${{ inputs.release_tag || 'latest' }}

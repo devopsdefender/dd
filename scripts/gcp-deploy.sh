@@ -67,6 +67,17 @@ DD_GITHUB_CLIENT_ID="${DD_GITHUB_CLIENT_ID:-}"
 DD_GITHUB_CLIENT_SECRET="${DD_GITHUB_CLIENT_SECRET:-}"
 DD_GITHUB_CALLBACK_URL="${DD_GITHUB_CALLBACK_URL:-https://${DD_HOSTNAME}/auth/github/callback}"
 
+# Intel Trust Authority — mandatory. DD_ITA_API_KEY must be set in the
+# workflow (from secrets.DD_ITA_API_KEY). The CP will refuse to start
+# without one. Everything else has a default.
+if [ -z "${DD_ITA_API_KEY:-}" ]; then
+  echo "DD_ITA_API_KEY is required (configure secrets.DD_ITA_API_KEY)" >&2
+  exit 1
+fi
+DD_ITA_BASE_URL="${DD_ITA_BASE_URL:-https://api.trustauthority.intel.com}"
+DD_ITA_JWKS_URL="${DD_ITA_JWKS_URL:-https://portal.trustauthority.intel.com/certs}"
+DD_ITA_ISSUER="${DD_ITA_ISSUER:-https://portal.trustauthority.intel.com}"
+
 # ── Build the workload spec ──────────────────────────────────────────────
 # Two boot workloads:
 #   1. cloudflared — fetch-only. easyenclave downloads cloudflare's
@@ -87,6 +98,10 @@ EE_BOOT_WORKLOADS=$(jq -c -n \
   --arg gh_client_id   "$DD_GITHUB_CLIENT_ID" \
   --arg gh_client_secret "$DD_GITHUB_CLIENT_SECRET" \
   --arg gh_callback    "$DD_GITHUB_CALLBACK_URL" \
+  --arg ita_api_key    "$DD_ITA_API_KEY" \
+  --arg ita_base_url   "$DD_ITA_BASE_URL" \
+  --arg ita_jwks_url   "$DD_ITA_JWKS_URL" \
+  --arg ita_issuer     "$DD_ITA_ISSUER" \
   '[
     {
       "github_release": {
@@ -123,6 +138,12 @@ EE_BOOT_WORKLOADS=$(jq -c -n \
           ("DD_GITHUB_CLIENT_SECRET=" + $gh_client_secret),
           ("DD_GITHUB_CALLBACK_URL="  + $gh_callback)
         ] end)
+        + [
+          ("DD_ITA_API_KEY="          + $ita_api_key),
+          ("DD_ITA_BASE_URL="         + $ita_base_url),
+          ("DD_ITA_JWKS_URL="         + $ita_jwks_url),
+          ("DD_ITA_ISSUER="           + $ita_issuer)
+        ]
       )
     }
   ]')

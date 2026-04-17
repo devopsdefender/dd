@@ -139,6 +139,12 @@ jobs:
           # empty DD_GITHUB_CLIENT_ID and skips them in the workload
           # spec. dd-web then disables /auth/github/* and serves
           # /auth/pat for browser access.
+          #
+          # Intel Trust Authority — optional. When the secret is set,
+          # the CP mints its own ITA token at startup and verifies
+          # agent-supplied tokens on /register. DD_ITA_REQUIRED stays
+          # false (default) so unsigned agents still register.
+          DD_ITA_API_KEY: ${{ secrets.DD_ITA_API_KEY }}
           DD_RELEASE_TAG: ${{ needs.build.outputs.tag }}
         run: scripts/gcp-deploy.sh
 

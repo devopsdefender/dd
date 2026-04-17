@@ -1,14 +1,15 @@
 //! Background collector — discovers agents, scrapes `/health`, GC's dead tunnels.
 //!
-//! One tick:
-//!   1. List CF tunnels whose name starts with `dd-{env}-agent-` (CP tunnels
-//!      use a different prefix, so they can't be misidentified as agents —
-//!      previous design needed an ingress-config round-trip to distinguish
-//!      and got this wrong once, PR #103).
+//! Every agent entry in the store carries freshly-verified ITA claims. The
+//! collector scrapes `/health`, extracts the `ita_token` field, and runs
+//! it through the CP's verifier; agents whose tokens are missing, expired,
+//! or mis-signed don't enter the store. One tick:
+//!
+//!   1. List CF tunnels whose name starts with `dd-{env}-agent-`.
 //!   2. Scrape `https://{tunnel-name}.{domain}/health` in parallel.
-//!   3. Mark dead if scrape fails for >5 min; delete tunnel+DNS for dead.
-//!   4. Insert a `control-plane` entry for ourselves so the fleet view
-//!      lists the CP too.
+//!   3. Verify the `ita_token` field from each /health body.
+//!   4. Insert on success; mark dead / GC tunnel on repeated scrape failures.
+//!   5. Refresh the `control-plane` entry (its claims come from CP startup).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -21,6 +22,7 @@ use tokio::sync::Mutex;
 use crate::cf;
 use crate::config::CfCreds;
 use crate::ee::Ee;
+use crate::ita;
 
 const DEAD_THRESHOLD_SECS: i64 = 300;
 
@@ -37,16 +39,21 @@ pub struct Agent {
     pub cpu_percent: u64,
     pub memory_used_mb: u64,
     pub memory_total_mb: u64,
+    /// Intel-verified ITA claims. Required — agents without a valid
+    /// token don't enter the store.
+    pub ita: ita::Claims,
 }
 
 pub type Store = Arc<Mutex<HashMap<String, Agent>>>;
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     store: Store,
     cf: CfCreds,
     env_label: String,
     cp_hostname: String,
     ee: Arc<Ee>,
+    verifier: Arc<ita::Verifier>,
     interval: Duration,
 ) -> ! {
     let prefix = cf::agent_prefix(&env_label);
@@ -63,20 +70,31 @@ pub async fn run(
     let mut ticker = tokio::time::interval(interval);
     loop {
         ticker.tick().await;
-        tick(&store, &http, &cf, &prefix, &ee, &env_label, &cp_hostname).await;
+        tick(
+            &store,
+            &http,
+            &cf,
+            &prefix,
+            &ee,
+            &verifier,
+            &env_label,
+            &cp_hostname,
+        )
+        .await;
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn tick(
     store: &Store,
     http: &reqwest::Client,
     cf: &CfCreds,
     prefix: &str,
     ee: &Arc<Ee>,
+    verifier: &Arc<ita::Verifier>,
     env_label: &str,
     cp_hostname: &str,
 ) {
-    // Discover agents by name prefix only — no ingress round-trip.
     let tunnels: Vec<(String, String)> = cf::list(http, cf)
         .await
         .unwrap_or_default()
@@ -111,65 +129,65 @@ async fn tick(
 
     let now = Utc::now();
     let mut orphans: Vec<(String, String)> = Vec::new();
+    let mut verified = 0usize;
 
-    {
-        let mut s = store.lock().await;
-        for (name, host, body, err) in &results {
-            if let Some(h) = body {
-                let agent_id = h["agent_id"].as_str().unwrap_or(name).to_string();
-                s.insert(
-                    agent_id.clone(),
-                    Agent {
-                        agent_id,
-                        hostname: host.clone(),
-                        vm_name: h["vm_name"].as_str().unwrap_or("unknown").to_string(),
-                        attestation_type: h["attestation_type"]
-                            .as_str()
-                            .unwrap_or("unknown")
-                            .to_string(),
-                        status: "healthy".into(),
-                        last_seen: now,
-                        deployment_count: h["deployment_count"].as_u64().unwrap_or(0) as usize,
-                        deployment_names: h["deployments"]
-                            .as_array()
-                            .map(|a| {
-                                a.iter()
-                                    .filter_map(|v| v.as_str().map(String::from))
-                                    .collect()
-                            })
-                            .unwrap_or_default(),
-                        cpu_percent: h["cpu_percent"].as_u64().unwrap_or(0),
-                        memory_used_mb: h["memory_used_mb"].as_u64().unwrap_or(0),
-                        memory_total_mb: h["memory_total_mb"].as_u64().unwrap_or(0),
-                    },
-                );
-            } else {
-                let existing = s.values_mut().find(|a| a.hostname == *host);
-                if let Some(a) = existing {
-                    let age = now.signed_duration_since(a.last_seen).num_seconds();
-                    if age > DEAD_THRESHOLD_SECS {
-                        a.status = "dead".into();
-                        orphans.push((name.clone(), host.clone()));
-                    } else {
-                        a.status = "stale".into();
-                    }
-                } else if err
-                    .as_ref()
-                    .is_some_and(|e| e.contains("connect") || e.contains("timed out"))
-                {
-                    orphans.push((name.clone(), host.clone()));
-                }
+    for (name, host, body, err) in &results {
+        let Some(h) = body else {
+            mark_stale_or_orphan(store, host, name, err, now, &mut orphans).await;
+            continue;
+        };
+        let Some(token) = h["ita_token"].as_str() else {
+            eprintln!("cp: collector: {name} /health lacks ita_token — skipping");
+            continue;
+        };
+        let claims = match verifier.verify(token).await {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("cp: collector: {name} ITA verify failed: {e}");
+                continue;
             }
-        }
+        };
+        let agent_id = h["agent_id"].as_str().unwrap_or(name).to_string();
+        store.lock().await.insert(
+            agent_id.clone(),
+            Agent {
+                agent_id,
+                hostname: host.clone(),
+                vm_name: h["vm_name"].as_str().unwrap_or("unknown").to_string(),
+                attestation_type: h["attestation_type"]
+                    .as_str()
+                    .unwrap_or("unknown")
+                    .to_string(),
+                status: "healthy".into(),
+                last_seen: now,
+                deployment_count: h["deployment_count"].as_u64().unwrap_or(0) as usize,
+                deployment_names: h["deployments"]
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                cpu_percent: h["cpu_percent"].as_u64().unwrap_or(0),
+                memory_used_mb: h["memory_used_mb"].as_u64().unwrap_or(0),
+                memory_total_mb: h["memory_total_mb"].as_u64().unwrap_or(0),
+                ita: claims,
+            },
+        );
+        verified += 1;
+    }
 
-        let dead: Vec<String> = s
-            .iter()
+    // Collect + delete dead entries from the store.
+    let dead: Vec<String> = {
+        let s = store.lock().await;
+        s.iter()
             .filter(|(_, a)| a.status == "dead")
             .map(|(k, _)| k.clone())
-            .collect();
-        for k in &dead {
-            s.remove(k);
-        }
+            .collect()
+    };
+    for k in &dead {
+        store.lock().await.remove(k);
     }
 
     if !orphans.is_empty() {
@@ -180,7 +198,9 @@ async fn tick(
         }
     }
 
-    // Insert ourselves into the store so the fleet list includes the CP.
+    // Refresh the CP's own entry. Its ITA claims were seeded at CP
+    // startup and are preserved here across ticks; everything else
+    // (status, workloads, attestation) gets refreshed from EE.
     let (deployments, attestation) = match ee.list().await {
         Ok(deps) => {
             let names: Vec<String> = deps["deployments"]
@@ -202,27 +222,46 @@ async fn tick(
         Err(_) => (vec![], "tdx".into()),
     };
     let count = deployments.len();
-    store.lock().await.insert(
-        "control-plane".into(),
-        Agent {
-            agent_id: "control-plane".into(),
-            hostname: cp_hostname.to_string(),
-            vm_name: format!("dd-{env_label}-cp"),
-            attestation_type: attestation,
-            status: "healthy".into(),
-            last_seen: now,
-            deployment_count: count,
-            deployment_names: deployments,
-            cpu_percent: 0,
-            memory_used_mb: 0,
-            memory_total_mb: 0,
-        },
-    );
+    let mut store_lock = store.lock().await;
+    if let Some(cp) = store_lock.get_mut("control-plane") {
+        cp.hostname = cp_hostname.to_string();
+        cp.vm_name = format!("dd-{env_label}-cp");
+        cp.attestation_type = attestation;
+        cp.status = "healthy".into();
+        cp.last_seen = now;
+        cp.deployment_count = count;
+        cp.deployment_names = deployments;
+    }
+    drop(store_lock);
 
-    let healthy = results.iter().filter(|r| r.2.is_some()).count();
     eprintln!(
-        "cp: scraped {} agents ({healthy} healthy, {} orphans GC'd)",
+        "cp: scraped {} tunnels ({verified} verified, {} orphans GC'd)",
         results.len(),
         orphans.len()
     );
+}
+
+async fn mark_stale_or_orphan(
+    store: &Store,
+    host: &str,
+    name: &str,
+    err: &Option<String>,
+    now: DateTime<Utc>,
+    orphans: &mut Vec<(String, String)>,
+) {
+    let mut s = store.lock().await;
+    if let Some(a) = s.values_mut().find(|a| a.hostname == *host) {
+        let age = now.signed_duration_since(a.last_seen).num_seconds();
+        if age > DEAD_THRESHOLD_SECS {
+            a.status = "dead".into();
+            orphans.push((name.to_string(), host.to_string()));
+        } else {
+            a.status = "stale".into();
+        }
+    } else if err
+        .as_ref()
+        .is_some_and(|e| e.contains("connect") || e.contains("timed out"))
+    {
+        orphans.push((name.to_string(), host.to_string()));
+    }
 }
