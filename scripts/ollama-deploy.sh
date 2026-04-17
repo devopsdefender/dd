@@ -197,21 +197,52 @@ OPENCLAW_SPEC=$(jq -c -n --arg m "$MODEL" '{
 }')
 agent /deploy -H 'Content-Type: application/json' -d "$OPENCLAW_SPEC" | jq -c '.' || true
 
-# ── 9. Confirm openclaw is in the agent's deployment list ──────────
+# ── 9. Confirm openclaw is registered and talking to us ────────────
+# Two probes:
+#   a) EE lists `openclaw` in /health — proves the workload was
+#      accepted (weak — flips on fork, before npm install finishes).
+#   b) `openclaw plugins list` inside the container exits 0 — proves
+#      the gateway daemon is actually responsive. That subcommand
+#      goes through the running gateway, so an unresponsive or
+#      still-installing openclaw fails it. Strongest documented probe
+#      short of an HTTP port (which the docs don't publish).
 echo "  confirming openclaw workload is registered..."
 for i in $(seq 1 30); do
   list=$(agent /health 2>/dev/null || true)
   if echo "$list" | jq -e '.deployments // [] | index("openclaw")' >/dev/null 2>&1; then
-    echo "  openclaw: deployed"
+    echo "  openclaw: registered"
     break
   fi
   sleep 5
 done
 
+# First launch can take a while because of the npm install of
+# @ollama/openclaw + the web-search/fetch plugin. 5 min ceiling.
+echo "  waiting for openclaw gateway to respond to CLI..."
+openclaw_ok=0
+for i in $(seq 1 60); do
+  resp=$(agent /exec -H 'Content-Type: application/json' \
+    -d '{"cmd":["/var/lib/easyenclave/bin/podman","exec","ollama","openclaw","plugins","list"],"timeout_secs":15}' \
+    2>/dev/null || true)
+  if echo "$resp" | jq -e '.exit_code == 0' >/dev/null 2>&1; then
+    echo "  openclaw: responding"
+    echo "  plugins:"
+    echo "$resp" | jq -r '.stdout // ""' | sed 's/^/    /'
+    openclaw_ok=1
+    break
+  fi
+  sleep 5
+done
+if [ "$openclaw_ok" = "0" ]; then
+  echo "  WARNING: openclaw plugins list never returned — gateway may still be installing"
+  echo "  last /exec response:"
+  echo "$resp" | jq -c '.' | head -c 500
+fi
+
 echo
 echo "=== agent fleet summary ==="
 echo "  agent:    https://$agent_host"
 echo "  model:    $MODEL"
-echo "  ollama:   podman container 'ollama' on host net"
-echo "  openclaw: ollama launch openclaw (subcommand)"
+echo "  ollama:   podman container 'ollama' on host net, :11434"
+echo "  openclaw: ollama launch openclaw — plugins listing responded"
 echo "==========================="
