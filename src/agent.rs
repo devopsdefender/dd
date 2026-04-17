@@ -15,8 +15,9 @@ use std::time::{Duration, Instant};
 use axum::extract::{Path, State, WebSocketUpgrade};
 use axum::http::HeaderMap;
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
+use serde::Deserialize;
 use tokio::sync::RwLock;
 
 use crate::auth::{self, Keys};
@@ -105,6 +106,8 @@ pub async fn run() -> Result<()> {
         .route("/workload/{id}", get(workload_page))
         .route("/session/{app}", get(session_page))
         .route("/ws/session/{app}", get(session_ws))
+        .route("/deploy", post(deploy))
+        .route("/exec", post(exec))
         .with_state(state);
 
     let addr = format!("0.0.0.0:{}", cfg.common.port);
@@ -413,6 +416,34 @@ async fn session_page(
     }
     let ws = format!("/ws/session/{}", urlencoding::encode(&app));
     Html(terminal::page(&app, &ws)).into_response()
+}
+
+async fn deploy(
+    State(s): State<St>,
+    headers: HeaderMap,
+    Json(spec): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>> {
+    auth::resolve(&s.keys, &s.cfg.common.owner, &headers).await?;
+    Ok(Json(s.ee.deploy(spec).await?))
+}
+
+#[derive(Debug, Deserialize)]
+struct ExecReq {
+    cmd: Vec<String>,
+    #[serde(default = "default_exec_timeout")]
+    timeout_secs: u64,
+}
+fn default_exec_timeout() -> u64 {
+    60
+}
+
+async fn exec(
+    State(s): State<St>,
+    headers: HeaderMap,
+    Json(req): Json<ExecReq>,
+) -> Result<Json<serde_json::Value>> {
+    auth::resolve(&s.keys, &s.cfg.common.owner, &headers).await?;
+    Ok(Json(s.ee.exec(&req.cmd, req.timeout_secs).await?))
 }
 
 async fn session_ws(

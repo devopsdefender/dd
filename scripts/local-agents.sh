@@ -71,12 +71,23 @@ build_config_iso() {
     }')
   fi
 
+  # Mount the persistent models disk (vdc) at /var/lib/easyenclave/ollama
+  # before ollama might try to use it. Pre-formatted ext4 on the host.
+  local mount_workload
+  mount_workload=$(jq -c -n '{
+    app_name:"mount-models",
+    cmd:["/bin/busybox","sh","-c",
+         "mkdir -p /var/lib/easyenclave/ollama && mount /dev/vdc /var/lib/easyenclave/ollama && echo mount-models: ok; sleep inf"]
+  }')
+
   local workloads
   workloads=$(jq -c -n \
     --argjson nv "$nv_workload" \
+    --argjson mount "$mount_workload" \
     --arg cp "$cp" --arg pat "$DD_PAT" --arg ita "$DD_ITA_API_KEY" \
     --arg env "$env" --arg vm "dd-local-$name" '[
       $nv,
+      $mount,
       {"app_name":"cloudflared",
        "github_release":{"repo":"cloudflare/cloudflared","asset":"cloudflared-linux-amd64","rename":"cloudflared"}},
       {"app_name":"dd-agent",
@@ -116,6 +127,24 @@ build_overlay() {
   echo "  wrote $overlay (backing $BASE)"
 }
 
+# Persistent models disk — survives VM relaunch, so ollama doesn't
+# re-download the model each time. Pre-formatted ext4 on the host;
+# the guest just mounts it.
+build_models_disk() {
+  # $1=name, $2=size_gb
+  local name="$1" size_gb="$2"
+  local models="$IMG_DIR/dd-local-$name-models.qcow2"
+  if [ -f "$models" ]; then
+    echo "  models disk $models already exists (reusing)"
+    return
+  fi
+  qemu-img create -q -f raw "$models.raw" "${size_gb}G"
+  mkfs.ext4 -q -F "$models.raw"
+  qemu-img convert -q -f raw -O qcow2 "$models.raw" "$models"
+  rm -f "$models.raw"
+  echo "  wrote $models (${size_gb}G ext4)"
+}
+
 render_domain_xml() {
   # $1=name, $2=with_gpu (yes/no)
   local name="$1" with_gpu="$2"
@@ -150,6 +179,20 @@ render_domain_xml() {
          /<\/hostdev>/{skip=0}' "$out" > "$out.tmp" && mv "$out.tmp" "$out"
   fi
 
+  # Add a persistent models disk as vdc. EE will mount it at
+  # /var/lib/easyenclave/ollama via the mount-models boot workload.
+  local models="$IMG_DIR/dd-local-$name-models.qcow2"
+  local disk_block="    <disk type='file' device='disk'>
+      <driver name='qemu' type='qcow2'/>
+      <source file='$models'/>
+      <target dev='vdc' bus='virtio'/>
+    </disk>"
+  # Insert before </devices>.
+  awk -v block="$disk_block" '
+    /<\/devices>/ { print block }
+    { print }
+  ' "$out" > "$out.tmp" && mv "$out.tmp" "$out"
+
   echo "$out"
 }
 
@@ -161,6 +204,12 @@ define_agent() {
 
   echo "== dd-local-$name → $cp (env=$env_label, gpu=$with_gpu) =="
   build_overlay "$name"
+  # Models disk: prod holds the GPU model (few GB), preview holds the small CPU one.
+  if [ "$with_gpu" = "yes" ]; then
+    build_models_disk "$name" 40
+  else
+    build_models_disk "$name" 10
+  fi
   build_config_iso "$name" "$cp" "$env_label" "$with_gpu"
   local xml
   xml=$(render_domain_xml "$name" "$with_gpu")

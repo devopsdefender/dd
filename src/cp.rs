@@ -191,6 +191,7 @@ pub async fn run() -> Result<()> {
         .route("/register", post(register))
         .route("/agent/{id}", get(agent_detail))
         .route("/agent/{id}/logs/{app}", get(agent_logs))
+        .route("/api/agents", get(api_agents))
         .route("/cp/attest", get(cp_attest))
         .route("/cp/ita", get(cp_ita))
         .route("/cp/shell", get(shell_page))
@@ -398,6 +399,33 @@ async fn fleet(
         ),
     ))
     .into_response()
+}
+
+/// GET /api/agents — JSON list of `{agent_id, vm_name, hostname, status}`.
+/// Used by host-side scripts (dd-relaunch.sh) to discover a specific
+/// agent's tunnel hostname after it registers.
+async fn api_agents(
+    State(s): State<St>,
+    headers: HeaderMap,
+    axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
+) -> Result<Json<Vec<serde_json::Value>>> {
+    if require_auth(&s, &headers, &uri).await.is_err() {
+        return Err(Error::Unauthorized);
+    }
+    let agents = s.store.lock().await.clone();
+    Ok(Json(
+        agents
+            .into_values()
+            .map(|a| {
+                serde_json::json!({
+                    "agent_id": a.agent_id,
+                    "vm_name": a.vm_name,
+                    "hostname": a.hostname,
+                    "status": a.status,
+                })
+            })
+            .collect(),
+    ))
 }
 
 async fn agent_detail(

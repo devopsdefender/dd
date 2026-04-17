@@ -51,6 +51,24 @@ impl Ee {
             .await
     }
 
+    /// Deploy a workload at runtime. Spec is a workload object
+    /// (`app_name`, `github_release`/`cmd`, `env`, ...) — we just set
+    /// `method` and forward.
+    pub async fn deploy(&self, mut spec: serde_json::Value) -> Result<serde_json::Value> {
+        spec["method"] = serde_json::json!("deploy");
+        self.call(spec).await
+    }
+
+    /// Run a command inside the enclave and capture stdout/stderr.
+    pub async fn exec(&self, cmd: &[String], timeout_secs: u64) -> Result<serde_json::Value> {
+        self.call(serde_json::json!({
+            "method": "exec",
+            "cmd": cmd,
+            "timeout_secs": timeout_secs,
+        }))
+        .await
+    }
+
     /// Open a PTY shell. Sends the attach request, reads the ack, returns
     /// the raw stream for byte bridging to a WebSocket.
     pub async fn attach(&self, cmd: &[String]) -> Result<UnixStream> {
