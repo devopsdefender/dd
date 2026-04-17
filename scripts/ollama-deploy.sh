@@ -87,13 +87,16 @@ agent() { curl -fsS --max-time 300 "${AUTH[@]}" "https://$agent_host$1" "${@:2}"
 # ── 3. Fetch podman-static (fetch-only DD workload) ────────────────
 # Tarball unpacks to /var/lib/easyenclave/bin/podman-linux-amd64/
 # with usr/local/bin/{podman,crun,conmon,netavark,...}.
+# NOTE: omit `tag` — EE treats `tag: null` as "GET /releases/latest"
+# (the real newest release), while `tag: "latest"` is a literal tag
+# lookup and 404s on repos like mgoltzsche/podman-static that version
+# their tags as v5.7.1 rather than with a rolling "latest" ref.
 echo "  POST /deploy podman-static..."
 A_SPEC=$(jq -c -n '{
   app_name: "podman-static",
   github_release: {
     repo: "mgoltzsche/podman-static",
-    asset: "podman-linux-amd64.tar.gz",
-    tag: "latest"
+    asset: "podman-linux-amd64.tar.gz"
   }
 }')
 agent /deploy -H 'Content-Type: application/json' -d "$A_SPEC" | jq -c '.' || true
