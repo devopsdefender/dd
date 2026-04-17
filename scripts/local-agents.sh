@@ -165,6 +165,27 @@ render_domain_xml() {
   # sharing the same path collide with "Device or resource busy".
   sed -i "s|/var/log/ee-local\\.log|/var/log/ee-local-$name.log|g" "$out"
 
+  # Size the VM for the workload. Base easyenclave-local is 4 GiB /
+  # 2 vCPU — fine for a bare agent, undersized for podman + ollama
+  # + the openclaw gateway on a 900 MB container image. Host has
+  # 243 GiB / 64 cores, so we can be generous.
+  #
+  #   prod:    32 GiB / 16 vCPU  (GPU handles the model; host RAM
+  #                               for podman, openclaw, image pull
+  #                               scratch, model load spill)
+  #   preview: 16 GiB / 8 vCPU   (CPU-only inference needs cores;
+  #                               qwen2.5:0.5b + 64k ctx + gateway)
+  if [ "$with_gpu" = "yes" ]; then
+    local mem_kib=33554432  # 32 GiB
+    local vcpus=16
+  else
+    local mem_kib=16777216  # 16 GiB
+    local vcpus=8
+  fi
+  sed -i -E "s|<memory unit='KiB'>[0-9]+</memory>|<memory unit='KiB'>$mem_kib</memory>|" "$out"
+  sed -i -E "s|<currentMemory unit='KiB'>[0-9]+</currentMemory>|<currentMemory unit='KiB'>$mem_kib</currentMemory>|" "$out"
+  sed -i -E "s|<vcpu placement='static'>[0-9]+</vcpu>|<vcpu placement='static'>$vcpus</vcpu>|" "$out"
+
   # Wire QEMU's tdx-guest to the host's QGS unix socket so the guest's
   # TDVMCALL for a quote actually reaches Intel's quote-generation
   # service. Without this, configfs-tsm `outblob` returns 0 bytes →
