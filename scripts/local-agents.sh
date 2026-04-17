@@ -14,12 +14,20 @@
 #   export DD_ITA_API_KEY="$(cat ~/.secrets/ita_api_key)"
 #   ./scripts/local-agents.sh https://pr-106.devopsdefender.com https://app.devopsdefender.com
 #
+# Pass "" for either URL to skip defining that VM:
+#   ./scripts/local-agents.sh "" https://app.devopsdefender.com   # prod only
+#   ./scripts/local-agents.sh https://pr-N.devopsdefender.com ""  # preview only
+#
 # After: virsh start dd-local-preview && virsh start dd-local-prod
 
 set -euo pipefail
 
-PREVIEW_CP="${1?usage: $0 <preview-cp-url> <prod-cp-url>}"
-PROD_CP="${2?usage: $0 <preview-cp-url> <prod-cp-url>}"
+PREVIEW_CP="${1-}"
+PROD_CP="${2-}"
+if [ -z "$PREVIEW_CP" ] && [ -z "$PROD_CP" ]; then
+  echo "usage: $0 <preview-cp-url|\"\"> <prod-cp-url|\"\">" >&2
+  exit 1
+fi
 : "${DD_PAT?set DD_PAT (e.g. DD_PAT=\$(gh auth token))}"
 : "${DD_ITA_API_KEY?set DD_ITA_API_KEY}"
 
@@ -133,14 +141,14 @@ define_agent() {
   echo "  defined dd-local-$name (xml at $xml)"
 }
 
-define_agent preview "$PREVIEW_CP" no
-define_agent prod    "$PROD_CP"    yes
+[ -n "$PREVIEW_CP" ] && define_agent preview "$PREVIEW_CP" no
+[ -n "$PROD_CP"    ] && define_agent prod    "$PROD_CP"    yes
 
 echo
 echo "done. start with:"
-echo "  virsh start dd-local-preview"
-echo "  virsh start dd-local-prod"
+[ -n "$PREVIEW_CP" ] && echo "  virsh start dd-local-preview"
+[ -n "$PROD_CP"    ] && echo "  virsh start dd-local-prod"
 echo
-echo "watch registration:"
-echo "  virsh console dd-local-preview   # Ctrl-] to exit"
-echo "  virsh console dd-local-prod"
+echo "watch registration (Ctrl-] to exit):"
+[ -n "$PREVIEW_CP" ] && echo "  virsh console dd-local-preview"
+[ -n "$PROD_CP"    ] && echo "  virsh console dd-local-prod"
