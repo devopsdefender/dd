@@ -147,11 +147,15 @@ async fn tick(
                 continue;
             }
         };
-        let agent_id = h["agent_id"].as_str().unwrap_or(name).to_string();
+        // Store key is the tunnel name (authoritative on the CP side),
+        // NOT the agent's self-reported agent_id. The agent currently
+        // reports its full hostname there, which would land in a
+        // different key than /register used (the bare tunnel name) and
+        // produce a duplicate /api/agents entry per agent.
         store.lock().await.insert(
-            agent_id.clone(),
+            name.clone(),
             Agent {
-                agent_id,
+                agent_id: name.clone(),
                 hostname: host.clone(),
                 vm_name: h["vm_name"].as_str().unwrap_or("unknown").to_string(),
                 attestation_type: h["attestation_type"]
