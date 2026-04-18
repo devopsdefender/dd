@@ -218,6 +218,8 @@ async fn health(State(s): State<St>) -> Json<serde_json::Value> {
         "cpu_percent": m.cpu_pct,
         "memory_used_mb": m.mem_used_mb,
         "memory_total_mb": m.mem_total_mb,
+        "nets": m.nets,
+        "disks": m.disks,
         "uptime_secs": s.started.elapsed().as_secs(),
         "ita_token": ita_token,
     }))

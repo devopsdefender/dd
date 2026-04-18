@@ -39,6 +39,10 @@ pub struct Agent {
     pub cpu_percent: u64,
     pub memory_used_mb: u64,
     pub memory_total_mb: u64,
+    #[serde(default)]
+    pub nets: Vec<crate::metrics::NetStats>,
+    #[serde(default)]
+    pub disks: Vec<crate::metrics::DiskStats>,
     /// Intel-verified ITA claims. Required — agents without a valid
     /// token don't enter the store.
     pub ita: ita::Claims,
@@ -176,6 +180,8 @@ async fn tick(
                 cpu_percent: h["cpu_percent"].as_u64().unwrap_or(0),
                 memory_used_mb: h["memory_used_mb"].as_u64().unwrap_or(0),
                 memory_total_mb: h["memory_total_mb"].as_u64().unwrap_or(0),
+                nets: serde_json::from_value(h["nets"].clone()).unwrap_or_default(),
+                disks: serde_json::from_value(h["disks"].clone()).unwrap_or_default(),
                 ita: claims,
             },
         );
