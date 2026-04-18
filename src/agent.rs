@@ -129,11 +129,17 @@ struct Bootstrap {
 async fn register(cfg: &Cfg, ita_token: &str) -> Result<Bootstrap> {
     let http = reqwest::Client::new();
     let url = format!("{}/register", cfg.cp_url.trim_end_matches('/'));
+    let extra_ingress: Vec<serde_json::Value> = cfg
+        .extra_ingress
+        .iter()
+        .map(|(label, port)| serde_json::json!({"hostname_label": label, "port": port}))
+        .collect();
     let body = serde_json::json!({
         "vm_name": cfg.common.vm_name,
         "env_label": cfg.common.env_label,
         "owner": cfg.common.owner,
         "ita_token": ita_token,
+        "extra_ingress": extra_ingress,
     });
     let resp = http
         .post(&url)

@@ -1,8 +1,14 @@
 #!/usr/bin/env bash
 # local-agents.sh — define two local TDX agent VMs on this host:
 #
-#   dd-local-preview : no GPU, registers with the PR-preview CP
-#   dd-local-prod    : H100 passthrough, registers with production
+#   dd-local-preview : no GPU, registers with the PR-preview CP. Bare
+#                      agent + podman — no demo workload — so the release
+#                      pipeline can prove registration + tunnel end-to-end
+#                      against per-PR CPs without needing GPU hardware.
+#   dd-local-prod    : H100 passthrough, registers with production. Boots
+#                      the web-nvidia-smi demo workload + declares a
+#                      `gpu.<agent-host>` ingress so the output is reachable
+#                      from the public internet.
 #
 # Both reuse the existing easyenclave base qcow2 via copy-on-write
 # overlays; each gets its own config.iso baking in DD_CP_URL + DD_PAT +
@@ -46,9 +52,7 @@ BASE_DOMAIN="easyenclave-local"
 #
 # envsubst is restricted to the ALL-CAPS `${VAR}` references that
 # appear in the template itself. Lowercase `$i`, `${i}`, and bare
-# `$((…))` arithmetic inside shell cmd strings are left alone —
-# otherwise envsubst would eat shell locals in openclaw's `until`
-# loop and produce broken scripts.
+# `$((…))` arithmetic inside shell cmd strings are left alone.
 bake() {
   case "$1" in
     *.json.tmpl)
@@ -65,6 +69,13 @@ bake() {
       return 1
       ;;
   esac
+}
+
+# Extract `expose` entries from a stream of baked workloads and emit
+# them as a compact JSON array of `{hostname_label, port}` — the
+# shape dd-agent expects in $DD_EXTRA_INGRESS.
+extract_extra_ingress() {
+  jq -cs '[.[] | select(.expose) | .expose]'
 }
 
 [ -r "$BASE" ] || { echo "missing $BASE" >&2; exit 1; }
@@ -90,44 +101,41 @@ build_config_iso() {
   tmp=$(mktemp -d)
   trap "rm -rf $tmp" RETURN
 
-  # Boot workload chain (EE spawns concurrently; each uses `until`
-  # loops to self-sequence):
-  #   nv             — insmod nvidia driver (prod only, first so the
-  #                    device nodes exist by the time ollama runs)
-  #   mount-models   — mount /dev/vdc at /var/lib/easyenclave/ollama
-  #   podman-static  — fetch the podman binary tarball into /var/lib/easyenclave/bin
-  #   podman-bootstrap — stage binaries, write containers.conf + policy.json,
-  #                    install /var/lib/easyenclave/bin/podman as the wrapper
-  #                    (symlinked from dd-podman for back-compat)
-  #   ollama         — run docker.io/ollama/ollama:latest serve via the wrapper
-  #   openclaw       — wait for ollama, pull $MODEL, launch openclaw gateway
-  #   cloudflared    — fetch cloudflared binary (dd-register spawns it)
-  #   dd-agent       — run devopsdefender agent, register with CP, serve workloads
-  #
-  # Prod gets the GPU model; preview gets the tiny CPU-friendly one.
-  local model ollama_spec
-  if [ "$with_gpu" = "yes" ]; then
-    model="qwen2.5:7b"
-    ollama_spec="$REPO_ROOT/apps/ollama/workload.prod.json"
-  else
-    model="qwen2.5:0.5b"
-    ollama_spec="$REPO_ROOT/apps/ollama/workload.preview.json"
-  fi
+  # Boot workload chain (EE spawns concurrently; dependents self-sequence
+  # via `until` loops):
+  #   nv             — insmod nvidia driver (prod only, first so device
+  #                    nodes exist by the time web-nvidia-smi runs)
+  #   podman-static  — fetch the podman tarball into /var/lib/easyenclave/bin
+  #   podman-bootstrap — stage binaries, install /var/lib/easyenclave/bin/podman
+  #                    wrapper + containers.conf + policy.json
+  #   web-nvidia-smi — prod only. Run nvidia/cuda container, serve
+  #                    `nvidia-smi` output on :8081.
+  #   cloudflared    — fetch binary (agent spawns the tunnel process)
+  #   dd-agent       — register with CP, serve workloads. Requests the
+  #                    gpu.<agent-host> ingress via $DD_EXTRA_INGRESS,
+  #                    computed below from `expose` entries on the
+  #                    baked workloads.
+  local bare_workloads
+  bare_workloads=$({
+    [ "$with_gpu" = "yes" ] && bake "$REPO_ROOT/apps/nv/workload.json"
+    bake "$REPO_ROOT/apps/podman-static/workload.json"
+    bake "$REPO_ROOT/apps/podman-bootstrap/workload.json"
+    [ "$with_gpu" = "yes" ] && bake "$REPO_ROOT/apps/web-nvidia-smi/workload.json"
+    bake "$REPO_ROOT/apps/cloudflared/workload.json"
+  })
+
+  local extra_ingress
+  extra_ingress=$(echo "$bare_workloads" | extract_extra_ingress)
 
   local workloads
   workloads=$({
-    [ "$with_gpu" = "yes" ] && bake "$REPO_ROOT/apps/nv/workload.json"
-    bake "$REPO_ROOT/apps/mount-models/workload.json"
-    bake "$REPO_ROOT/apps/podman-static/workload.json"
-    bake "$REPO_ROOT/apps/podman-bootstrap/workload.json"
-    bake "$ollama_spec"
-    MODEL="$model" bake "$REPO_ROOT/apps/openclaw/workload.json.tmpl"
-    bake "$REPO_ROOT/apps/cloudflared/workload.json"
+    echo "$bare_workloads"
     DD_CP_URL="$cp" \
       DD_PAT="$DD_PAT" \
       DD_ITA_API_KEY="$DD_ITA_API_KEY" \
       DD_ENV="$env" \
       DD_VM_NAME="dd-local-$name" \
+      DD_EXTRA_INGRESS="$extra_ingress" \
       bake "$REPO_ROOT/apps/dd-agent/workload.json.tmpl"
   } | jq -cs '.')
 
@@ -139,7 +147,7 @@ build_config_iso() {
   # ext4 — EE rootfs has no iso9660 module.
   truncate -s 4M "$out"
   mkfs.ext4 -q -d "$tmp" "$out"
-  echo "  wrote $out (env=$env, gpu=$with_gpu, model=$model)"
+  echo "  wrote $out (env=$env, gpu=$with_gpu, extra_ingress=$extra_ingress)"
 }
 
 build_overlay() {
@@ -152,24 +160,6 @@ build_overlay() {
   fi
   qemu-img create -q -F qcow2 -b "$BASE" -f qcow2 "$overlay" 10G
   echo "  wrote $overlay (backing $BASE)"
-}
-
-# Persistent models disk — survives VM relaunch, so ollama doesn't
-# re-download the model each time. Pre-formatted ext4 on the host;
-# the guest just mounts it.
-build_models_disk() {
-  # $1=name, $2=size_gb
-  local name="$1" size_gb="$2"
-  local models="$IMG_DIR/dd-local-$name-models.qcow2"
-  if [ -f "$models" ]; then
-    echo "  models disk $models already exists (reusing)"
-    return
-  fi
-  qemu-img create -q -f raw "$models.raw" "${size_gb}G"
-  mkfs.ext4 -q -F "$models.raw"
-  qemu-img convert -q -f raw -O qcow2 "$models.raw" "$models"
-  rm -f "$models.raw"
-  echo "  wrote $models (${size_gb}G ext4)"
 }
 
 render_domain_xml() {
@@ -193,22 +183,11 @@ render_domain_xml() {
   sed -i "s|/var/log/ee-local\\.log|/var/log/ee-local-$name.log|g" "$out"
 
   # Size the VM for the workload. Base easyenclave-local is 4 GiB /
-  # 2 vCPU — fine for a bare agent, undersized for podman + ollama
-  # + the openclaw gateway on a 900 MB container image. Host has
-  # 243 GiB / 64 cores, so we can be generous.
-  #
-  #   prod:    32 GiB / 16 vCPU  (GPU handles the model; host RAM
-  #                               for podman, openclaw, image pull
-  #                               scratch, model load spill)
-  #   preview: 16 GiB / 8 vCPU   (CPU-only inference; qwen2.5:0.5b
-  #                               + 64k ctx + gateway)
-  if [ "$with_gpu" = "yes" ]; then
-    local mem_kib=33554432  # 32 GiB
-    local vcpus=16
-  else
-    local mem_kib=16777216  # 16 GiB
-    local vcpus=8
-  fi
+  # 2 vCPU — fine for a bare agent. The demo workloads are modest
+  # (web-nvidia-smi just runs nvidia-smi on demand + one apt-get at
+  # boot for netcat). Host has 243 GiB / 64 cores.
+  local mem_kib=8388608   # 8 GiB
+  local vcpus=8
   sed -i -E "s|<memory unit='KiB'>[0-9]+</memory>|<memory unit='KiB'>$mem_kib</memory>|" "$out"
   sed -i -E "s|<currentMemory unit='KiB'>[0-9]+</currentMemory>|<currentMemory unit='KiB'>$mem_kib</currentMemory>|" "$out"
   sed -i -E "s|<vcpu placement='static'>[0-9]+</vcpu>|<vcpu placement='static'>$vcpus</vcpu>|" "$out"
@@ -231,20 +210,6 @@ render_domain_xml() {
          /<\/hostdev>/{skip=0}' "$out" > "$out.tmp" && mv "$out.tmp" "$out"
   fi
 
-  # Add a persistent models disk as vdc. EE will mount it at
-  # /var/lib/easyenclave/ollama via the mount-models boot workload.
-  local models="$IMG_DIR/dd-local-$name-models.qcow2"
-  local disk_block="    <disk type='file' device='disk'>
-      <driver name='qemu' type='qcow2'/>
-      <source file='$models'/>
-      <target dev='vdc' bus='virtio'/>
-    </disk>"
-  # Insert before </devices>.
-  awk -v block="$disk_block" '
-    /<\/devices>/ { print block }
-    { print }
-  ' "$out" > "$out.tmp" && mv "$out.tmp" "$out"
-
   echo "$out"
 }
 
@@ -256,12 +221,6 @@ define_agent() {
 
   echo "== dd-local-$name → $cp (env=$env_label, gpu=$with_gpu) =="
   build_overlay "$name"
-  # Models disk: prod holds the GPU model (few GB), preview holds the small CPU one.
-  if [ "$with_gpu" = "yes" ]; then
-    build_models_disk "$name" 40
-  else
-    build_models_disk "$name" 10
-  fi
   build_config_iso "$name" "$cp" "$env_label" "$with_gpu"
   local xml
   xml=$(render_domain_xml "$name" "$with_gpu")

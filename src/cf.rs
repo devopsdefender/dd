@@ -32,6 +32,8 @@ pub struct Tunnel {
     pub id: String,
     pub token: String,
     pub hostname: String,
+    #[serde(default)]
+    pub extra_hostnames: Vec<String>,
 }
 
 /// One-liner HTTP wrapper: all CF calls go through this. Returns the
@@ -62,8 +64,17 @@ async fn call(
 }
 
 /// Create (or recreate) a CF tunnel with ingress pointing at the local
-/// service on port 8080, and a proxied CNAME for `hostname`.
-pub async fn create(http: &Client, cf: &CfCreds, name: &str, hostname: &str) -> Result<Tunnel> {
+/// service on port 8080, a proxied CNAME for `hostname`, and one
+/// additional `{label}.{hostname}` → `localhost:{port}` ingress +
+/// CNAME per entry in `extras`. Extras are prepended to the ingress
+/// rules so they match before the primary wildcard catch-all.
+pub async fn create(
+    http: &Client,
+    cf: &CfCreds,
+    name: &str,
+    hostname: &str,
+    extras: &[(String, u16)],
+) -> Result<Tunnel> {
     delete_by_name(http, cf, name).await;
 
     let secret = base64::engine::general_purpose::STANDARD.encode(uuid::Uuid::new_v4().as_bytes());
@@ -85,28 +96,43 @@ pub async fn create(http: &Client, cf: &CfCreds, name: &str, hostname: &str) -> 
         .ok_or_else(|| Error::Upstream("tunnel create: missing token".into()))?
         .to_string();
 
+    let mut ingress: Vec<serde_json::Value> = extras
+        .iter()
+        .map(|(label, port)| {
+            serde_json::json!({
+                "hostname": format!("{label}.{hostname}"),
+                "service": format!("http://localhost:{port}"),
+            })
+        })
+        .collect();
+    ingress.push(serde_json::json!({
+        "hostname": hostname,
+        "service": "http://localhost:8080",
+    }));
+    ingress.push(serde_json::json!({"service": "http_status:404"}));
+
     call(
         http,
         cf,
         Method::PUT,
         &format!("/accounts/{}/cfd_tunnel/{id}/configurations", cf.account_id),
-        Some(serde_json::json!({
-            "config": {
-                "ingress": [
-                    {"hostname": hostname, "service": "http://localhost:8080"},
-                    {"service": "http_status:404"},
-                ],
-            },
-        })),
+        Some(serde_json::json!({"config": {"ingress": ingress}})),
     )
     .await?;
 
     upsert_cname(http, cf, &id, hostname).await?;
+    let mut extra_hostnames = Vec::with_capacity(extras.len());
+    for (label, _) in extras {
+        let extra = format!("{label}.{hostname}");
+        upsert_cname(http, cf, &id, &extra).await?;
+        extra_hostnames.push(extra);
+    }
 
     Ok(Tunnel {
         id,
         token,
         hostname: hostname.to_string(),
+        extra_hostnames,
     })
 }
 

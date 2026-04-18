@@ -1,7 +1,0 @@
-{
-  "app_name": "mount-models",
-  "cmd": [
-    "/bin/busybox", "sh", "-c",
-    "mkdir -p /var/lib/easyenclave/ollama && mount /dev/vdc /var/lib/easyenclave/ollama && echo mount-models: ok; sleep inf"
-  ]
-}
