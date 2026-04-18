@@ -131,6 +131,12 @@ pub async fn run() -> Result<()> {
             nets: cp_m.nets,
             disks: cp_m.disks,
             ita: cp_claims,
+            // CP doesn't take per-workload runtime ingress — its own tunnel
+            // only routes `DD_HOSTNAME → localhost:8080`. tunnel_id stays
+            // empty so the runtime-ingress endpoint rejects attempts to
+            // target "control-plane".
+            tunnel_id: String::new(),
+            extras: Vec::new(),
         },
     );
 
@@ -207,6 +213,7 @@ pub async fn run() -> Result<()> {
         .route("/", get(fleet))
         .route("/health", get(health))
         .route("/register", post(register))
+        .route("/ingress/replace", post(ingress_replace))
         .route("/agent/{id}", get(agent_detail))
         .route("/agent/{id}/logs/{app}", get(agent_logs))
         .route("/api/agents", get(api_agents))
@@ -372,6 +379,10 @@ async fn register(
                 nets: Vec::new(),
                 disks: Vec::new(),
                 ita: ita_claims,
+                // Seeded from the boot `extra_ingress`; runtime /deploy
+                // requests extend this list via /ingress/replace (below).
+                tunnel_id: tunnel.id.clone(),
+                extras: extras.clone(),
             },
         );
     }
@@ -387,6 +398,78 @@ async fn register(
         "agent_id": name,
         "jwt_secret_b64": s.keys.secret_b64,
         "cp_hostname": s.cfg.hostname,
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+struct IngressReplaceReq {
+    /// The agent's own `agent_id` (== tunnel name) as returned from
+    /// /register. Authenticated indirectly: the caller's PAT must
+    /// belong to `DD_OWNER`, and the agent must already exist in the
+    /// CP's store under this id (so anyone with a valid owner-PAT can
+    /// only target agents the CP already knows about).
+    agent_id: String,
+    /// Full replacement set of per-workload ingress rules for this
+    /// agent. The CP re-PUTs the tunnel config with `extras` first,
+    /// the primary `hostname → localhost:8080` rule, and the 404
+    /// catch-all. Runtime additions from /deploy live alongside the
+    /// boot-time `extra_ingress` from /register here — the agent
+    /// owns the merge.
+    extras: Vec<IngressPair>,
+}
+
+#[derive(Debug, Deserialize)]
+struct IngressPair {
+    hostname_label: String,
+    port: u16,
+}
+
+/// POST /ingress/replace — agent pushes an updated ingress list
+/// (boot extras + anything POSTed to /deploy with an `expose` field)
+/// and the CP re-PUTs the tunnel config + CNAMEs. No tunnel
+/// recreation — the token + tunnel id stay stable across calls.
+async fn ingress_replace(
+    State(s): State<St>,
+    headers: HeaderMap,
+    Json(req): Json<IngressReplaceReq>,
+) -> Result<Json<serde_json::Value>> {
+    let pat = auth::bearer(&headers).ok_or(Error::Unauthorized)?;
+    let _login = auth::verify_pat(&pat, &s.cfg.common.owner).await?;
+
+    let (tunnel_id, hostname) = {
+        let store = s.store.lock().await;
+        let agent = store.get(&req.agent_id).ok_or(Error::NotFound)?;
+        if agent.tunnel_id.is_empty() {
+            // Control-plane pseudo-entry, or an older store entry that
+            // pre-dates the tunnel_id field. Either way, nothing to update.
+            return Err(Error::BadRequest(format!(
+                "{} has no tunnel — runtime ingress applies only to agent tunnels",
+                req.agent_id
+            )));
+        }
+        (agent.tunnel_id.clone(), agent.hostname.clone())
+    };
+
+    let extras: Vec<(String, u16)> = req
+        .extras
+        .iter()
+        .map(|e| (e.hostname_label.clone(), e.port))
+        .collect();
+
+    let http = reqwest::Client::new();
+    let hostnames = cf::update_ingress(&http, &s.cfg.cf, &tunnel_id, &hostname, &extras).await?;
+
+    {
+        let mut store = s.store.lock().await;
+        if let Some(agent) = store.get_mut(&req.agent_id) {
+            agent.extras = extras;
+        }
+    }
+
+    eprintln!("cp: ingress/replace {} → {:?}", req.agent_id, hostnames);
+    Ok(Json(serde_json::json!({
+        "agent_id": req.agent_id,
+        "extra_hostnames": hostnames,
     })))
 }
 

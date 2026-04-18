@@ -40,10 +40,20 @@ struct St {
     ee: Arc<Ee>,
     keys: Arc<Keys>,
     hostname: String,
+    /// Tunnel name returned by the CP at /register — stable for the
+    /// life of this agent's tunnel. The /ingress/replace call on the
+    /// CP keys off this to look up the tunnel_id.
+    agent_id: String,
     cp_hostname: String,
     started: Instant,
     /// Current Intel-signed JWT. Refreshed by a background task.
     ita_token: Arc<RwLock<String>>,
+    /// Live set of per-workload ingress rules this agent has asked
+    /// the CP to publish. Seeded from boot `cfg.extra_ingress`;
+    /// appended each time a POSTed workload declares `expose`. The
+    /// agent forwards the full list on every /ingress/replace call
+    /// so the CP's PUT is a straight replacement.
+    extras: Arc<RwLock<Vec<(String, u16)>>>,
 }
 
 pub async fn run() -> Result<()> {
@@ -95,9 +105,11 @@ pub async fn run() -> Result<()> {
         ee,
         keys,
         hostname: b.hostname,
+        agent_id: b.agent_id,
         cp_hostname: b.cp_hostname,
         started: Instant::now(),
         ita_token,
+        extras: Arc::new(RwLock::new(cfg.extra_ingress.clone())),
     };
 
     let app = Router::new()
@@ -122,6 +134,7 @@ pub async fn run() -> Result<()> {
 struct Bootstrap {
     tunnel_token: String,
     hostname: String,
+    agent_id: String,
     jwt_secret_b64: String,
     cp_hostname: String,
 }
@@ -432,7 +445,84 @@ async fn deploy(
     Json(spec): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>> {
     auth::resolve(&s.keys, &s.cfg.common.owner, &headers).await?;
-    Ok(Json(s.ee.deploy(spec).await?))
+
+    // Pull `expose` off the spec before forwarding to EE. EE ignores
+    // unknown fields today but keeping the payload tidy avoids future
+    // surprises if EE ever grows stricter parsing.
+    let expose = parse_expose(&spec);
+
+    let response = s.ee.deploy(spec).await?;
+
+    if let Some((label, port)) = expose {
+        if let Err(e) = push_extra_ingress(&s, label.clone(), port).await {
+            // Soft-fail: the workload is deployed, the owner just can't
+            // reach it from the public internet yet. Better than failing
+            // the whole /deploy and leaving the caller unsure whether
+            // the process is running.
+            eprintln!(
+                "agent: /ingress/replace add {label}:{port} failed (workload still running): {e}"
+            );
+        }
+    }
+
+    Ok(Json(response))
+}
+
+/// Extract `expose.hostname_label` + `expose.port` from a DeployRequest
+/// JSON body. Returns None if the field is missing or malformed; the
+/// caller treats that as "no runtime ingress requested" and moves on.
+fn parse_expose(spec: &serde_json::Value) -> Option<(String, u16)> {
+    let expose = spec.get("expose")?;
+    let label = expose.get("hostname_label")?.as_str()?.to_string();
+    let port = expose.get("port")?.as_u64()?;
+    if label.is_empty() || port == 0 || port > u16::MAX as u64 {
+        return None;
+    }
+    Some((label, port as u16))
+}
+
+/// Append `(label, port)` to the live extras list (dedup by label —
+/// redeploying the same app_name with the same hostname_label is a
+/// no-op, not a duplicate rule) and POST the full list to the CP's
+/// /ingress/replace endpoint. The CP re-PUTs the tunnel config and
+/// upserts CNAMEs.
+async fn push_extra_ingress(s: &St, label: String, port: u16) -> Result<()> {
+    let extras = {
+        let mut guard = s.extras.write().await;
+        if let Some(existing) = guard.iter_mut().find(|(l, _)| *l == label) {
+            existing.1 = port;
+        } else {
+            guard.push((label, port));
+        }
+        guard.clone()
+    };
+
+    let body_extras: Vec<serde_json::Value> = extras
+        .iter()
+        .map(|(l, p)| serde_json::json!({"hostname_label": l, "port": p}))
+        .collect();
+    let body = serde_json::json!({
+        "agent_id": s.agent_id,
+        "extras": body_extras,
+    });
+
+    let url = format!("{}/ingress/replace", s.cfg.cp_url.trim_end_matches('/'));
+    let resp = reqwest::Client::new()
+        .post(&url)
+        .bearer_auth(&s.cfg.pat)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| Error::Upstream(format!("ingress/replace {url}: {e}")))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        return Err(Error::Upstream(format!(
+            "ingress/replace {url} → {status}: {text}"
+        )));
+    }
+    eprintln!("agent: ingress/replace ok ({} extras total)", extras.len());
+    Ok(())
 }
 
 #[derive(Debug, Deserialize)]

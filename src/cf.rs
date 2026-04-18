@@ -96,6 +96,43 @@ pub async fn create(
         .ok_or_else(|| Error::Upstream("tunnel create: missing token".into()))?
         .to_string();
 
+    let extra_hostnames = apply_ingress(http, cf, &id, hostname, extras).await?;
+
+    Ok(Tunnel {
+        id,
+        token,
+        hostname: hostname.to_string(),
+        extra_hostnames,
+    })
+}
+
+/// Replace an existing tunnel's ingress rules + CNAME records. Used
+/// for runtime updates — e.g. a workload POSTed to `/deploy` declares
+/// `expose`, the agent forwards the full current extras list to the
+/// CP, and the CP calls this to re-PUT the tunnel config without
+/// recreating the tunnel or touching the tunnel token. Returns the
+/// resolved extra hostnames so the caller can log / store them.
+pub async fn update_ingress(
+    http: &Client,
+    cf: &CfCreds,
+    tunnel_id: &str,
+    hostname: &str,
+    extras: &[(String, u16)],
+) -> Result<Vec<String>> {
+    apply_ingress(http, cf, tunnel_id, hostname, extras).await
+}
+
+/// Build the ingress array (extras first, then the primary
+/// `hostname → localhost:8080` rule, then the 404 catch-all), PUT
+/// it to the tunnel, and upsert a CNAME for each hostname pointing
+/// at `{tunnel_id}.cfargotunnel.com`.
+async fn apply_ingress(
+    http: &Client,
+    cf: &CfCreds,
+    tunnel_id: &str,
+    hostname: &str,
+    extras: &[(String, u16)],
+) -> Result<Vec<String>> {
     let mut ingress: Vec<serde_json::Value> = extras
         .iter()
         .map(|(label, port)| {
@@ -115,25 +152,22 @@ pub async fn create(
         http,
         cf,
         Method::PUT,
-        &format!("/accounts/{}/cfd_tunnel/{id}/configurations", cf.account_id),
+        &format!(
+            "/accounts/{}/cfd_tunnel/{tunnel_id}/configurations",
+            cf.account_id
+        ),
         Some(serde_json::json!({"config": {"ingress": ingress}})),
     )
     .await?;
 
-    upsert_cname(http, cf, &id, hostname).await?;
+    upsert_cname(http, cf, tunnel_id, hostname).await?;
     let mut extra_hostnames = Vec::with_capacity(extras.len());
     for (label, _) in extras {
         let extra = format!("{label}.{hostname}");
-        upsert_cname(http, cf, &id, &extra).await?;
+        upsert_cname(http, cf, tunnel_id, &extra).await?;
         extra_hostnames.push(extra);
     }
-
-    Ok(Tunnel {
-        id,
-        token,
-        hostname: hostname.to_string(),
-        extra_hostnames,
-    })
+    Ok(extra_hostnames)
 }
 
 async fn upsert_cname(http: &Client, cf: &CfCreds, tunnel_id: &str, hostname: &str) -> Result<()> {
