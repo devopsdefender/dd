@@ -41,22 +41,22 @@
         <div class="step">
           <div class="step-num">1</div>
           <div class="step-content">
-            <h3>Deploy</h3>
-            <p>Push your container image via GitHub Actions. The <code>deploy-workload</code> action POSTs your deploy spec to dd-agent's API through the Cloudflare tunnel. No SSH keys, no raw IPs.</p>
+            <h3>Declare</h3>
+            <p>Write your app as one JSON spec at <code>apps/&lt;name&gt;/workload.json</code> &mdash; or paste it inline in your GitHub Actions workflow. A workload is <code>{app_name, cmd, env, github_release}</code>: a container, a binary, a shell script, your call.</p>
           </div>
         </div>
         <div class="step">
           <div class="step-num">2</div>
           <div class="step-content">
-            <h3>Attest</h3>
-            <p>The TDX VM generates a cryptographic quote proving the exact code running inside the enclave. EasyEnclave's attestation API lets you verify the measurement against known-good builds.</p>
+            <h3>Deploy</h3>
+            <p>Push via GitHub Actions &mdash; the <code>deploy-workload</code> action POSTs the spec to the agent's <code>/deploy</code> through its Cloudflare tunnel. No SSH, no raw IPs, no port forwards. Or skip the action and bake it as a boot workload.</p>
           </div>
         </div>
         <div class="step">
           <div class="step-num">3</div>
           <div class="step-content">
-            <h3>Run</h3>
-            <p>Your workload runs inside hardware-encrypted memory. The fleet dashboard shows health, metrics, and attestation status across all your agents. Logs stay inside the enclave boundary.</p>
+            <h3>Attest &amp; run</h3>
+            <p>Intel TDX seals the guest memory; the agent mints a quote and the CP verifies it via Intel Trust Authority at <code>/register</code>. Your workload runs inside hardware-encrypted memory while the fleet dashboard streams live CPU, disk, and network metrics.</p>
           </div>
         </div>
       </div>
@@ -75,13 +75,13 @@
         </div>
         <div class="card">
           <div class="icon">&#x1f4ca;</div>
-          <h3>Fleet Management</h3>
-          <p>dd-web dashboard shows all agents across your infrastructure. Prometheus-style collector scrapes /health. Federation for horizontal scaling.</p>
+          <h3>Fleet Metrics</h3>
+          <p>CP dashboard scrapes <code>/health</code> on every agent: CPU, memory, per-disk capacity, per-NIC rx/tx, ITA attestation status. Click an agent for detail; open a per-app terminal in the browser.</p>
         </div>
         <div class="card">
           <div class="icon">&#x1f680;</div>
-          <h3>API-Driven Deploys</h3>
-          <p>GitHub Actions deploy workloads via POST /deploy. No SSH. GITHUB_TOKEN auth works out of the box. Retry logic handles tunnel instability.</p>
+          <h3>Workloads as JSON</h3>
+          <p>Every app &mdash; cloudflared, dd-agent, ollama, openclaw, yours &mdash; is one file at <code>apps/&lt;name&gt;/workload.json</code>. Boot workloads and runtime deploys share the same schema. Drop in a JSON, ship it.</p>
         </div>
         <div class="card">
           <div class="icon">&#x20bf;</div>
@@ -96,7 +96,12 @@
         <div class="card">
           <div class="icon">&#x1f310;</div>
           <h3>Cloudflare Tunnels</h3>
-          <p>Every agent gets a tunnel hostname. No public IPs, no firewall rules, no port forwarding. dd-register provisions tunnels automatically on registration.</p>
+          <p>Every agent gets a tunnel hostname. No public IPs, no firewall rules, no port forwarding. The CP provisions tunnels automatically on registration.</p>
+        </div>
+        <div class="card">
+          <div class="icon">&#x1f4dc;</div>
+          <h3>Signed Releases</h3>
+          <p>Every <code>devopsdefender</code> binary CI publishes carries a Sigstore-backed GitHub build attestation. <code>gh attestation verify</code> proves a binary came from this repo's release workflow &mdash; provable provenance, not trust us.</p>
         </div>
       </div>
     </div>
@@ -105,7 +110,7 @@
   <section id="arch" class="section-center">
     <div class="container">
       <h2>Architecture</h2>
-      <p class="subtitle">1 binary, 2 modes, zero trust.</p>
+      <p class="subtitle">1 binary, 2 modes, workloads as code.</p>
       <div class="arch">
 <pre>
 <span class="hl">Customer</span> (browser)
@@ -114,20 +119,20 @@
 <span class="hl">Cloudflare Edge</span> ──── tunnel ────> <span class="gr">TDX VM</span>
                                     |
                             <span class="gr">easyenclave</span> (PID 1)
-                            ├── unix socket API
-                            ├── workload: <span class="hl">devopsdefender agent</span>
-                            │   ├── /health, /deploy, /exec
-                            │   ├── ITA-signed attestation
-                            │   └── registers with devopsdefender cp
-                            └── workload: <span class="hl">openclaw + ollama</span> (podman)
-                                ├── llama3.1:8b (GPU, prod)
-                                └── qwen2.5:0.5b (CPU, preview)
+                            |
+                            └── spawns workloads from <span class="hl">apps/*/workload.json</span>
+                                ├── <span class="hl">cloudflared</span>           (fetch-only, gives us a tunnel)
+                                ├── <span class="hl">devopsdefender agent</span>  (/health, /deploy, /exec)
+                                ├── <span class="hl">podman</span>                (static, rootful, daemon-less)
+                                └── container: <span class="hl">ollama + openclaw</span>
+                                    ├── llama3.1:8b on H100 (prod)
+                                    └── qwen2.5:0.5b on CPU (preview)
 
 <span class="hl">devopsdefender cp</span> (fleet dashboard + management)
   ├── discovers agents via CF tunnels
-  ├── scrapes /health (Prometheus-style)
-  ├── verifies agent ITA tokens at /register
-  └── web UI: fleet, per-agent terminal, logs
+  ├── scrapes /health (per-disk + per-NIC metrics)
+  ├── verifies each agent's ITA quote at /register
+  └── web UI: fleet table, per-agent detail, in-browser shell
 </pre>
       </div>
     </div>
@@ -142,7 +147,7 @@
 <pre><span class="k">- uses:</span> <span class="s">devopsdefender/dd/.github/actions/deploy-workload@main</span>
   <span class="k">with:</span>
     <span class="k">agent-url:</span> <span class="s">https://app.devopsdefender.com</span>
-    <span class="c"># deploy-spec: apps/myapp/deploy.json   # or a file path</span>
+    <span class="c"># deploy-spec: apps/myapp/workload.json   # or a file path</span>
     <span class="k">deploy-spec-inline:</span> <span class="s">|</span>
       <span class="s">{</span>
         <span class="s">"app_name": "myapp",</span>
@@ -159,6 +164,7 @@
     <span class="k">deployment:</span> <span class="s">myapp</span>
     <span class="k">timeout:</span> <span class="s">300</span></pre>
       </div>
+      <p style="margin-top:16px;color:var(--text-dim);font-size:14px;">Every workload &mdash; dd-agent, cloudflared, ollama, openclaw, yours &mdash; is one JSON spec at <code>apps/&lt;name&gt;/workload.json</code>. Boot-time, runtime, first-class; same schema everywhere.</p>
     </div>
   </section>
 
