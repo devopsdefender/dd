@@ -8,8 +8,9 @@
 //!   1. List CF tunnels whose name starts with `dd-{env}-agent-`.
 //!   2. Scrape `https://{tunnel-name}.{domain}/health` in parallel.
 //!   3. Verify the `ita_token` field from each /health body.
-//!   4. Insert on success; mark dead / GC tunnel on repeated scrape failures.
-//!   5. Refresh the `control-plane` entry (its claims come from CP startup).
+//!   4. Insert on success, including tunnel id and reported ingress.
+//!   5. Mark dead / GC tunnel on repeated scrape failures.
+//!   6. Refresh the `control-plane` entry (its claims come from CP startup).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -55,8 +56,8 @@ pub struct Agent {
     /// tunnel. Seeded at /register from the boot-workload `expose`
     /// set; appended on each runtime /ingress/replace call. If the
     /// agent relaunches, the CP re-seeds from the new register's
-    /// `extra_ingress` field — runtime extras are intentionally NOT
-    /// persisted across relaunches.
+    /// `extra_ingress` field. If only the CP restarts, the collector
+    /// recovers this list from the agent's `/health` response.
     #[serde(default)]
     pub extras: Vec<(String, u16)>,
 }
@@ -112,33 +113,41 @@ async fn tick(
     env_label: &str,
     cp_hostname: &str,
 ) {
-    let tunnels: Vec<(String, String)> = cf::list(http, cf)
+    let tunnels: Vec<(String, String, String)> = cf::list(http, cf)
         .await
         .unwrap_or_default()
         .into_iter()
         .filter_map(|t| {
             let name = t["name"].as_str()?;
+            let id = t["id"].as_str()?;
             if !name.starts_with(prefix) {
                 return None;
             }
             let hostname = format!("{name}.{}", cf.domain);
-            Some((name.to_string(), hostname))
+            Some((name.to_string(), id.to_string(), hostname))
         })
         .collect();
 
-    let scrapes = tunnels.iter().map(|(name, host)| {
+    let scrapes = tunnels.iter().map(|(name, tunnel_id, host)| {
         let http = http.clone();
         let name = name.clone();
+        let tunnel_id = tunnel_id.clone();
         let host = host.clone();
         async move {
             let r = http.get(format!("https://{host}/health")).send().await;
             match r {
                 Ok(resp) if resp.status().is_success() => {
                     let body = resp.json::<serde_json::Value>().await.ok();
-                    (name, host, body, None)
+                    (name, tunnel_id, host, body, None)
                 }
-                Ok(resp) => (name, host, None, Some(format!("status {}", resp.status()))),
-                Err(e) => (name, host, None, Some(e.to_string())),
+                Ok(resp) => (
+                    name,
+                    tunnel_id,
+                    host,
+                    None,
+                    Some(format!("status {}", resp.status())),
+                ),
+                Err(e) => (name, tunnel_id, host, None, Some(e.to_string())),
             }
         }
     });
@@ -148,7 +157,7 @@ async fn tick(
     let mut orphans: Vec<(String, String)> = Vec::new();
     let mut verified = 0usize;
 
-    for (name, host, body, err) in &results {
+    for (name, tunnel_id, host, body, err) in &results {
         let Some(h) = body else {
             mark_stale_or_orphan(store, host, name, err, now, &mut orphans).await;
             continue;
@@ -165,18 +174,10 @@ async fn tick(
             }
         };
         // Store key is the tunnel name (authoritative on the CP side),
-        // NOT the agent's self-reported agent_id. The agent currently
-        // reports its full hostname there, which would land in a
-        // different key than /register used (the bare tunnel name) and
-        // produce a duplicate /api/agents entry per agent.
+        // NOT the agent's self-reported agent_id.
         let mut s = store.lock().await;
-        // Preserve tunnel_id + extras across scrapes — they're owned by
-        // /register and /ingress/replace; the collector's job is
-        // health/metrics refresh only, not ingress bookkeeping.
-        let (tunnel_id, extras) = s
-            .get(name)
-            .map(|a| (a.tunnel_id.clone(), a.extras.clone()))
-            .unwrap_or_default();
+        let extras = parse_extra_ingress(h)
+            .unwrap_or_else(|| s.get(name).map(|a| a.extras.clone()).unwrap_or_default());
         s.insert(
             name.clone(),
             Agent {
@@ -204,7 +205,7 @@ async fn tick(
                 nets: serde_json::from_value(h["nets"].clone()).unwrap_or_default(),
                 disks: serde_json::from_value(h["disks"].clone()).unwrap_or_default(),
                 ita: claims,
-                tunnel_id,
+                tunnel_id: tunnel_id.clone(),
                 extras,
             },
         );
@@ -275,6 +276,22 @@ async fn tick(
     );
 }
 
+fn parse_extra_ingress(h: &serde_json::Value) -> Option<Vec<(String, u16)>> {
+    h.get("extra_ingress")?.as_array().map(|items| {
+        items
+            .iter()
+            .filter_map(|item| {
+                let label = item.get("hostname_label")?.as_str()?;
+                let port = item.get("port")?.as_u64()?;
+                if label.is_empty() || port == 0 || port > u16::MAX as u64 {
+                    return None;
+                }
+                Some((label.to_string(), port as u16))
+            })
+            .collect()
+    })
+}
+
 async fn mark_stale_or_orphan(
     store: &Store,
     host: &str,
@@ -297,5 +314,47 @@ async fn mark_stale_or_orphan(
         .is_some_and(|e| e.contains("connect") || e.contains("timed out"))
     {
         orphans.push((name.to_string(), host.to_string()));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_extra_ingress;
+
+    #[test]
+    fn missing_extra_ingress_preserves_existing_state() {
+        let h = serde_json::json!({});
+
+        assert_eq!(parse_extra_ingress(&h), None);
+    }
+
+    #[test]
+    fn parses_valid_extra_ingress() {
+        let h = serde_json::json!({
+            "extra_ingress": [
+                {"hostname_label": "gpu", "port": 8081},
+                {"hostname_label": "web", "port": 9000}
+            ]
+        });
+
+        assert_eq!(
+            parse_extra_ingress(&h),
+            Some(vec![("gpu".into(), 8081), ("web".into(), 9000)])
+        );
+    }
+
+    #[test]
+    fn drops_malformed_extra_ingress_entries() {
+        let h = serde_json::json!({
+            "extra_ingress": [
+                {"hostname_label": "gpu", "port": 8081},
+                {"hostname_label": "", "port": 8082},
+                {"hostname_label": "bad-zero", "port": 0},
+                {"hostname_label": "bad-wide", "port": 70000},
+                {"hostname_label": "bad-string", "port": "8083"}
+            ]
+        });
+
+        assert_eq!(parse_extra_ingress(&h), Some(vec![("gpu".into(), 8081)]));
     }
 }

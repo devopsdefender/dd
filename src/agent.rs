@@ -223,11 +223,18 @@ async fn health(State(s): State<St>) -> Json<serde_json::Value> {
         .unwrap_or_default();
     let m = metrics::collect().await;
     let ita_token = s.ita_token.read().await.clone();
+    let extra_ingress: Vec<serde_json::Value> = s
+        .extras
+        .read()
+        .await
+        .iter()
+        .map(|(label, port)| serde_json::json!({"hostname_label": label, "port": port}))
+        .collect();
 
     Json(serde_json::json!({
         "ok": true,
         "service": "agent",
-        "agent_id": s.hostname,
+        "agent_id": s.agent_id,
         "vm_name": s.cfg.common.vm_name,
         "hostname": s.hostname,
         "owner": s.cfg.common.owner,
@@ -241,6 +248,7 @@ async fn health(State(s): State<St>) -> Json<serde_json::Value> {
         "disks": m.disks,
         "uptime_secs": s.started.elapsed().as_secs(),
         "ita_token": ita_token,
+        "extra_ingress": extra_ingress,
     }))
 }
 
