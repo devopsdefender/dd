@@ -124,12 +124,12 @@ pub struct Agent {
     pub pat: String,
     pub ee_socket: String,
     pub ita: Ita,
-    /// Extra cloudflared ingress rules requested at register time.
-    /// Populated from `DD_EXTRA_INGRESS` — a JSON array of
-    /// `{"hostname_label": "...", "port": N}` objects assembled by
-    /// the boot-workload builder (`apps/_infra/local-agents.sh`)
-    /// from `expose` hints on individual workload specs. Empty is
-    /// fine — the agent just gets the default dashboard rule.
+    /// Extra cloudflared ingress rules requested at register time,
+    /// parsed from `DD_EXTRA_INGRESS` (a comma-separated list of
+    /// `label:port` pairs, e.g. `gpu:8081,web:9000`). The boot-workload
+    /// builder (`apps/_infra/local-agents.sh`) collects these from
+    /// `expose` hints on individual workload specs. Empty is fine —
+    /// the agent just gets the default dashboard rule.
     pub extra_ingress: Vec<(String, u16)>,
 }
 

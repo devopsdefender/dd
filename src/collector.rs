@@ -46,6 +46,19 @@ pub struct Agent {
     /// Intel-verified ITA claims. Required — agents without a valid
     /// token don't enter the store.
     pub ita: ita::Claims,
+    /// CF tunnel ID (not name) — needed to re-PUT ingress at runtime
+    /// when a POSTed workload declares `expose`. Empty for the
+    /// `control-plane` pseudo-entry which doesn't take runtime slop.
+    #[serde(default)]
+    pub tunnel_id: String,
+    /// Currently-active per-workload ingress rules for this agent's
+    /// tunnel. Seeded at /register from the boot-workload `expose`
+    /// set; appended on each runtime /ingress/replace call. If the
+    /// agent relaunches, the CP re-seeds from the new register's
+    /// `extra_ingress` field — runtime extras are intentionally NOT
+    /// persisted across relaunches.
+    #[serde(default)]
+    pub extras: Vec<(String, u16)>,
 }
 
 pub type Store = Arc<Mutex<HashMap<String, Agent>>>;
@@ -156,7 +169,15 @@ async fn tick(
         // reports its full hostname there, which would land in a
         // different key than /register used (the bare tunnel name) and
         // produce a duplicate /api/agents entry per agent.
-        store.lock().await.insert(
+        let mut s = store.lock().await;
+        // Preserve tunnel_id + extras across scrapes — they're owned by
+        // /register and /ingress/replace; the collector's job is
+        // health/metrics refresh only, not ingress bookkeeping.
+        let (tunnel_id, extras) = s
+            .get(name)
+            .map(|a| (a.tunnel_id.clone(), a.extras.clone()))
+            .unwrap_or_default();
+        s.insert(
             name.clone(),
             Agent {
                 agent_id: name.clone(),
@@ -183,8 +204,11 @@ async fn tick(
                 nets: serde_json::from_value(h["nets"].clone()).unwrap_or_default(),
                 disks: serde_json::from_value(h["disks"].clone()).unwrap_or_default(),
                 ita: claims,
+                tunnel_id,
+                extras,
             },
         );
+        drop(s);
         verified += 1;
     }
 
