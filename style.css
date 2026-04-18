@@ -76,6 +76,7 @@ section .subtitle { color: var(--text-dim); font-size: 16px; margin-bottom: 40px
 .code-block pre { padding: 20px; font-family: var(--mono); font-size: 13px; line-height: 1.6; overflow-x: auto; }
 .code-block .k { color: var(--mauve); }
 .code-block .s { color: var(--green); }
+.code-block .c { color: var(--text-dim); font-style: italic; }
 
 /* Callout */
 .callout { background: var(--bg-alt); border: 1px solid var(--surface); border-radius: 12px; padding: 40px; text-align: center; max-width: 640px; margin: 0 auto; }
