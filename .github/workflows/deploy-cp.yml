@@ -1,18 +1,17 @@
 name: Deploy CP
 
 # Reusable workflow: provision the CP TDX VM on GCP, wait for it to be
-# healthy, verify attestation + dashboard + STONITH, and cascade a
-# relaunch of the matching dd-local agent VM. Called from release.yml
-# (preview path) and production-deploy.yml (prod path) with different
-# inputs — both paths share this exact set of verification steps, so
-# preview CI exercises the same code that prod runs.
+# healthy, verify attestation + dashboard + STONITH, then cascade a
+# relaunch of the matching dd-local agent VM and block until it
+# re-registers. Called from release.yml's deploy-preview (PR path) and
+# deploy-production (main / dispatch path) with env-specific inputs —
+# both paths share this exact set of verification steps so every PR
+# exercises the prod deploy code.
 #
 # GitHub Actions allows ≤4 levels of workflow_call nesting. Today's
-# chain is `release.yml → deploy-cp.yml` (2) and
-# `production-deploy.yml → deploy-cp.yml` (2) — deep enough headroom
-# that we can still call one more reusable workflow below us if needed.
-# The agent-relaunch cascade uses a composite action (same-job, no
-# nesting) to keep that headroom.
+# chain is `release.yml → deploy-cp.yml` (2). The agent-relaunch
+# cascade uses a composite action (same-job, no nesting) to keep
+# headroom for future wrapping.
 
 on:
   workflow_call:
@@ -95,15 +94,75 @@ jobs:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.DD_CP_CF_ACCOUNT_ID }}
           CLOUDFLARE_ZONE_ID: ${{ secrets.DD_CP_CF_ZONE_ID }}
           # OAuth only in environments that have these set (production).
-          # When empty, gcp-deploy.sh omits the workload env vars →
-          # dd-web disables /auth/github/* and serves /auth/pat only.
+          # Empty placeholder values get stripped below before baking the
+          # workload spec, so dd-web disables /auth/github/* and serves
+          # /auth/pat only in those envs.
           DD_GITHUB_CLIENT_ID: ${{ inputs.oauth_enabled && (vars.DD_GITHUB_CLIENT_ID || secrets.DD_GITHUB_CLIENT_ID) || '' }}
           DD_GITHUB_CALLBACK_URL: ${{ inputs.oauth_enabled && vars.DD_GITHUB_CALLBACK_URL || '' }}
           DD_GITHUB_CLIENT_SECRET: ${{ inputs.oauth_enabled && secrets.DD_GITHUB_CLIENT_SECRET || '' }}
-          # ITA — optional. When set, the CP mints + verifies quotes.
           DD_ITA_API_KEY: ${{ secrets.DD_ITA_API_KEY }}
           DD_RELEASE_TAG: ${{ inputs.release_tag }}
-        run: scripts/gcp-deploy.sh
+          EE_IMAGE_FAMILY: easyenclave-staging
+          EE_IMAGE_PROJECT: easyenclave
+          VM_MACHINE_TYPE: c3-standard-4
+          VM_DISK_SIZE: 10GB
+          DD_ITA_BASE_URL: https://api.trustauthority.intel.com
+          DD_ITA_JWKS_URL: https://portal.trustauthority.intel.com/certs
+          DD_ITA_ISSUER: https://portal.trustauthority.intel.com
+        run: |
+          set -euo pipefail
+
+          VM_NAME="dd-${DD_ENV}-$(date +%s)"
+          : "${DD_ITA_API_KEY:?set DD_ITA_API_KEY via secrets.DD_ITA_API_KEY}"
+          export DD_GITHUB_CALLBACK_URL="${DD_GITHUB_CALLBACK_URL:-https://${DD_HOSTNAME}/auth/github/callback}"
+
+          # Bake a workload template: envsubst ${VAR} placeholders and
+          # strip any "KEY=" env entries that ended up with empty values
+          # (e.g. OAuth creds in non-prod envs).
+          bake() {
+            case "$1" in
+              *.json.tmpl)
+                envsubst < "$1" \
+                  | jq -c 'if .env then .env |= map(select(test("^[^=]+=.+"))) else . end'
+                ;;
+              *.json)
+                jq -c . "$1"
+                ;;
+              *)
+                echo "::error::unknown workload file type: $1" >&2
+                return 1
+                ;;
+            esac
+          }
+
+          # Boot workloads come from apps/<name>/workload.{json,json.tmpl}.
+          # cloudflared fetches the binary onto PATH; dd-management runs
+          # devopsdefender in DD_MODE=management (CP + dashboard).
+          EE_BOOT_WORKLOADS=$({
+            bake apps/cloudflared/workload.json
+            bake apps/dd-management/workload.json.tmpl
+          } | jq -cs '.')
+
+          jq -c -n \
+            --arg workloads "$EE_BOOT_WORKLOADS" \
+            '{ "EE_BOOT_WORKLOADS": $workloads, "EE_OWNER": "devopsdefender" }' \
+            > /tmp/ee-config.json
+
+          gcloud compute instances create "$VM_NAME" \
+            --project="$GCP_PROJECT_ID" \
+            --zone="$GCP_ZONE" \
+            --machine-type="$VM_MACHINE_TYPE" \
+            --confidential-compute-type=TDX \
+            --maintenance-policy=TERMINATE \
+            --boot-disk-size="$VM_DISK_SIZE" \
+            --image-family="$EE_IMAGE_FAMILY" \
+            --image-project="$EE_IMAGE_PROJECT" \
+            --metadata-from-file=ee-config=/tmp/ee-config.json \
+            --labels=devopsdefender=managed,dd_env="${DD_ENV}" \
+            --tags=dd-management
+
+          rm -f /tmp/ee-config.json
+          echo "VM: $VM_NAME ($DD_HOSTNAME, release $DD_RELEASE_TAG)"
 
       - name: Wait for agent health (streams serial console)
         env:
@@ -287,15 +346,11 @@ jobs:
             }
 
       # Cascade a relaunch of the matching dd-local-{env} libvirt domain
-      # on the tdx2 host. Preview runs dd-local-preview against the PR's
-      # CP; prod runs dd-local-prod against app.devopsdefender.com.
-      # Non-blocking (`continue-on-error`) because the openclaw boot
-      # chain inside dd-local-preview can take 30 min on first boot —
-      # we want PR status reflecting the CP deploy, with the agent
-      # relaunch as a signal-only exercise until vdc is warm.
+      # on the tdx2 host, then block on it registering with the freshly-
+      # deployed CP. This is the gate: a release is "done" only when the
+      # local agent is back online talking to the new CP.
       - name: Relaunch dd-local-${{ inputs.env == 'production' && 'prod' || 'preview' }}
         if: inputs.relaunch_agent
-        continue-on-error: true
         uses: ./.github/actions/relaunch-agent
         with:
           kind: ${{ inputs.env == 'production' && 'prod' || 'preview' }}

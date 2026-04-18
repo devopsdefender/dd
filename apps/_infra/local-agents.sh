@@ -12,11 +12,11 @@
 # Usage:
 #   export DD_PAT="$(gh auth token)"
 #   export DD_ITA_API_KEY="$(cat ~/.secrets/ita_api_key)"
-#   ./scripts/local-agents.sh https://pr-106.devopsdefender.com https://app.devopsdefender.com
+#   ./apps/_infra/local-agents.sh https://pr-106.devopsdefender.com https://app.devopsdefender.com
 #
 # Pass "" for either URL to skip defining that VM:
-#   ./scripts/local-agents.sh "" https://app.devopsdefender.com   # prod only
-#   ./scripts/local-agents.sh https://pr-N.devopsdefender.com ""  # preview only
+#   ./apps/_infra/local-agents.sh "" https://app.devopsdefender.com   # prod only
+#   ./apps/_infra/local-agents.sh https://pr-N.devopsdefender.com ""  # preview only
 #
 # After: virsh start dd-local-preview && virsh start dd-local-prod
 

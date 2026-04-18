@@ -1,13 +1,18 @@
 name: Release
 
-# Build the static musl binary, publish it as a GitHub release asset,
-# and (on PRs) deploy it to an ephemeral per-PR preview. Replaces the
-# Docker build+push pipeline — easyenclave fetches the asset directly
-# via its github_release workload source.
+# One workflow to rule them all: build the static musl binary, publish
+# it as a GitHub release asset, and deploy it to either the PR preview
+# (per-PR ephemeral CP at pr-N.domain) or production (app.domain). Both
+# paths cascade into a relaunch of the matching dd-local agent VM on
+# the tdx2 host, and the Release run only goes green when that agent
+# re-registers with the freshly-deployed CP.
 #
-# PR:             pre-release tagged pr-{sha12}, then full PR-preview deploy.
-# push to main:   rolling `latest` release (no deploy — that's production)
-# push v* tag:    versioned release (no deploy)
+# Paths:
+#   pull_request        → build → deploy-preview → dd-local-preview relaunch
+#   push main           → build → deploy-production → dd-local-prod relaunch
+#   push v*             → build only (versioned release, no deploy)
+#   workflow_dispatch   → build → deploy-production (rollback tool;
+#                          release_tag input picks which tag to deploy)
 
 on:
   push:
@@ -18,10 +23,18 @@ on:
   pull_request:
     paths-ignore:
       - "README.md"
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Release tag to deploy to production (rollback tool; default: latest)'
+        required: false
+        default: 'latest'
 
 concurrency:
   group: dd-release-${{ github.ref }}
-  cancel-in-progress: true
+  # PR pushes cancel old runs. Main / tag / manual dispatch queue —
+  # we never want to cancel an in-progress prod deploy.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: write
@@ -75,10 +88,7 @@ jobs:
       #  `https://github.com/devopsdefender/dd/.github/workflows/release.yml@<ref>`).
       # The attestation is stored on the repo's /attestations endpoint
       # and retrievable via `gh attestation verify` or the REST API.
-      #
-      # For now we're tracking (not enforcing) — the CP will eventually
-      # use this to verify that a registering agent's artifact came
-      # from this workflow. Skipped on fork PRs (they lack id-token).
+      # Skipped on fork PRs (they lack id-token).
       - name: Attest devopsdefender binary
         if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
         uses: actions/attest-build-provenance@v2
@@ -113,13 +123,8 @@ jobs:
             | tail -n +12 \
             | xargs -rI{} gh release delete {} --yes --cleanup-tag
 
-  # Deploy the freshly-built binary to the PR's ephemeral preview.
-  # Each PR gets its own env at pr-{N}.{domain} with DD_ENV=pr-{N}
-  # (hostname-isolated, no OAuth — browser access via /auth/pat).
-  # main/v* produce releases that production-deploy picks up separately.
-  #
-  # Body lives in deploy-cp.yml — same workflow prod uses, so every PR
-  # exercises the prod deploy path.
+  # Per-PR ephemeral preview at pr-{N}.{domain}. No OAuth (browser login
+  # via /auth/pat). Cascades into dd-local-preview relaunch.
   deploy-preview:
     if: github.event_name == 'pull_request'
     needs: build
@@ -138,4 +143,32 @@ jobs:
       oauth_enabled: false
       comment_on_pr: true
       ref: ${{ github.event.pull_request.head.ref }}
+    secrets: inherit
+
+  # Production deploy at app.{domain}. Fires on push-to-main OR on a
+  # manual workflow_dispatch (rollback to a specific release_tag).
+  # Tag pushes (v*) intentionally do not auto-deploy — they just
+  # publish the artifact. Cascades into dd-local-prod relaunch.
+  deploy-production:
+    if: >-
+      (github.event_name == 'push' && github.ref == 'refs/heads/main')
+      || github.event_name == 'workflow_dispatch'
+    needs: build
+    permissions:
+      contents: read
+      id-token: write
+      # Granted (though unused — comment_on_pr=false here) so the
+      # permissions intersection with deploy-cp.yml's job matches.
+      pull-requests: write
+    uses: ./.github/workflows/deploy-cp.yml
+    with:
+      env: production
+      hostname: app.${{ vars.DD_CF_DOMAIN || 'devopsdefender.com' }}
+      gcp_environment: production
+      workload_identity_provider: 'projects/779946350556/locations/global/workloadIdentityPools/github-actions-pool/providers/github-provider'
+      service_account: 'easyenclave-production-ci@easyenclave.iam.gserviceaccount.com'
+      release_tag: ${{ inputs.release_tag || 'latest' }}
+      oauth_enabled: true
+      comment_on_pr: false
+      ref: main
     secrets: inherit
