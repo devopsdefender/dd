@@ -59,8 +59,22 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-unknown-linux-musl
+          components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@v2
+
+      # Folded in from the old ci.yml so we don't duplicate the compile
+      # pass. clippy + test run against the musl target we're about to
+      # build the release binary for — same toolchain, shared sccache,
+      # one compile of the dep graph for the whole job.
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets --target x86_64-unknown-linux-musl -- -D warnings
+
+      - name: cargo test
+        run: cargo test --workspace --target x86_64-unknown-linux-musl
 
       - name: Build static binary
         run: cargo build --release -p devopsdefender --target x86_64-unknown-linux-musl
