@@ -72,10 +72,14 @@ bake() {
 }
 
 # Extract `expose` entries from a stream of baked workloads and emit
-# them as a compact JSON array of `{hostname_label, port}` — the
-# shape dd-agent expects in $DD_EXTRA_INGRESS.
+# them as a comma-separated `label:port` string — the shape dd-agent
+# expects in $DD_EXTRA_INGRESS. Using plain text (not JSON) avoids
+# quote-escaping when the value gets substituted into the dd-agent
+# workload template's `"DD_EXTRA_INGRESS=${DD_EXTRA_INGRESS}"` env
+# entry: embedded `"` would close the outer JSON string early and
+# produce invalid JSON (jq: "Invalid numeric literal").
 extract_extra_ingress() {
-  jq -cs '[.[] | select(.expose) | .expose]'
+  jq -rs 'map(select(.expose) | "\(.expose.hostname_label):\(.expose.port)") | join(",")'
 }
 
 [ -r "$BASE" ] || { echo "missing $BASE" >&2; exit 1; }

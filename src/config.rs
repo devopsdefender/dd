@@ -155,28 +155,100 @@ impl Agent {
     }
 }
 
+/// Parse `DD_EXTRA_INGRESS` as a comma-separated list of `label:port`
+/// pairs — e.g. `"gpu:8081"` or `"gpu:8081,web:9000"`. Chosen over
+/// JSON to sidestep `"`-escaping when the value is substituted into
+/// the dd-agent workload template's `"DD_EXTRA_INGRESS=${…}"` env
+/// entry (embedded quotes would close the outer JSON string early).
+/// Empty / unset → empty Vec.
 fn parse_extra_ingress() -> Result<Vec<(String, u16)>> {
     let raw = match std::env::var("DD_EXTRA_INGRESS") {
         Ok(s) if !s.trim().is_empty() => s,
         _ => return Ok(Vec::new()),
     };
-    let parsed: Vec<serde_json::Value> = serde_json::from_str(&raw)
-        .map_err(|e| Error::Internal(format!("DD_EXTRA_INGRESS: invalid JSON array: {e}")))?;
-    let mut out = Vec::with_capacity(parsed.len());
-    for v in parsed {
-        let label = v["hostname_label"]
-            .as_str()
-            .ok_or_else(|| Error::Internal("DD_EXTRA_INGRESS entry missing hostname_label".into()))?
-            .to_string();
-        let port = v["port"]
-            .as_u64()
-            .ok_or_else(|| Error::Internal("DD_EXTRA_INGRESS entry missing port".into()))?;
-        if port == 0 || port > u16::MAX as u64 {
+    let mut out = Vec::new();
+    for entry in raw.split(',') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        let (label, port_s) = entry.split_once(':').ok_or_else(|| {
+            Error::Internal(format!(
+                "DD_EXTRA_INGRESS entry {entry:?}: expected label:port"
+            ))
+        })?;
+        let port: u16 = port_s.parse().map_err(|e| {
+            Error::Internal(format!(
+                "DD_EXTRA_INGRESS entry {entry:?}: port must be u16 ({e})"
+            ))
+        })?;
+        if label.is_empty() {
             return Err(Error::Internal(format!(
-                "DD_EXTRA_INGRESS port {port} out of range"
+                "DD_EXTRA_INGRESS entry {entry:?}: empty label"
             )));
         }
-        out.push((label, port as u16));
+        out.push((label.to_string(), port));
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(s: &str) -> Result<Vec<(String, u16)>> {
+        // SAFETY: tests are single-threaded under `cargo test` unless
+        // configured otherwise. This file doesn't opt into parallelism.
+        unsafe {
+            std::env::set_var("DD_EXTRA_INGRESS", s);
+        }
+        let r = parse_extra_ingress();
+        unsafe {
+            std::env::remove_var("DD_EXTRA_INGRESS");
+        }
+        r
+    }
+
+    #[test]
+    fn empty_parses_to_empty_vec() {
+        assert!(parse("").unwrap().is_empty());
+        assert!(parse("   ").unwrap().is_empty());
+    }
+
+    #[test]
+    fn single_entry() {
+        assert_eq!(parse("gpu:8081").unwrap(), vec![("gpu".into(), 8081)]);
+    }
+
+    #[test]
+    fn multiple_entries() {
+        assert_eq!(
+            parse("gpu:8081,web:9000").unwrap(),
+            vec![("gpu".into(), 8081), ("web".into(), 9000)]
+        );
+    }
+
+    #[test]
+    fn tolerates_whitespace_and_trailing_commas() {
+        assert_eq!(
+            parse("gpu:8081, , web:9000,").unwrap(),
+            vec![("gpu".into(), 8081), ("web".into(), 9000)]
+        );
+    }
+
+    #[test]
+    fn bad_port_errors() {
+        assert!(parse("gpu:notaport").is_err());
+        assert!(parse("gpu:99999").is_err()); // > u16
+    }
+
+    #[test]
+    fn missing_colon_errors() {
+        assert!(parse("gpu").is_err());
+    }
+
+    #[test]
+    fn empty_label_errors() {
+        assert!(parse(":8081").is_err());
+    }
 }
