@@ -7,6 +7,9 @@ name: Production Deploy
 #     we don't promote.
 #   - workflow_dispatch: manual re-deploy of any existing tag (e.g. a
 #     known-good v0.2.0 after a bad main push).
+#
+# Body lives in deploy-cp.yml — same workflow PR previews use, so every
+# PR exercises the prod deploy path before it lands here.
 
 on:
   workflow_run:
@@ -20,127 +23,25 @@ on:
         required: false
         default: 'latest'
 
-concurrency:
-  group: dd-production
-  cancel-in-progress: false
-
-env:
-  GCP_ZONE: us-central1-c
-  DD_ENV: production
-  DD_DOMAIN: ${{ vars.DD_CF_DOMAIN || 'devopsdefender.com' }}
-
 permissions:
   contents: read
 
 jobs:
-  # dd-register STONITHs the old VM on startup by deleting its CF
-  # tunnel, so no explicit teardown here.
   deploy:
-    # workflow_run fires on every Release completion, including
-    # failures. Only promote on success.
+    # workflow_run fires on every Release completion, including failures.
+    # Only promote on success.
     if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
-    runs-on: ubuntu-latest
-    environment: production
-    permissions:
-      contents: read
-      id-token: write
-    steps:
-      - uses: actions/checkout@v4
-      - uses: google-github-actions/auth@v2
-        with:
-          workload_identity_provider: 'projects/779946350556/locations/global/workloadIdentityPools/github-actions-pool/providers/github-provider'
-          service_account: 'easyenclave-production-ci@easyenclave.iam.gserviceaccount.com'
-      - uses: google-github-actions/setup-gcloud@v2
-
-      - name: Create TDX VM (boots from easyenclave, fetches dd from GitHub releases)
-        env:
-          GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
-          CLOUDFLARE_API_TOKEN: ${{ secrets.DD_CP_CF_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.DD_CP_CF_ACCOUNT_ID }}
-          CLOUDFLARE_ZONE_ID: ${{ secrets.DD_CP_CF_ZONE_ID }}
-          DD_GITHUB_CLIENT_ID: ${{ vars.DD_GITHUB_CLIENT_ID || secrets.DD_GITHUB_CLIENT_ID }}
-          DD_GITHUB_CALLBACK_URL: ${{ vars.DD_GITHUB_CALLBACK_URL }}
-          DD_GITHUB_CLIENT_SECRET: ${{ secrets.DD_GITHUB_CLIENT_SECRET }}
-          # Intel Trust Authority — optional. When the secret is set,
-          # the CP mints its own ITA token and verifies incoming agent
-          # registrations. DD_ITA_REQUIRED stays false (default).
-          DD_ITA_API_KEY: ${{ secrets.DD_ITA_API_KEY }}
-          # workflow_run has no `inputs`; fall back to `latest`, which
-          # release.yml just (re)published on push to main.
-          DD_RELEASE_TAG: ${{ inputs.release_tag || 'latest' }}
-        run: scripts/gcp-deploy.sh
-
-      - name: Wait for agent health
-        env:
-          AGENT_URL: https://app.${{ env.DD_DOMAIN }}
-        run: |
-          for i in $(seq 1 60); do
-            curl -fsS "${AGENT_URL}/health" >/dev/null 2>&1 && {
-              echo "Agent healthy at ${AGENT_URL}"
-              exit 0
-            }
-            echo "  waiting for tunnel... (${i}/60)"
-            sleep 5
-          done
-          echo "::error::Agent not healthy within 5 minutes"
-          exit 1
-
-      - name: Verify dashboard renders
-        env:
-          AGENT_URL: https://app.${{ env.DD_DOMAIN }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          # New auth model: dashboard expects a GitHub PAT/GITHUB_TOKEN with
-          # access to the dd repo; the CP verifies against DD_OWNER via the
-          # standard /user + /repos/{owner}/dd fallback. No OIDC audience wiring.
-          for attempt in $(seq 1 12); do
-            code=$(curl -s -o /dev/null -w '%{http_code}' \
-              -H "Authorization: Bearer ${GITHUB_TOKEN}" \
-              "${AGENT_URL}/" || echo 000)
-            if [ "$code" = "200" ]; then
-              echo "Dashboard renders (HTTP 200, attempt ${attempt})"
-              exit 0
-            fi
-            echo "  dashboard returned HTTP ${code}, retrying... (${attempt}/12)"
-            sleep 5
-          done
-          echo "::error::dashboard / never returned 200 (last HTTP ${code})"
-          exit 1
-
-      - name: Verify STONITH halted prior production VM(s)
-        env:
-          GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
-          GCP_ZONE: ${{ env.GCP_ZONE }}
-        run: |
-          # Mirror of release.yml's verify-step for PR previews. Give
-          # STONITH-by-tunnel-delete 120s to work on well-behaved old
-          # prod VMs (their cloudflared exits → dd-register poweroffs
-          # → GCP TERMINATED → cleanup.yml reaps). After the timeout,
-          # force-delete any remaining RUNNING prod VMs so we don't
-          # leak compute indefinitely.
-          NEW_VM=$(gcloud compute instances list \
-            --project="$GCP_PROJECT_ID" \
-            --filter="labels.devopsdefender=managed AND labels.dd_env=production" \
-            --format="value(name)" --sort-by=~creationTimestamp | head -1)
-          echo "new VM: $NEW_VM"
-          SURVIVORS=""
-          for i in $(seq 1 24); do
-            SURVIVORS=$(gcloud compute instances list \
-              --project="$GCP_PROJECT_ID" \
-              --filter="labels.devopsdefender=managed AND labels.dd_env=production AND status=RUNNING" \
-              --format="value(name)" \
-              | grep -vx "$NEW_VM" || true)
-            if [ -z "$SURVIVORS" ]; then
-              echo "STONITH verified — only $NEW_VM running in prod"
-              exit 0
-            fi
-            echo "  still running besides $NEW_VM: $(echo "$SURVIVORS" | tr '\n' ' ')"
-            echo "  waiting for STONITH poweroff... (${i}/24)"
-            sleep 5
-          done
-          echo "::warning::STONITH-by-tunnel-delete timed out in prod; force-deleting:"
-          echo "$SURVIVORS"
-          # shellcheck disable=SC2086
-          gcloud compute instances delete $SURVIVORS \
-            --project="$GCP_PROJECT_ID" --zone="$GCP_ZONE" --quiet || true
-          echo "zombies reaped; $NEW_VM is the only production VM"
+    uses: ./.github/workflows/deploy-cp.yml
+    with:
+      env: production
+      hostname: app.${{ vars.DD_CF_DOMAIN || 'devopsdefender.com' }}
+      gcp_environment: production
+      workload_identity_provider: 'projects/779946350556/locations/global/workloadIdentityPools/github-actions-pool/providers/github-provider'
+      service_account: 'easyenclave-production-ci@easyenclave.iam.gserviceaccount.com'
+      # workflow_run has no `inputs`; fall back to `latest`, which
+      # release.yml just (re)published on push to main.
+      release_tag: ${{ inputs.release_tag || 'latest' }}
+      oauth_enabled: true
+      comment_on_pr: false
+      ref: main
+    secrets: inherit
