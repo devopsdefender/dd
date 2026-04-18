@@ -40,6 +40,7 @@ struct St {
     cfg: Arc<Cfg>,
     ee: Arc<Ee>,
     keys: Arc<Keys>,
+    access: Option<Arc<auth::AccessValidator>>,
     store: Store,
     started: Instant,
     verifier: Arc<ita::Verifier>,
@@ -81,6 +82,8 @@ pub async fn run() -> Result<()> {
     let store: Store = Arc::new(Mutex::new(HashMap::new()));
 
     let keys = Arc::new(Keys::fresh(&cfg.hostname));
+    let access_cfg = discover_access_for(&http, &cfg.cf, &cfg.hostname, "cp").await;
+    let access = access_cfg.map(auth::AccessValidator::new).map(Arc::new);
 
     // ITA verifier — required.
     let verifier = ita::Verifier::new(cfg.ita.jwks_url.clone(), cfg.ita.issuer.clone());
@@ -203,6 +206,7 @@ pub async fn run() -> Result<()> {
         cfg: cfg.clone(),
         ee,
         keys,
+        access,
         store,
         started: Instant::now(),
         verifier,
@@ -338,6 +342,7 @@ async fn register(
         .map(|e| (e.hostname_label.clone(), e.port))
         .collect();
     let tunnel = cf::create(&http, &s.cfg.cf, &name, &agent_hostname, &extras).await?;
+    let access_cfg = discover_access_for(&http, &s.cfg.cf, &agent_hostname, &req.vm_name).await;
     if !tunnel.extra_hostnames.is_empty() {
         eprintln!(
             "cp: registered extra ingress for {}: {:?}",
@@ -398,7 +403,34 @@ async fn register(
         "agent_id": name,
         "jwt_secret_b64": s.keys.secret_b64,
         "cp_hostname": s.cfg.hostname,
+        "cf_access": access_cfg,
     })))
+}
+
+async fn discover_access_for(
+    http: &reqwest::Client,
+    cf: &crate::config::CfCreds,
+    hostname: &str,
+    label: &str,
+) -> Option<crate::config::CfAccess> {
+    match crate::cf::discover_access(http, cf, hostname).await {
+        Ok(Some(access)) => {
+            eprintln!(
+                "cp: Cloudflare Access auth enabled for {label} ({hostname}, issuer={}, audiences={})",
+                access.issuer,
+                access.audiences.join(",")
+            );
+            Some(access)
+        }
+        Ok(None) => {
+            eprintln!("cp: no Cloudflare Access app matched {hostname}; using legacy auth only");
+            None
+        }
+        Err(e) => {
+            eprintln!("cp: Cloudflare Access discovery failed for {hostname}: {e}");
+            None
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -835,7 +867,7 @@ async fn shell_ws(
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Result<Response> {
-    auth::resolve(&s.keys, &s.cfg.common.owner, &headers).await?;
+    auth::resolve(&s.keys, &s.cfg.common.owner, s.access.as_deref(), &headers).await?;
     let ee = s.ee.clone();
     let vm = format!("dd-{}-cp", s.cfg.common.env_label);
     Ok(ws.on_upgrade(move |socket| async move {
@@ -850,7 +882,7 @@ async fn require_auth(
     headers: &HeaderMap,
     uri: &axum::http::Uri,
 ) -> std::result::Result<String, Response> {
-    match auth::resolve(&s.keys, &s.cfg.common.owner, headers).await {
+    match auth::resolve(&s.keys, &s.cfg.common.owner, s.access.as_deref(), headers).await {
         Ok(login) => Ok(login),
         Err(Error::Unauthorized) => Err(auth::login_redirect_local(uri)),
         Err(e) => Err(e.into_response()),

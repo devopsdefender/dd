@@ -1,6 +1,7 @@
 //! Environment-derived configuration for both modes.
 
 use crate::error::{Error, Result};
+use serde::{Deserialize, Serialize};
 
 #[derive(Clone)]
 pub struct CfCreds {
@@ -55,6 +56,15 @@ impl Common {
             vm_name,
         })
     }
+}
+
+/// Cloudflare Access origin JWT validation metadata discovered from
+/// Cloudflare's Access application config.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CfAccess {
+    pub issuer: String,
+    pub audiences: Vec<String>,
+    pub jwks_url: String,
 }
 
 /// ITA (Intel Trust Authority) configuration. All fields required —

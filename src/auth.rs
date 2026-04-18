@@ -1,26 +1,35 @@
-//! Single-path auth.
+//! Origin auth.
 //!
-//! One token type: GitHub PAT. Two presentations:
-//!   - `Authorization: Bearer <pat>` — CI, curl. Verified against GitHub.
-//!   - `dd_auth` JWT cookie (HS256, `Domain=.{cf.domain}`) — browsers.
-//!     Issued only by the CP's `/auth/pat` POST; shared across all
-//!     `*.{cf.domain}` hosts, so agents verify it without ever issuing.
+//! During the Cloudflare Access migration we accept three presentations:
+//!   - `Cf-Access-Jwt-Assertion` — preferred browser/service identity,
+//!     signed by Cloudflare Access and validated locally by CP/agents.
+//!   - `dd_auth` JWT cookie (HS256, `Domain=.{cf.domain}`) — legacy
+//!     browser auth issued by the CP's `/auth/pat` POST.
+//!   - `Authorization: Bearer <pat>` — legacy CI/curl path verified
+//!     against GitHub.
 
 use std::time::Duration;
 
 use axum::http::header::{AUTHORIZATION, COOKIE, SET_COOKIE};
-use axum::http::{HeaderMap, HeaderValue, Uri};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Uri};
 use axum::response::{IntoResponse, Redirect, Response};
 use base64::Engine;
-use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation};
+use jsonwebtoken::jwk::{Jwk, JwkSet};
+use jsonwebtoken::{
+    decode, decode_header, Algorithm, DecodingKey, EncodingKey, Header, Validation,
+};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use tokio::sync::RwLock;
 
+use crate::config::CfAccess;
 use crate::error::{Error, Result};
 
 pub const AUTH_COOKIE: &str = "dd_auth";
 pub const COOKIE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 const JWT_ALG: Algorithm = Algorithm::HS256;
+const CF_ACCESS_JWT_ASSERTION: HeaderName = HeaderName::from_static("cf-access-jwt-assertion");
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Claims {
@@ -42,6 +51,101 @@ pub struct Keys {
     /// Raw secret bytes, base64-encoded. The CP passes this to agents
     /// in their register response so they can verify the same JWTs.
     pub secret_b64: String,
+}
+
+#[derive(Clone)]
+pub struct AccessValidator {
+    cfg: CfAccess,
+    http: Client,
+    jwks: Arc<RwLock<Option<JwkSet>>>,
+}
+
+impl AccessValidator {
+    pub fn new(cfg: CfAccess) -> Self {
+        Self {
+            cfg,
+            http: Client::new(),
+            jwks: Arc::new(RwLock::new(None)),
+        }
+    }
+
+    pub async fn resolve(&self, headers: &HeaderMap) -> Result<Option<String>> {
+        let Some(token) = access_token(headers) else {
+            return Ok(None);
+        };
+        let claims = self.verify_token(token).await?;
+        Ok(Some(access_principal(&claims)))
+    }
+
+    async fn verify_token(&self, token: &str) -> Result<serde_json::Value> {
+        let header = decode_header(token).map_err(|_| Error::Unauthorized)?;
+        if header.alg != Algorithm::RS256 {
+            return Err(Error::Unauthorized);
+        }
+        let kid = header.kid.ok_or(Error::Unauthorized)?;
+
+        let jwk = self.get_jwk(&kid).await?;
+        match self.decode_with_jwk(token, &jwk) {
+            Ok(claims) => Ok(claims),
+            Err(_) => {
+                // Access rotates signing keys; refresh once on failure
+                // in case the cached set is stale but the token is valid.
+                self.refresh_jwks().await?;
+                let jwk = self.get_cached_jwk(&kid).await.ok_or(Error::Unauthorized)?;
+                self.decode_with_jwk(token, &jwk)
+                    .map_err(|_| Error::Unauthorized)
+            }
+        }
+    }
+
+    async fn get_jwk(&self, kid: &str) -> Result<Jwk> {
+        if let Some(jwk) = self.get_cached_jwk(kid).await {
+            return Ok(jwk);
+        }
+        self.refresh_jwks().await?;
+        self.get_cached_jwk(kid).await.ok_or(Error::Unauthorized)
+    }
+
+    async fn get_cached_jwk(&self, kid: &str) -> Option<Jwk> {
+        self.jwks
+            .read()
+            .await
+            .as_ref()
+            .and_then(|set| set.find(kid).cloned())
+    }
+
+    async fn refresh_jwks(&self) -> Result<()> {
+        let resp = self
+            .http
+            .get(&self.cfg.jwks_url)
+            .send()
+            .await
+            .map_err(|e| Error::Upstream(format!("CF Access certs: {e}")))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            return Err(Error::Upstream(format!(
+                "CF Access certs {} -> {status}: {text}",
+                self.cfg.jwks_url
+            )));
+        }
+        let jwks = resp.json::<JwkSet>().await?;
+        *self.jwks.write().await = Some(jwks);
+        Ok(())
+    }
+
+    fn decode_with_jwk(
+        &self,
+        token: &str,
+        jwk: &Jwk,
+    ) -> jsonwebtoken::errors::Result<serde_json::Value> {
+        let key = DecodingKey::from_jwk(jwk)?;
+        let mut validation = Validation::new(Algorithm::RS256);
+        validation.set_required_spec_claims(&["exp", "iss", "aud"]);
+        validation.set_issuer(&[self.cfg.issuer.as_str()]);
+        validation.set_audience(&self.cfg.audiences);
+        decode::<serde_json::Value>(token, &key, &validation).map(|d| d.claims)
+    }
 }
 
 impl Keys {
@@ -181,6 +285,26 @@ pub fn bearer(headers: &HeaderMap) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+fn access_token(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(CF_ACCESS_JWT_ASSERTION)?
+        .to_str()
+        .ok()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
+fn access_principal(claims: &serde_json::Value) -> String {
+    for key in ["email", "common_name", "sub"] {
+        if let Some(v) = claims.get(key).and_then(|v| v.as_str()) {
+            if !v.is_empty() {
+                return v.to_string();
+            }
+        }
+    }
+    "cf-access".into()
+}
+
 pub fn with_cookie(resp: impl IntoResponse, cookie_value: String) -> Response {
     let mut r = resp.into_response();
     if let Ok(hv) = HeaderValue::from_str(&cookie_value) {
@@ -196,7 +320,17 @@ pub fn sanitize_next(next: Option<&str>) -> String {
     }
 }
 
-pub async fn resolve(keys: &Keys, owner: &str, headers: &HeaderMap) -> Result<String> {
+pub async fn resolve(
+    keys: &Keys,
+    owner: &str,
+    access: Option<&AccessValidator>,
+    headers: &HeaderMap,
+) -> Result<String> {
+    if let Some(access) = access {
+        if let Some(principal) = access.resolve(headers).await? {
+            return Ok(principal);
+        }
+    }
     if let Some(jwt) = read_cookie(headers, AUTH_COOKIE) {
         if let Some(c) = keys.verify(&jwt) {
             return Ok(c.login);

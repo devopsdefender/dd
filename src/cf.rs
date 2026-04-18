@@ -9,7 +9,7 @@ use base64::Engine;
 use reqwest::{Client, Method};
 use serde::{Deserialize, Serialize};
 
-use crate::config::CfCreds;
+use crate::config::{CfAccess, CfCreds};
 use crate::error::{Error, Result};
 
 const API: &str = "https://api.cloudflare.com/client/v4";
@@ -285,6 +285,124 @@ pub async fn list(http: &Client, cf: &CfCreds) -> Result<Vec<serde_json::Value>>
     Ok(resp["result"].as_array().cloned().unwrap_or_default())
 }
 
+/// Discover Cloudflare Access origin-JWT verifier metadata for a hostname
+/// from the account's configured Access applications. Exact hostname apps
+/// win over wildcard apps. Returns `Ok(None)` when Access is not configured
+/// for the hostname.
+pub async fn discover_access(
+    http: &Client,
+    cf: &CfCreds,
+    hostname: &str,
+) -> Result<Option<CfAccess>> {
+    let org = call(
+        http,
+        cf,
+        Method::GET,
+        &format!("/accounts/{}/access/organizations", cf.account_id),
+        None,
+    )
+    .await?;
+    let auth_domain = org["result"]["auth_domain"]
+        .as_str()
+        .ok_or_else(|| Error::Upstream("CF Access organization: missing auth_domain".into()))?;
+    let issuer = normalize_access_issuer(auth_domain);
+
+    let apps = call(
+        http,
+        cf,
+        Method::GET,
+        &format!("/accounts/{}/access/apps?per_page=200", cf.account_id),
+        None,
+    )
+    .await?;
+    let Some(items) = apps["result"].as_array() else {
+        return Ok(None);
+    };
+
+    let mut best: Option<(u8, String)> = None;
+    for app in items {
+        if app["type"].as_str() != Some("self_hosted") {
+            continue;
+        }
+        let Some(aud) = app["aud"].as_str() else {
+            continue;
+        };
+        let score = access_app_match_score(app, hostname);
+        if score > best.as_ref().map(|(s, _)| *s).unwrap_or(0) {
+            best = Some((score, aud.to_string()));
+        }
+    }
+
+    Ok(best.map(|(_, aud)| CfAccess {
+        jwks_url: format!("{issuer}/cdn-cgi/access/certs"),
+        issuer,
+        audiences: vec![aud],
+    }))
+}
+
+fn normalize_access_issuer(raw: &str) -> String {
+    let raw = raw.trim().trim_end_matches('/');
+    if raw.starts_with("https://") || raw.starts_with("http://") {
+        raw.to_string()
+    } else {
+        format!("https://{raw}")
+    }
+}
+
+fn access_app_match_score(app: &serde_json::Value, hostname: &str) -> u8 {
+    access_app_patterns(app)
+        .into_iter()
+        .filter_map(|pattern| hostname_pattern_score(&pattern, hostname))
+        .max()
+        .unwrap_or(0)
+}
+
+fn access_app_patterns(app: &serde_json::Value) -> Vec<String> {
+    let mut patterns = Vec::new();
+    if let Some(domain) = app["domain"].as_str() {
+        patterns.push(domain.to_string());
+    }
+    if let Some(items) = app["self_hosted_domains"].as_array() {
+        patterns.extend(items.iter().filter_map(|v| v.as_str().map(String::from)));
+    }
+    if let Some(items) = app["destinations"].as_array() {
+        patterns.extend(
+            items
+                .iter()
+                .filter_map(|v| v["uri"].as_str().map(String::from)),
+        );
+    }
+    patterns
+}
+
+fn hostname_pattern_score(pattern: &str, hostname: &str) -> Option<u8> {
+    let pattern = pattern_host(pattern)?;
+    if pattern == hostname {
+        return Some(2);
+    }
+    let suffix = pattern.strip_prefix("*.")?;
+    if hostname != suffix && hostname.ends_with(&format!(".{suffix}")) {
+        Some(1)
+    } else {
+        None
+    }
+}
+
+fn pattern_host(pattern: &str) -> Option<String> {
+    let without_scheme = pattern
+        .trim()
+        .strip_prefix("https://")
+        .or_else(|| pattern.trim().strip_prefix("http://"))
+        .unwrap_or_else(|| pattern.trim());
+    let host = without_scheme
+        .split('/')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .trim_end_matches('.');
+    (!host.is_empty()).then(|| host.to_ascii_lowercase())
+}
+
 /// `Some(true)` if present, `Some(false)` if confirmed deleted, `None`
 /// on ambiguous transport error — the watchdog uses `None` to mean
 /// "don't count as gone" and avoid flaky kernel_poweroffs.
@@ -305,5 +423,52 @@ pub async fn exists(http: &Client, cf: &CfCreds, tunnel_id: &str) -> Option<bool
             Some(body["result"]["deleted_at"].is_null())
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{access_app_match_score, hostname_pattern_score, normalize_access_issuer};
+
+    #[test]
+    fn issuer_is_normalized_to_https_url() {
+        assert_eq!(
+            normalize_access_issuer("team.cloudflareaccess.com"),
+            "https://team.cloudflareaccess.com"
+        );
+        assert_eq!(
+            normalize_access_issuer("https://team.cloudflareaccess.com/"),
+            "https://team.cloudflareaccess.com"
+        );
+    }
+
+    #[test]
+    fn hostname_patterns_match_exact_and_wildcard() {
+        assert_eq!(
+            hostname_pattern_score("app.example.com", "app.example.com"),
+            Some(2)
+        );
+        assert_eq!(
+            hostname_pattern_score("*.example.com", "agent.example.com"),
+            Some(1)
+        );
+        assert_eq!(hostname_pattern_score("*.example.com", "example.com"), None);
+        assert_eq!(
+            hostname_pattern_score("*.example.com", "badexample.com"),
+            None
+        );
+    }
+
+    #[test]
+    fn access_app_match_score_reads_all_supported_fields() {
+        let app = serde_json::json!({
+            "domain": "old.example.com",
+            "self_hosted_domains": ["*.example.com"],
+            "destinations": [{"type": "public", "uri": "https://exact.example.com/path"}]
+        });
+
+        assert_eq!(access_app_match_score(&app, "agent.example.com"), 1);
+        assert_eq!(access_app_match_score(&app, "exact.example.com"), 2);
+        assert_eq!(access_app_match_score(&app, "other.test"), 0);
     }
 }
