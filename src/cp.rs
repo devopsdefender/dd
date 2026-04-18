@@ -54,7 +54,7 @@ pub async fn run() -> Result<()> {
     eprintln!("cp: self-provisioning tunnel for {}", cfg.hostname);
     let http = reqwest::Client::new();
     let self_name = cf::cp_tunnel_name(&cfg.common.env_label);
-    let tunnel = match cf::create(&http, &cfg.cf, &self_name, &cfg.hostname).await {
+    let tunnel = match cf::create(&http, &cfg.cf, &self_name, &cfg.hostname, &[]).await {
         Ok(t) => t,
         Err(e) => {
             eprintln!("cp: self-register failed: {e}");
@@ -274,6 +274,18 @@ struct RegisterReq {
     env_label: String,
     owner: String,
     ita_token: String,
+    /// Optional per-workload ingress: each entry becomes
+    /// `{hostname_label}.{agent_hostname}` → `localhost:{port}` in the
+    /// agent's cloudflared tunnel config, in addition to the default
+    /// `{agent_hostname}` → `localhost:8080` dashboard rule.
+    #[serde(default)]
+    extra_ingress: Vec<ExtraIngress>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExtraIngress {
+    hostname_label: String,
+    port: u16,
 }
 
 /// POST /register — agent presents a GitHub PAT belonging to DD_OWNER;
@@ -313,7 +325,18 @@ async fn register(
     let http = reqwest::Client::new();
     let name = cf::agent_tunnel_name(&s.cfg.common.env_label);
     let agent_hostname = format!("{name}.{}", s.cfg.cf.domain);
-    let tunnel = cf::create(&http, &s.cfg.cf, &name, &agent_hostname).await?;
+    let extras: Vec<(String, u16)> = req
+        .extra_ingress
+        .iter()
+        .map(|e| (e.hostname_label.clone(), e.port))
+        .collect();
+    let tunnel = cf::create(&http, &s.cfg.cf, &name, &agent_hostname, &extras).await?;
+    if !tunnel.extra_hostnames.is_empty() {
+        eprintln!(
+            "cp: registered extra ingress for {}: {:?}",
+            req.vm_name, tunnel.extra_hostnames
+        );
+    }
 
     // Seed the store so the dashboard shows the agent before the first
     // collector tick. Also evict any prior entries with the same

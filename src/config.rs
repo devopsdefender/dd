@@ -124,6 +124,13 @@ pub struct Agent {
     pub pat: String,
     pub ee_socket: String,
     pub ita: Ita,
+    /// Extra cloudflared ingress rules requested at register time.
+    /// Populated from `DD_EXTRA_INGRESS` — a JSON array of
+    /// `{"hostname_label": "...", "port": N}` objects assembled by
+    /// the boot-workload builder (`apps/_infra/local-agents.sh`)
+    /// from `expose` hints on individual workload specs. Empty is
+    /// fine — the agent just gets the default dashboard rule.
+    pub extra_ingress: Vec<(String, u16)>,
 }
 
 impl Agent {
@@ -136,12 +143,40 @@ impl Agent {
             .map_err(|_| Error::Internal("DD_PAT required (GitHub PAT for owner check)".into()))?;
         let ee_socket = std::env::var("EE_SOCKET_PATH")
             .unwrap_or_else(|_| "/var/lib/easyenclave/agent.sock".into());
+        let extra_ingress = parse_extra_ingress()?;
         Ok(Self {
             common,
             cp_url,
             pat,
             ee_socket,
             ita: Ita::from_env()?,
+            extra_ingress,
         })
     }
+}
+
+fn parse_extra_ingress() -> Result<Vec<(String, u16)>> {
+    let raw = match std::env::var("DD_EXTRA_INGRESS") {
+        Ok(s) if !s.trim().is_empty() => s,
+        _ => return Ok(Vec::new()),
+    };
+    let parsed: Vec<serde_json::Value> = serde_json::from_str(&raw)
+        .map_err(|e| Error::Internal(format!("DD_EXTRA_INGRESS: invalid JSON array: {e}")))?;
+    let mut out = Vec::with_capacity(parsed.len());
+    for v in parsed {
+        let label = v["hostname_label"]
+            .as_str()
+            .ok_or_else(|| Error::Internal("DD_EXTRA_INGRESS entry missing hostname_label".into()))?
+            .to_string();
+        let port = v["port"]
+            .as_u64()
+            .ok_or_else(|| Error::Internal("DD_EXTRA_INGRESS entry missing port".into()))?;
+        if port == 0 || port > u16::MAX as u64 {
+            return Err(Error::Internal(format!(
+                "DD_EXTRA_INGRESS port {port} out of range"
+            )));
+        }
+        out.push((label, port as u16));
+    }
+    Ok(out)
 }
