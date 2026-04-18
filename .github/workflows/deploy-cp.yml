@@ -116,13 +116,18 @@ jobs:
           : "${DD_ITA_API_KEY:?set DD_ITA_API_KEY via secrets.DD_ITA_API_KEY}"
           export DD_GITHUB_CALLBACK_URL="${DD_GITHUB_CALLBACK_URL:-https://${DD_HOSTNAME}/auth/github/callback}"
 
-          # Bake a workload template: envsubst ${VAR} placeholders and
-          # strip any "KEY=" env entries that ended up with empty values
-          # (e.g. OAuth creds in non-prod envs).
+          # Bake a workload template: substitute ${VAR} placeholders
+          # and strip "KEY=" env entries that ended up with empty values
+          # (e.g. OAuth creds in non-prod envs). envsubst is restricted
+          # to the uppercase ${VAR} refs the template actually declares
+          # so shell locals inside cmd strings ($i, $((…)), etc.)
+          # aren't eaten.
           bake() {
             case "$1" in
               *.json.tmpl)
-                envsubst < "$1" \
+                local vars
+                vars=$(grep -oE '\$\{[A-Z_][A-Z0-9_]*\}' "$1" | sort -u | tr -d '\n')
+                envsubst "$vars" < "$1" \
                   | jq -c 'if .env then .env |= map(select(test("^[^=]+=.+"))) else . end'
                 ;;
               *.json)

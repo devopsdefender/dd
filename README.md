@@ -22,22 +22,7 @@ The sealed enclave runtime is [EasyEnclave](https://github.com/easyenclave/easye
 
 Every fleet VM boots from a sealed easyenclave image published by [easyenclave/easyenclave](https://github.com/easyenclave/easyenclave/releases). No cloud-init, no stock Ubuntu, no runtime `apt-get install`. The TDX VM's rootfs is the latest image in the `easyenclave-staging` (or `-stable`) family, attestable against a single UKI SHA256.
 
-The `devopsdefender` binary ships as a **GitHub release asset** — not an OCI image. Easyenclave fetches it directly via its `github_release` boot workload source:
-
-```json
-{
-  "github_release": {
-    "repo": "devopsdefender/dd",
-    "asset": "devopsdefender",
-    "tag": "latest"
-  },
-  "cmd": ["devopsdefender"],
-  "app_name": "dd-management",
-  "env": ["DD_MODE=management", ...]
-}
-```
-
-`cloudflared` is also pulled directly from `cloudflare/cloudflared`'s GitHub releases as a fetch-only boot workload — no bundling in our image, no Dockerfile step.
+Every workload is a JSON spec consumed by easyenclave's `DeployRequest`. Boot-time and runtime-deployed workloads share one schema; both the `devopsdefender` binary and `cloudflared` ship as **GitHub release assets** — not OCI images — and easyenclave fetches them via its `github_release` source. The full set of specs and a guide to writing your own lives in [`apps/README.md`](apps/README.md).
 
 Per-VM configuration (CF credentials, GitHub OAuth, the workload spec itself) is passed to easyenclave at boot via **GCE instance metadata** (`ee-config` attribute), read by `easyenclave::init::fetch_gce_metadata_config()` and applied as env vars. The CP-deploy step in `.github/workflows/deploy-cp.yml` builds the spec and invokes `gcloud compute instances create --image-family=easyenclave-staging --metadata-from-file=ee-config=...`.
 
