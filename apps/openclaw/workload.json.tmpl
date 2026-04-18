@@ -1,0 +1,7 @@
+{
+  "app_name": "openclaw",
+  "cmd": [
+    "/bin/busybox", "sh", "-c",
+    "echo 'openclaw: waiting for ollama on 127.0.0.1:11434...'\ni=0\nuntil /bin/busybox wget -q -T 3 -O- http://127.0.0.1:11434/api/tags >/dev/null 2>&1; do\n  i=$((i+1))\n  if [ $((i % 6)) -eq 0 ]; then echo \"openclaw: still waiting for ollama ($i tries, ${i}x5s elapsed)\"; fi\n  sleep 5\ndone\necho 'openclaw: ollama responding, pulling model ${MODEL}'\n/var/lib/easyenclave/bin/dd-podman exec ollama ollama pull ${MODEL} 2>&1\necho 'openclaw: model pulled, launching gateway'\nexec /var/lib/easyenclave/bin/dd-podman exec ollama ollama launch openclaw --model ${MODEL} --yes"
+  ]
+}

@@ -1,13 +1,18 @@
 name: Release
 
-# Build the static musl binary, publish it as a GitHub release asset,
-# and (on PRs) deploy it to an ephemeral per-PR preview. Replaces the
-# Docker build+push pipeline — easyenclave fetches the asset directly
-# via its github_release workload source.
+# One workflow to rule them all: build the static musl binary, publish
+# it as a GitHub release asset, and deploy it to either the PR preview
+# (per-PR ephemeral CP at pr-N.domain) or production (app.domain). Both
+# paths cascade into a relaunch of the matching dd-local agent VM on
+# the tdx2 host, and the Release run only goes green when that agent
+# re-registers with the freshly-deployed CP.
 #
-# PR:             pre-release tagged pr-{sha12}, then full PR-preview deploy.
-# push to main:   rolling `latest` release (no deploy — that's production)
-# push v* tag:    versioned release (no deploy)
+# Paths:
+#   pull_request        → build → deploy-preview → dd-local-preview relaunch
+#   push main           → build → deploy-production → dd-local-prod relaunch
+#   push v*             → build only (versioned release, no deploy)
+#   workflow_dispatch   → build → deploy-production (rollback tool;
+#                          release_tag input picks which tag to deploy)
 
 on:
   push:
@@ -18,10 +23,18 @@ on:
   pull_request:
     paths-ignore:
       - "README.md"
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Release tag to deploy to production (rollback tool; default: latest)'
+        required: false
+        default: 'latest'
 
 concurrency:
   group: dd-release-${{ github.ref }}
-  cancel-in-progress: true
+  # PR pushes cancel old runs. Main / tag / manual dispatch queue —
+  # we never want to cancel an in-progress prod deploy.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: write
@@ -30,10 +43,6 @@ permissions:
   # verify a registering agent's artifact came from this workflow.
   id-token: write
   attestations: write
-
-env:
-  DD_DOMAIN: ${{ vars.DD_CF_DOMAIN || 'devopsdefender.com' }}
-  GCP_ZONE: us-central1-c
 
 jobs:
   build:
@@ -79,10 +88,7 @@ jobs:
       #  `https://github.com/devopsdefender/dd/.github/workflows/release.yml@<ref>`).
       # The attestation is stored on the repo's /attestations endpoint
       # and retrievable via `gh attestation verify` or the REST API.
-      #
-      # For now we're tracking (not enforcing) — the CP will eventually
-      # use this to verify that a registering agent's artifact came
-      # from this workflow. Skipped on fork PRs (they lack id-token).
+      # Skipped on fork PRs (they lack id-token).
       - name: Attest devopsdefender binary
         if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
         uses: actions/attest-build-provenance@v2
@@ -117,227 +123,52 @@ jobs:
             | tail -n +12 \
             | xargs -rI{} gh release delete {} --yes --cleanup-tag
 
-  # Deploy the freshly-built binary to the PR's ephemeral preview.
-  # Each PR gets its own env at pr-{N}.{domain} with DD_ENV=pr-{N}
-  # (hostname-isolated, no OAuth — browser access via /auth/pat).
-  # main/v* produce releases that production-deploy picks up separately.
+  # Per-PR ephemeral preview at pr-{N}.{domain}. No OAuth (browser login
+  # via /auth/pat). Cascades into dd-local-preview relaunch.
   deploy-preview:
     if: github.event_name == 'pull_request'
     needs: build
-    runs-on: ubuntu-latest
-    environment: staging
     permissions:
       contents: read
       id-token: write
       pull-requests: write
-    env:
-      DD_ENV: pr-${{ github.event.number }}
-      DD_HOSTNAME: pr-${{ github.event.number }}.${{ vars.DD_CF_DOMAIN || 'devopsdefender.com' }}
-    steps:
-      - uses: actions/checkout@v4
+    uses: ./.github/workflows/deploy-cp.yml
+    with:
+      env: pr-${{ github.event.number }}
+      hostname: pr-${{ github.event.number }}.${{ vars.DD_CF_DOMAIN || 'devopsdefender.com' }}
+      gcp_environment: staging
+      workload_identity_provider: 'projects/654815109728/locations/global/workloadIdentityPools/github-actions-pool/providers/github-provider'
+      service_account: 'easyenclave-staging-ci@eestaging.iam.gserviceaccount.com'
+      release_tag: ${{ needs.build.outputs.tag }}
+      oauth_enabled: false
+      comment_on_pr: true
+      ref: ${{ github.event.pull_request.head.ref }}
+    secrets: inherit
 
-      - uses: google-github-actions/auth@v2
-        with:
-          workload_identity_provider: 'projects/654815109728/locations/global/workloadIdentityPools/github-actions-pool/providers/github-provider'
-          service_account: 'easyenclave-staging-ci@eestaging.iam.gserviceaccount.com'
-      - uses: google-github-actions/setup-gcloud@v2
-
-      - name: Create TDX VM (boots from easyenclave, fetches dd from GitHub releases)
-        env:
-          GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
-          CLOUDFLARE_API_TOKEN: ${{ secrets.DD_CP_CF_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.DD_CP_CF_ACCOUNT_ID }}
-          CLOUDFLARE_ZONE_ID: ${{ secrets.DD_CP_CF_ZONE_ID }}
-          # OAuth env vars intentionally omitted — gcp-deploy.sh sees
-          # empty DD_GITHUB_CLIENT_ID and skips them in the workload
-          # spec. dd-web then disables /auth/github/* and serves
-          # /auth/pat for browser access.
-          #
-          # Intel Trust Authority — optional. When the secret is set,
-          # the CP mints its own ITA token at startup and verifies
-          # agent-supplied tokens on /register. DD_ITA_REQUIRED stays
-          # false (default) so unsigned agents still register.
-          DD_ITA_API_KEY: ${{ secrets.DD_ITA_API_KEY }}
-          DD_RELEASE_TAG: ${{ needs.build.outputs.tag }}
-        run: scripts/gcp-deploy.sh
-
-      - name: Wait for agent health (streams serial console)
-        env:
-          AGENT_URL: https://${{ env.DD_HOSTNAME }}
-          GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
-          GCP_ZONE: ${{ env.GCP_ZONE }}
-        run: |
-          VM_NAME=$(gcloud compute instances list \
-            --project="$GCP_PROJECT_ID" \
-            --filter="labels.devopsdefender=managed AND labels.dd_env=${DD_ENV}" \
-            --format="value(name)" --sort-by=~creationTimestamp | head -1)
-          if [ -z "$VM_NAME" ]; then
-            echo "::error::no dd-${DD_ENV} VM found — gcp-deploy.sh must have failed"
-            exit 1
-          fi
-          echo "Watching VM: $VM_NAME (zone: $GCP_ZONE)"
-
-          LAST_LINES=0
-          for i in $(seq 1 60); do
-            # Stream serial console so boot failures (DHCP hang, GitHub
-            # release fetch error, cloudflared exit, etc.) are visible
-            # without shelling into GCP.
-            gcloud compute instances get-serial-port-output "$VM_NAME" \
-              --project="$GCP_PROJECT_ID" --zone="$GCP_ZONE" 2>/dev/null \
-              > /tmp/serial.log || true
-            TOTAL_LINES=$(wc -l < /tmp/serial.log)
-            if [ "$TOTAL_LINES" -gt "$LAST_LINES" ]; then
-              tail -n +$((LAST_LINES + 1)) /tmp/serial.log \
-                | sed 's/^/[serial] /'
-              LAST_LINES=$TOTAL_LINES
-            fi
-
-            if grep -qE "FATAL|Kernel panic|Invalid ELF header|/bin/sh: can't access tty" /tmp/serial.log; then
-              echo "::error::boot failed — serial log shows fatal pattern"
-              exit 1
-            fi
-
-            # /health via the Cloudflare tunnel tests the full chain:
-            # VM boot → easyenclave init → github_release fetch of dd +
-            # cloudflared → cloudflared tunnel up.
-            if curl -fsS "${AGENT_URL}/health" >/dev/null 2>&1; then
-              echo "Agent healthy at ${AGENT_URL}"
-              exit 0
-            fi
-            echo "  waiting for tunnel... (${i}/60)"
-            sleep 5
-          done
-          echo "::error::Agent not healthy within 5 minutes"
-          echo "--- final serial tail ---"
-          tail -80 /tmp/serial.log | sed 's/^/[serial] /'
-          exit 1
-
-      - name: Verify NEW VM via TDX attestation
-        env:
-          AGENT_URL: https://${{ env.DD_HOSTNAME }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          # /cp/attest proves the freshly-deployed VM is serving the tunnel
-          # (stale tunnels point at old VMs that 404 on this endpoint).
-          # Auth: GITHUB_TOKEN via Bearer — the CP's /repos/{owner}/dd probe
-          # accepts any token with repo access. No OIDC audience wiring.
-          NONCE=$(openssl rand -base64 16)
-
-          # 60 × 10s = 10 min. New VM has to boot, fetch cloudflared
-          # and dd from GitHub releases, start, and bring its tunnel up.
-          for attempt in $(seq 1 60); do
-            BODY=$(curl -sG -w '\n%{http_code}' \
-              -H "Authorization: Bearer ${GITHUB_TOKEN}" \
-              --data-urlencode "nonce=${NONCE}" \
-              "${AGENT_URL}/cp/attest" || echo $'\n000')
-            CODE=$(echo "$BODY" | tail -n1)
-            JSON=$(echo "$BODY" | sed '$d')
-            if [ "$CODE" = "200" ]; then
-              QUOTE_B64=$(echo "$JSON" | jq -r '.quote_b64 // empty')
-              if [ -n "$QUOTE_B64" ] && [ "$QUOTE_B64" != "null" ]; then
-                # MRTD = 48 bytes at offset 184 in TDX quote v4.
-                # If it's non-zero, attestation actually worked.
-                MRTD=$(echo "$QUOTE_B64" | base64 -d \
-                  | dd bs=1 skip=184 count=48 status=none | xxd -p -c 48)
-                if [ -n "$MRTD" ] && [ "$MRTD" != "$(printf '00%.0s' {1..48})" ]; then
-                  echo "NEW VM verified — MRTD: $MRTD"
-                  exit 0
-                fi
-                echo "  /cp/attest 200 but MRTD empty/zero, retrying... (${attempt}/60)"
-              else
-                echo "  /cp/attest 200 but no quote_b64, retrying... (${attempt}/60)"
-              fi
-            else
-              echo "  /cp/attest returned HTTP ${CODE}, retrying... (${attempt}/60)"
-            fi
-            sleep 10
-          done
-          echo "::error::/cp/attest never returned a valid quote — stale tunnel or new VM never came up"
-          exit 1
-
-      - name: Verify STONITH halted prior VM(s) in this env
-        env:
-          GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
-          GCP_ZONE: ${{ env.GCP_ZONE }}
-        run: |
-          # STONITH (dd-register deletes the old tunnel → old cloudflared
-          # exits → old dd-register poweroffs the VM) is the ONLY cleanup
-          # mechanism. Scoped to this PR's env — previews are
-          # hostname-isolated from each other, so this only reaps prior
-          # deploys of the same PR (re-pushes).
-          NEW_VM=$(gcloud compute instances list \
-            --project="$GCP_PROJECT_ID" \
-            --filter="labels.devopsdefender=managed AND labels.dd_env=${DD_ENV}" \
-            --format="value(name)" --sort-by=~creationTimestamp | head -1)
-          echo "new VM: $NEW_VM"
-
-          # Give STONITH-by-tunnel-delete 120s to work on well-behaved
-          # old VMs (their cloudflared exits → dd-register poweroffs).
-          # After that, force-delete any remaining survivors: they're
-          # zombies whose dd-register failed before creating a tunnel
-          # (e.g. CF auth error at boot — see src/cp.rs
-          # which now kernel_poweroff's on init failure, so this is a
-          # safety net for pre-fix zombies and any future init failure
-          # modes we haven't handled).
-          SURVIVORS=""
-          for i in $(seq 1 24); do
-            SURVIVORS=$(gcloud compute instances list \
-              --project="$GCP_PROJECT_ID" \
-              --filter="labels.devopsdefender=managed AND labels.dd_env=${DD_ENV} AND status=RUNNING" \
-              --format="value(name)" \
-              | grep -vx "$NEW_VM" || true)
-            if [ -z "$SURVIVORS" ]; then
-              echo "STONITH verified — only $NEW_VM running in dd_env=${DD_ENV}"
-              exit 0
-            fi
-            echo "  still running besides $NEW_VM: $(echo "$SURVIVORS" | tr '\n' ' ')"
-            echo "  waiting for STONITH poweroff... (${i}/24)"
-            sleep 5
-          done
-          echo "::warning::STONITH-by-tunnel-delete timed out; force-deleting zombies:"
-          echo "$SURVIVORS"
-          # shellcheck disable=SC2086
-          gcloud compute instances delete $SURVIVORS \
-            --project="$GCP_PROJECT_ID" --zone="$GCP_ZONE" --quiet || true
-          echo "zombies reaped; $NEW_VM is the only $DD_ENV VM"
-
-      - name: Comment preview URL on PR
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const url = `https://${process.env.DD_HOSTNAME}`;
-            const body = [
-              `### DD preview ready`,
-              ``,
-              `**URL:** ${url}`,
-              ``,
-              `Browser login: paste \`gh auth token\` output at ${url}/auth/pat`,
-              ``,
-              `CLI / curl: \`curl -H "Authorization: Bearer $(gh auth token)" ${url}/\``,
-              ``,
-              `Register endpoint for a local agent: \`wss://${process.env.DD_HOSTNAME}/register\``,
-            ].join('\n');
-
-            // Update existing bot comment if present, else create.
-            const { data: comments } = await github.rest.issues.listComments({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number,
-            });
-            const marker = '### DD preview ready';
-            const existing = comments.find(c => c.user.type === 'Bot' && c.body && c.body.includes(marker));
-            if (existing) {
-              await github.rest.issues.updateComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                comment_id: existing.id,
-                body,
-              });
-            } else {
-              await github.rest.issues.createComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: context.issue.number,
-                body,
-              });
-            }
+  # Production deploy at app.{domain}. Fires on push-to-main OR on a
+  # manual workflow_dispatch (rollback to a specific release_tag).
+  # Tag pushes (v*) intentionally do not auto-deploy — they just
+  # publish the artifact. Cascades into dd-local-prod relaunch.
+  deploy-production:
+    if: >-
+      (github.event_name == 'push' && github.ref == 'refs/heads/main')
+      || github.event_name == 'workflow_dispatch'
+    needs: build
+    permissions:
+      contents: read
+      id-token: write
+      # Granted (though unused — comment_on_pr=false here) so the
+      # permissions intersection with deploy-cp.yml's job matches.
+      pull-requests: write
+    uses: ./.github/workflows/deploy-cp.yml
+    with:
+      env: production
+      hostname: app.${{ vars.DD_CF_DOMAIN || 'devopsdefender.com' }}
+      gcp_environment: production
+      workload_identity_provider: 'projects/779946350556/locations/global/workloadIdentityPools/github-actions-pool/providers/github-provider'
+      service_account: 'easyenclave-production-ci@easyenclave.iam.gserviceaccount.com'
+      release_tag: ${{ inputs.release_tag || 'latest' }}
+      oauth_enabled: true
+      comment_on_pr: false
+      ref: main
+    secrets: inherit

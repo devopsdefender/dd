@@ -12,11 +12,11 @@
 # Usage:
 #   export DD_PAT="$(gh auth token)"
 #   export DD_ITA_API_KEY="$(cat ~/.secrets/ita_api_key)"
-#   ./scripts/local-agents.sh https://pr-106.devopsdefender.com https://app.devopsdefender.com
+#   ./apps/_infra/local-agents.sh https://pr-106.devopsdefender.com https://app.devopsdefender.com
 #
 # Pass "" for either URL to skip defining that VM:
-#   ./scripts/local-agents.sh "" https://app.devopsdefender.com   # prod only
-#   ./scripts/local-agents.sh https://pr-N.devopsdefender.com ""  # preview only
+#   ./apps/_infra/local-agents.sh "" https://app.devopsdefender.com   # prod only
+#   ./apps/_infra/local-agents.sh https://pr-N.devopsdefender.com ""  # preview only
 #
 # After: virsh start dd-local-preview && virsh start dd-local-prod
 
@@ -31,9 +31,41 @@ fi
 : "${DD_PAT?set DD_PAT (e.g. DD_PAT=\$(gh auth token))}"
 : "${DD_ITA_API_KEY?set DD_ITA_API_KEY}"
 
+# Resolve repo root regardless of invoking CWD — the workload specs
+# under apps/<name>/ need absolute paths so bake() can find them.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+
 IMG_DIR=/var/lib/libvirt/images
 BASE="$IMG_DIR/easyenclave-local.qcow2"
 BASE_DOMAIN="easyenclave-local"
+
+# Render one workload spec. Matches the helper inlined in
+# .github/workflows/deploy-cp.yml — same envsubst + empty-entry strip,
+# so boot-time (config.iso) and runtime (/deploy) see identical JSON.
+#
+# envsubst is restricted to the ALL-CAPS `${VAR}` references that
+# appear in the template itself. Lowercase `$i`, `${i}`, and bare
+# `$((…))` arithmetic inside shell cmd strings are left alone —
+# otherwise envsubst would eat shell locals in openclaw's `until`
+# loop and produce broken scripts.
+bake() {
+  case "$1" in
+    *.json.tmpl)
+      local vars
+      vars=$(grep -oE '\$\{[A-Z_][A-Z0-9_]*\}' "$1" | sort -u | tr -d '\n')
+      envsubst "$vars" < "$1" \
+        | jq -c 'if .env then .env |= map(select(test("^[^=]+=.+"))) else . end'
+      ;;
+    *.json)
+      jq -c . "$1"
+      ;;
+    *)
+      echo "local-agents.sh: unknown workload file type: $1" >&2
+      return 1
+      ;;
+  esac
+}
 
 [ -r "$BASE" ] || { echo "missing $BASE" >&2; exit 1; }
 virsh dominfo "$BASE_DOMAIN" >/dev/null 2>&1 || {
@@ -58,51 +90,46 @@ build_config_iso() {
   tmp=$(mktemp -d)
   trap "rm -rf $tmp" RETURN
 
-  # EE reads `agent.env` from the config disk (dotenv: KEY=VALUE per
-  # line). EE_BOOT_WORKLOADS is a JSON-encoded array of workload
-  # specs. The first entry on the GPU VM insmods the nvidia driver
-  # so it's ready by the time the dd-agent comes up.
-  local nv_workload="null"
+  # Boot workload chain (EE spawns concurrently; each uses `until`
+  # loops to self-sequence):
+  #   nv             — insmod nvidia driver (prod only, first so the
+  #                    device nodes exist by the time ollama runs)
+  #   mount-models   — mount /dev/vdc at /var/lib/easyenclave/ollama
+  #   podman-static  — fetch the podman binary tarball into /var/lib/easyenclave/bin
+  #   podman-bootstrap — stage binaries, write containers.conf + policy.json,
+  #                    install /var/lib/easyenclave/bin/podman as the wrapper
+  #                    (symlinked from dd-podman for back-compat)
+  #   ollama         — run docker.io/ollama/ollama:latest serve via the wrapper
+  #   openclaw       — wait for ollama, pull $MODEL, launch openclaw gateway
+  #   cloudflared    — fetch cloudflared binary (dd-register spawns it)
+  #   dd-agent       — run devopsdefender agent, register with CP, serve workloads
+  #
+  # Prod gets the GPU model; preview gets the tiny CPU-friendly one.
+  local model ollama_spec
   if [ "$with_gpu" = "yes" ]; then
-    nv_workload=$(jq -c -n '{
-      app_name:"nv",
-      cmd:["/bin/busybox","sh","-c",
-           "/sbin/insmod /lib/modules/7.0.0-14-generic/kernel/nvidia-580srv-open/nvidia.ko NVreg_OpenRmEnableUnsupportedGpus=1 2>&1 && echo nv: loaded || echo nv: failed; sleep inf"]
-    }')
+    model="qwen2.5:7b"
+    ollama_spec="$REPO_ROOT/apps/ollama/workload.prod.json"
+  else
+    model="qwen2.5:0.5b"
+    ollama_spec="$REPO_ROOT/apps/ollama/workload.preview.json"
   fi
 
-  # Mount the persistent models disk (vdc) at /var/lib/easyenclave/ollama
-  # before ollama might try to use it. Pre-formatted ext4 on the host.
-  local mount_workload
-  mount_workload=$(jq -c -n '{
-    app_name:"mount-models",
-    cmd:["/bin/busybox","sh","-c",
-         "mkdir -p /var/lib/easyenclave/ollama && mount /dev/vdc /var/lib/easyenclave/ollama && echo mount-models: ok; sleep inf"]
-  }')
-
   local workloads
-  workloads=$(jq -c -n \
-    --argjson nv "$nv_workload" \
-    --argjson mount "$mount_workload" \
-    --arg cp "$cp" --arg pat "$DD_PAT" --arg ita "$DD_ITA_API_KEY" \
-    --arg env "$env" --arg vm "dd-local-$name" '[
-      $nv,
-      $mount,
-      {"app_name":"cloudflared",
-       "github_release":{"repo":"cloudflare/cloudflared","asset":"cloudflared-linux-amd64","rename":"cloudflared"}},
-      {"app_name":"dd-agent",
-       "github_release":{"repo":"devopsdefender/dd","asset":"devopsdefender","tag":"latest"},
-       "cmd":["devopsdefender","agent"],
-       "env":[
-         "DD_MODE=agent",
-         ("DD_CP_URL=" + $cp), ("DD_PAT=" + $pat), ("DD_ITA_API_KEY=" + $ita),
-         "DD_ITA_BASE_URL=https://api.trustauthority.intel.com",
-         "DD_ITA_JWKS_URL=https://portal.trustauthority.intel.com/certs",
-         "DD_ITA_ISSUER=https://portal.trustauthority.intel.com",
-         "DD_OWNER=devopsdefender", ("DD_ENV=" + $env), ("DD_VM_NAME=" + $vm),
-         "DD_PORT=8080"
-       ]}
-    ] | map(select(. != null))')
+  workloads=$({
+    [ "$with_gpu" = "yes" ] && bake "$REPO_ROOT/apps/nv/workload.json"
+    bake "$REPO_ROOT/apps/mount-models/workload.json"
+    bake "$REPO_ROOT/apps/podman-static/workload.json"
+    bake "$REPO_ROOT/apps/podman-bootstrap/workload.json"
+    bake "$ollama_spec"
+    MODEL="$model" bake "$REPO_ROOT/apps/openclaw/workload.json.tmpl"
+    bake "$REPO_ROOT/apps/cloudflared/workload.json"
+    DD_CP_URL="$cp" \
+      DD_PAT="$DD_PAT" \
+      DD_ITA_API_KEY="$DD_ITA_API_KEY" \
+      DD_ENV="$env" \
+      DD_VM_NAME="dd-local-$name" \
+      bake "$REPO_ROOT/apps/dd-agent/workload.json.tmpl"
+  } | jq -cs '.')
 
   {
     echo "EE_OWNER=devopsdefender"
@@ -112,7 +139,7 @@ build_config_iso() {
   # ext4 — EE rootfs has no iso9660 module.
   truncate -s 4M "$out"
   mkfs.ext4 -q -d "$tmp" "$out"
-  echo "  wrote $out (env=$env, gpu=$with_gpu)"
+  echo "  wrote $out (env=$env, gpu=$with_gpu, model=$model)"
 }
 
 build_overlay() {
@@ -255,3 +282,8 @@ echo
 echo "watch registration (Ctrl-] to exit):"
 [ -n "$PREVIEW_CP" ] && echo "  virsh console dd-local-preview"
 [ -n "$PROD_CP"    ] && echo "  virsh console dd-local-prod"
+
+# Explicit 0 — the tail `[ -n "$PROD_CP" ] && …` returns 1 when
+# PROD_CP="" (preview-only), bubbling up as the script exit status
+# and tripping set -e in dd-relaunch.sh. Force success.
+exit 0
