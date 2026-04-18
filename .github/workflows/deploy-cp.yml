@@ -1,0 +1,367 @@
+name: Deploy CP
+
+# Reusable workflow: provision the CP TDX VM on GCP, wait for it to be
+# healthy, verify attestation + dashboard + STONITH, then cascade a
+# relaunch of the matching dd-local agent VM and block until it
+# re-registers. Called from release.yml's deploy-preview (PR path) and
+# deploy-production (main / dispatch path) with env-specific inputs —
+# both paths share this exact set of verification steps so every PR
+# exercises the prod deploy code.
+#
+# GitHub Actions allows ≤4 levels of workflow_call nesting. Today's
+# chain is `release.yml → deploy-cp.yml` (2). The agent-relaunch
+# cascade uses a composite action (same-job, no nesting) to keep
+# headroom for future wrapping.
+
+on:
+  workflow_call:
+    inputs:
+      env:
+        description: 'DD_ENV (e.g. "production", "pr-42")'
+        required: true
+        type: string
+      hostname:
+        description: 'Public hostname (e.g. app.devopsdefender.com)'
+        required: true
+        type: string
+      gcp_environment:
+        description: 'GitHub environment name — "production" | "staging"'
+        required: true
+        type: string
+      workload_identity_provider:
+        description: 'GCP Workload Identity Federation provider resource name'
+        required: true
+        type: string
+      service_account:
+        description: 'GCP service account email'
+        required: true
+        type: string
+      release_tag:
+        description: 'devopsdefender release tag to deploy (e.g. "latest", "pr-abc123")'
+        required: true
+        type: string
+      oauth_enabled:
+        description: 'Enable GitHub OAuth (prod only; previews use PAT)'
+        required: false
+        type: boolean
+        default: false
+      comment_on_pr:
+        description: 'Leave a PR comment with the preview URL'
+        required: false
+        type: boolean
+        default: false
+      relaunch_agent:
+        description: 'After CP deploy, cascade a relaunch of dd-local-{env} via SSH'
+        required: false
+        type: boolean
+        default: true
+      ref:
+        description: 'Git ref the tdx2 host should pull before relaunching the agent VM'
+        required: false
+        type: string
+        default: main
+
+concurrency:
+  group: deploy-cp-${{ inputs.env }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.gcp_environment }}
+    permissions:
+      contents: read
+      id-token: write
+      pull-requests: write
+    env:
+      DD_ENV: ${{ inputs.env }}
+      DD_HOSTNAME: ${{ inputs.hostname }}
+      GCP_ZONE: us-central1-c
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ inputs.workload_identity_provider }}
+          service_account: ${{ inputs.service_account }}
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Create TDX VM (boots from easyenclave, fetches dd from GitHub releases)
+        env:
+          GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+          DD_DOMAIN: ${{ vars.DD_CF_DOMAIN || 'devopsdefender.com' }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.DD_CP_CF_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.DD_CP_CF_ACCOUNT_ID }}
+          CLOUDFLARE_ZONE_ID: ${{ secrets.DD_CP_CF_ZONE_ID }}
+          # OAuth only in environments that have these set (production).
+          # Empty placeholder values get stripped below before baking the
+          # workload spec, so dd-web disables /auth/github/* and serves
+          # /auth/pat only in those envs.
+          DD_GITHUB_CLIENT_ID: ${{ inputs.oauth_enabled && (vars.DD_GITHUB_CLIENT_ID || secrets.DD_GITHUB_CLIENT_ID) || '' }}
+          DD_GITHUB_CALLBACK_URL: ${{ inputs.oauth_enabled && vars.DD_GITHUB_CALLBACK_URL || '' }}
+          DD_GITHUB_CLIENT_SECRET: ${{ inputs.oauth_enabled && secrets.DD_GITHUB_CLIENT_SECRET || '' }}
+          DD_ITA_API_KEY: ${{ secrets.DD_ITA_API_KEY }}
+          DD_RELEASE_TAG: ${{ inputs.release_tag }}
+          EE_IMAGE_FAMILY: easyenclave-staging
+          EE_IMAGE_PROJECT: easyenclave
+          VM_MACHINE_TYPE: c3-standard-4
+          VM_DISK_SIZE: 10GB
+          DD_ITA_BASE_URL: https://api.trustauthority.intel.com
+          DD_ITA_JWKS_URL: https://portal.trustauthority.intel.com/certs
+          DD_ITA_ISSUER: https://portal.trustauthority.intel.com
+        run: |
+          set -euo pipefail
+
+          VM_NAME="dd-${DD_ENV}-$(date +%s)"
+          : "${DD_ITA_API_KEY:?set DD_ITA_API_KEY via secrets.DD_ITA_API_KEY}"
+          export DD_GITHUB_CALLBACK_URL="${DD_GITHUB_CALLBACK_URL:-https://${DD_HOSTNAME}/auth/github/callback}"
+
+          # Bake a workload template: substitute ${VAR} placeholders
+          # and strip "KEY=" env entries that ended up with empty values
+          # (e.g. OAuth creds in non-prod envs). envsubst is restricted
+          # to the uppercase ${VAR} refs the template actually declares
+          # so shell locals inside cmd strings ($i, $((…)), etc.)
+          # aren't eaten.
+          bake() {
+            case "$1" in
+              *.json.tmpl)
+                local vars
+                vars=$(grep -oE '\$\{[A-Z_][A-Z0-9_]*\}' "$1" | sort -u | tr -d '\n')
+                envsubst "$vars" < "$1" \
+                  | jq -c 'if .env then .env |= map(select(test("^[^=]+=.+"))) else . end'
+                ;;
+              *.json)
+                jq -c . "$1"
+                ;;
+              *)
+                echo "::error::unknown workload file type: $1" >&2
+                return 1
+                ;;
+            esac
+          }
+
+          # Boot workloads come from apps/<name>/workload.{json,json.tmpl}.
+          # cloudflared fetches the binary onto PATH; dd-management runs
+          # devopsdefender in DD_MODE=management (CP + dashboard).
+          EE_BOOT_WORKLOADS=$({
+            bake apps/cloudflared/workload.json
+            bake apps/dd-management/workload.json.tmpl
+          } | jq -cs '.')
+
+          jq -c -n \
+            --arg workloads "$EE_BOOT_WORKLOADS" \
+            '{ "EE_BOOT_WORKLOADS": $workloads, "EE_OWNER": "devopsdefender" }' \
+            > /tmp/ee-config.json
+
+          gcloud compute instances create "$VM_NAME" \
+            --project="$GCP_PROJECT_ID" \
+            --zone="$GCP_ZONE" \
+            --machine-type="$VM_MACHINE_TYPE" \
+            --confidential-compute-type=TDX \
+            --maintenance-policy=TERMINATE \
+            --boot-disk-size="$VM_DISK_SIZE" \
+            --image-family="$EE_IMAGE_FAMILY" \
+            --image-project="$EE_IMAGE_PROJECT" \
+            --metadata-from-file=ee-config=/tmp/ee-config.json \
+            --labels=devopsdefender=managed,dd_env="${DD_ENV}" \
+            --tags=dd-management
+
+          rm -f /tmp/ee-config.json
+          echo "VM: $VM_NAME ($DD_HOSTNAME, release $DD_RELEASE_TAG)"
+
+      - name: Wait for agent health (streams serial console)
+        env:
+          AGENT_URL: https://${{ inputs.hostname }}
+          GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+        run: |
+          VM_NAME=$(gcloud compute instances list \
+            --project="$GCP_PROJECT_ID" \
+            --filter="labels.devopsdefender=managed AND labels.dd_env=${DD_ENV}" \
+            --format="value(name)" --sort-by=~creationTimestamp | head -1)
+          if [ -z "$VM_NAME" ]; then
+            echo "::error::no dd-${DD_ENV} VM found — gcp-deploy.sh must have failed"
+            exit 1
+          fi
+          echo "Watching VM: $VM_NAME (zone: $GCP_ZONE)"
+
+          LAST_LINES=0
+          for i in $(seq 1 60); do
+            # Stream serial console so boot failures (DHCP hang, release
+            # fetch error, cloudflared exit, etc.) are visible without
+            # shelling into GCP.
+            gcloud compute instances get-serial-port-output "$VM_NAME" \
+              --project="$GCP_PROJECT_ID" --zone="$GCP_ZONE" 2>/dev/null \
+              > /tmp/serial.log || true
+            TOTAL_LINES=$(wc -l < /tmp/serial.log)
+            if [ "$TOTAL_LINES" -gt "$LAST_LINES" ]; then
+              tail -n +$((LAST_LINES + 1)) /tmp/serial.log \
+                | sed 's/^/[serial] /'
+              LAST_LINES=$TOTAL_LINES
+            fi
+
+            if grep -qE "FATAL|Kernel panic|Invalid ELF header|/bin/sh: can't access tty" /tmp/serial.log; then
+              echo "::error::boot failed — serial log shows fatal pattern"
+              exit 1
+            fi
+
+            if curl -fsS "${AGENT_URL}/health" >/dev/null 2>&1; then
+              echo "Agent healthy at ${AGENT_URL}"
+              exit 0
+            fi
+            echo "  waiting for tunnel... (${i}/60)"
+            sleep 5
+          done
+          echo "::error::Agent not healthy within 5 minutes"
+          echo "--- final serial tail ---"
+          tail -80 /tmp/serial.log | sed 's/^/[serial] /'
+          exit 1
+
+      - name: Verify NEW VM via TDX attestation
+        env:
+          AGENT_URL: https://${{ inputs.hostname }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # /cp/attest proves the freshly-deployed VM is serving the tunnel
+          # (stale tunnels point at old VMs that 404 on this endpoint).
+          # MRTD = 48 bytes at offset 184 in TDX quote v4; if non-zero,
+          # attestation actually worked.
+          NONCE=$(openssl rand -base64 16)
+          for attempt in $(seq 1 60); do
+            BODY=$(curl -sG -w '\n%{http_code}' \
+              -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+              --data-urlencode "nonce=${NONCE}" \
+              "${AGENT_URL}/cp/attest" || echo $'\n000')
+            CODE=$(echo "$BODY" | tail -n1)
+            JSON=$(echo "$BODY" | sed '$d')
+            if [ "$CODE" = "200" ]; then
+              QUOTE_B64=$(echo "$JSON" | jq -r '.quote_b64 // empty')
+              if [ -n "$QUOTE_B64" ] && [ "$QUOTE_B64" != "null" ]; then
+                MRTD=$(echo "$QUOTE_B64" | base64 -d \
+                  | dd bs=1 skip=184 count=48 status=none | xxd -p -c 48)
+                if [ -n "$MRTD" ] && [ "$MRTD" != "$(printf '00%.0s' {1..48})" ]; then
+                  echo "NEW VM verified — MRTD: $MRTD"
+                  exit 0
+                fi
+                echo "  /cp/attest 200 but MRTD empty/zero, retrying... (${attempt}/60)"
+              else
+                echo "  /cp/attest 200 but no quote_b64, retrying... (${attempt}/60)"
+              fi
+            else
+              echo "  /cp/attest returned HTTP ${CODE}, retrying... (${attempt}/60)"
+            fi
+            sleep 10
+          done
+          echo "::error::/cp/attest never returned a valid quote — stale tunnel or new VM never came up"
+          exit 1
+
+      - name: Verify dashboard renders
+        env:
+          AGENT_URL: https://${{ inputs.hostname }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Fast sanity check on top of /cp/attest — proves dd-web is up
+          # and accepts the CI PAT's Bearer auth.
+          for attempt in $(seq 1 12); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' \
+              -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+              "${AGENT_URL}/" || echo 000)
+            if [ "$code" = "200" ]; then
+              echo "Dashboard renders (HTTP 200, attempt ${attempt})"
+              exit 0
+            fi
+            echo "  dashboard returned HTTP ${code}, retrying... (${attempt}/12)"
+            sleep 5
+          done
+          echo "::error::dashboard / never returned 200 (last HTTP ${code})"
+          exit 1
+
+      - name: Verify STONITH halted prior VM(s) in this env
+        env:
+          GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+        run: |
+          # dd-register STONITHs the old VM on startup by deleting its
+          # CF tunnel → old cloudflared exits → old dd-register poweroffs.
+          # Scoped to this env — per-PR previews are hostname-isolated,
+          # so this only reaps prior deploys of the same env.
+          NEW_VM=$(gcloud compute instances list \
+            --project="$GCP_PROJECT_ID" \
+            --filter="labels.devopsdefender=managed AND labels.dd_env=${DD_ENV}" \
+            --format="value(name)" --sort-by=~creationTimestamp | head -1)
+          echo "new VM: $NEW_VM"
+          SURVIVORS=""
+          for i in $(seq 1 24); do
+            SURVIVORS=$(gcloud compute instances list \
+              --project="$GCP_PROJECT_ID" \
+              --filter="labels.devopsdefender=managed AND labels.dd_env=${DD_ENV} AND status=RUNNING" \
+              --format="value(name)" \
+              | grep -vx "$NEW_VM" || true)
+            if [ -z "$SURVIVORS" ]; then
+              echo "STONITH verified — only $NEW_VM running in ${DD_ENV}"
+              exit 0
+            fi
+            echo "  still running besides $NEW_VM: $(echo "$SURVIVORS" | tr '\n' ' ')"
+            echo "  waiting for STONITH poweroff... (${i}/24)"
+            sleep 5
+          done
+          echo "::warning::STONITH-by-tunnel-delete timed out; force-deleting zombies:"
+          echo "$SURVIVORS"
+          # shellcheck disable=SC2086
+          gcloud compute instances delete $SURVIVORS \
+            --project="$GCP_PROJECT_ID" --zone="$GCP_ZONE" --quiet || true
+          echo "zombies reaped; $NEW_VM is the only ${DD_ENV} VM"
+
+      - name: Comment preview URL on PR
+        if: inputs.comment_on_pr && github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const url = `https://${{ inputs.hostname }}`;
+            const body = [
+              `### DD preview ready`,
+              ``,
+              `**URL:** ${url}`,
+              ``,
+              `Browser login: paste \`gh auth token\` output at ${url}/auth/pat`,
+              ``,
+              `CLI / curl: \`curl -H "Authorization: Bearer $(gh auth token)" ${url}/\``,
+              ``,
+              `Register endpoint for a local agent: \`wss://${{ inputs.hostname }}/register\``,
+            ].join('\n');
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            const marker = '### DD preview ready';
+            const existing = comments.find(c => c.user.type === 'Bot' && c.body && c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }
+
+      # Cascade a relaunch of the matching dd-local-{env} libvirt domain
+      # on the tdx2 host, then block on it registering with the freshly-
+      # deployed CP. This is the gate: a release is "done" only when the
+      # local agent is back online talking to the new CP.
+      - name: Relaunch dd-local-${{ inputs.env == 'production' && 'prod' || 'preview' }}
+        if: inputs.relaunch_agent
+        uses: ./.github/actions/relaunch-agent
+        with:
+          kind: ${{ inputs.env == 'production' && 'prod' || 'preview' }}
+          url: https://${{ inputs.hostname }}
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.DD_LOCAL_SSH_KEY }}
+          host: ${{ secrets.DD_LOCAL_HOST }}
+          dd-pat: ${{ secrets.GITHUB_TOKEN }}
+          ita-api-key: ${{ secrets.DD_ITA_API_KEY }}

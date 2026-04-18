@@ -1,29 +1,34 @@
 name: Cleanup
 
-# Reap TERMINATED dd-{env}-* VMs. STONITH self-poweroff leaves the VM
-# in TERMINATED state — it uses no compute but clutters the inventory
-# and a long enough chain of deploys turns into pages of dead VMs.
+# Background safety net that reaps GCE VMs the primary cleanup paths
+# missed. Primary paths today:
 #
-# Two jobs run in parallel, one per environment, so a regression in
-# either auth/zone/project doesn't block the other. The cleanup is
-# idempotent: skip if nothing to reap.
+#   - STONITH:  dd-register deletes the old VM's CF tunnel on startup →
+#               old cloudflared exits → old dd-register poweroffs →
+#               TERMINATED. Happens on every deploy of the same env.
+#   - Teardown: pr-teardown.yml fires on branch-delete and deletes the
+#               VM + tunnel + DNS. Happens when a dev deletes the branch.
+#
+# Gaps this workflow covers:
+#   - TERMINATED VMs accumulate between STONITH and branch-delete.
+#   - A PR that's merged/closed but whose branch survives → the preview
+#     VM stays RUNNING forever, burning compute. reap-merged-pr-previews
+#     finds these and treats them like a branch-delete (VM + tunnel + DNS).
 #
 # Triggers:
 #   - workflow_dispatch (operator-initiated cleanup)
-#   - workflow_run completion of Release / Production Deploy (catch
-#     post-deploy zombies opportunistically)
+#   - workflow_run completion of Release (catch post-deploy zombies
+#     opportunistically; Release covers both preview and prod now)
 #   - schedule, every 6 hours (background safety net)
 
 on:
   workflow_dispatch:
   workflow_run:
-    workflows: ["Release", "Production Deploy"]
+    workflows: ["Release"]
     types: [completed]
   schedule:
     - cron: '0 */6 * * *'
 
-# Don't pile up identical reaps when several deploys land in quick
-# succession — one in-flight reap is enough.
 concurrency:
   group: dd-cleanup
   cancel-in-progress: false
@@ -31,11 +36,14 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  GCP_ZONE: us-central1-c
+
 jobs:
-  # PR preview envs (dd_env=pr-*) accumulate during active PRs — every
-  # push STONITHs the old VM into TERMINATED. PR close runs
-  # pr-teardown.yml which deletes them, but between pushes they stack
-  # up. This job reaps them in place.
+  # PR preview envs (dd_env=pr-*) accumulate TERMINATED VMs during
+  # active PRs — every push STONITHs the old VM. Branch-delete reaps
+  # the matching VMs; between pushes they stack up. This reaps them
+  # in place.
   reap-pr-previews:
     runs-on: ubuntu-latest
     environment: staging
@@ -51,47 +59,13 @@ jobs:
       - name: Reap TERMINATED dd-pr-* VMs
         env:
           GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
-          GCP_ZONE: us-central1-c
         run: |
-          # gcloud filter regex: `~` matches against the value. Anchor
-          # to start so we don't accidentally match an env like
-          # "foo-pr-bar" in the future.
           DEAD=$(gcloud compute instances list \
             --project="$GCP_PROJECT_ID" \
             --filter='labels.devopsdefender=managed AND labels.dd_env~"^pr-" AND status=TERMINATED' \
             --format="value(name)")
           if [ -z "$DEAD" ]; then
             echo "No TERMINATED dd-pr-* VMs to reap."
-            exit 0
-          fi
-          echo "Reaping: $(echo "$DEAD" | tr '\n' ' ')"
-          # shellcheck disable=SC2086
-          gcloud compute instances delete $DEAD \
-            --project="$GCP_PROJECT_ID" --zone="$GCP_ZONE" --quiet
-
-  reap-staging:
-    runs-on: ubuntu-latest
-    environment: staging
-    permissions:
-      contents: read
-      id-token: write
-    steps:
-      - uses: google-github-actions/auth@v2
-        with:
-          workload_identity_provider: 'projects/654815109728/locations/global/workloadIdentityPools/github-actions-pool/providers/github-provider'
-          service_account: 'easyenclave-staging-ci@eestaging.iam.gserviceaccount.com'
-      - uses: google-github-actions/setup-gcloud@v2
-      - name: Reap TERMINATED dd-staging VMs
-        env:
-          GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
-          GCP_ZONE: us-central1-c
-        run: |
-          DEAD=$(gcloud compute instances list \
-            --project="$GCP_PROJECT_ID" \
-            --filter="labels.devopsdefender=managed AND labels.dd_env=staging AND status=TERMINATED" \
-            --format="value(name)")
-          if [ -z "$DEAD" ]; then
-            echo "No TERMINATED dd-staging VMs to reap."
             exit 0
           fi
           echo "Reaping: $(echo "$DEAD" | tr '\n' ' ')"
@@ -114,7 +88,6 @@ jobs:
       - name: Reap TERMINATED dd-production VMs
         env:
           GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
-          GCP_ZONE: us-central1-c
         run: |
           DEAD=$(gcloud compute instances list \
             --project="$GCP_PROJECT_ID" \
@@ -128,3 +101,98 @@ jobs:
           # shellcheck disable=SC2086
           gcloud compute instances delete $DEAD \
             --project="$GCP_PROJECT_ID" --zone="$GCP_ZONE" --quiet
+
+  # RUNNING pr-N VMs whose PR is merged or closed are leaked compute —
+  # neither STONITH (waits for a new deploy) nor pr-teardown.yml (waits
+  # for branch-delete) reaches them. This finds them and tears them
+  # down like a branch-delete would have: VM + CF tunnel + DNS CNAME.
+  reap-merged-pr-previews:
+    runs-on: ubuntu-latest
+    environment: staging
+    permissions:
+      contents: read
+      id-token: write
+      pull-requests: read
+    steps:
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: 'projects/654815109728/locations/global/workloadIdentityPools/github-actions-pool/providers/github-provider'
+          service_account: 'easyenclave-staging-ci@eestaging.iam.gserviceaccount.com'
+      - uses: google-github-actions/setup-gcloud@v2
+      - name: Reap RUNNING pr-N VMs whose PR is closed or merged
+        env:
+          GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+          CF_API_TOKEN:   ${{ secrets.DD_CP_CF_API_TOKEN }}
+          CF_ACCOUNT_ID:  ${{ secrets.DD_CP_CF_ACCOUNT_ID }}
+          CF_ZONE_ID:     ${{ secrets.DD_CP_CF_ZONE_ID }}
+          DD_DOMAIN:      ${{ vars.DD_CF_DOMAIN || 'devopsdefender.com' }}
+          GH_TOKEN:       ${{ github.token }}
+        run: |
+          # Unique set of pr-N envs currently RUNNING.
+          envs=$(gcloud compute instances list \
+            --project="$GCP_PROJECT_ID" \
+            --filter='labels.devopsdefender=managed AND labels.dd_env~"^pr-" AND status=RUNNING' \
+            --format='value(labels.dd_env)' | sort -u)
+          if [ -z "$envs" ]; then
+            echo "No RUNNING dd-pr-* VMs to consider."
+            exit 0
+          fi
+
+          for env in $envs; do
+            pr="${env#pr-}"
+            state=$(gh pr view "$pr" --repo "${{ github.repository }}" \
+              --json state --jq .state 2>/dev/null || echo "UNKNOWN")
+            if [ "$state" = "OPEN" ]; then
+              echo "pr-$pr still OPEN — leaving RUNNING VMs alone."
+              continue
+            fi
+            if [ "$state" = "UNKNOWN" ]; then
+              echo "::warning::could not resolve state for pr-$pr (gh pr view failed); leaving alone"
+              continue
+            fi
+            echo "pr-$pr is $state — tearing down preview env $env"
+
+            # VMs
+            vms=$(gcloud compute instances list \
+              --project="$GCP_PROJECT_ID" \
+              --filter="labels.devopsdefender=managed AND labels.dd_env=$env" \
+              --format='value(name)')
+            if [ -n "$vms" ]; then
+              echo "  deleting VMs: $(echo "$vms" | tr '\n' ' ')"
+              # shellcheck disable=SC2086
+              gcloud compute instances delete $vms \
+                --project="$GCP_PROJECT_ID" --zone="$GCP_ZONE" --quiet
+            fi
+
+            # CF tunnels — named `dd-{env}-{uuid}`.
+            resp=$(curl -fsS \
+              -H "Authorization: Bearer $CF_API_TOKEN" \
+              "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/cfd_tunnel?is_deleted=false&per_page=200")
+            ids=$(echo "$resp" | jq -r --arg prefix "dd-$env-" \
+              '.result[] | select(.name | startswith($prefix)) | .id')
+            for id in $ids; do
+              echo "  deleting tunnel $id"
+              curl -fsS -X DELETE \
+                -H "Authorization: Bearer $CF_API_TOKEN" \
+                "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/cfd_tunnel/$id/connections" \
+                >/dev/null || true
+              curl -fsS -X DELETE \
+                -H "Authorization: Bearer $CF_API_TOKEN" \
+                "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/cfd_tunnel/$id" \
+                >/dev/null || echo "::warning::tunnel $id delete failed (may already be gone)"
+            done
+
+            # DNS CNAME for pr-N.{domain}
+            hostname="$env.$DD_DOMAIN"
+            record_id=$(curl -fsS \
+              -H "Authorization: Bearer $CF_API_TOKEN" \
+              "https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/dns_records?type=CNAME&name=$hostname" \
+              | jq -r '.result[0].id // empty')
+            if [ -n "$record_id" ]; then
+              echo "  deleting CNAME $hostname ($record_id)"
+              curl -fsS -X DELETE \
+                -H "Authorization: Bearer $CF_API_TOKEN" \
+                "https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/dns_records/$record_id" \
+                >/dev/null
+            fi
+          done
