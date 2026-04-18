@@ -195,10 +195,15 @@ fn parse_extra_ingress() -> Result<Vec<(String, u16)>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
     fn parse(s: &str) -> Result<Vec<(String, u16)>> {
-        // SAFETY: tests are single-threaded under `cargo test` unless
-        // configured otherwise. This file doesn't opt into parallelism.
+        let _guard = ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         unsafe {
             std::env::set_var("DD_EXTRA_INGRESS", s);
         }
