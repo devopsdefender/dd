@@ -39,7 +39,7 @@ The `devopsdefender` binary ships as a **GitHub release asset** — not an OCI i
 
 `cloudflared` is also pulled directly from `cloudflare/cloudflared`'s GitHub releases as a fetch-only boot workload — no bundling in our image, no Dockerfile step.
 
-Per-VM configuration (CF credentials, GitHub OAuth, the workload spec itself) is passed to easyenclave at boot via **GCE instance metadata** (`ee-config` attribute), read by `easyenclave::init::fetch_gce_metadata_config()` and applied as env vars. `scripts/gcp-deploy.sh` builds the spec and invokes `gcloud compute instances create --image-family=easyenclave-staging --metadata-from-file=ee-config=...`.
+Per-VM configuration (CF credentials, GitHub OAuth, the workload spec itself) is passed to easyenclave at boot via **GCE instance metadata** (`ee-config` attribute), read by `easyenclave::init::fetch_gce_metadata_config()` and applied as env vars. The CP-deploy step in `.github/workflows/deploy-cp.yml` builds the spec and invokes `gcloud compute instances create --image-family=easyenclave-staging --metadata-from-file=ee-config=...`.
 
 ## CI/CD
 
@@ -48,16 +48,18 @@ PR              → pre-release tagged pr-{sha12}, then ephemeral preview at pr-
 branch deleted  → pr-teardown.yml deletes the preview's VM, CF tunnel, and DNS
 push to main    → rolling `latest` release, then auto-deploy to production
 push v* tag     → versioned release (no auto-deploy)
-manual          → production-deploy.yml promotes any existing tag
+manual dispatch → redeploy any existing tag to production (rollback tool)
 ```
 
-Each PR gets its own isolated env at `pr-{N}.{domain}` with `DD_ENV=pr-{N}` — no more shared staging tier. `.github/workflows/release.yml` builds the static musl binary, publishes it as a GitHub release asset, deploys the PR's preview VM, and posts the URL back to the PR. The preview VM is verified via:
+Every path lives in `.github/workflows/release.yml`: one `build` job, then either `deploy-preview` (PR) or `deploy-production` (main / dispatch), both calling the reusable `deploy-cp.yml` with env-specific inputs. Each cascades into a relaunch of the matching `dd-local-{env}` VM on the tdx2 host — the Release run only goes green when that agent re-registers with the freshly-deployed CP. Verifications along the way:
 
 1. `/health` via the Cloudflare tunnel
 2. `/cp/attest` returning a real TDX MRTD (cryptographic proof the freshly-deployed VM is running — old VMs don't have the endpoint and return 404)
-3. No other `dd-pr-{N}-*` VM is RUNNING after deploy (STONITH must have halted the previous instance of this PR)
+3. Dashboard `/` returning HTTP 200 under a Bearer PAT
+4. No other `dd-{env}-*` VM is RUNNING after deploy (STONITH must have halted the previous instance)
+5. `dd-local-{env}` re-registers with the new CP within 5 min
 
-Browser access to a PR preview goes through `/auth/pat` (paste a GitHub PAT, validated against `DD_OWNER`). OAuth is only wired for production, which `production-deploy.yml` still targets at `app.{domain}`.
+Browser access to a PR preview goes through `/auth/pat` (paste a GitHub PAT, validated against `DD_OWNER`). OAuth is only wired for production, at `app.{domain}`.
 
 ## STONITH
 

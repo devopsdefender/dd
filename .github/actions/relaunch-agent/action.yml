@@ -1,0 +1,103 @@
+name: Relaunch local TDX agent
+description: >-
+  SSH into the tdx2 host, recreate the matching dd-local-{kind} libvirt
+  domain against the given CP url (pulling apps/ from the given git ref),
+  then block until the agent re-registers with the CP. A release is "done"
+  only when this action succeeds end-to-end.
+
+inputs:
+  kind:
+    description: 'prod | preview — which libvirt domain to relaunch'
+    required: true
+  url:
+    description: 'CP URL the agent should register against (e.g. https://app.devopsdefender.com)'
+    required: true
+  ref:
+    description: 'git ref whose scripts/apps tree dd-relaunch.sh should check out on the host'
+    required: true
+  ssh-key:
+    description: 'Private SSH key for tdx2@host'
+    required: true
+  host:
+    description: 'Public host address of the tdx2 node'
+    required: true
+  dd-pat:
+    description: 'GitHub PAT the agent uses to talk to the CP'
+    required: true
+  ita-api-key:
+    description: 'Intel Trust Authority API key for attestation'
+    required: true
+
+runs:
+  using: composite
+  steps:
+    # CP must be reachable before we SSH — on PR pushes we race with
+    # Release's deploy-preview standing up the pr-N CP. /health is public.
+    - name: Wait for CP to be healthy
+      shell: bash
+      env:
+        URL: ${{ inputs.url }}
+      run: |
+        for i in $(seq 1 60); do
+          if curl -fsS --max-time 5 "$URL/health" >/dev/null 2>&1; then
+            echo "CP $URL healthy after ${i} attempts"
+            exit 0
+          fi
+          echo "  waiting for $URL... (${i}/60)"
+          sleep 10
+        done
+        echo "::error::CP $URL never came up within 10 min"
+        exit 1
+
+    # SSH in and relaunch the VM (destroy + redefine + start). Finishes
+    # in ~10 s — the baked config.iso's EE_BOOT_WORKLOADS drives the rest.
+    - name: ssh + relaunch VM
+      shell: bash
+      env:
+        SSH_KEY:        ${{ inputs.ssh-key }}
+        HOST:           ${{ inputs.host }}
+        DD_PAT:         ${{ inputs.dd-pat }}
+        DD_ITA_API_KEY: ${{ inputs.ita-api-key }}
+        KIND:           ${{ inputs.kind }}
+        URL:            ${{ inputs.url }}
+        REF:            ${{ inputs.ref }}
+      run: |
+        mkdir -p ~/.ssh
+        printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
+        chmod 600 ~/.ssh/id_ed25519
+        ssh-keyscan -H "$HOST" >> ~/.ssh/known_hosts 2>/dev/null
+        ssh -o BatchMode=yes -o StrictHostKeyChecking=yes \
+            -i ~/.ssh/id_ed25519 "tdx2@$HOST" \
+            "DD_PAT='$DD_PAT' DD_ITA_API_KEY='$DD_ITA_API_KEY' /home/tdx2/src/dd/apps/_infra/dd-relaunch.sh '$KIND' '$URL' '$REF'"
+
+    # Block until the freshly-booted agent VM registers with the CP.
+    # This is the "I can see the local agent deployment worked" signal
+    # that gates the whole release. 5-min budget covers a cold VM boot
+    # (~60s) + cloudflared tunnel (~30s) + agent startup + register —
+    # plenty of headroom. Doesn't probe openclaw/ollama readiness —
+    # that first-boot pays a 30-min npm-install tax and isn't part
+    # of the release gate.
+    - name: Verify agent registered with CP
+      shell: bash
+      env:
+        URL:    ${{ inputs.url }}
+        DD_PAT: ${{ inputs.dd-pat }}
+        KIND:   ${{ inputs.kind }}
+      run: |
+        vm="dd-local-$KIND"
+        started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+        AUTH=(-H "Authorization: Bearer $DD_PAT")
+        for i in $(seq 1 30); do
+          host=$(curl -fsS --max-time 10 "${AUTH[@]}" "$URL/api/agents" 2>/dev/null \
+            | jq -r --arg since "$started_at" --arg vm "$vm" '
+                [.[] | select(.vm_name==$vm and .status=="healthy" and .last_seen > $since)]
+                | sort_by(.last_seen) | reverse | .[0].hostname // empty' 2>/dev/null || true)
+          if [ -n "$host" ] && [ "$host" != "null" ]; then
+            echo "$vm registered at https://$host"
+            exit 0
+          fi
+          echo "  waiting for $vm to register with $URL... (${i}/30)"
+          sleep 10
+        done
+        echo "::error::$vm never registered with $URL within 5 min"
+        exit 1
