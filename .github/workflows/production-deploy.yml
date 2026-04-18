@@ -31,6 +31,12 @@ jobs:
     # workflow_run fires on every Release completion, including failures.
     # Only promote on success.
     if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    permissions:
+      contents: read
+      id-token: write
+      # Granted (though unused — inputs.comment_on_pr=false here) so the
+      # intersection with deploy-cp.yml's job-level permissions matches.
+      pull-requests: write
     uses: ./.github/workflows/deploy-cp.yml
     with:
       env: production

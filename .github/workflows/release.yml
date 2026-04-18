@@ -123,6 +123,10 @@ jobs:
   deploy-preview:
     if: github.event_name == 'pull_request'
     needs: build
+    permissions:
+      contents: read
+      id-token: write
+      pull-requests: write
     uses: ./.github/workflows/deploy-cp.yml
     with:
       env: pr-${{ github.event.number }}
