@@ -38,13 +38,52 @@ manual dispatch → redeploy any existing tag to production (rollback tool)
 
 Every path lives in `.github/workflows/release.yml`: one `build` job, then either `deploy-preview` (PR) or `deploy-production` (main / dispatch), both calling the reusable `deploy-cp.yml` with env-specific inputs. Each cascades into a relaunch of the matching `dd-local-{env}` VM on the tdx2 host — the Release run only goes green when that agent re-registers with the freshly-deployed CP. Verifications along the way:
 
-1. `/health` via the Cloudflare tunnel
-2. `/cp/attest` returning a real TDX MRTD (cryptographic proof the freshly-deployed VM is running — old VMs don't have the endpoint and return 404)
-3. Dashboard `/` returning HTTP 200 under a Bearer PAT
+1. `/health` via the Cloudflare tunnel (public; CF Access bypass)
+2. `/cp/attest` returning a real TDX MRTD, called with a CF Access service token (cryptographic proof the freshly-deployed VM is running — old VMs don't have the endpoint and return 404)
+3. Dashboard `/` returning a CF Access redirect (HTTP 302) to the Cloudflare login flow
 4. No other `dd-{env}-*` VM is RUNNING after deploy (STONITH must have halted the previous instance)
 5. `dd-local-{env}` re-registers with the new CP within 5 min
 
-Browser access to a PR preview goes through `/auth/pat` (paste a GitHub PAT, validated against `DD_OWNER`). OAuth is only wired for production, at `app.{domain}`.
+## Auth
+
+Zero shared secrets. Every CP and agent URL is fronted by [Cloudflare Access](https://developers.cloudflare.com/cloudflare-one/applications/); everything else is gated by signed tokens validated in code.
+
+| Caller | Endpoint | Auth |
+| --- | --- | --- |
+| Human browser | CP `/`, agent `/`, dashboards | CF Access → GitHub OAuth → `github-organization:DD_OWNER` or `emails:DD_ACCESS_ADMIN_EMAIL` |
+| Agent → CP | `/register`, `/ingress/replace` | CF Access bypass + Intel ITA token verified in-code |
+| CI → agent | `/deploy`, `/exec` | CF Access bypass + GitHub Actions OIDC JWT verified in-code (`repository_owner == DD_OWNER`) |
+| Anyone | `/health`, `/cp/attest`, `/api/agents`, workload URLs | CF Access bypass; read-only or self-authenticating content |
+
+No PATs. No CF Access service tokens. No Worker. Agents ship with nothing but an ITA API key; CI ships with nothing but its per-job GitHub OIDC token.
+
+First-time setup on a fresh Cloudflare account:
+1. Zero Trust → Settings → Authentication → Login methods → add GitHub (`read:user` scope only).
+2. Extend `DD_CF_API_TOKEN` with **Access: Apps and Policies: Edit** and **Access: Identity Providers: Read**.
+3. Set repo var/secret `DD_ACCESS_ADMIN_EMAIL` (break-glass human login).
+4. Deploy. No per-deploy bootstrap step.
+
+## Deploy a workload from GitHub Actions
+
+The [`dd-deploy`](.github/actions/dd-deploy/README.md) composite action mints a per-job OIDC token and POSTs any workload JSON to a DD agent. Works from any repository in the `DD_OWNER` GitHub org with zero stored credentials:
+
+```yaml
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: devopsdefender/dd/.github/actions/dd-deploy@main
+        with:
+          cp-url: https://app.devopsdefender.com
+          vm-name: dd-local-prod
+          workload: apps/myapp/workload.json
+```
+
+The agent verifies the OIDC token against GitHub's JWKS, checks `repository_owner == DD_OWNER`, and launches the workload. Full inputs/outputs in [`.github/actions/dd-deploy/README.md`](.github/actions/dd-deploy/README.md).
 
 ## STONITH
 

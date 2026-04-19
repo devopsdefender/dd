@@ -5,18 +5,21 @@
 #                      agent + podman — no demo workload — so the release
 #                      pipeline can prove registration + tunnel end-to-end
 #                      against per-PR CPs without needing GPU hardware.
-#   dd-local-prod    : H100 passthrough, registers with production. Boots
-#                      the web-nvidia-smi demo workload + declares a
-#                      `gpu.<agent-host>` ingress so the output is reachable
-#                      from the public internet.
+#   dd-local-prod    : H100 passthrough, registers with production. The
+#                      web-nvidia-smi demo is NOT a boot workload — it's
+#                      deployed post-registration by a Release workflow
+#                      step using GitHub Actions OIDC against the agent's
+#                      /deploy endpoint. Boot stays fast and minimal.
 #
 # Both reuse the existing easyenclave base qcow2 via copy-on-write
-# overlays; each gets its own config.iso baking in DD_CP_URL + DD_PAT +
-# DD_ITA_API_KEY for that target. Libvirt XML is rendered from the
-# existing `easyenclave-local` domain (strip hostdev for preview).
+# overlays; each gets its own config.iso baking in DD_CP_URL +
+# DD_ITA_API_KEY for that target. No GitHub PAT — the agent
+# authenticates to the CP via ITA attestation at /register and picks
+# up a CF Access service token from the register response for all
+# subsequent machine-to-machine calls. Libvirt XML is rendered from
+# the existing `easyenclave-local` domain (strip hostdev for preview).
 #
 # Usage:
-#   export DD_PAT="$(gh auth token)"
 #   export DD_ITA_API_KEY="$(cat ~/.secrets/ita_api_key)"
 #   ./apps/_infra/local-agents.sh https://pr-106.devopsdefender.com https://app.devopsdefender.com
 #
@@ -34,8 +37,11 @@ if [ -z "$PREVIEW_CP" ] && [ -z "$PROD_CP" ]; then
   echo "usage: $0 <preview-cp-url|\"\"> <prod-cp-url|\"\">" >&2
   exit 1
 fi
-: "${DD_PAT?set DD_PAT (e.g. DD_PAT=\$(gh auth token))}"
 : "${DD_ITA_API_KEY?set DD_ITA_API_KEY}"
+# DD_RELEASE_TAG pins which devopsdefender binary the agent downloads.
+# Defaults to "latest" for ad-hoc runs; the relaunch-agent action sets
+# it to the PR's release tag so preview deploys test the PR binary.
+DD_RELEASE_TAG="${DD_RELEASE_TAG:-latest}"
 
 # Resolve repo root regardless of invoking CWD — the workload specs
 # under apps/<name>/ need absolute paths so bake() can find them.
@@ -119,12 +125,14 @@ build_config_iso() {
   #                    gpu.<agent-host> ingress via $DD_EXTRA_INGRESS,
   #                    computed below from `expose` entries on the
   #                    baked workloads.
+  # web-nvidia-smi is intentionally NOT a boot workload — it's
+  # deployed post-registration by the Release workflow via GH OIDC.
+  # Boot is: nvidia driver (GPU only), podman runtime, cloudflared.
   local bare_workloads
   bare_workloads=$({
     [ "$with_gpu" = "yes" ] && bake "$REPO_ROOT/apps/nv/workload.json"
     bake "$REPO_ROOT/apps/podman-static/workload.json"
     bake "$REPO_ROOT/apps/podman-bootstrap/workload.json"
-    [ "$with_gpu" = "yes" ] && bake "$REPO_ROOT/apps/web-nvidia-smi/workload.json"
     bake "$REPO_ROOT/apps/cloudflared/workload.json"
   })
 
@@ -135,11 +143,11 @@ build_config_iso() {
   workloads=$({
     echo "$bare_workloads"
     DD_CP_URL="$cp" \
-      DD_PAT="$DD_PAT" \
       DD_ITA_API_KEY="$DD_ITA_API_KEY" \
       DD_ENV="$env" \
       DD_VM_NAME="dd-local-$name" \
       DD_EXTRA_INGRESS="$extra_ingress" \
+      DD_RELEASE_TAG="$DD_RELEASE_TAG" \
       bake "$REPO_ROOT/apps/dd-agent/workload.json.tmpl"
   } | jq -cs '.')
 

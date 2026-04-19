@@ -1,13 +1,19 @@
 //! Agent mode — runs inside an easyenclave TDX VM.
 //!
-//! On startup: POST `{vm_name, env_label, owner}` with a PAT bearer to
-//! `$DD_CP_URL/register`, receive `{tunnel_token, hostname, agent_id,
-//! jwt_secret_b64, cp_hostname}`, spawn cloudflared, then serve.
+//! On startup: POST `{vm_name, env_label, owner, ita_token}` to
+//! `$DD_CP_URL/register` (no auth — ITA attestation is the gate;
+//! the path is exempt from CF Access via a bypass app). The CP
+//! responds with `{tunnel_token, hostname, agent_id, cp_hostname}`.
 //!
-//! The agent never mints its own JWTs or hosts a login page. The CP
-//! issues the `dd_auth` cookie with `Domain=.{cf.domain}`; browsers
-//! send it to the agent subdomain automatically, and the agent verifies
-//! with the secret it received at registration.
+//! Auth after registration:
+//!   - Browser routes (`/`, `/workload/*`, `/session/*`) are behind
+//!     CF Access with the same human policy as the CP dashboard.
+//!   - `/deploy` and `/exec` are CF-Access-bypassed and gated in-code
+//!     by a GitHub Actions OIDC token — any CI workflow in the
+//!     `DD_OWNER` org can call them by presenting its per-job OIDC
+//!     JWT as `Authorization: Bearer …`.
+//!   - Agent → CP `/ingress/replace` calls include the agent's fresh
+//!     ITA token in the body; the CP verifies it against Intel.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -20,10 +26,10 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use tokio::sync::RwLock;
 
-use crate::auth::{self, Keys};
 use crate::config::Agent as Cfg;
 use crate::ee::Ee;
 use crate::error::{Error, Result};
+use crate::gh_oidc;
 use crate::html::{self, shell};
 use crate::ita;
 use crate::metrics;
@@ -38,13 +44,11 @@ const ITA_REFRESH: Duration = Duration::from_secs(180);
 struct St {
     cfg: Arc<Cfg>,
     ee: Arc<Ee>,
-    keys: Arc<Keys>,
     hostname: String,
     /// Tunnel name returned by the CP at /register — stable for the
     /// life of this agent's tunnel. The /ingress/replace call on the
     /// CP keys off this to look up the tunnel_id.
     agent_id: String,
-    cp_hostname: String,
     started: Instant,
     /// Current Intel-signed JWT. Refreshed by a background task.
     ita_token: Arc<RwLock<String>>,
@@ -54,6 +58,11 @@ struct St {
     /// agent forwards the full list on every /ingress/replace call
     /// so the CP's PUT is a straight replacement.
     extras: Arc<RwLock<Vec<(String, u16)>>>,
+    /// Verifier for GitHub Actions OIDC JWTs — the auth on /deploy
+    /// and /exec. CI workflows in the DD_OWNER org can call them
+    /// without any shared secret; anyone else is denied at claim
+    /// check.
+    gh: Arc<gh_oidc::Verifier>,
 }
 
 pub async fn run() -> Result<()> {
@@ -75,7 +84,6 @@ pub async fn run() -> Result<()> {
 
     spawn_cloudflared(b.tunnel_token);
 
-    let keys = Arc::new(Keys::from_b64(&b.jwt_secret_b64, &b.cp_hostname)?);
     let ita_token = Arc::new(RwLock::new(initial_token));
 
     // Background re-mint so /health always serves a non-expired token
@@ -100,16 +108,17 @@ pub async fn run() -> Result<()> {
         });
     }
 
+    let gh = gh_oidc::Verifier::new(cfg.common.owner.clone(), "dd-agent".into());
+
     let state = St {
         cfg: cfg.clone(),
         ee,
-        keys,
         hostname: b.hostname,
         agent_id: b.agent_id,
-        cp_hostname: b.cp_hostname,
         started: Instant::now(),
         ita_token,
         extras: Arc::new(RwLock::new(cfg.extra_ingress.clone())),
+        gh,
     };
 
     let app = Router::new()
@@ -135,7 +144,7 @@ struct Bootstrap {
     tunnel_token: String,
     hostname: String,
     agent_id: String,
-    jwt_secret_b64: String,
+    #[allow(dead_code)]
     cp_hostname: String,
 }
 
@@ -154,9 +163,9 @@ async fn register(cfg: &Cfg, ita_token: &str) -> Result<Bootstrap> {
         "ita_token": ita_token,
         "extra_ingress": extra_ingress,
     });
+    // /register is CF-Access-bypassed; ITA attestation is the gate.
     let resp = http
         .post(&url)
-        .bearer_auth(&cfg.pat)
         .json(&body)
         .send()
         .await
@@ -252,26 +261,7 @@ async fn health(State(s): State<St>) -> Json<serde_json::Value> {
     }))
 }
 
-async fn require_auth(
-    s: &St,
-    headers: &HeaderMap,
-    uri: &axum::http::Uri,
-) -> std::result::Result<String, Response> {
-    match auth::resolve(&s.keys, &s.cfg.common.owner, headers).await {
-        Ok(login) => Ok(login),
-        Err(Error::Unauthorized) => Err(auth::login_redirect(&s.cp_hostname, uri)),
-        Err(e) => Err(e.into_response()),
-    }
-}
-
-async fn dashboard(
-    State(s): State<St>,
-    headers: HeaderMap,
-    axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
-) -> Response {
-    if let Err(r) = require_auth(&s, &headers, &uri).await {
-        return r;
-    }
+async fn dashboard(State(s): State<St>) -> Response {
     let m = metrics::collect().await;
     let list = s.ee.list().await.unwrap_or_default();
     let ee_health = s.ee.health().await.unwrap_or_default();
@@ -341,15 +331,7 @@ async fn dashboard(
     .into_response()
 }
 
-async fn workload_page(
-    State(s): State<St>,
-    Path(id): Path<String>,
-    headers: HeaderMap,
-    axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
-) -> Result<Response> {
-    if let Err(r) = require_auth(&s, &headers, &uri).await {
-        return Ok(r);
-    }
+async fn workload_page(State(s): State<St>, Path(id): Path<String>) -> Result<Response> {
     let list = s.ee.list().await?;
     let deployments: Vec<&serde_json::Value> = list["deployments"]
         .as_array()
@@ -434,17 +416,25 @@ async fn workload_page(
     .into_response())
 }
 
-async fn session_page(
-    State(s): State<St>,
-    Path(app): Path<String>,
-    headers: HeaderMap,
-    axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
-) -> Response {
-    if let Err(r) = require_auth(&s, &headers, &uri).await {
-        return r;
-    }
+async fn session_page(Path(app): Path<String>) -> Response {
     let ws = format!("/ws/session/{}", urlencoding::encode(&app));
     Html(terminal::page(&app, &ws)).into_response()
+}
+
+/// Extract + verify a GitHub Actions OIDC bearer token. The /deploy
+/// and /exec endpoints are CF-Access-bypassed; this is the real gate.
+async fn require_gh_oidc(s: &St, headers: &HeaderMap) -> Result<gh_oidc::Claims> {
+    let auth = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .ok_or(Error::Unauthorized)?;
+    let token = auth
+        .strip_prefix("Bearer ")
+        .or_else(|| auth.strip_prefix("bearer "))
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .ok_or(Error::Unauthorized)?;
+    s.gh.verify(token).await
 }
 
 async fn deploy(
@@ -452,7 +442,11 @@ async fn deploy(
     headers: HeaderMap,
     Json(spec): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>> {
-    auth::resolve(&s.keys, &s.cfg.common.owner, &headers).await?;
+    let claims = require_gh_oidc(&s, &headers).await?;
+    eprintln!(
+        "agent: /deploy by {} (repo={}, ref={})",
+        claims.sub, claims.repository, claims.ref_
+    );
 
     // Pull `expose` off the spec before forwarding to EE. EE ignores
     // unknown fields today but keeping the payload tidy avoids future
@@ -509,15 +503,16 @@ async fn push_extra_ingress(s: &St, label: String, port: u16) -> Result<()> {
         .iter()
         .map(|(l, p)| serde_json::json!({"hostname_label": l, "port": p}))
         .collect();
+    let ita_token = s.ita_token.read().await.clone();
     let body = serde_json::json!({
         "agent_id": s.agent_id,
+        "ita_token": ita_token,
         "extras": body_extras,
     });
 
     let url = format!("{}/ingress/replace", s.cfg.cp_url.trim_end_matches('/'));
     let resp = reqwest::Client::new()
         .post(&url)
-        .bearer_auth(&s.cfg.pat)
         .json(&body)
         .send()
         .await
@@ -548,17 +543,15 @@ async fn exec(
     headers: HeaderMap,
     Json(req): Json<ExecReq>,
 ) -> Result<Json<serde_json::Value>> {
-    auth::resolve(&s.keys, &s.cfg.common.owner, &headers).await?;
+    let _ = require_gh_oidc(&s, &headers).await?;
     Ok(Json(s.ee.exec(&req.cmd, req.timeout_secs).await?))
 }
 
 async fn session_ws(
     State(s): State<St>,
     Path(app): Path<String>,
-    headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Result<Response> {
-    auth::resolve(&s.keys, &s.cfg.common.owner, &headers).await?;
     let _ = app;
     let vm = s.cfg.common.vm_name.clone();
     let ee = s.ee.clone();

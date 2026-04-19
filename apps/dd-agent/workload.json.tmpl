@@ -3,13 +3,12 @@
   "github_release": {
     "repo": "devopsdefender/dd",
     "asset": "devopsdefender",
-    "tag": "latest"
+    "tag": "${DD_RELEASE_TAG}"
   },
   "cmd": ["devopsdefender", "agent"],
   "env": [
     "DD_MODE=agent",
     "DD_CP_URL=${DD_CP_URL}",
-    "DD_PAT=${DD_PAT}",
     "DD_ITA_API_KEY=${DD_ITA_API_KEY}",
     "DD_ITA_BASE_URL=https://api.trustauthority.intel.com",
     "DD_ITA_JWKS_URL=https://portal.trustauthority.intel.com/certs",

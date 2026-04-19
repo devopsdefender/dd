@@ -3,21 +3,21 @@
 //! One HTTP port (`$DD_PORT`, default 8080) behind the CP's own CF tunnel.
 //! On startup we: self-provision a CF tunnel at `$DD_HOSTNAME`, spawn
 //! cloudflared, STONITH any older CP (by `dd-{env}-cp-*` name prefix),
-//! start the self-watchdog and collector, then serve the router.
+//! provision CF Access apps + a shared service token, start the
+//! self-watchdog and collector, then serve the router. No app-layer
+//! auth — CF Access validates every request at the edge.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::extract::{Path, Query, State, WebSocketUpgrade};
-use axum::http::HeaderMap;
-use axum::response::{Html, IntoResponse, Redirect, Response};
+use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
-use axum::{Form, Json, Router};
+use axum::{Json, Router};
 use serde::Deserialize;
 use tokio::sync::{Mutex, RwLock};
 
-use crate::auth::{self, Keys};
 use crate::cf;
 use crate::collector::{self, Store};
 use crate::config::Cp as Cfg;
@@ -39,7 +39,6 @@ const ITA_REFRESH: Duration = Duration::from_secs(180);
 struct St {
     cfg: Arc<Cfg>,
     ee: Arc<Ee>,
-    keys: Arc<Keys>,
     store: Store,
     started: Instant,
     verifier: Arc<ita::Verifier>,
@@ -80,7 +79,23 @@ pub async fn run() -> Result<()> {
 
     let store: Store = Arc::new(Mutex::new(HashMap::new()));
 
-    let keys = Arc::new(Keys::fresh(&cfg.hostname));
+    // Provision CF Access apps — one human app + bypass paths for
+    // endpoints gated in-code. Fatal on any failure; the CP refuses
+    // to start without edge auth configured.
+    if let Err(e) = cf::provision_cp_access(
+        &http,
+        &cfg.cf,
+        &cfg.common.env_label,
+        &cfg.hostname,
+        &cfg.common.owner,
+        &cfg.access.admin_email,
+    )
+    .await
+    {
+        eprintln!("cp: CF Access provisioning failed: {e}");
+        stonith::poweroff();
+    }
+    eprintln!("cp: CF Access ready");
 
     // ITA verifier — required.
     let verifier = ita::Verifier::new(cfg.ita.jwks_url.clone(), cfg.ita.issuer.clone());
@@ -202,7 +217,6 @@ pub async fn run() -> Result<()> {
     let state = St {
         cfg: cfg.clone(),
         ee,
-        keys,
         store,
         started: Instant::now(),
         verifier,
@@ -221,8 +235,6 @@ pub async fn run() -> Result<()> {
         .route("/cp/ita", get(cp_ita))
         .route("/cp/shell", get(shell_page))
         .route("/cp/ws/shell", get(shell_ws))
-        .route("/auth/pat", get(pat_form).post(pat_submit))
-        .route("/auth/logout", get(logout))
         .with_state(state);
 
     let addr = format!("0.0.0.0:{}", cfg.common.port);
@@ -295,18 +307,16 @@ struct ExtraIngress {
     port: u16,
 }
 
-/// POST /register — agent presents a GitHub PAT belonging to DD_OWNER;
-/// we verify, optionally verify its ITA token, create an agent tunnel,
-/// and return the tunnel token + the JWT signing secret (so the agent
-/// can verify CP-issued cookies).
+/// POST /register — the CF Access bypass app on this path lets anyone
+/// reach it; the real gate is ITA attestation in-code. We verify the
+/// agent's Intel-signed quote, create its tunnel, provision its CF
+/// Access apps (human dashboard + per-workload bypass URLs), and
+/// return the tunnel token + shared CF Access service token pair so
+/// the agent can authenticate future M2M calls.
 async fn register(
     State(s): State<St>,
-    headers: HeaderMap,
     Json(req): Json<RegisterReq>,
 ) -> Result<Json<serde_json::Value>> {
-    let pat = auth::bearer(&headers).ok_or(Error::Unauthorized)?;
-    let login = auth::verify_pat(&pat, &s.cfg.common.owner).await?;
-
     if req.owner != s.cfg.common.owner {
         return Err(Error::BadRequest(format!(
             "owner mismatch: got {} expected {}",
@@ -343,6 +353,21 @@ async fn register(
             "cp: registered extra ingress for {}: {:?}",
             req.vm_name, tunnel.extra_hostnames
         );
+    }
+
+    let labels: Vec<String> = extras.iter().map(|(l, _)| l.clone()).collect();
+    if let Err(e) = cf::provision_agent_access(
+        &http,
+        &s.cfg.cf,
+        &s.cfg.common.env_label,
+        &agent_hostname,
+        &s.cfg.common.owner,
+        &s.cfg.access.admin_email,
+        &labels,
+    )
+    .await
+    {
+        eprintln!("cp: provision_agent_access {agent_hostname} failed: {e}");
     }
 
     // Seed the store so the dashboard shows the agent before the first
@@ -387,16 +412,12 @@ async fn register(
         );
     }
 
-    eprintln!(
-        "cp: registered {} as {} (login={login})",
-        req.vm_name, agent_hostname
-    );
+    eprintln!("cp: registered {} as {}", req.vm_name, agent_hostname);
 
     Ok(Json(serde_json::json!({
         "tunnel_token": tunnel.token,
         "hostname": tunnel.hostname,
         "agent_id": name,
-        "jwt_secret_b64": s.keys.secret_b64,
         "cp_hostname": s.cfg.hostname,
     })))
 }
@@ -404,11 +425,14 @@ async fn register(
 #[derive(Debug, Deserialize)]
 struct IngressReplaceReq {
     /// The agent's own `agent_id` (== tunnel name) as returned from
-    /// /register. Authenticated indirectly: the caller's PAT must
-    /// belong to `DD_OWNER`, and the agent must already exist in the
-    /// CP's store under this id (so anyone with a valid owner-PAT can
-    /// only target agents the CP already knows about).
+    /// /register. Used to look up the tunnel id in the CP's store.
     agent_id: String,
+    /// Fresh Intel-signed attestation token from the agent — same
+    /// shape as /register, re-presented here because this endpoint
+    /// is CF Access-bypassed and the ITA verification is the auth.
+    /// The agent already refreshes this token every few minutes for
+    /// /health, so forwarding it on each call is trivial.
+    ita_token: String,
     /// Full replacement set of per-workload ingress rules for this
     /// agent. The CP re-PUTs the tunnel config with `extras` first,
     /// the primary `hostname → localhost:8080` rule, and the 404
@@ -424,17 +448,17 @@ struct IngressPair {
     port: u16,
 }
 
-/// POST /ingress/replace — agent pushes an updated ingress list
-/// (boot extras + anything POSTed to /deploy with an `expose` field)
-/// and the CP re-PUTs the tunnel config + CNAMEs. No tunnel
-/// recreation — the token + tunnel id stay stable across calls.
+/// POST /ingress/replace — CF-Access-bypassed; authenticated by the
+/// same Intel ITA token the agent already refreshes for /health.
+/// The agent forwards its full current ingress list; the CP re-PUTs
+/// the tunnel config + CNAMEs and reconciles per-workload CF Access
+/// bypass apps (creates new, deletes stale).
 async fn ingress_replace(
     State(s): State<St>,
-    headers: HeaderMap,
     Json(req): Json<IngressReplaceReq>,
 ) -> Result<Json<serde_json::Value>> {
-    let pat = auth::bearer(&headers).ok_or(Error::Unauthorized)?;
-    let _login = auth::verify_pat(&pat, &s.cfg.common.owner).await?;
+    // ITA is the auth — any failure → 401.
+    let _claims = s.verifier.verify(&req.ita_token).await?;
 
     let (tunnel_id, hostname) = {
         let store = s.store.lock().await;
@@ -458,6 +482,21 @@ async fn ingress_replace(
 
     let http = reqwest::Client::new();
     let hostnames = cf::update_ingress(&http, &s.cfg.cf, &tunnel_id, &hostname, &extras).await?;
+
+    let labels: Vec<String> = extras.iter().map(|(l, _)| l.clone()).collect();
+    if let Err(e) = cf::provision_agent_access(
+        &http,
+        &s.cfg.cf,
+        &s.cfg.common.env_label,
+        &hostname,
+        &s.cfg.common.owner,
+        &s.cfg.access.admin_email,
+        &labels,
+    )
+    .await
+    {
+        eprintln!("cp: provision_agent_access on /ingress/replace failed: {e}");
+    }
 
     {
         let mut store = s.store.lock().await;
@@ -487,15 +526,7 @@ async fn mint_cp_ita(cfg: &Cfg, ee: &Ee) -> Result<String> {
 
 // ── Fleet dashboard ──────────────────────────────────────────────────────
 
-async fn fleet(
-    State(s): State<St>,
-    headers: HeaderMap,
-    axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
-) -> Response {
-    if let Err(r) = require_auth(&s, &headers, &uri).await {
-        return r;
-    }
-
+async fn fleet(State(s): State<St>) -> Response {
     let agents = s.store.lock().await.clone();
     let mut rows = String::new();
     let mut by_id: Vec<_> = agents.into_iter().collect();
@@ -546,14 +577,7 @@ async fn fleet(
 /// `{agent_id, vm_name, hostname, status, last_seen}`.
 /// Used by the Local Agents workflow's HTTPS step to discover a
 /// specific agent's tunnel hostname after it re-registers.
-async fn api_agents(
-    State(s): State<St>,
-    headers: HeaderMap,
-    axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
-) -> Result<Json<Vec<serde_json::Value>>> {
-    if require_auth(&s, &headers, &uri).await.is_err() {
-        return Err(Error::Unauthorized);
-    }
+async fn api_agents(State(s): State<St>) -> Result<Json<Vec<serde_json::Value>>> {
     let agents = s.store.lock().await.clone();
     Ok(Json(
         agents
@@ -571,15 +595,7 @@ async fn api_agents(
     ))
 }
 
-async fn agent_detail(
-    State(s): State<St>,
-    Path(id): Path<String>,
-    headers: HeaderMap,
-    axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
-) -> Response {
-    if let Err(r) = require_auth(&s, &headers, &uri).await {
-        return r;
-    }
+async fn agent_detail(State(s): State<St>, Path(id): Path<String>) -> Response {
     let agent = s.store.lock().await.get(&id).cloned();
     let Some(a) = agent else {
         return (
@@ -731,15 +747,7 @@ async fn agent_detail(
 /// GET /agent/control-plane/logs/{app} — show logs for a CP workload via the
 /// local easyenclave socket. For other agents we'd proxy to their dashboard;
 /// today the detail page links directly there instead.
-async fn agent_logs(
-    State(s): State<St>,
-    Path((id, app)): Path<(String, String)>,
-    headers: HeaderMap,
-    axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
-) -> Response {
-    if let Err(r) = require_auth(&s, &headers, &uri).await {
-        return r;
-    }
+async fn agent_logs(State(s): State<St>, Path((id, app)): Path<(String, String)>) -> Response {
     if id != "control-plane" {
         return Error::NotFound.into_response();
     }
@@ -781,12 +789,7 @@ async fn agent_logs(
 async fn cp_attest(
     State(s): State<St>,
     Query(q): Query<HashMap<String, String>>,
-    headers: HeaderMap,
-    axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
 ) -> Result<Json<serde_json::Value>> {
-    if require_auth(&s, &headers, &uri).await.is_err() {
-        return Err(Error::Unauthorized);
-    }
     // EE base64-decodes the nonce; synthesize one if the caller didn't
     // pass one (browser-click from the dashboard).
     let nonce = q
@@ -803,14 +806,7 @@ async fn cp_attest(
 /// GET /cp/ita — the CP's own ITA token, minted + self-verified at
 /// startup. External verifiers can confirm the CP VM's TDX measurement
 /// by decoding it against Intel's JWKS.
-async fn cp_ita(
-    State(s): State<St>,
-    headers: HeaderMap,
-    axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
-) -> Result<Json<serde_json::Value>> {
-    if require_auth(&s, &headers, &uri).await.is_err() {
-        return Err(Error::Unauthorized);
-    }
+async fn cp_ita(State(s): State<St>) -> Result<Json<serde_json::Value>> {
     let token = s.cp_ita_token.read().await.clone();
     let claims = s.verifier.verify(&token).await?;
     Ok(Json(serde_json::json!({
@@ -819,102 +815,14 @@ async fn cp_ita(
     })))
 }
 
-async fn shell_page(
-    State(s): State<St>,
-    headers: HeaderMap,
-    axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
-) -> Response {
-    if let Err(r) = require_auth(&s, &headers, &uri).await {
-        return r;
-    }
+async fn shell_page() -> Response {
     Html(terminal::page("cp", "/cp/ws/shell")).into_response()
 }
 
-async fn shell_ws(
-    State(s): State<St>,
-    headers: HeaderMap,
-    ws: WebSocketUpgrade,
-) -> Result<Response> {
-    auth::resolve(&s.keys, &s.cfg.common.owner, &headers).await?;
+async fn shell_ws(State(s): State<St>, ws: WebSocketUpgrade) -> Result<Response> {
     let ee = s.ee.clone();
     let vm = format!("dd-{}-cp", s.cfg.common.env_label);
     Ok(ws.on_upgrade(move |socket| async move {
         terminal::bridge(socket, ee, &vm).await;
     }))
-}
-
-// ── Auth routes ─────────────────────────────────────────────────────────
-
-async fn require_auth(
-    s: &St,
-    headers: &HeaderMap,
-    uri: &axum::http::Uri,
-) -> std::result::Result<String, Response> {
-    match auth::resolve(&s.keys, &s.cfg.common.owner, headers).await {
-        Ok(login) => Ok(login),
-        Err(Error::Unauthorized) => Err(auth::login_redirect_local(uri)),
-        Err(e) => Err(e.into_response()),
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct NextQ {
-    next: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct PatF {
-    pat: String,
-    next: Option<String>,
-}
-
-async fn pat_form(Query(q): Query<NextQ>) -> Html<String> {
-    let next = auth::sanitize_next(q.next.as_deref());
-    Html(shell(
-        "Sign in — DD",
-        "",
-        &format!(
-            r#"<h1>Sign in</h1>
-<div class="sub">Paste a GitHub PAT (run <code>gh auth token</code>).</div>
-<form method="POST" action="/auth/pat" style="max-width:480px">
-  <input type="hidden" name="next" value="{next}">
-  <input type="password" name="pat" placeholder="ghp_... or ghu_..." autofocus autocomplete="off">
-  <p></p>
-  <button type="submit">Sign in</button>
-</form>"#,
-            next = html::escape(&next)
-        ),
-    ))
-}
-
-async fn pat_submit(State(s): State<St>, Form(f): Form<PatF>) -> Response {
-    let next = auth::sanitize_next(f.next.as_deref());
-    let pat = f.pat.trim();
-    if pat.is_empty() {
-        return Redirect::to(&format!("/auth/pat?next={}", urlencoding::encode(&next)))
-            .into_response();
-    }
-    let Ok(login) = auth::verify_pat(pat, &s.cfg.common.owner).await else {
-        return Redirect::to(&format!("/auth/pat?next={}", urlencoding::encode(&next)))
-            .into_response();
-    };
-    let Ok(jwt) = s.keys.mint(&login) else {
-        return Error::Internal("mint".into()).into_response();
-    };
-    auth::with_cookie(
-        Redirect::to(&next),
-        auth::cookie(
-            auth::AUTH_COOKIE,
-            &jwt,
-            Some(&s.cfg.cf.domain),
-            auth::COOKIE_TTL.as_secs(),
-        ),
-    )
-}
-
-async fn logout(State(s): State<St>) -> Response {
-    auth::with_cookie(
-        Redirect::to("/auth/pat"),
-        auth::cookie(auth::AUTH_COOKIE, "", Some(&s.cfg.cf.domain), 0),
-    )
 }

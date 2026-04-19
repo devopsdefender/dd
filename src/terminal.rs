@@ -47,7 +47,6 @@ pub fn page(title: &str, ws_path: &str) -> String {
     <span id="status" class="warn">Connecting</span>
     <span id="banner"></span>
     <span class="spacer"></span>
-    <a href="/auth/logout">log out</a>
   </header>
   <section class="frame"><div id="term"></div></section>
   <nav class="keys">

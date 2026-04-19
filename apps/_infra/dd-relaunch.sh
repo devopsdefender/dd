@@ -10,14 +10,20 @@
 #   dd-relaunch.sh prod    https://app.devopsdefender.com    main
 #   dd-relaunch.sh preview https://pr-N.devopsdefender.com   feat/some-pr
 #
-# DD_PAT and DD_ITA_API_KEY must be set in the environment.
+# DD_ITA_API_KEY must be set in the environment. No GitHub PAT — the
+# agent authenticates to the CP via ITA attestation at /register and
+# uses a CF Access service token (received in the register response)
+# for subsequent machine-to-machine calls.
 
 set -euo pipefail
 
-KIND="${1?usage: dd-relaunch.sh <prod|preview> <cp-url> [ref]}"
+KIND="${1?usage: dd-relaunch.sh <prod|preview> <cp-url> [ref] [release-tag]}"
 CP="${2?cp url required}"
 REF="${3:-main}"
-: "${DD_PAT?DD_PAT must be set}"
+# DD_RELEASE_TAG optional — defaults to "latest" (prod cascade) but CI
+# passes the PR-specific tag for preview so the agent binary matches
+# the CP binary (auth protocol, bootstrap shape, etc.).
+export DD_RELEASE_TAG="${4:-${DD_RELEASE_TAG:-latest}}"
 : "${DD_ITA_API_KEY?DD_ITA_API_KEY must be set}"
 
 case "$KIND" in

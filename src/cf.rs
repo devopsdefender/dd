@@ -307,3 +307,311 @@ pub async fn exists(http: &Client, cf: &CfCreds, tunnel_id: &str) -> Option<bool
         _ => None,
     }
 }
+
+// ── CF Access (Zero Trust) provisioning ────────────────────────────────
+//
+// The CP provisions a handful of Access apps at startup and one human
+// app per agent at /register. Everything machine-to-machine uses
+// bypass apps + in-code auth (ITA for /register + /ingress/replace,
+// GitHub Actions OIDC for agent /deploy + /exec). No service tokens,
+// no External Evaluation — just CF Access for humans and bypass for
+// everything else.
+
+/// Return the UUID of the GitHub login method in this CF Access
+/// account, if configured. Manual one-time setup in the Cloudflare
+/// dashboard (Zero Trust → Settings → Authentication → Login methods
+/// → add GitHub) is required before the CP can provision org-based
+/// policies.
+pub async fn github_idp_uuid(http: &Client, cf: &CfCreds) -> Result<String> {
+    let resp = call(
+        http,
+        cf,
+        Method::GET,
+        &format!("/accounts/{}/access/identity_providers", cf.account_id),
+        None,
+    )
+    .await?;
+    resp["result"]
+        .as_array()
+        .and_then(|items| items.iter().find(|i| i["type"].as_str() == Some("github")))
+        .and_then(|i| i["id"].as_str())
+        .map(String::from)
+        .ok_or_else(|| {
+            Error::Upstream(
+                "CF Access has no GitHub identity provider — add one in \
+                 Zero Trust → Settings → Authentication → Login methods"
+                    .into(),
+            )
+        })
+}
+
+/// List all Access apps, return the full app JSON for one whose primary
+/// or included `domain` exactly matches `domain`, or `None`.
+async fn find_app_by_domain(
+    http: &Client,
+    cf: &CfCreds,
+    domain: &str,
+) -> Result<Option<serde_json::Value>> {
+    let resp = call(
+        http,
+        cf,
+        Method::GET,
+        &format!("/accounts/{}/access/apps?per_page=1000", cf.account_id),
+        None,
+    )
+    .await?;
+    Ok(resp["result"].as_array().and_then(|items| {
+        items
+            .iter()
+            .find(|a| a["domain"].as_str() == Some(domain))
+            .cloned()
+    }))
+}
+
+/// Build the two-include GitHub-org-OR-admin-email policy used for
+/// every human-facing app (CP root + per-agent dashboard).
+fn human_policy(owner: &str, admin_email: &str, gh_idp_uuid: &str) -> serde_json::Value {
+    serde_json::json!({
+        "name": "dd-human",
+        "decision": "allow",
+        "include": [
+            { "github-organization": { "name": owner, "identity_provider_id": gh_idp_uuid } },
+            { "email": { "email": admin_email } }
+        ],
+    })
+}
+
+fn bypass_policy() -> serde_json::Value {
+    serde_json::json!({
+        "name": "dd-bypass",
+        "decision": "bypass",
+        "include": [ { "everyone": {} } ],
+    })
+}
+
+/// Idempotently upsert a self-hosted Access app at `domain` with the
+/// provided policy list. Matches on exact `domain`; updates in place
+/// if present, creates otherwise.
+async fn ensure_app(
+    http: &Client,
+    cf: &CfCreds,
+    name: &str,
+    domain: &str,
+    policies: Vec<serde_json::Value>,
+) -> Result<String> {
+    let body = serde_json::json!({
+        "name": name,
+        "domain": domain,
+        "type": "self_hosted",
+        "session_duration": "24h",
+        "app_launcher_visible": false,
+        "policies": policies,
+    });
+    if let Some(existing) = find_app_by_domain(http, cf, domain).await? {
+        let id = existing["id"].as_str().unwrap_or_default().to_string();
+        call(
+            http,
+            cf,
+            Method::PUT,
+            &format!("/accounts/{}/access/apps/{id}", cf.account_id),
+            Some(body),
+        )
+        .await?;
+        return Ok(id);
+    }
+    let resp = call(
+        http,
+        cf,
+        Method::POST,
+        &format!("/accounts/{}/access/apps", cf.account_id),
+        Some(body),
+    )
+    .await?;
+    resp["result"]["id"]
+        .as_str()
+        .map(String::from)
+        .ok_or_else(|| Error::Upstream(format!("Access app create missing id for {domain}")))
+}
+
+/// Idempotently upsert a path-scoped bypass Access app. Anyone can
+/// reach `domain/path` without authentication; used for /health,
+/// /register (which is authenticated by ITA in-app), and every
+/// workload-exposed URL.
+async fn ensure_bypass_app(http: &Client, cf: &CfCreds, name: &str, domain: &str) -> Result<()> {
+    ensure_app(http, cf, name, domain, vec![bypass_policy()]).await?;
+    Ok(())
+}
+
+/// Provision the CP's Access apps at startup.
+///
+/// Apps created:
+///   - Human: `{hostname}` — GitHub org or admin email (dashboard, /agent/*, /cp/*)
+///   - Bypass: `{hostname}/health` — public (read-only fleet health)
+///   - Bypass: `{hostname}/cp/attest` — TDX quote is self-authenticating
+///   - Bypass: `{hostname}/api/agents` — read-only agent list
+///   - Bypass: `{hostname}/register` — ITA-gated in code
+///   - Bypass: `{hostname}/ingress/replace` — ITA-gated in code
+pub async fn provision_cp_access(
+    http: &Client,
+    cf: &CfCreds,
+    env: &str,
+    hostname: &str,
+    owner: &str,
+    admin_email: &str,
+) -> Result<()> {
+    let idp = github_idp_uuid(http, cf).await?;
+    let human = human_policy(owner, admin_email, &idp);
+
+    ensure_app(http, cf, &format!("dd-{env}-cp"), hostname, vec![human]).await?;
+    for (suffix, label) in [
+        ("/health", "health"),
+        ("/cp/attest", "attest"),
+        ("/api/agents", "api-agents"),
+        ("/register", "register"),
+        ("/ingress/replace", "ingress"),
+    ] {
+        ensure_bypass_app(
+            http,
+            cf,
+            &format!("dd-{env}-cp-{label}"),
+            &format!("{hostname}{suffix}"),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// Provision Access apps for one agent. Called at /register and again
+/// at /ingress/replace so newly-exposed workload labels get their
+/// bypass apps and labels that disappeared get cleaned up.
+///
+///   - Human: `{agent}.{domain}` — browser dashboard only
+///   - Bypass: `{agent}.{domain}/health` — public
+///   - Bypass: `{agent}.{domain}/deploy` — GH-OIDC-gated in code
+///   - Bypass: `{agent}.{domain}/exec` — GH-OIDC-gated in code
+///   - Bypass: `{label}.{agent}.{domain}` for each label — workload URLs
+///     are public by default (this is the nvidia-smi exemption).
+///   - Any existing `*.{agent}.{domain}` app whose label is no longer
+///     in `workload_labels` is deleted.
+pub async fn provision_agent_access(
+    http: &Client,
+    cf: &CfCreds,
+    env: &str,
+    agent_hostname: &str,
+    owner: &str,
+    admin_email: &str,
+    workload_labels: &[String],
+) -> Result<()> {
+    let idp = github_idp_uuid(http, cf).await?;
+    let human = human_policy(owner, admin_email, &idp);
+
+    ensure_app(
+        http,
+        cf,
+        &format!("dd-{env}-agent-{agent_hostname}"),
+        agent_hostname,
+        vec![human],
+    )
+    .await?;
+    for (suffix, label) in [
+        ("/health", "health"),
+        ("/deploy", "deploy"),
+        ("/exec", "exec"),
+    ] {
+        ensure_bypass_app(
+            http,
+            cf,
+            &format!("dd-{env}-agent-{agent_hostname}-{label}"),
+            &format!("{agent_hostname}{suffix}"),
+        )
+        .await?;
+    }
+
+    let desired: std::collections::HashSet<String> = workload_labels
+        .iter()
+        .map(|l| format!("{l}.{agent_hostname}"))
+        .collect();
+    for domain in &desired {
+        ensure_bypass_app(http, cf, &format!("dd-{env}-workload-{domain}"), domain).await?;
+    }
+
+    // Reap any stale workload bypass apps under this agent that are
+    // no longer in the desired set. Matches on domain suffix so we
+    // don't accidentally delete the agent's own human app.
+    let suffix = format!(".{agent_hostname}");
+    let resp = call(
+        http,
+        cf,
+        Method::GET,
+        &format!("/accounts/{}/access/apps?per_page=1000", cf.account_id),
+        None,
+    )
+    .await?;
+    if let Some(items) = resp["result"].as_array() {
+        for app in items {
+            let Some(domain) = app["domain"].as_str() else {
+                continue;
+            };
+            if !domain.ends_with(&suffix) || domain == agent_hostname {
+                continue;
+            }
+            if desired.contains(domain) {
+                continue;
+            }
+            if let Some(id) = app["id"].as_str() {
+                let _ = call(
+                    http,
+                    cf,
+                    Method::DELETE,
+                    &format!("/accounts/{}/access/apps/{id}", cf.account_id),
+                    None,
+                )
+                .await;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Cleanup hook invoked by the collector's orphan-GC path and by any
+/// explicit reap: delete the agent's human app, its /health bypass,
+/// and every `*.{agent_hostname}` workload bypass in one sweep.
+pub async fn delete_access_apps_for(http: &Client, cf: &CfCreds, agent_hostname: &str) {
+    let Ok(resp) = call(
+        http,
+        cf,
+        Method::GET,
+        &format!("/accounts/{}/access/apps?per_page=1000", cf.account_id),
+        None,
+    )
+    .await
+    else {
+        return;
+    };
+    let Some(items) = resp["result"].as_array() else {
+        return;
+    };
+    let suffix = format!(".{agent_hostname}");
+    for app in items {
+        let Some(domain) = app["domain"].as_str() else {
+            continue;
+        };
+        let matches_agent = domain == agent_hostname
+            || domain.starts_with(&format!("{agent_hostname}/"))
+            || domain.ends_with(&suffix)
+            || domain.contains(&format!(".{agent_hostname}/"));
+        if !matches_agent {
+            continue;
+        }
+        if let Some(id) = app["id"].as_str() {
+            let _ = call(
+                http,
+                cf,
+                Method::DELETE,
+                &format!("/accounts/{}/access/apps/{id}", cf.account_id),
+                None,
+            )
+            .await;
+        }
+    }
+}

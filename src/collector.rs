@@ -230,6 +230,11 @@ async fn tick(
             eprintln!("cp: GC dead tunnel {name}");
             cf::delete_by_name(http, cf, name).await;
             let _ = cf::delete_cname(http, cf, host).await;
+            // Sweep the agent's CF Access apps — its human dashboard
+            // app and every workload-URL bypass under this hostname.
+            // Without this the account accumulates dead apps every
+            // STONITH cycle.
+            cf::delete_access_apps_for(http, cf, host).await;
         }
     }
 

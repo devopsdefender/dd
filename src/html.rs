@@ -58,7 +58,10 @@ pub fn nav(items: &[(&str, &str, bool)]) -> String {
         let class = if *active { r#" class="active""# } else { "" };
         s.push_str(&format!(r#"<a href="{href}"{class}>{label}</a>"#));
     }
-    s.push_str(r#"<span class="spacer"></span><a href="/auth/logout">log out</a></nav>"#);
+    // Log out is handled at the edge via CF Access
+    // (https://<domain>/cdn-cgi/access/logout). We don't own auth, so
+    // we don't render a log-out button in the nav.
+    s.push_str(r#"<span class="spacer"></span></nav>"#);
     s
 }
 
