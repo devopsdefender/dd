@@ -333,19 +333,35 @@ jobs:
           ita-api-key: ${{ secrets.DD_ITA_API_KEY }}
           release-tag: ${{ inputs.release_tag }}
 
-      # Every env: deploy hello-world to the just-registered agent
-      # via /deploy with a per-job GitHub Actions OIDC token. This
-      # exercises the full GH-OIDC auth path (mint → agent verify
+      # Preview only: deploy hello-world as the end-to-end canary.
+      # Exercises the full GH-OIDC auth path (mint → agent verify
       # against GitHub JWKS → repository_owner check) AND proves
-      # podman bootstrapped correctly on the agent. Also probes the
-      # rejection path: a curl without the OIDC header must 401.
+      # podman bootstrapped correctly on the agent. Prod uses
+      # web-nvidia-smi (below) for the same verification, so running
+      # hello-world there too is just noise.
       - name: Deploy hello-world via GH OIDC
-        if: inputs.relaunch_agent
+        if: inputs.relaunch_agent && inputs.env != 'production'
         uses: ./.github/actions/dd-deploy
         with:
           cp-url: https://${{ inputs.hostname }}
-          vm-name: ${{ inputs.env == 'production' && 'dd-local-prod' || 'dd-local-preview' }}
+          vm-name: dd-local-preview
           workload: apps/hello-world/workload.json
+
+      # Prod only: redeploy the nvidia-smi demo every main-push so
+      # `<agent-base>-gpu.devopsdefender.com` stays live and pinned to
+      # the freshly-booted prod agent. Preview agents have no GPU, so
+      # the workload's podman run with /dev/nvidia* devices would fail.
+      - name: Deploy web-nvidia-smi via GH OIDC
+        if: inputs.relaunch_agent && inputs.env == 'production'
+        uses: ./.github/actions/dd-deploy
+        with:
+          cp-url: https://${{ inputs.hostname }}
+          vm-name: dd-local-prod
+          workload: apps/web-nvidia-smi/workload.json
+          # nvidia-smi's container needs a `podman pull` + apt-get
+          # install of netcat in the first run — give it headroom
+          # past the default 120s so the /health poll catches it.
+          wait-for-deployment-seconds: '300'
 
       # Runs last so the relaunch cascade's own STONITH wave (old agent
       # re-registers → old CP's CF tunnel is deleted → old CP poweroffs)
