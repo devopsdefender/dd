@@ -135,6 +135,7 @@ build_config_iso() {
     bake "$REPO_ROOT/apps/podman-bootstrap/workload.json"
     bake "$REPO_ROOT/apps/cloudflared/workload.json"
     bake "$REPO_ROOT/apps/ttyd/workload.json"
+    bake "$REPO_ROOT/apps/tmuxrs/workload.json"
   })
 
   local extra_ingress

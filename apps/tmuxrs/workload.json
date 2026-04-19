@@ -1,0 +1,8 @@
+{
+  "app_name": "tmuxrs",
+  "github_release": {
+    "repo": "beijaflor/tmuxrs",
+    "asset": "tmuxrs-linux-amd64",
+    "rename": "tmuxrs"
+  }
+}
