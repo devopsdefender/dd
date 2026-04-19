@@ -2,6 +2,6 @@
   "app_name": "nv",
   "cmd": [
     "/bin/busybox", "sh", "-c",
-    "/sbin/insmod /lib/modules/7.0.0-14-generic/kernel/nvidia-580srv-open/nvidia.ko NVreg_OpenRmEnableUnsupportedGpus=1 2>&1 && echo nv: loaded || echo nv: failed"
+    "set -e; K=/lib/modules/7.0.0-14-generic/kernel/nvidia-580srv-open; /sbin/insmod $K/nvidia.ko NVreg_OpenRmEnableUnsupportedGpus=1 2>/dev/null || true; /sbin/insmod $K/nvidia-uvm.ko 2>/dev/null || true; [ -e /dev/nvidiactl ] || mknod -m 666 /dev/nvidiactl c 195 255; [ -e /dev/nvidia0 ] || mknod -m 666 /dev/nvidia0 c 195 0; U=$(awk '/ nvidia-uvm$/{print $1}' /proc/devices); if [ -n \"$U\" ]; then [ -e /dev/nvidia-uvm ] || mknod -m 666 /dev/nvidia-uvm c $U 0; [ -e /dev/nvidia-uvm-tools ] || mknod -m 666 /dev/nvidia-uvm-tools c $U 1; fi; echo nv: ready; ls /dev/nvidia* 2>&1"
   ]
 }
