@@ -1,7 +1,11 @@
-//! Lightweight /proc-derived system metrics for the agent dashboard
-//! and the /health JSON. No external process dependencies.
+//! System metrics for the dashboard and `/health` JSON. Most of the
+//! work is done by the `sysinfo` crate — we just project its data
+//! into our stable wire shape. CPU utilization still comes from
+//! `/proc/stat` since `sysinfo` requires a 200 ms sample to report
+//! non-zero CPU, and we don't want that delay on every request.
 
 use serde::{Deserialize, Serialize};
+use sysinfo::{Disks, Networks, System};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct DiskStats {
@@ -23,169 +27,109 @@ pub struct SysMetrics {
     pub cpu_pct: u64,
     pub mem_used_mb: u64,
     pub mem_total_mb: u64,
+    /// Swap used / total (0 if the VM has no swap).
+    pub swap_used_mb: u64,
+    pub swap_total_mb: u64,
     pub load_1m: f64,
+    pub load_5m: f64,
+    pub load_15m: f64,
+    /// System uptime in seconds (how long the VM has been booted).
+    pub uptime_secs: u64,
     /// Per-interface RX/TX byte counters (excludes `lo`).
     pub nets: Vec<NetStats>,
     /// Per-mount capacity stats (excludes pseudo-filesystems).
     pub disks: Vec<DiskStats>,
 }
 
-/// /proc-filesystem types we don't want in disk stats. Everything else
-/// (ext4, xfs, btrfs, overlay, vfat, …) gets statvfs'd.
-const PSEUDO_FSTYPES: &[&str] = &[
-    "proc",
-    "sysfs",
-    "cgroup",
-    "cgroup2",
-    "tmpfs",
-    "devtmpfs",
-    "ramfs",
-    "devpts",
-    "mqueue",
-    "tracefs",
-    "debugfs",
-    "securityfs",
-    "pstore",
-    "bpf",
-    "configfs",
-    "autofs",
-    "binfmt_misc",
-    "hugetlbfs",
-    "rpc_pipefs",
-    "fusectl",
-    "nsfs",
-    "squashfs",
-    "iso9660",
-];
-
 pub async fn collect() -> SysMetrics {
-    let mut m = SysMetrics::default();
+    let cpu_pct = tokio::fs::read_to_string("/proc/stat")
+        .await
+        .ok()
+        .and_then(|s| cpu_pct_from_stat(&s))
+        .unwrap_or(0);
 
-    if let Ok(mi) = tokio::fs::read_to_string("/proc/meminfo").await {
-        let (mut total, mut avail) = (0u64, 0u64);
-        for line in mi.lines() {
-            if let Some(v) = line.strip_prefix("MemTotal:") {
-                total = v
-                    .split_whitespace()
-                    .next()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(0);
-            } else if let Some(v) = line.strip_prefix("MemAvailable:") {
-                avail = v
-                    .split_whitespace()
-                    .next()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(0);
-            }
-        }
-        if total > 0 {
-            m.mem_total_mb = total / 1024;
-            m.mem_used_mb = total.saturating_sub(avail) / 1024;
-        }
-    }
+    // sysinfo's API is sync and does blocking I/O; hop off the
+    // reactor thread so long /proc walks don't stall the server.
+    tokio::task::spawn_blocking(move || {
+        let mut sys = System::new();
+        sys.refresh_memory();
 
-    if let Ok(la) = tokio::fs::read_to_string("/proc/loadavg").await {
-        if let Some(v) = la.split_whitespace().next() {
-            m.load_1m = v.parse().unwrap_or(0.0);
-        }
-    }
+        let load = System::load_average();
+        let uptime_secs = System::uptime();
 
-    if let Ok(stat) = tokio::fs::read_to_string("/proc/stat").await {
-        if let Some(line) = stat.lines().next() {
-            let vals: Vec<u64> = line
-                .split_whitespace()
-                .skip(1)
-                .filter_map(|v| v.parse().ok())
-                .collect();
-            if vals.len() >= 4 {
-                let total: u64 = vals.iter().sum();
-                let idle = vals[3];
-                if let Some(idle_pct) = (idle.saturating_mul(100)).checked_div(total) {
-                    m.cpu_pct = 100u64.saturating_sub(idle_pct);
+        let mem_total_mb = sys.total_memory() / 1024 / 1024;
+        let mem_used_mb = sys.used_memory() / 1024 / 1024;
+        let swap_total_mb = sys.total_swap() / 1024 / 1024;
+        let swap_used_mb = sys.used_swap() / 1024 / 1024;
+
+        let nets = Networks::new_with_refreshed_list()
+            .iter()
+            .filter(|(name, _)| *name != "lo")
+            .map(|(name, data)| NetStats {
+                iface: name.to_string(),
+                rx_bytes: data.total_received(),
+                tx_bytes: data.total_transmitted(),
+            })
+            .collect();
+
+        let mut seen = std::collections::HashSet::new();
+        let disks = Disks::new_with_refreshed_list()
+            .iter()
+            .filter_map(|d| {
+                let mount = d.mount_point().to_string_lossy().into_owned();
+                if !seen.insert(mount.clone()) {
+                    return None;
                 }
-            }
-        }
-    }
+                let total = d.total_space();
+                if total == 0 {
+                    return None;
+                }
+                Some(DiskStats {
+                    mount,
+                    fstype: d.file_system().to_string_lossy().into_owned(),
+                    total_bytes: total,
+                    used_bytes: total.saturating_sub(d.available_space()),
+                })
+            })
+            .collect();
 
-    // /proc/net/dev: one row per interface, space-separated counters.
-    //   Inter-|   Receive                             ...
-    //    face |bytes    packets errs drop fifo frame compressed multicast | bytes ...
-    //       lo:  46340 …
-    //     eth0:  12345 …
-    // Col 0 = RX bytes, col 8 = TX bytes. Skip `lo`.
-    if let Ok(dev) = tokio::fs::read_to_string("/proc/net/dev").await {
-        for line in dev.lines().skip(2) {
-            let Some((iface, rest)) = line.split_once(':') else {
-                continue;
-            };
-            let iface = iface.trim();
-            if iface == "lo" || iface.is_empty() {
-                continue;
-            }
-            let cols: Vec<u64> = rest
-                .split_whitespace()
-                .filter_map(|s| s.parse().ok())
-                .collect();
-            if cols.len() >= 9 {
-                m.nets.push(NetStats {
-                    iface: iface.to_string(),
-                    rx_bytes: cols[0],
-                    tx_bytes: cols[8],
-                });
-            }
+        SysMetrics {
+            cpu_pct,
+            mem_total_mb,
+            mem_used_mb,
+            swap_total_mb,
+            swap_used_mb,
+            load_1m: load.one,
+            load_5m: load.five,
+            load_15m: load.fifteen,
+            uptime_secs,
+            nets,
+            disks,
         }
-    }
+    })
+    .await
+    .unwrap_or_default()
+}
 
-    // /proc/mounts: one row per mount, space-separated:
-    //   <source> <mount-point> <fstype> <opts> <dump> <pass>
-    // For every mount whose fstype isn't a known pseudo-filesystem, call
-    // statvfs to get capacity. libc is already in the tree; one unsafe
-    // block per statvfs call.
-    if let Ok(mounts) = tokio::fs::read_to_string("/proc/mounts").await {
-        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for line in mounts.lines() {
-            let cols: Vec<&str> = line.split_whitespace().collect();
-            if cols.len() < 3 {
-                continue;
-            }
-            let mount = cols[1];
-            let fstype = cols[2];
-            if PSEUDO_FSTYPES.contains(&fstype) {
-                continue;
-            }
-            // Dedupe — a disk may be bind-mounted multiple times.
-            if !seen.insert(mount.to_string()) {
-                continue;
-            }
-            let Ok(cmount) = std::ffi::CString::new(mount) else {
-                continue;
-            };
-            let mut vfs: libc::statvfs = unsafe { std::mem::zeroed() };
-            // SAFETY: statvfs writes only to its out param; cmount is a valid C string.
-            if unsafe { libc::statvfs(cmount.as_ptr(), &mut vfs) } != 0 {
-                continue;
-            }
-            #[allow(clippy::unnecessary_cast)]
-            let frsize: u64 = vfs.f_frsize as u64;
-            #[allow(clippy::unnecessary_cast)]
-            let blocks: u64 = vfs.f_blocks as u64;
-            #[allow(clippy::unnecessary_cast)]
-            let bavail: u64 = vfs.f_bavail as u64;
-            // Skip 0-sized "filesystems" (often virtual overlays with
-            // no meaningful capacity).
-            if blocks == 0 {
-                continue;
-            }
-            m.disks.push(DiskStats {
-                mount: mount.to_string(),
-                fstype: fstype.to_string(),
-                total_bytes: frsize.saturating_mul(blocks),
-                used_bytes: frsize.saturating_mul(blocks.saturating_sub(bavail)),
-            });
-        }
+/// One-shot CPU utilization from `/proc/stat`'s aggregate counters:
+/// `(total - idle) / total` over the lifetime of the kernel. Coarse
+/// (it's an average, not an instantaneous reading) but doesn't
+/// require a two-sample delta like sysinfo's CPU, and matches the
+/// historical shape the dashboard has been rendering.
+fn cpu_pct_from_stat(stat: &str) -> Option<u64> {
+    let line = stat.lines().next()?;
+    let vals: Vec<u64> = line
+        .split_whitespace()
+        .skip(1)
+        .filter_map(|v| v.parse().ok())
+        .collect();
+    if vals.len() < 4 {
+        return None;
     }
-
-    m
+    let total: u64 = vals.iter().sum();
+    let idle = vals[3];
+    let idle_pct = (idle.saturating_mul(100)).checked_div(total)?;
+    Some(100u64.saturating_sub(idle_pct))
 }
 
 pub fn format_bytes_mb(mb: u64) -> String {
@@ -216,11 +160,47 @@ pub fn format_bytes_si(b: u64) -> String {
 }
 
 pub fn format_duration_secs(s: u64) -> String {
-    if s >= 3600 {
+    if s >= 86400 {
+        format!("{}d {}h", s / 86400, (s % 86400) / 3600)
+    } else if s >= 3600 {
         format!("{}h {}m", s / 3600, (s % 3600) / 60)
     } else if s >= 60 {
         format!("{}m", s / 60)
     } else {
         format!("{s}s")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cpu_pct_computes_from_stat() {
+        // user=100 nice=0 system=50 idle=850 … → (150/1000)=15% used.
+        let stat = "cpu  100 0 50 850 0 0 0 0 0 0\ncpu0 50 0 25 425 0 0 0 0 0 0";
+        assert_eq!(cpu_pct_from_stat(stat), Some(15));
+    }
+
+    #[test]
+    fn cpu_pct_handles_zero_total() {
+        assert_eq!(cpu_pct_from_stat("cpu  0 0 0 0"), None);
+    }
+
+    #[test]
+    fn format_bytes_si_boundaries() {
+        assert_eq!(format_bytes_si(0), "0B");
+        assert_eq!(format_bytes_si(1023), "1023B");
+        assert_eq!(format_bytes_si(1024), "1.0K");
+        assert_eq!(format_bytes_si(1024 * 1024), "1.0M");
+        assert_eq!(format_bytes_si(1024u64.pow(3)), "1.0G");
+    }
+
+    #[test]
+    fn format_duration_shapes() {
+        assert_eq!(format_duration_secs(45), "45s");
+        assert_eq!(format_duration_secs(3 * 60), "3m");
+        assert_eq!(format_duration_secs(2 * 3600 + 30 * 60), "2h 30m");
+        assert_eq!(format_duration_secs(3 * 86400 + 5 * 3600), "3d 5h");
     }
 }
