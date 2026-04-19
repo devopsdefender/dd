@@ -1,13 +1,14 @@
 //! Agent mode — runs inside an easyenclave TDX VM.
 //!
-//! On startup: POST `{vm_name, env_label, owner}` with a PAT bearer to
-//! `$DD_CP_URL/register`, receive `{tunnel_token, hostname, agent_id,
-//! jwt_secret_b64, cp_hostname}`, spawn cloudflared, then serve.
+//! On startup: POST `{vm_name, env_label, owner, ita_token, extra_ingress}`
+//! with a PAT bearer to `$DD_CP_URL/register`; receive
+//! `{tunnel_token, hostname, agent_id, cp_hostname, cf_access}`;
+//! spawn cloudflared; serve.
 //!
-//! The agent never mints its own JWTs or hosts a login page. The CP
-//! issues the `dd_auth` cookie with `Domain=.{cf.domain}`; browsers
-//! send it to the agent subdomain automatically, and the agent verifies
-//! with the secret it received at registration.
+//! Browser auth is Cloudflare Access — the CP provisions a per-agent
+//! Access app at register time and returns the validator metadata
+//! (`cf_access`) for this agent to verify `Cf-Access-Jwt-Assertion`
+//! headers. Programmatic auth is Bearer PAT via `auth::verify_pat`.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -20,8 +21,8 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use tokio::sync::RwLock;
 
-use crate::auth::{self, Keys};
-use crate::config::Agent as Cfg;
+use crate::auth;
+use crate::config::{Agent as Cfg, CfAccess};
 use crate::ee::Ee;
 use crate::error::{Error, Result};
 use crate::html::{self, shell};
@@ -38,13 +39,12 @@ const ITA_REFRESH: Duration = Duration::from_secs(180);
 struct St {
     cfg: Arc<Cfg>,
     ee: Arc<Ee>,
-    keys: Arc<Keys>,
+    access: Arc<auth::AccessValidator>,
     hostname: String,
     /// Tunnel name returned by the CP at /register — stable for the
     /// life of this agent's tunnel. The /ingress/replace call on the
     /// CP keys off this to look up the tunnel_id.
     agent_id: String,
-    cp_hostname: String,
     started: Instant,
     /// Current Intel-signed JWT. Refreshed by a background task.
     ita_token: Arc<RwLock<String>>,
@@ -75,7 +75,8 @@ pub async fn run() -> Result<()> {
 
     spawn_cloudflared(b.tunnel_token);
 
-    let keys = Arc::new(Keys::from_b64(&b.jwt_secret_b64, &b.cp_hostname)?);
+    let access = Arc::new(auth::AccessValidator::new(b.cf_access));
+    eprintln!("agent: Cloudflare Access auth enabled");
     let ita_token = Arc::new(RwLock::new(initial_token));
 
     // Background re-mint so /health always serves a non-expired token
@@ -103,10 +104,9 @@ pub async fn run() -> Result<()> {
     let state = St {
         cfg: cfg.clone(),
         ee,
-        keys,
+        access,
         hostname: b.hostname,
         agent_id: b.agent_id,
-        cp_hostname: b.cp_hostname,
         started: Instant::now(),
         ita_token,
         extras: Arc::new(RwLock::new(cfg.extra_ingress.clone())),
@@ -135,8 +135,7 @@ struct Bootstrap {
     tunnel_token: String,
     hostname: String,
     agent_id: String,
-    jwt_secret_b64: String,
-    cp_hostname: String,
+    cf_access: CfAccess,
 }
 
 async fn register(cfg: &Cfg, ita_token: &str) -> Result<Bootstrap> {
@@ -255,11 +254,10 @@ async fn health(State(s): State<St>) -> Json<serde_json::Value> {
 async fn require_auth(
     s: &St,
     headers: &HeaderMap,
-    uri: &axum::http::Uri,
+    _uri: &axum::http::Uri,
 ) -> std::result::Result<String, Response> {
-    match auth::resolve(&s.keys, &s.cfg.common.owner, headers).await {
+    match auth::resolve(&s.access, &s.cfg.common.owner, headers).await {
         Ok(login) => Ok(login),
-        Err(Error::Unauthorized) => Err(auth::login_redirect(&s.cp_hostname, uri)),
         Err(e) => Err(e.into_response()),
     }
 }
@@ -452,7 +450,7 @@ async fn deploy(
     headers: HeaderMap,
     Json(spec): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>> {
-    auth::resolve(&s.keys, &s.cfg.common.owner, &headers).await?;
+    auth::resolve(&s.access, &s.cfg.common.owner, &headers).await?;
 
     // Pull `expose` off the spec before forwarding to EE. EE ignores
     // unknown fields today but keeping the payload tidy avoids future
@@ -548,7 +546,7 @@ async fn exec(
     headers: HeaderMap,
     Json(req): Json<ExecReq>,
 ) -> Result<Json<serde_json::Value>> {
-    auth::resolve(&s.keys, &s.cfg.common.owner, &headers).await?;
+    auth::resolve(&s.access, &s.cfg.common.owner, &headers).await?;
     Ok(Json(s.ee.exec(&req.cmd, req.timeout_secs).await?))
 }
 
@@ -558,7 +556,7 @@ async fn session_ws(
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Result<Response> {
-    auth::resolve(&s.keys, &s.cfg.common.owner, &headers).await?;
+    auth::resolve(&s.access, &s.cfg.common.owner, &headers).await?;
     let _ = app;
     let vm = s.cfg.common.vm_name.clone();
     let ee = s.ee.clone();

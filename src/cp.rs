@@ -11,13 +11,13 @@ use std::time::{Duration, Instant};
 
 use axum::extract::{Path, Query, State, WebSocketUpgrade};
 use axum::http::HeaderMap;
-use axum::response::{Html, IntoResponse, Redirect, Response};
+use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
-use axum::{Form, Json, Router};
+use axum::{Json, Router};
 use serde::Deserialize;
 use tokio::sync::{Mutex, RwLock};
 
-use crate::auth::{self, Keys};
+use crate::auth;
 use crate::cf;
 use crate::collector::{self, Store};
 use crate::config::Cp as Cfg;
@@ -39,7 +39,11 @@ const ITA_REFRESH: Duration = Duration::from_secs(180);
 struct St {
     cfg: Arc<Cfg>,
     ee: Arc<Ee>,
-    keys: Arc<Keys>,
+    access: Arc<auth::AccessValidator>,
+    /// Resolved `AccessAllow` shape — `Org(name)` for org-typed
+    /// `DD_OWNER`, `Emails(..)` for user-typed. Used when provisioning
+    /// per-agent Access apps in `/register`.
+    allow: Arc<crate::config::AccessAllow>,
     store: Store,
     started: Instant,
     verifier: Arc<ita::Verifier>,
@@ -80,7 +84,35 @@ pub async fn run() -> Result<()> {
 
     let store: Store = Arc::new(Mutex::new(HashMap::new()));
 
-    let keys = Arc::new(Keys::fresh(&cfg.hostname));
+    // Resolve the Access allow policy from DD_OWNER (org membership
+    // for orgs, admin email list for users) then provision the CF
+    // Access apps covering this hostname + bypass apps for the
+    // programmatic /register + /ingress/replace paths. Fatal on
+    // failure — the CP refuses to start without enforced auth.
+    let allow = match resolve_access_allow(&cfg).await {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("cp: access allow policy: {e}");
+            stonith::poweroff();
+        }
+    };
+    let access_cfg =
+        match cf::provision_cp_access(&http, &cfg.cf, &cfg.common.env_label, &cfg.hostname, &allow)
+            .await
+        {
+            Ok(a) => a,
+            Err(e) => {
+                eprintln!("cp: provision CF Access apps: {e}");
+                stonith::poweroff();
+            }
+        };
+    eprintln!(
+        "cp: CF Access provisioned for {} (issuer={}, audiences={})",
+        cfg.hostname,
+        access_cfg.issuer,
+        access_cfg.audiences.join(",")
+    );
+    let access = Arc::new(auth::AccessValidator::new(access_cfg));
 
     // ITA verifier — required.
     let verifier = ita::Verifier::new(cfg.ita.jwks_url.clone(), cfg.ita.issuer.clone());
@@ -202,7 +234,8 @@ pub async fn run() -> Result<()> {
     let state = St {
         cfg: cfg.clone(),
         ee,
-        keys,
+        access,
+        allow: Arc::new(allow),
         store,
         started: Instant::now(),
         verifier,
@@ -221,8 +254,6 @@ pub async fn run() -> Result<()> {
         .route("/cp/ita", get(cp_ita))
         .route("/cp/shell", get(shell_page))
         .route("/cp/ws/shell", get(shell_ws))
-        .route("/auth/pat", get(pat_form).post(pat_submit))
-        .route("/auth/logout", get(logout))
         .with_state(state);
 
     let addr = format!("0.0.0.0:{}", cfg.common.port);
@@ -338,6 +369,20 @@ async fn register(
         .map(|e| (e.hostname_label.clone(), e.port))
         .collect();
     let tunnel = cf::create(&http, &s.cfg.cf, &name, &agent_hostname, &extras).await?;
+    let access_cfg = cf::provision_agent_access(
+        &http,
+        &s.cfg.cf,
+        &s.cfg.common.env_label,
+        &agent_hostname,
+        &s.allow,
+    )
+    .await?;
+    eprintln!(
+        "cp: provisioned Access app for {} ({}, audiences={})",
+        req.vm_name,
+        agent_hostname,
+        access_cfg.audiences.join(",")
+    );
     if !tunnel.extra_hostnames.is_empty() {
         eprintln!(
             "cp: registered extra ingress for {}: {:?}",
@@ -396,8 +441,8 @@ async fn register(
         "tunnel_token": tunnel.token,
         "hostname": tunnel.hostname,
         "agent_id": name,
-        "jwt_secret_b64": s.keys.secret_b64,
         "cp_hostname": s.cfg.hostname,
+        "cf_access": access_cfg,
     })))
 }
 
@@ -835,7 +880,7 @@ async fn shell_ws(
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Result<Response> {
-    auth::resolve(&s.keys, &s.cfg.common.owner, &headers).await?;
+    auth::resolve(&s.access, &s.cfg.common.owner, &headers).await?;
     let ee = s.ee.clone();
     let vm = format!("dd-{}-cp", s.cfg.common.env_label);
     Ok(ws.on_upgrade(move |socket| async move {
@@ -843,78 +888,60 @@ async fn shell_ws(
     }))
 }
 
-// ── Auth routes ─────────────────────────────────────────────────────────
+// ── Auth + access provisioning ─────────────────────────────────────────
 
 async fn require_auth(
     s: &St,
     headers: &HeaderMap,
-    uri: &axum::http::Uri,
+    _uri: &axum::http::Uri,
 ) -> std::result::Result<String, Response> {
-    match auth::resolve(&s.keys, &s.cfg.common.owner, headers).await {
+    match auth::resolve(&s.access, &s.cfg.common.owner, headers).await {
         Ok(login) => Ok(login),
-        Err(Error::Unauthorized) => Err(auth::login_redirect_local(uri)),
         Err(e) => Err(e.into_response()),
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct NextQ {
-    next: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct PatF {
-    pat: String,
-    next: Option<String>,
-}
-
-async fn pat_form(Query(q): Query<NextQ>) -> Html<String> {
-    let next = auth::sanitize_next(q.next.as_deref());
-    Html(shell(
-        "Sign in — DD",
-        "",
-        &format!(
-            r#"<h1>Sign in</h1>
-<div class="sub">Paste a GitHub PAT (run <code>gh auth token</code>).</div>
-<form method="POST" action="/auth/pat" style="max-width:480px">
-  <input type="hidden" name="next" value="{next}">
-  <input type="password" name="pat" placeholder="ghp_... or ghu_..." autofocus autocomplete="off">
-  <p></p>
-  <button type="submit">Sign in</button>
-</form>"#,
-            next = html::escape(&next)
-        ),
-    ))
-}
-
-async fn pat_submit(State(s): State<St>, Form(f): Form<PatF>) -> Response {
-    let next = auth::sanitize_next(f.next.as_deref());
-    let pat = f.pat.trim();
-    if pat.is_empty() {
-        return Redirect::to(&format!("/auth/pat?next={}", urlencoding::encode(&next)))
-            .into_response();
+/// Resolve the Access allow policy from `DD_OWNER`:
+///
+/// - Probes `GET https://api.github.com/users/<owner>`. `type: "Organization"`
+///   → `AccessAllow::Org(owner)`; `type: "User"` → `AccessAllow::Emails(
+///   cfg.access_admin_emails)`. Errors out for user-typed owners if the
+///   admin email list is empty, since the GitHub IdP has no "specific
+///   login" policy type and we need something to narrow on.
+/// - Uses a plain unauthenticated probe — `/users/{login}` is public.
+async fn resolve_access_allow(cfg: &Cfg) -> Result<crate::config::AccessAllow> {
+    let http = reqwest::Client::new();
+    let resp = http
+        .get(format!("https://api.github.com/users/{}", cfg.common.owner))
+        .header("User-Agent", "devopsdefender")
+        .send()
+        .await
+        .map_err(|e| Error::Upstream(format!("github /users/{}: {e}", cfg.common.owner)))?;
+    if !resp.status().is_success() {
+        return Err(Error::Upstream(format!(
+            "github /users/{}: {}",
+            cfg.common.owner,
+            resp.status()
+        )));
     }
-    let Ok(login) = auth::verify_pat(pat, &s.cfg.common.owner).await else {
-        return Redirect::to(&format!("/auth/pat?next={}", urlencoding::encode(&next)))
-            .into_response();
-    };
-    let Ok(jwt) = s.keys.mint(&login) else {
-        return Error::Internal("mint".into()).into_response();
-    };
-    auth::with_cookie(
-        Redirect::to(&next),
-        auth::cookie(
-            auth::AUTH_COOKIE,
-            &jwt,
-            Some(&s.cfg.cf.domain),
-            auth::COOKIE_TTL.as_secs(),
-        ),
-    )
-}
-
-async fn logout(State(s): State<St>) -> Response {
-    auth::with_cookie(
-        Redirect::to("/auth/pat"),
-        auth::cookie(auth::AUTH_COOKIE, "", Some(&s.cfg.cf.domain), 0),
-    )
+    let body: serde_json::Value = resp.json().await?;
+    let kind = body["type"].as_str().unwrap_or("");
+    match kind {
+        "Organization" => Ok(crate::config::AccessAllow::Org(cfg.common.owner.clone())),
+        "User" => {
+            if cfg.access_admin_emails.is_empty() {
+                Err(Error::Internal(format!(
+                    "DD_OWNER={} is a user; set DD_ACCESS_ADMIN_EMAIL (comma-separated) so CF Access has something to allow",
+                    cfg.common.owner
+                )))
+            } else {
+                Ok(crate::config::AccessAllow::Emails(
+                    cfg.access_admin_emails.clone(),
+                ))
+            }
+        }
+        other => Err(Error::Upstream(format!(
+            "unexpected github /users type: {other:?}"
+        ))),
+    }
 }

@@ -1,103 +1,127 @@
-//! Single-path auth.
+//! Origin auth — Cloudflare Access JWT for browsers, GitHub PAT for programmatic callers.
 //!
-//! One token type: GitHub PAT. Two presentations:
-//!   - `Authorization: Bearer <pat>` — CI, curl. Verified against GitHub.
-//!   - `dd_auth` JWT cookie (HS256, `Domain=.{cf.domain}`) — browsers.
-//!     Issued only by the CP's `/auth/pat` POST; shared across all
-//!     `*.{cf.domain}` hosts, so agents verify it without ever issuing.
+//! Two presentations, checked in order:
+//!
+//! - `Cf-Access-Jwt-Assertion` — the browser path. Validated locally
+//!   against the account's Cloudflare Access JWKS; Access enforces
+//!   identity at the edge and the app only needs to confirm the
+//!   signature + audience + issuer.
+//! - `Authorization: Bearer <pat>` — the programmatic path. Verified
+//!   against GitHub (`/user`, `/user/orgs`, `/repos/{owner}/dd`). Used
+//!   by agents for the /register + /ingress/replace handshake (those
+//!   paths have a CF Access bypass app so Bearer calls reach the
+//!   origin) and by any CI / curl client with a PAT.
+//!
+//! There is no in-app cookie any more — the dd_auth HS256 cookie + the
+//! `/auth/pat` form that minted it are gone. Browsers authenticate via
+//! CF Access; the `Cf-Access-Jwt-Assertion` header that CF injects
+//! carries the identity we need.
 
-use std::time::Duration;
-
-use axum::http::header::{AUTHORIZATION, COOKIE, SET_COOKIE};
-use axum::http::{HeaderMap, HeaderValue, Uri};
-use axum::response::{IntoResponse, Redirect, Response};
-use base64::Engine;
-use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation};
+use axum::http::header::AUTHORIZATION;
+use axum::http::{HeaderMap, HeaderName};
+use jsonwebtoken::jwk::{Jwk, JwkSet};
+use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 use reqwest::Client;
-use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use tokio::sync::RwLock;
 
+use crate::config::CfAccess;
 use crate::error::{Error, Result};
 
-pub const AUTH_COOKIE: &str = "dd_auth";
-pub const COOKIE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
-const JWT_ALG: Algorithm = Algorithm::HS256;
+const CF_ACCESS_JWT_ASSERTION: HeaderName = HeaderName::from_static("cf-access-jwt-assertion");
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Claims {
-    pub sub: String,
-    pub login: String,
-    pub iss: String,
-    pub iat: i64,
-    pub exp: i64,
-}
-
-/// Auth keys. CP has both halves; agents have verify-only (they receive
-/// the secret from the CP in their register bootstrap response).
 #[derive(Clone)]
-pub struct Keys {
-    signing: Option<EncodingKey>,
-    decoding: DecodingKey,
-    /// Used both for the `iss` claim on minted JWTs and for logging.
-    pub issuer: String,
-    /// Raw secret bytes, base64-encoded. The CP passes this to agents
-    /// in their register response so they can verify the same JWTs.
-    pub secret_b64: String,
+pub struct AccessValidator {
+    cfg: CfAccess,
+    http: Client,
+    jwks: Arc<RwLock<Option<JwkSet>>>,
 }
 
-impl Keys {
-    /// Mint a fresh HS256 secret. Used by the CP on startup.
-    pub fn fresh(issuer_host: &str) -> Self {
-        let mut bytes = [0u8; 32];
-        bytes[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
-        bytes[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
-        Self::from_secret(&bytes, issuer_host)
-    }
-
-    /// Build verify+sign keys from a known secret. Used by both CP
-    /// (restoring) and agent (holds secret for verify only but sign
-    /// is never called there).
-    pub fn from_secret(bytes: &[u8], issuer_host: &str) -> Self {
+impl AccessValidator {
+    pub fn new(cfg: CfAccess) -> Self {
         Self {
-            signing: Some(EncodingKey::from_secret(bytes)),
-            decoding: DecodingKey::from_secret(bytes),
-            issuer: format!("https://{issuer_host}"),
-            secret_b64: base64::engine::general_purpose::STANDARD.encode(bytes),
+            cfg,
+            http: Client::new(),
+            jwks: Arc::new(RwLock::new(None)),
         }
     }
 
-    /// Verify-only keys from a base64 secret delivered by the CP.
-    pub fn from_b64(secret_b64: &str, issuer_host: &str) -> Result<Self> {
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(secret_b64)
-            .map_err(|e| Error::BadRequest(format!("jwt secret b64: {e}")))?;
-        let mut k = Self::from_secret(&bytes, issuer_host);
-        k.signing = None;
-        Ok(k)
-    }
-
-    pub fn mint(&self, login: &str) -> Result<String> {
-        let signing = self
-            .signing
-            .as_ref()
-            .ok_or_else(|| Error::Internal("no signing key".into()))?;
-        let now = chrono::Utc::now().timestamp();
-        let claims = Claims {
-            sub: login.to_string(),
-            login: login.to_string(),
-            iss: self.issuer.clone(),
-            iat: now,
-            exp: now + COOKIE_TTL.as_secs() as i64,
+    pub async fn resolve(&self, headers: &HeaderMap) -> Result<Option<String>> {
+        let Some(token) = access_token(headers) else {
+            return Ok(None);
         };
-        jsonwebtoken::encode(&Header::new(JWT_ALG), &claims, signing)
-            .map_err(|e| Error::Internal(format!("jwt encode: {e}")))
+        let claims = self.verify_token(token).await?;
+        Ok(Some(access_principal(&claims)))
     }
 
-    pub fn verify(&self, jwt: &str) -> Option<Claims> {
-        let mut v = Validation::new(JWT_ALG);
-        v.set_required_spec_claims(&["exp", "sub", "iss"]);
-        jsonwebtoken::decode::<Claims>(jwt, &self.decoding, &v)
-            .ok()
-            .map(|d| d.claims)
+    async fn verify_token(&self, token: &str) -> Result<serde_json::Value> {
+        let header = decode_header(token).map_err(|_| Error::Unauthorized)?;
+        if header.alg != Algorithm::RS256 {
+            return Err(Error::Unauthorized);
+        }
+        let kid = header.kid.ok_or(Error::Unauthorized)?;
+
+        let jwk = self.get_jwk(&kid).await?;
+        match self.decode_with_jwk(token, &jwk) {
+            Ok(claims) => Ok(claims),
+            Err(_) => {
+                // Access rotates signing keys; refresh once on failure
+                // in case the cached set is stale but the token is valid.
+                self.refresh_jwks().await?;
+                let jwk = self.get_cached_jwk(&kid).await.ok_or(Error::Unauthorized)?;
+                self.decode_with_jwk(token, &jwk)
+                    .map_err(|_| Error::Unauthorized)
+            }
+        }
+    }
+
+    async fn get_jwk(&self, kid: &str) -> Result<Jwk> {
+        if let Some(jwk) = self.get_cached_jwk(kid).await {
+            return Ok(jwk);
+        }
+        self.refresh_jwks().await?;
+        self.get_cached_jwk(kid).await.ok_or(Error::Unauthorized)
+    }
+
+    async fn get_cached_jwk(&self, kid: &str) -> Option<Jwk> {
+        self.jwks
+            .read()
+            .await
+            .as_ref()
+            .and_then(|set| set.find(kid).cloned())
+    }
+
+    async fn refresh_jwks(&self) -> Result<()> {
+        let resp = self
+            .http
+            .get(&self.cfg.jwks_url)
+            .send()
+            .await
+            .map_err(|e| Error::Upstream(format!("CF Access certs: {e}")))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            return Err(Error::Upstream(format!(
+                "CF Access certs {} -> {status}: {text}",
+                self.cfg.jwks_url
+            )));
+        }
+        let jwks = resp.json::<JwkSet>().await?;
+        *self.jwks.write().await = Some(jwks);
+        Ok(())
+    }
+
+    fn decode_with_jwk(
+        &self,
+        token: &str,
+        jwk: &Jwk,
+    ) -> jsonwebtoken::errors::Result<serde_json::Value> {
+        let key = DecodingKey::from_jwk(jwk)?;
+        let mut validation = Validation::new(Algorithm::RS256);
+        validation.set_required_spec_claims(&["exp", "iss", "aud"]);
+        validation.set_issuer(&[self.cfg.issuer.as_str()]);
+        validation.set_audience(&self.cfg.audiences);
+        decode::<serde_json::Value>(token, &key, &validation).map(|d| d.claims)
     }
 }
 
@@ -151,28 +175,6 @@ pub async fn verify_pat(pat: &str, owner: &str) -> Result<String> {
     Err(Error::Unauthorized)
 }
 
-pub fn cookie(name: &str, value: &str, domain: Option<&str>, max_age: u64) -> String {
-    let mut c =
-        format!("{name}={value}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age={max_age}");
-    if let Some(d) = domain {
-        c.push_str(&format!("; Domain=.{d}"));
-    }
-    c
-}
-
-pub fn read_cookie(headers: &HeaderMap, name: &str) -> Option<String> {
-    let cs = headers.get(COOKIE)?.to_str().ok()?;
-    for c in cs.split(';') {
-        let mut kv = c.trim().splitn(2, '=');
-        let k = kv.next()?.trim();
-        let v = kv.next()?.trim();
-        if k == name {
-            return Some(v.to_string());
-        }
-    }
-    None
-}
-
 pub fn bearer(headers: &HeaderMap) -> Option<String> {
     let v = headers.get(AUTHORIZATION)?.to_str().ok()?;
     v.strip_prefix("Bearer ")
@@ -181,46 +183,36 @@ pub fn bearer(headers: &HeaderMap) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-pub fn with_cookie(resp: impl IntoResponse, cookie_value: String) -> Response {
-    let mut r = resp.into_response();
-    if let Ok(hv) = HeaderValue::from_str(&cookie_value) {
-        r.headers_mut().append(SET_COOKIE, hv);
-    }
-    r
+fn access_token(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(CF_ACCESS_JWT_ASSERTION)?
+        .to_str()
+        .ok()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
 }
 
-pub fn sanitize_next(next: Option<&str>) -> String {
-    match next {
-        Some(p) if p.starts_with('/') && !p.starts_with("//") => p.to_string(),
-        _ => "/".to_string(),
-    }
-}
-
-pub async fn resolve(keys: &Keys, owner: &str, headers: &HeaderMap) -> Result<String> {
-    if let Some(jwt) = read_cookie(headers, AUTH_COOKIE) {
-        if let Some(c) = keys.verify(&jwt) {
-            return Ok(c.login);
+fn access_principal(claims: &serde_json::Value) -> String {
+    for key in ["email", "common_name", "sub"] {
+        if let Some(v) = claims.get(key).and_then(|v| v.as_str()) {
+            if !v.is_empty() {
+                return v.to_string();
+            }
         }
+    }
+    "cf-access".into()
+}
+
+/// Resolve the caller's identity. CF Access header wins (browsers);
+/// Bearer PAT is the fallback for programmatic callers that bypass
+/// Access (or hit `/register` + `/ingress/replace`, which have CF
+/// Access bypass apps in front of them).
+pub async fn resolve(access: &AccessValidator, owner: &str, headers: &HeaderMap) -> Result<String> {
+    if let Some(principal) = access.resolve(headers).await? {
+        return Ok(principal);
     }
     if let Some(pat) = bearer(headers) {
         return verify_pat(&pat, owner).await;
     }
     Err(Error::Unauthorized)
-}
-
-/// Redirect unauthenticated browsers to the CP's PAT login.
-pub fn login_redirect(cp_hostname: &str, uri: &Uri) -> Response {
-    let next = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
-    let location = format!(
-        "https://{cp_hostname}/auth/pat?next={}",
-        urlencoding::encode(&format!("https://{}{next}", cp_hostname))
-    );
-    Redirect::to(&location).into_response()
-}
-
-/// CP-local redirect for its own routes (no absolute URL needed).
-pub fn login_redirect_local(uri: &Uri) -> Response {
-    let next = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
-    let location = format!("/auth/pat?next={}", urlencoding::encode(next));
-    Redirect::to(&location).into_response()
 }
