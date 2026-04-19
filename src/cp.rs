@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use axum::extract::{Path, Query, State, WebSocketUpgrade};
+use axum::extract::{Path, Query, State};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -27,7 +27,6 @@ use crate::html::{self, shell};
 use crate::ita;
 use crate::metrics;
 use crate::stonith;
-use crate::terminal;
 
 /// Re-mint interval for the CP's own ITA token. The CP isn't scraped
 /// by its own collector (different tunnel prefix), so a background
@@ -53,7 +52,12 @@ pub async fn run() -> Result<()> {
     eprintln!("cp: self-provisioning tunnel for {}", cfg.hostname);
     let http = reqwest::Client::new();
     let self_name = cf::cp_tunnel_name(&cfg.common.env_label);
-    let tunnel = match cf::create(&http, &cfg.cf, &self_name, &cfg.hostname, &[]).await {
+    // `term.<hostname>` routes to the ttyd workload on port 7681.
+    // The CP boot set always includes ttyd, so the CNAME + ingress
+    // rule always resolve. CF Access gates this subdomain with the
+    // same human policy as the CP dashboard.
+    let cp_extras: Vec<(String, u16)> = vec![("term".into(), 7681)];
+    let tunnel = match cf::create(&http, &cfg.cf, &self_name, &cfg.hostname, &cp_extras).await {
         Ok(t) => t,
         Err(e) => {
             eprintln!("cp: self-register failed: {e}");
@@ -233,8 +237,6 @@ pub async fn run() -> Result<()> {
         .route("/api/agents", get(api_agents))
         .route("/cp/attest", get(cp_attest))
         .route("/cp/ita", get(cp_ita))
-        .route("/cp/shell", get(shell_page))
-        .route("/cp/ws/shell", get(shell_ws))
         .with_state(state);
 
     let addr = format!("0.0.0.0:{}", cfg.common.port);
@@ -664,12 +666,19 @@ async fn agent_detail(State(s): State<St>, Path(id): Path<String>) -> Response {
         )
     };
 
+    // `{hostname-base}-term.{tld}` is the ttyd subdomain (CP's own
+    // tunnel publishes it; agents publish it via their register-time
+    // `extra_ingress`). Flat shape so Universal SSL covers the cert.
+    // Human-gated by CF Access; each click spawns a fresh `/bin/sh`
+    // with no carry-over from any deployment.
+    let term_host = html::escape(&cf::label_hostname(&a.hostname, "term"));
     let extra = if is_cp {
-        r#"<p><a href="/cp/shell">open CP shell</a> · <a href="/cp/attest">raw quote</a> · <a href="/cp/ita">ITA token</a></p>"#
-            .to_string()
+        format!(
+            r#"<p><a href="https://{term_host}/" target="_blank">Terminal ↗</a> · <a href="/cp/attest">raw quote</a> · <a href="/cp/ita">ITA token</a></p>"#
+        )
     } else {
         format!(
-            r#"<p><a href="https://{h}/">open agent dashboard ↗</a></p>"#,
+            r#"<p><a href="https://{h}/">open agent dashboard ↗</a> · <a href="https://{term_host}/" target="_blank">Terminal ↗</a></p>"#,
             h = html::escape(&a.hostname)
         )
     };
@@ -813,16 +822,4 @@ async fn cp_ita(State(s): State<St>) -> Result<Json<serde_json::Value>> {
         "token": token,
         "claims": claims,
     })))
-}
-
-async fn shell_page() -> Response {
-    Html(terminal::page("cp", "/cp/ws/shell")).into_response()
-}
-
-async fn shell_ws(State(s): State<St>, ws: WebSocketUpgrade) -> Result<Response> {
-    let ee = s.ee.clone();
-    let vm = format!("dd-{}-cp", s.cfg.common.env_label);
-    Ok(ws.on_upgrade(move |socket| async move {
-        terminal::bridge(socket, ee, &vm).await;
-    }))
 }
