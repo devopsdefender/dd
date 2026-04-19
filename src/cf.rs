@@ -701,6 +701,125 @@ pub async fn delete_access_apps_for(http: &Client, cf: &CfCreds, agent_hostname:
     }
 }
 
+/// Walk every `dd-{env}-*` Access app, look up its domain's CNAME,
+/// and delete the app if the target tunnel id isn't in the current
+/// live tunnel list. Meant to be called on CP startup (or from a
+/// manual reap workflow) so orphan apps from force-deleted VMs or
+/// old naming schemes don't accumulate in the account forever.
+///
+/// Returns the count of deleted apps. Best-effort: any single
+/// lookup failure is logged and skipped; we'd rather leave an
+/// ambiguous app in place than blast one we shouldn't.
+pub async fn reap_orphan_access_apps(http: &Client, cf: &CfCreds, env: &str) -> Result<usize> {
+    let prefix = format!("dd-{env}-");
+
+    // Live tunnel set — ids of every cfd tunnel on this account
+    // that hasn't been soft-deleted.
+    let live: std::collections::HashSet<String> = list(http, cf)
+        .await?
+        .iter()
+        .filter_map(|t| t["id"].as_str().map(String::from))
+        .collect();
+
+    let resp = call(
+        http,
+        cf,
+        Method::GET,
+        &format!("/accounts/{}/access/apps?per_page=1000", cf.account_id),
+        None,
+    )
+    .await?;
+    let Some(items) = resp["result"].as_array() else {
+        return Ok(0);
+    };
+
+    // Cache CNAME lookups — many apps share a base hostname (per-path
+    // bypass apps on the same agent), and each lookup is a CF API
+    // round-trip.
+    let mut cname_target: std::collections::HashMap<String, Option<String>> =
+        std::collections::HashMap::new();
+    let mut deleted = 0usize;
+
+    for app in items {
+        let Some(app_name) = app["name"].as_str() else {
+            continue;
+        };
+        if !app_name.starts_with(&prefix) {
+            continue;
+        }
+        let Some(domain_field) = app["domain"].as_str() else {
+            continue;
+        };
+        // Strip any "/path" suffix — CF Access's domain field
+        // encodes path-scoped apps as `host/path`.
+        let host = domain_field
+            .split_once('/')
+            .map(|(h, _)| h)
+            .unwrap_or(domain_field);
+
+        let target = if let Some(cached) = cname_target.get(host) {
+            cached.clone()
+        } else {
+            let t = resolve_cname_tunnel_id(http, cf, host).await;
+            cname_target.insert(host.to_string(), t.clone());
+            t
+        };
+
+        let orphan = match target {
+            None => true,                         // DNS already torn down
+            Some(ref tid) => !live.contains(tid), // tunnel no longer exists
+        };
+        if !orphan {
+            continue;
+        }
+
+        let Some(id) = app["id"].as_str() else {
+            continue;
+        };
+        if let Err(e) = call(
+            http,
+            cf,
+            Method::DELETE,
+            &format!("/accounts/{}/access/apps/{id}", cf.account_id),
+            None,
+        )
+        .await
+        {
+            eprintln!("cp: reap: delete {app_name} ({host}) failed: {e}");
+            continue;
+        }
+        deleted += 1;
+        eprintln!("cp: reap: deleted {app_name} ({host})");
+    }
+
+    Ok(deleted)
+}
+
+/// Look up `hostname`'s CNAME and extract the cfd tunnel id from
+/// its content (`{tid}.cfargotunnel.com`). Returns `None` if the
+/// record doesn't exist, has no target, or doesn't point at a cfd
+/// tunnel (we treat non-tunnel CNAMEs as "not one of ours").
+async fn resolve_cname_tunnel_id(http: &Client, cf: &CfCreds, hostname: &str) -> Option<String> {
+    let resp = call(
+        http,
+        cf,
+        Method::GET,
+        &format!(
+            "/zones/{}/dns_records?type=CNAME&name={hostname}",
+            cf.zone_id
+        ),
+        None,
+    )
+    .await
+    .ok()?;
+    let content = resp["result"]
+        .as_array()?
+        .first()?
+        .get("content")?
+        .as_str()?;
+    content.strip_suffix(".cfargotunnel.com").map(String::from)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

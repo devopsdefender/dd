@@ -101,6 +101,29 @@ pub async fn run() -> Result<()> {
     }
     eprintln!("cp: CF Access ready");
 
+    // Fire-and-forget orphan Access-app reap. Walks every
+    // `dd-{env}-*` app, checks its domain's CNAME against the live
+    // tunnel list, deletes dangling ones. Handles the case where a
+    // preview VM got force-deleted in GCP without the collector's
+    // orphan-GC path running, or apps from an older naming scheme.
+    // Spawned off the critical path so a slow CF API call doesn't
+    // delay the collector or agent registration.
+    {
+        let http = http.clone();
+        let cf = cfg.cf.clone();
+        let env = cfg.common.env_label.clone();
+        tokio::spawn(async move {
+            // Small delay so in-flight creates from the startup path
+            // above land before we enumerate and check ownership.
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            match cf::reap_orphan_access_apps(&http, &cf, &env).await {
+                Ok(0) => {}
+                Ok(n) => eprintln!("cp: reaped {n} orphan CF Access apps (env={env})"),
+                Err(e) => eprintln!("cp: reap_orphan_access_apps failed: {e}"),
+            }
+        });
+    }
+
     // ITA verifier — required.
     let verifier = ita::Verifier::new(cfg.ita.jwks_url.clone(), cfg.ita.issuer.clone());
     eprintln!("cp: ITA verifier enabled (issuer={})", cfg.ita.issuer);
