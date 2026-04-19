@@ -49,7 +49,7 @@
           <div class="step-num">2</div>
           <div class="step-content">
             <h3>Deploy</h3>
-            <p>Push via GitHub Actions &mdash; the <code>deploy-workload</code> action POSTs the spec to the agent's <code>/deploy</code> through its Cloudflare tunnel. No SSH, no raw IPs, no port forwards. Or skip the action and bake it as a boot workload.</p>
+            <p>Push via GitHub Actions &mdash; the <code>dd-deploy</code> action mints a per-job OIDC token and POSTs the spec to the agent's <code>/deploy</code> through its Cloudflare tunnel. Zero stored credentials; only workflows in the DD GitHub org are allowed. Or skip the action and bake it as a boot workload.</p>
           </div>
         </div>
         <div class="step">
@@ -141,30 +141,24 @@
   <section class="section-center">
     <div class="container">
       <h2>Deploy with GitHub Actions</h2>
-      <p class="subtitle">One action to deploy. One action to verify. Inline spec, no extra files.</p>
+      <p class="subtitle">Per-job OIDC token, no stored credentials. Any workflow in the DD GitHub org deploys &mdash; nothing else does.</p>
       <div class="code-block">
         <div class="code-header">.github/workflows/deploy.yml</div>
-<pre><span class="k">- uses:</span> <span class="s">devopsdefender/dd/.github/actions/deploy-workload@main</span>
-  <span class="k">with:</span>
-    <span class="k">agent-url:</span> <span class="s">https://app.devopsdefender.com</span>
-    <span class="c"># deploy-spec: apps/myapp/workload.json   # or a file path</span>
-    <span class="k">deploy-spec-inline:</span> <span class="s">|</span>
-      <span class="s">{</span>
-        <span class="s">"app_name": "myapp",</span>
-        <span class="s">"github_release": {</span>
-          <span class="s">"repo": "me/myapp",</span>
-          <span class="s">"asset": "myapp-linux-amd64"</span>
-        <span class="s">},</span>
-        <span class="s">"cmd": ["myapp", "serve"]</span>
-      <span class="s">}</span>
-
-<span class="k">- uses:</span> <span class="s">devopsdefender/dd/.github/actions/verify-deployment@main</span>
-  <span class="k">with:</span>
-    <span class="k">agent-url:</span> <span class="s">https://app.devopsdefender.com</span>
-    <span class="k">deployment:</span> <span class="s">myapp</span>
-    <span class="k">timeout:</span> <span class="s">300</span></pre>
+<pre><span class="k">jobs:</span>
+  <span class="k">deploy:</span>
+    <span class="k">runs-on:</span> <span class="s">ubuntu-latest</span>
+    <span class="k">permissions:</span>
+      <span class="k">id-token:</span> <span class="s">write</span>   <span class="c"># mints the OIDC token</span>
+      <span class="k">contents:</span> <span class="s">read</span>
+    <span class="k">steps:</span>
+      <span class="k">- uses:</span> <span class="s">actions/checkout@v4</span>
+      <span class="k">- uses:</span> <span class="s">devopsdefender/dd/.github/actions/dd-deploy@main</span>
+        <span class="k">with:</span>
+          <span class="k">cp-url:</span> <span class="s">https://app.devopsdefender.com</span>
+          <span class="k">vm-name:</span> <span class="s">dd-local-prod</span>
+          <span class="k">workload:</span> <span class="s">apps/myapp/workload.json</span></pre>
       </div>
-      <p style="margin-top:16px;color:var(--text-dim);font-size:14px;">Every workload &mdash; dd-agent, cloudflared, ollama, openclaw, yours &mdash; is one JSON spec at <code>apps/&lt;name&gt;/workload.json</code>. Boot-time, runtime, first-class; same schema everywhere.</p>
+      <p style="margin-top:16px;color:var(--text-dim);font-size:14px;">The agent verifies the GitHub Actions OIDC JWT in-code against GitHub's JWKS, checks <code>repository_owner == DD_OWNER</code>, and launches the workload. No service tokens, no PATs, no secrets stored anywhere.</p>
     </div>
   </section>
 
