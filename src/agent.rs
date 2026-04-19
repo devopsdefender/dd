@@ -39,7 +39,7 @@ const ITA_REFRESH: Duration = Duration::from_secs(180);
 struct St {
     cfg: Arc<Cfg>,
     ee: Arc<Ee>,
-    access: Arc<auth::AccessValidator>,
+    access: Option<Arc<auth::AccessValidator>>,
     hostname: String,
     /// Tunnel name returned by the CP at /register — stable for the
     /// life of this agent's tunnel. The /ingress/replace call on the
@@ -75,8 +75,12 @@ pub async fn run() -> Result<()> {
 
     spawn_cloudflared(b.tunnel_token);
 
-    let access = Arc::new(auth::AccessValidator::new(b.cf_access));
-    eprintln!("agent: Cloudflare Access auth enabled");
+    let access = b.cf_access.map(auth::AccessValidator::new).map(Arc::new);
+    if access.is_some() {
+        eprintln!("agent: Cloudflare Access auth enabled");
+    } else {
+        eprintln!("agent: WARNING — CP returned no CF Access config for this hostname; browser routes will 401 until one is added in Zero Trust. Bearer PAT still works.");
+    }
     let ita_token = Arc::new(RwLock::new(initial_token));
 
     // Background re-mint so /health always serves a non-expired token
@@ -135,7 +139,8 @@ struct Bootstrap {
     tunnel_token: String,
     hostname: String,
     agent_id: String,
-    cf_access: CfAccess,
+    #[serde(default)]
+    cf_access: Option<CfAccess>,
 }
 
 async fn register(cfg: &Cfg, ita_token: &str) -> Result<Bootstrap> {
@@ -256,7 +261,14 @@ async fn require_auth(
     headers: &HeaderMap,
     _uri: &axum::http::Uri,
 ) -> std::result::Result<String, Response> {
-    match auth::resolve(&s.access, &s.cfg.common.owner, headers).await {
+    match auth::resolve(
+        s.access.as_deref(),
+        Some(&s.cfg.pat),
+        &s.cfg.common.owner,
+        headers,
+    )
+    .await
+    {
         Ok(login) => Ok(login),
         Err(e) => Err(e.into_response()),
     }
@@ -450,7 +462,13 @@ async fn deploy(
     headers: HeaderMap,
     Json(spec): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>> {
-    auth::resolve(&s.access, &s.cfg.common.owner, &headers).await?;
+    auth::resolve(
+        s.access.as_deref(),
+        Some(&s.cfg.pat),
+        &s.cfg.common.owner,
+        &headers,
+    )
+    .await?;
 
     // Pull `expose` off the spec before forwarding to EE. EE ignores
     // unknown fields today but keeping the payload tidy avoids future
@@ -546,7 +564,13 @@ async fn exec(
     headers: HeaderMap,
     Json(req): Json<ExecReq>,
 ) -> Result<Json<serde_json::Value>> {
-    auth::resolve(&s.access, &s.cfg.common.owner, &headers).await?;
+    auth::resolve(
+        s.access.as_deref(),
+        Some(&s.cfg.pat),
+        &s.cfg.common.owner,
+        &headers,
+    )
+    .await?;
     Ok(Json(s.ee.exec(&req.cmd, req.timeout_secs).await?))
 }
 
@@ -556,7 +580,13 @@ async fn session_ws(
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Result<Response> {
-    auth::resolve(&s.access, &s.cfg.common.owner, &headers).await?;
+    auth::resolve(
+        s.access.as_deref(),
+        Some(&s.cfg.pat),
+        &s.cfg.common.owner,
+        &headers,
+    )
+    .await?;
     let _ = app;
     let vm = s.cfg.common.vm_name.clone();
     let ee = s.ee.clone();

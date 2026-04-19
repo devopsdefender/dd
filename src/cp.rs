@@ -39,11 +39,7 @@ const ITA_REFRESH: Duration = Duration::from_secs(180);
 struct St {
     cfg: Arc<Cfg>,
     ee: Arc<Ee>,
-    access: Arc<auth::AccessValidator>,
-    /// Resolved `AccessAllow` shape — `Org(name)` for org-typed
-    /// `DD_OWNER`, `Emails(..)` for user-typed. Used when provisioning
-    /// per-agent Access apps in `/register`.
-    allow: Arc<crate::config::AccessAllow>,
+    access: Option<Arc<auth::AccessValidator>>,
     store: Store,
     started: Instant,
     verifier: Arc<ita::Verifier>,
@@ -84,35 +80,47 @@ pub async fn run() -> Result<()> {
 
     let store: Store = Arc::new(Mutex::new(HashMap::new()));
 
-    // Resolve the Access allow policy from DD_OWNER (org membership
-    // for orgs, admin email list for users) then provision the CF
-    // Access apps covering this hostname + bypass apps for the
-    // programmatic /register + /ingress/replace paths. Fatal on
-    // failure — the CP refuses to start without enforced auth.
-    let allow = match resolve_access_allow(&cfg).await {
-        Ok(a) => a,
+    // Upsert the CF Access bypass apps covering programmatic paths
+    // (/register, /ingress/replace, /cp/attest, /deploy, /exec,
+    // /health). Operator owns the wildcard allow app + GitHub IdP
+    // config in the dashboard; the CP maintains the bypass side so
+    // nobody has to click through 6 identical "Add application"
+    // forms. Best-effort — log-and-continue on failure.
+    if let Err(e) = cf::ensure_bypass_apps(&http, &cfg.cf).await {
+        eprintln!(
+            "cp: WARNING — failed to ensure CF Access bypass apps ({e}); programmatic callers may see 302s until fixed"
+        );
+    }
+
+    // Discover the Cloudflare Access app covering this hostname.
+    // Non-fatal on miss: the CP stays up so the Bearer-PAT path
+    // keeps working, but browser routes will 401 until an Access
+    // app is configured.
+    let access = match cf::discover_access(&http, &cfg.cf, &cfg.hostname).await {
+        Ok(Some(a)) => {
+            eprintln!(
+                "cp: Cloudflare Access enabled for {} (issuer={}, audiences={})",
+                cfg.hostname,
+                a.issuer,
+                a.audiences.join(",")
+            );
+            Some(Arc::new(auth::AccessValidator::new(a)))
+        }
+        Ok(None) => {
+            eprintln!(
+                "cp: WARNING — no Cloudflare Access app matches {}; browser routes will 401 until you add a self-hosted app (wildcard or host-specific) in Zero Trust → Access → Applications. Bearer PAT still works.",
+                cfg.hostname
+            );
+            None
+        }
         Err(e) => {
-            eprintln!("cp: access allow policy: {e}");
-            stonith::poweroff();
+            eprintln!(
+                "cp: WARNING — discover_access({}) failed ({e}); browser routes will 401 until resolved. Bearer PAT still works.",
+                cfg.hostname
+            );
+            None
         }
     };
-    let access_cfg =
-        match cf::provision_cp_access(&http, &cfg.cf, &cfg.common.env_label, &cfg.hostname, &allow)
-            .await
-        {
-            Ok(a) => a,
-            Err(e) => {
-                eprintln!("cp: provision CF Access apps: {e}");
-                stonith::poweroff();
-            }
-        };
-    eprintln!(
-        "cp: CF Access provisioned for {} (issuer={}, audiences={})",
-        cfg.hostname,
-        access_cfg.issuer,
-        access_cfg.audiences.join(",")
-    );
-    let access = Arc::new(auth::AccessValidator::new(access_cfg));
 
     // ITA verifier — required.
     let verifier = ita::Verifier::new(cfg.ita.jwks_url.clone(), cfg.ita.issuer.clone());
@@ -235,7 +243,6 @@ pub async fn run() -> Result<()> {
         cfg: cfg.clone(),
         ee,
         access,
-        allow: Arc::new(allow),
         store,
         started: Instant::now(),
         verifier,
@@ -369,20 +376,19 @@ async fn register(
         .map(|e| (e.hostname_label.clone(), e.port))
         .collect();
     let tunnel = cf::create(&http, &s.cfg.cf, &name, &agent_hostname, &extras).await?;
-    let access_cfg = cf::provision_agent_access(
-        &http,
-        &s.cfg.cf,
-        &s.cfg.common.env_label,
-        &agent_hostname,
-        &s.allow,
-    )
-    .await?;
-    eprintln!(
-        "cp: provisioned Access app for {} ({}, audiences={})",
-        req.vm_name,
-        agent_hostname,
-        access_cfg.audiences.join(",")
-    );
+    // Discover the Access app covering this agent's hostname — the
+    // wildcard app set up once for `*.${cf.domain}` matches here too.
+    // None is fine during bring-up; agent will warn and run without
+    // browser auth until an Access app appears.
+    let access_cfg = cf::discover_access(&http, &s.cfg.cf, &agent_hostname)
+        .await
+        .ok()
+        .flatten();
+    if access_cfg.is_none() {
+        eprintln!(
+            "cp: WARNING — no CF Access app matches {agent_hostname}; agent will run without browser auth until one is added"
+        );
+    }
     if !tunnel.extra_hostnames.is_empty() {
         eprintln!(
             "cp: registered extra ingress for {}: {:?}",
@@ -880,7 +886,13 @@ async fn shell_ws(
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Result<Response> {
-    auth::resolve(&s.access, &s.cfg.common.owner, &headers).await?;
+    auth::resolve(
+        s.access.as_deref(),
+        s.cfg.mgmt_pat.as_deref(),
+        &s.cfg.common.owner,
+        &headers,
+    )
+    .await?;
     let ee = s.ee.clone();
     let vm = format!("dd-{}-cp", s.cfg.common.env_label);
     Ok(ws.on_upgrade(move |socket| async move {
@@ -888,60 +900,22 @@ async fn shell_ws(
     }))
 }
 
-// ── Auth + access provisioning ─────────────────────────────────────────
+// ── Auth ───────────────────────────────────────────────────────────────
 
 async fn require_auth(
     s: &St,
     headers: &HeaderMap,
     _uri: &axum::http::Uri,
 ) -> std::result::Result<String, Response> {
-    match auth::resolve(&s.access, &s.cfg.common.owner, headers).await {
+    match auth::resolve(
+        s.access.as_deref(),
+        s.cfg.mgmt_pat.as_deref(),
+        &s.cfg.common.owner,
+        headers,
+    )
+    .await
+    {
         Ok(login) => Ok(login),
         Err(e) => Err(e.into_response()),
-    }
-}
-
-/// Resolve the Access allow policy from `DD_OWNER`:
-///
-/// - Probes `GET https://api.github.com/users/<owner>`. `type: "Organization"`
-///   → `AccessAllow::Org(owner)`; `type: "User"` → `AccessAllow::Emails(
-///   cfg.access_admin_emails)`. Errors out for user-typed owners if the
-///   admin email list is empty, since the GitHub IdP has no "specific
-///   login" policy type and we need something to narrow on.
-/// - Uses a plain unauthenticated probe — `/users/{login}` is public.
-async fn resolve_access_allow(cfg: &Cfg) -> Result<crate::config::AccessAllow> {
-    let http = reqwest::Client::new();
-    let resp = http
-        .get(format!("https://api.github.com/users/{}", cfg.common.owner))
-        .header("User-Agent", "devopsdefender")
-        .send()
-        .await
-        .map_err(|e| Error::Upstream(format!("github /users/{}: {e}", cfg.common.owner)))?;
-    if !resp.status().is_success() {
-        return Err(Error::Upstream(format!(
-            "github /users/{}: {}",
-            cfg.common.owner,
-            resp.status()
-        )));
-    }
-    let body: serde_json::Value = resp.json().await?;
-    let kind = body["type"].as_str().unwrap_or("");
-    match kind {
-        "Organization" => Ok(crate::config::AccessAllow::Org(cfg.common.owner.clone())),
-        "User" => {
-            if cfg.access_admin_emails.is_empty() {
-                Err(Error::Internal(format!(
-                    "DD_OWNER={} is a user; set DD_ACCESS_ADMIN_EMAIL (comma-separated) so CF Access has something to allow",
-                    cfg.common.owner
-                )))
-            } else {
-                Ok(crate::config::AccessAllow::Emails(
-                    cfg.access_admin_emails.clone(),
-                ))
-            }
-        }
-        other => Err(Error::Upstream(format!(
-            "unexpected github /users type: {other:?}"
-        ))),
     }
 }

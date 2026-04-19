@@ -98,23 +98,6 @@ impl Ita {
     }
 }
 
-/// How the CP's Cloudflare Access apps allow users through. Resolved
-/// from `DD_OWNER` at CP startup (+ the optional admin email list):
-///
-/// - **`Org`** — `DD_OWNER` is a GitHub org. Policy include uses
-///   `github-organization` with the org name and the account's
-///   discovered GitHub Access IdP UUID.
-/// - **`Emails`** — `DD_OWNER` is a GitHub user. GitHub IdP in
-///   Access has no first-class "specific GitHub login" include, so
-///   fall back to an `emails` policy populated from
-///   `DD_ACCESS_ADMIN_EMAIL` (comma-separated). Startup errors out
-///   if this is empty for user-typed owners.
-#[derive(Clone, Debug)]
-pub enum AccessAllow {
-    Org(String),
-    Emails(Vec<String>),
-}
-
 /// Control-plane-mode config.
 pub struct Cp {
     pub common: Common,
@@ -122,9 +105,13 @@ pub struct Cp {
     pub hostname: String,
     pub scrape_interval_secs: u64,
     pub ita: Ita,
-    /// Admin emails for the `Emails` case of `AccessAllow`. Parsed
-    /// here so the CP has it ready when resolving `DD_OWNER`'s type.
-    pub access_admin_emails: Vec<String>,
+    /// Org-owner PAT (needs `read:org`) the CP uses to check
+    /// `DD_OWNER` membership for identities coming in via the
+    /// Cloudflare Access JWT path. Without it, the CF Access policy
+    /// must do the org filter itself (dashboard-side config). With
+    /// it, the CF Access policy can be as permissive as "any GitHub
+    /// IdP login" and the app enforces ownership.
+    pub mgmt_pat: Option<String>,
 }
 
 impl Cp {
@@ -137,19 +124,14 @@ impl Cp {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(30);
-        let access_admin_emails = std::env::var("DD_ACCESS_ADMIN_EMAIL")
-            .unwrap_or_default()
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
+        let mgmt_pat = std::env::var("DD_MGMT_PAT").ok().filter(|s| !s.is_empty());
         Ok(Self {
             common,
             cf,
             hostname,
             scrape_interval_secs,
             ita: Ita::from_env()?,
-            access_admin_emails,
+            mgmt_pat,
         })
     }
 }

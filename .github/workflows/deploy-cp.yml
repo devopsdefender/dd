@@ -88,10 +88,11 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.DD_CP_CF_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.DD_CP_CF_ACCOUNT_ID }}
           CLOUDFLARE_ZONE_ID: ${{ secrets.DD_CP_CF_ZONE_ID }}
-          # Populated only when `DD_OWNER` is an individual user —
-          # CP startup errors out in that case if this is empty. Org
-          # deploys ignore it.
-          DD_ACCESS_ADMIN_EMAIL: ${{ vars.DD_ACCESS_ADMIN_EMAIL || secrets.DD_ACCESS_ADMIN_EMAIL || '' }}
+          # Org-owner PAT with `read:org` — used by the CP to
+          # verify CF Access identities (email/login) against
+          # DD_OWNER membership. Optional; if empty, CF Access
+          # policy must do the org filter itself.
+          DD_MGMT_PAT: ${{ secrets.DD_MGMT_PAT || '' }}
           DD_ITA_API_KEY: ${{ secrets.DD_ITA_API_KEY }}
           DD_RELEASE_TAG: ${{ inputs.release_tag }}
           EE_IMAGE_FAMILY: easyenclave-staging

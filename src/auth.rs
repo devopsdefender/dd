@@ -193,7 +193,13 @@ fn access_token(headers: &HeaderMap) -> Option<&str> {
 }
 
 fn access_principal(claims: &serde_json::Value) -> String {
-    for key in ["email", "common_name", "sub"] {
+    // Prefer the GitHub login over email — CF Access's GitHub IdP
+    // puts the login in `sub`, and the downstream GitHub API call
+    // for org-membership is `/orgs/{owner}/members/{login}` (not by
+    // email). `preferred_username` is the OIDC-standard name some
+    // IdPs use; `sub` is what CF Access actually emits. Email stays
+    // as a last resort.
+    for key in ["preferred_username", "sub", "common_name", "email"] {
         if let Some(v) = claims.get(key).and_then(|v| v.as_str()) {
             if !v.is_empty() {
                 return v.to_string();
@@ -203,13 +209,46 @@ fn access_principal(claims: &serde_json::Value) -> String {
     "cf-access".into()
 }
 
-/// Resolve the caller's identity. CF Access header wins (browsers);
-/// Bearer PAT is the fallback for programmatic callers that bypass
-/// Access (or hit `/register` + `/ingress/replace`, which have CF
-/// Access bypass apps in front of them).
-pub async fn resolve(access: &AccessValidator, owner: &str, headers: &HeaderMap) -> Result<String> {
-    if let Some(principal) = access.resolve(headers).await? {
-        return Ok(principal);
+/// Resolve the caller's identity. CF Access header wins (browsers)
+/// when a validator is configured; Bearer PAT is the fallback for
+/// programmatic callers that bypass Access (or hit `/register` +
+/// `/ingress/replace`, which have CF Access bypass apps in front of
+/// them). `access: None` is used during bring-up when the Access app
+/// for the hostname hasn't been configured in the dashboard yet —
+/// Bearer PAT still works, browser routes 401.
+///
+/// `mgmt_pat` (GitHub PAT with `read:org`) enables the app to
+/// authorize CF Access identities against `owner` — mirrors what
+/// `verify_pat` does for Bearer callers. With it, the CF Access
+/// policy can be as open as "any GitHub login" and the app enforces
+/// the owner membership check. Without it, CF Access must filter
+/// by org itself (dashboard-side).
+pub async fn resolve(
+    access: Option<&AccessValidator>,
+    mgmt_pat: Option<&str>,
+    owner: &str,
+    headers: &HeaderMap,
+) -> Result<String> {
+    if let Some(access) = access {
+        if let Some(principal) = access.resolve(headers).await? {
+            if let Some(pat) = mgmt_pat {
+                if principal != owner {
+                    let resp = Client::new()
+                        .get(format!(
+                            "https://api.github.com/orgs/{owner}/members/{principal}"
+                        ))
+                        .bearer_auth(pat)
+                        .header("User-Agent", "devopsdefender")
+                        .send()
+                        .await
+                        .map_err(|e| Error::Upstream(format!("github orgs/members: {e}")))?;
+                    if resp.status().as_u16() != 204 {
+                        return Err(Error::Unauthorized);
+                    }
+                }
+            }
+            return Ok(principal);
+        }
     }
     if let Some(pat) = bearer(headers) {
         return verify_pat(&pat, owner).await;

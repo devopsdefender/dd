@@ -9,7 +9,23 @@ use base64::Engine;
 use reqwest::{Client, Method};
 use serde::{Deserialize, Serialize};
 
-use crate::config::{AccessAllow, CfAccess, CfCreds};
+use crate::config::{CfAccess, CfCreds};
+
+/// Paths under the wildcard Access domain that programmatic callers
+/// (CI probes, agent → CP handshake, slopandmop browser → agent
+/// deploy) hit with Bearer PAT. The CP upserts a bypass app for
+/// each on startup so CF Access doesn't 302 them to the login page
+/// before the Bearer reaches the origin. The app still enforces
+/// Bearer PAT + `verify_pat` internally — "bypass" at CF only means
+/// "don't challenge at the edge."
+pub const BYPASS_PATHS: &[&str] = &[
+    "health",
+    "cp/attest",
+    "register",
+    "ingress/replace",
+    "deploy",
+    "exec",
+];
 use crate::error::{Error, Result};
 
 const API: &str = "https://api.cloudflare.com/client/v4";
@@ -340,6 +356,107 @@ pub async fn discover_access(
     }))
 }
 
+/// Upsert the CF Access bypass apps for the programmatic paths
+/// listed in `BYPASS_PATHS`. Each one is a self-hosted app on the
+/// wildcard domain `*.{cf.domain}/{path}` with a single bypass
+/// policy (`include: everyone`). CF Access matches longest-domain
+/// first, so these override the global `*.{cf.domain}` allow app
+/// for their specific paths. Idempotent — skip/update on the app's
+/// `name`. Best-effort: log-and-continue on error so the CP still
+/// starts if CF Access isn't fully set up yet.
+pub async fn ensure_bypass_apps(http: &Client, cf: &CfCreds) -> Result<()> {
+    let existing = call(
+        http,
+        cf,
+        Method::GET,
+        &format!("/accounts/{}/access/apps?per_page=200", cf.account_id),
+        None,
+    )
+    .await
+    .ok();
+    let existing_map: std::collections::HashMap<String, String> = existing
+        .as_ref()
+        .and_then(|r| r["result"].as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|a| {
+                    let name = a["name"].as_str()?.to_string();
+                    let id = a["id"].as_str()?.to_string();
+                    Some((name, id))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    for path in BYPASS_PATHS {
+        let name = format!("dd-bypass-{}", path.replace('/', "-"));
+        let domain = format!("*.{}/{path}", cf.domain);
+        let body = serde_json::json!({
+            "name": name,
+            "type": "self_hosted",
+            "domain": domain,
+            "session_duration": "24h",
+            "auto_redirect_to_identity": false,
+        });
+        let app_id = if let Some(id) = existing_map.get(&name) {
+            let _ = call(
+                http,
+                cf,
+                Method::PUT,
+                &format!("/accounts/{}/access/apps/{id}", cf.account_id),
+                Some(body),
+            )
+            .await;
+            id.clone()
+        } else {
+            let resp = call(
+                http,
+                cf,
+                Method::POST,
+                &format!("/accounts/{}/access/apps", cf.account_id),
+                Some(body),
+            )
+            .await?;
+            resp["result"]["id"]
+                .as_str()
+                .ok_or_else(|| Error::Upstream(format!("access app {name}: missing id")))?
+                .to_string()
+        };
+        let policies = call(
+            http,
+            cf,
+            Method::GET,
+            &format!("/accounts/{}/access/apps/{app_id}/policies", cf.account_id),
+            None,
+        )
+        .await
+        .ok();
+        let have_bypass = policies
+            .as_ref()
+            .and_then(|p| p["result"].as_array())
+            .map(|arr| arr.iter().any(|p| p["decision"].as_str() == Some("bypass")))
+            .unwrap_or(false);
+        if !have_bypass {
+            let _ = call(
+                http,
+                cf,
+                Method::POST,
+                &format!("/accounts/{}/access/apps/{app_id}/policies", cf.account_id),
+                Some(serde_json::json!({
+                    "name": "bypass",
+                    "decision": "bypass",
+                    "include": [{"everyone": {}}],
+                    "precedence": 1,
+                })),
+            )
+            .await;
+        }
+        eprintln!("cp: CF Access bypass app ensured for {domain}");
+    }
+    Ok(())
+}
+
 fn normalize_access_issuer(raw: &str) -> String {
     let raw = raw.trim().trim_end_matches('/');
     if raw.starts_with("https://") || raw.starts_with("http://") {
@@ -401,342 +518,6 @@ fn pattern_host(pattern: &str) -> Option<String> {
         .trim()
         .trim_end_matches('.');
     (!host.is_empty()).then(|| host.to_ascii_lowercase())
-}
-
-/// Find the account's GitHub Access IdP. Required for the `Org` allow
-/// path: CF Access's `github-organization` policy include references
-/// a GitHub IdP UUID, and there's no code path that works without
-/// one. A GitHub IdP has to be created manually in the Cloudflare
-/// Access dashboard exactly once per account.
-pub async fn github_idp_uuid(http: &Client, cf: &CfCreds) -> Result<String> {
-    let resp = call(
-        http,
-        cf,
-        Method::GET,
-        &format!("/accounts/{}/access/identity_providers", cf.account_id),
-        None,
-    )
-    .await?;
-    resp["result"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .find(|idp| idp["type"].as_str() == Some("github"))
-        .and_then(|idp| idp["id"].as_str().map(String::from))
-        .ok_or_else(|| {
-            Error::Upstream(
-                "no GitHub IdP found in CF Access; add one at dash.cloudflare.com → Zero Trust → Settings → Authentication → Login methods".into(),
-            )
-        })
-}
-
-/// Build the policy `include` block for an allow policy given the
-/// resolved `AccessAllow` shape. Org case uses `github-organization`
-/// (requires the GitHub IdP UUID); email case is one `email` include
-/// per address so each is independently matchable.
-fn access_allow_include(allow: &AccessAllow, github_idp: &str) -> serde_json::Value {
-    match allow {
-        AccessAllow::Org(name) => serde_json::json!([{
-            "github-organization": { "name": name, "identity_provider_id": github_idp }
-        }]),
-        AccessAllow::Emails(emails) => serde_json::Value::Array(
-            emails
-                .iter()
-                .map(|e| serde_json::json!({ "email": { "email": e } }))
-                .collect(),
-        ),
-    }
-}
-
-/// Ensure a self-hosted Access app exists covering `app_domain`
-/// (which may include a path like `"app.example.com/register"` for
-/// path-scoped bypass apps) with the named single policy attached.
-/// Idempotent — app is matched by `name` and updated in place if it
-/// already exists. Returns the app's `aud`.
-#[allow(clippy::too_many_arguments)]
-async fn ensure_access_app(
-    http: &Client,
-    cf: &CfCreds,
-    name: &str,
-    app_domain: &str,
-    session_duration: &str,
-    policy_name: &str,
-    policy_decision: &str,
-    policy_include: serde_json::Value,
-) -> Result<String> {
-    // Find existing app by name.
-    let apps = call(
-        http,
-        cf,
-        Method::GET,
-        &format!("/accounts/{}/access/apps?per_page=200", cf.account_id),
-        None,
-    )
-    .await?;
-    let existing = apps["result"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .find(|a| a["name"].as_str() == Some(name))
-        .cloned();
-
-    let app_body = serde_json::json!({
-        "name": name,
-        "type": "self_hosted",
-        "domain": app_domain,
-        "session_duration": session_duration,
-        "auto_redirect_to_identity": false,
-    });
-
-    let app = if let Some(e) = existing {
-        let id = e["id"]
-            .as_str()
-            .ok_or_else(|| Error::Upstream(format!("access app {name}: missing id")))?;
-        call(
-            http,
-            cf,
-            Method::PUT,
-            &format!("/accounts/{}/access/apps/{id}", cf.account_id),
-            Some(app_body),
-        )
-        .await?
-    } else {
-        call(
-            http,
-            cf,
-            Method::POST,
-            &format!("/accounts/{}/access/apps", cf.account_id),
-            Some(app_body),
-        )
-        .await?
-    };
-
-    let app_id = app["result"]["id"]
-        .as_str()
-        .ok_or_else(|| Error::Upstream(format!("access app {name}: missing id after upsert")))?
-        .to_string();
-    let aud = app["result"]["aud"]
-        .as_str()
-        .ok_or_else(|| Error::Upstream(format!("access app {name}: missing aud")))?
-        .to_string();
-
-    // Ensure the single policy attached to this app matches what we want.
-    let policies = call(
-        http,
-        cf,
-        Method::GET,
-        &format!("/accounts/{}/access/apps/{app_id}/policies", cf.account_id),
-        None,
-    )
-    .await?;
-    let existing_policies: Vec<&serde_json::Value> = policies["result"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .collect();
-
-    let policy_body = serde_json::json!({
-        "name": policy_name,
-        "decision": policy_decision,
-        "include": policy_include,
-        "precedence": 1,
-    });
-
-    if let Some(p) = existing_policies
-        .iter()
-        .find(|p| p["name"].as_str() == Some(policy_name))
-    {
-        let pid = p["id"]
-            .as_str()
-            .ok_or_else(|| Error::Upstream(format!("access policy {policy_name}: missing id")))?;
-        call(
-            http,
-            cf,
-            Method::PUT,
-            &format!(
-                "/accounts/{}/access/apps/{app_id}/policies/{pid}",
-                cf.account_id
-            ),
-            Some(policy_body),
-        )
-        .await?;
-    } else {
-        call(
-            http,
-            cf,
-            Method::POST,
-            &format!("/accounts/{}/access/apps/{app_id}/policies", cf.account_id),
-            Some(policy_body),
-        )
-        .await?;
-    }
-
-    // Strip any stale policies attached to this app — idempotence
-    // across schema changes.
-    for p in &existing_policies {
-        if p["name"].as_str() == Some(policy_name) {
-            continue;
-        }
-        let Some(pid) = p["id"].as_str() else {
-            continue;
-        };
-        let _ = call(
-            http,
-            cf,
-            Method::DELETE,
-            &format!(
-                "/accounts/{}/access/apps/{app_id}/policies/{pid}",
-                cf.account_id
-            ),
-            None,
-        )
-        .await;
-    }
-
-    Ok(aud)
-}
-
-/// Provision the Access apps covering the CP hostname:
-///
-/// - **Main app** (`<hostname>`) — allow policy gating everything
-///   behind the configured `AccessAllow`.
-/// - **Bypass apps** (`<hostname>/register`, `<hostname>/ingress/replace`)
-///   — `decision: bypass`, include everyone. These paths carry
-///   agent → CP Bearer-PAT calls that can't present a CF Access JWT.
-///
-/// Returns the main app's `CfAccess` (issuer + audience + JWKS URL)
-/// ready to seed the `AccessValidator`. Idempotent across restarts.
-pub async fn provision_cp_access(
-    http: &Client,
-    cf: &CfCreds,
-    env_label: &str,
-    hostname: &str,
-    allow: &AccessAllow,
-) -> Result<CfAccess> {
-    let idp = match allow {
-        AccessAllow::Org(_) => github_idp_uuid(http, cf).await?,
-        AccessAllow::Emails(_) => String::new(),
-    };
-    let main_aud = ensure_access_app(
-        http,
-        cf,
-        &format!("dd-{env_label}-cp"),
-        hostname,
-        "24h",
-        "allow owner",
-        "allow",
-        access_allow_include(allow, &idp),
-    )
-    .await?;
-
-    for path in ["register", "ingress/replace"] {
-        ensure_access_app(
-            http,
-            cf,
-            &format!("dd-{env_label}-cp-bypass-{}", path.replace('/', "-")),
-            &format!("{hostname}/{path}"),
-            "24h",
-            "bypass programmatic",
-            "bypass",
-            serde_json::json!([{ "everyone": {} }]),
-        )
-        .await?;
-    }
-
-    let issuer = access_issuer(http, cf).await?;
-    Ok(CfAccess {
-        jwks_url: format!("{issuer}/cdn-cgi/access/certs"),
-        issuer,
-        audiences: vec![main_aud],
-    })
-}
-
-/// Provision a single allow-policy Access app covering an agent's
-/// main hostname. Called from `/register` for each agent. Returns
-/// the `CfAccess` validator metadata the CP sends back to the agent
-/// in its bootstrap payload.
-pub async fn provision_agent_access(
-    http: &Client,
-    cf: &CfCreds,
-    env_label: &str,
-    hostname: &str,
-    allow: &AccessAllow,
-) -> Result<CfAccess> {
-    let idp = match allow {
-        AccessAllow::Org(_) => github_idp_uuid(http, cf).await?,
-        AccessAllow::Emails(_) => String::new(),
-    };
-    let aud = ensure_access_app(
-        http,
-        cf,
-        &format!("dd-{env_label}-agent-{}", hostname),
-        hostname,
-        "24h",
-        "allow owner",
-        "allow",
-        access_allow_include(allow, &idp),
-    )
-    .await?;
-    let issuer = access_issuer(http, cf).await?;
-    Ok(CfAccess {
-        jwks_url: format!("{issuer}/cdn-cgi/access/certs"),
-        issuer,
-        audiences: vec![aud],
-    })
-}
-
-/// Delete any Access apps we provisioned for an agent hostname.
-/// Best-effort — failures don't propagate; a stray app gets cleaned
-/// up the next time the user edits it or we re-reap.
-pub async fn delete_access_apps_for(http: &Client, cf: &CfCreds, hostname: &str) {
-    let Ok(resp) = call(
-        http,
-        cf,
-        Method::GET,
-        &format!("/accounts/{}/access/apps?per_page=200", cf.account_id),
-        None,
-    )
-    .await
-    else {
-        return;
-    };
-    let Some(items) = resp["result"].as_array() else {
-        return;
-    };
-    for app in items {
-        let Some(id) = app["id"].as_str() else {
-            continue;
-        };
-        let Some(d) = app["domain"].as_str() else {
-            continue;
-        };
-        let host = d.split('/').next().unwrap_or(d);
-        if host == hostname {
-            let _ = call(
-                http,
-                cf,
-                Method::DELETE,
-                &format!("/accounts/{}/access/apps/{id}", cf.account_id),
-                None,
-            )
-            .await;
-        }
-    }
-}
-
-async fn access_issuer(http: &Client, cf: &CfCreds) -> Result<String> {
-    let org = call(
-        http,
-        cf,
-        Method::GET,
-        &format!("/accounts/{}/access/organizations", cf.account_id),
-        None,
-    )
-    .await?;
-    let auth_domain = org["result"]["auth_domain"]
-        .as_str()
-        .ok_or_else(|| Error::Upstream("CF Access organization: missing auth_domain".into()))?;
-    Ok(normalize_access_issuer(auth_domain))
 }
 
 /// `Some(true)` if present, `Some(false)` if confirmed deleted, `None`
