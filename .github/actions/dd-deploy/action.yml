@@ -56,8 +56,14 @@ runs:
         fi
 
         # Discover the agent hostname on the CP. /api/agents is
-        # CF-Access-bypassed (public read).
-        agent_host=$(curl -fsS "${CP_URL}/api/agents" \
+        # CF-Access-bypassed (public read). Curl's native --retry
+        # absorbs the transient 5xx (notably CF 530 "origin
+        # unreachable") that reliably hits right after an agent
+        # relaunch — the edge is momentarily between routes. ~30 s
+        # of retries, no bash loop.
+        agent_host=$(curl -fsS \
+          --retry 6 --retry-delay 5 --retry-all-errors \
+          "${CP_URL}/api/agents" \
           | jq -r --arg vm "$VM_NAME" '
               [.[] | select(.vm_name == $vm and .status == "healthy")]
               | sort_by(.last_seen) | reverse | .[0].hostname // empty')
@@ -82,10 +88,12 @@ runs:
         echo "app-name=$app_name" >> "$GITHUB_OUTPUT"
 
         echo "POST /deploy to $agent_host (app=$app_name, repo=$GITHUB_REPOSITORY)"
-        # Capture the body so we can show what EE said — the agent
-        # forwards EE's response verbatim and a non-2xx from the edge
-        # is the only signal curl -f catches.
-        body=$(curl -fsS -X POST "https://${agent_host}/deploy" \
+        # Same CF-edge transient can hit the agent hostname too —
+        # reuse the same retry envelope. Capture the body so we can
+        # show what EE said; the agent forwards it verbatim.
+        body=$(curl -fsS \
+          --retry 6 --retry-delay 5 --retry-all-errors \
+          -X POST "https://${agent_host}/deploy" \
           -H "Authorization: Bearer ${oidc}" \
           -H "Content-Type: application/json" \
           -d "$spec")
