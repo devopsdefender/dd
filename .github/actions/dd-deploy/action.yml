@@ -103,5 +103,18 @@ runs:
           done
           echo "::error::$app_name never appeared in /health within ${WAIT_SECS}s. Last deployments:"
           echo "$health" | jq '.deployments // []'
+          # Surface the agent's own stdout so we have agent-side
+          # ground truth without needing SSH. Failing to fetch is
+          # itself a signal ("agent isn't reachable") so we keep
+          # exit 1 regardless — but we want the fetch attempt to
+          # print whatever it can.
+          echo "--- dd-agent log from ${agent_host} ---"
+          agent_log=$(curl -fsS -H "Authorization: Bearer ${oidc}" \
+            "https://${agent_host}/logs/dd-agent" 2>&1 || true)
+          if echo "$agent_log" | jq -e '.lines' >/dev/null 2>&1; then
+            echo "$agent_log" | jq -r '.lines[]?'
+          else
+            echo "$agent_log"
+          fi
           exit 1
         fi

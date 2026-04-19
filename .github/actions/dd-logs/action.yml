@@ -1,0 +1,73 @@
+name: Pull a workload's log from a DD agent
+description: >-
+  Mint a per-job GitHub Actions OIDC token, discover the target
+  agent's current hostname from the DD control-plane's /api/agents,
+  and GET `https://<agent>/logs/<app>` to retrieve EE's captured
+  stdout for the named workload. Useful for ad-hoc debugging and
+  for CI to surface agent-side context when a deploy times out.
+
+  Requires `permissions: id-token: write` on the calling job.
+
+inputs:
+  cp-url:
+    description: 'Control-plane URL (e.g. https://app.devopsdefender.com)'
+    required: true
+  vm-name:
+    description: 'Target agent vm_name as reported on /api/agents (e.g. dd-local-prod)'
+    required: true
+  app:
+    description: 'app_name of the workload whose log to fetch (e.g. dd-agent, cloudflared, hello-world)'
+    required: true
+  audience:
+    description: 'OIDC audience the agent expects — must match gh_oidc::Verifier audience (default: dd-agent)'
+    required: false
+    default: dd-agent
+
+outputs:
+  agent-host:
+    description: 'Hostname the log was pulled from'
+    value: ${{ steps.fetch.outputs.agent-host }}
+
+runs:
+  using: composite
+  steps:
+    - name: Fetch
+      id: fetch
+      shell: bash
+      env:
+        CP_URL: ${{ inputs.cp-url }}
+        VM_NAME: ${{ inputs.vm-name }}
+        APP: ${{ inputs.app }}
+        AUDIENCE: ${{ inputs.audience }}
+      run: |
+        set -euo pipefail
+
+        if [ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
+          echo "::error::id-token not available — the calling job needs 'permissions: id-token: write'"
+          exit 1
+        fi
+
+        agent_host=$(curl -fsS "${CP_URL}/api/agents" \
+          | jq -r --arg vm "$VM_NAME" '
+              [.[] | select(.vm_name == $vm and .status == "healthy")]
+              | sort_by(.last_seen) | reverse | .[0].hostname // empty')
+        if [ -z "$agent_host" ]; then
+          echo "::error::no healthy agent with vm_name=$VM_NAME"
+          exit 1
+        fi
+        echo "agent-host=$agent_host" >> "$GITHUB_OUTPUT"
+
+        oidc=$(curl -fsSL \
+          -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+          "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${AUDIENCE}" | jq -r .value)
+
+        echo "GET /logs/${APP} from ${agent_host}"
+        body=$(curl -fsS -H "Authorization: Bearer ${oidc}" \
+          "https://${agent_host}/logs/${APP}")
+        # EE returns {lines: [...]}; fall back to the raw body if the
+        # shape is unexpected so callers still see something useful.
+        if echo "$body" | jq -e '.lines' >/dev/null 2>&1; then
+          echo "$body" | jq -r '.lines[]?'
+        else
+          echo "$body"
+        fi

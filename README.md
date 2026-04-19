@@ -85,6 +85,8 @@ jobs:
 
 The agent verifies the OIDC token against GitHub's JWKS, checks `repository_owner == DD_OWNER`, and launches the workload. Full inputs/outputs in [`.github/actions/dd-deploy/README.md`](.github/actions/dd-deploy/README.md).
 
+The companion [`dd-logs`](.github/actions/dd-logs/README.md) action pulls any workload's captured stdout from the same agent (`GET /logs/{app}`) using the same OIDC auth. `dd-deploy` also uses it internally to dump `dd-agent`'s own log when a deploy times out, so CI logs show agent-side ground truth without an SSH hop.
+
 ## STONITH
 
 When a new management VM boots, `dd-register` needs to kick out the old one. It does this by deleting the old tunnel via the Cloudflare API — when the old `cloudflared` loses its tunnel, it exits, and the old `dd-register` observes the exit and calls `poweroff`. The old VM shuts down, GCP marks it TERMINATED.

@@ -60,7 +60,22 @@ async fn call(
             "CF {method} {path} → {status}: {body}"
         )));
     }
-    Ok(resp.json().await?)
+    let parsed: serde_json::Value = resp.json().await?;
+    // CF v4 API returns 200 with {success: false, errors: [...]} on
+    // validation failures. We used to silently drop those — which led
+    // to Access apps that appeared created but never matched any
+    // requests (manifested as /health etc. 503'ing behind the root
+    // human app). Promote to Err so the CP's `?` unwinding catches it.
+    if parsed.get("success") == Some(&serde_json::Value::Bool(false)) {
+        let errors = parsed
+            .get("errors")
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        return Err(Error::Upstream(format!(
+            "CF {method} {path}: success=false errors={errors}"
+        )));
+    }
+    Ok(parsed)
 }
 
 /// Create (or recreate) a CF tunnel with ingress pointing at the local
@@ -122,6 +137,20 @@ pub async fn update_ingress(
     apply_ingress(http, cf, tunnel_id, hostname, extras).await
 }
 
+/// Turn `(hostname="pr-144.devopsdefender.com", label="term")` into
+/// `"pr-144-term.devopsdefender.com"`. Cloudflare's Universal SSL
+/// only covers one level of wildcard (`*.devopsdefender.com`), so
+/// we can't nest sub-workload subdomains under the agent's hostname
+/// — the TLS handshake fails for `foo.bar.devopsdefender.com`.
+/// Flattening the prefix keeps every workload URL one-level deep
+/// under the zone apex.
+pub fn label_hostname(hostname: &str, label: &str) -> String {
+    match hostname.split_once('.') {
+        Some((base, rest)) => format!("{base}-{label}.{rest}"),
+        None => format!("{hostname}-{label}"),
+    }
+}
+
 /// Build the ingress array (extras first, then the primary
 /// `hostname → localhost:8080` rule, then the 404 catch-all), PUT
 /// it to the tunnel, and upsert a CNAME for each hostname pointing
@@ -137,7 +166,7 @@ async fn apply_ingress(
         .iter()
         .map(|(label, port)| {
             serde_json::json!({
-                "hostname": format!("{label}.{hostname}"),
+                "hostname": label_hostname(hostname, label),
                 "service": format!("http://localhost:{port}"),
             })
         })
@@ -163,7 +192,7 @@ async fn apply_ingress(
     upsert_cname(http, cf, tunnel_id, hostname).await?;
     let mut extra_hostnames = Vec::with_capacity(extras.len());
     for (label, _) in extras {
-        let extra = format!("{label}.{hostname}");
+        let extra = label_hostname(hostname, label);
         upsert_cname(http, cf, tunnel_id, &extra).await?;
         extra_hostnames.push(extra);
     }
@@ -442,10 +471,21 @@ async fn ensure_bypass_app(http: &Client, cf: &CfCreds, name: &str, domain: &str
     Ok(())
 }
 
+/// Hostname labels that run admin workloads (shell access, future
+/// log viewer, future metrics panel). These get a human CF Access
+/// app, not a public bypass — otherwise exposing ttyd on a public
+/// subdomain would be a free shell for the internet.
+const ADMIN_LABELS: &[&str] = &["term"];
+
+fn is_admin_label(label: &str) -> bool {
+    ADMIN_LABELS.contains(&label)
+}
+
 /// Provision the CP's Access apps at startup.
 ///
 /// Apps created:
 ///   - Human: `{hostname}` — GitHub org or admin email (dashboard, /agent/*, /cp/*)
+///   - Human: `term.{hostname}` — ttyd shell, org members only
 ///   - Bypass: `{hostname}/health` — public (read-only fleet health)
 ///   - Bypass: `{hostname}/cp/attest` — TDX quote is self-authenticating
 ///   - Bypass: `{hostname}/api/agents` — read-only agent list
@@ -462,7 +502,23 @@ pub async fn provision_cp_access(
     let idp = github_idp_uuid(http, cf).await?;
     let human = human_policy(owner, admin_email, &idp);
 
-    ensure_app(http, cf, &format!("dd-{env}-cp"), hostname, vec![human]).await?;
+    ensure_app(
+        http,
+        cf,
+        &format!("dd-{env}-cp"),
+        hostname,
+        vec![human.clone()],
+    )
+    .await?;
+    // CP's own ttyd subdomain — human-gated, same policy as root.
+    ensure_app(
+        http,
+        cf,
+        &format!("dd-{env}-cp-term"),
+        &label_hostname(hostname, "term"),
+        vec![human],
+    )
+    .await?;
     for (suffix, label) in [
         ("/health", "health"),
         ("/cp/attest", "attest"),
@@ -486,11 +542,14 @@ pub async fn provision_cp_access(
 /// bypass apps and labels that disappeared get cleaned up.
 ///
 ///   - Human: `{agent}.{domain}` — browser dashboard only
+///   - Human: `<admin-label>.{agent}.{domain}` for labels in
+///     `ADMIN_LABELS` (ttyd et al) — org members only
 ///   - Bypass: `{agent}.{domain}/health` — public
 ///   - Bypass: `{agent}.{domain}/deploy` — GH-OIDC-gated in code
 ///   - Bypass: `{agent}.{domain}/exec` — GH-OIDC-gated in code
-///   - Bypass: `{label}.{agent}.{domain}` for each label — workload URLs
-///     are public by default (this is the nvidia-smi exemption).
+///   - Bypass: `{agent}.{domain}/logs/*` — GH-OIDC-gated in code
+///   - Bypass: `{label}.{agent}.{domain}` for other labels — workload
+///     URLs are public by default (this is the nvidia-smi exemption).
 ///   - Any existing `*.{agent}.{domain}` app whose label is no longer
 ///     in `workload_labels` is deleted.
 pub async fn provision_agent_access(
@@ -517,6 +576,7 @@ pub async fn provision_agent_access(
         ("/health", "health"),
         ("/deploy", "deploy"),
         ("/exec", "exec"),
+        ("/logs", "logs"),
     ] {
         ensure_bypass_app(
             http,
@@ -529,16 +589,35 @@ pub async fn provision_agent_access(
 
     let desired: std::collections::HashSet<String> = workload_labels
         .iter()
-        .map(|l| format!("{l}.{agent_hostname}"))
+        .map(|l| label_hostname(agent_hostname, l))
         .collect();
-    for domain in &desired {
-        ensure_bypass_app(http, cf, &format!("dd-{env}-workload-{domain}"), domain).await?;
+    for label in workload_labels {
+        let domain = label_hostname(agent_hostname, label);
+        if is_admin_label(label) {
+            ensure_app(
+                http,
+                cf,
+                &format!("dd-{env}-workload-{domain}"),
+                &domain,
+                vec![human_policy(owner, admin_email, &idp)],
+            )
+            .await?;
+        } else {
+            ensure_bypass_app(http, cf, &format!("dd-{env}-workload-{domain}"), &domain).await?;
+        }
     }
 
-    // Reap any stale workload bypass apps under this agent that are
-    // no longer in the desired set. Matches on domain suffix so we
-    // don't accidentally delete the agent's own human app.
-    let suffix = format!(".{agent_hostname}");
+    // Reap any stale workload apps under this agent that are no
+    // longer in the desired set. Flat-subdomain workload URLs look
+    // like `{base}-{label}.{tld}` (one level deep — see
+    // `label_hostname` for why). Prefix + suffix match so we don't
+    // accidentally delete the agent's own human app at
+    // `{base}.{tld}`.
+    let (base, tld) = agent_hostname
+        .split_once('.')
+        .unwrap_or((agent_hostname, ""));
+    let prefix = format!("{base}-");
+    let suffix_tld = format!(".{tld}");
     let resp = call(
         http,
         cf,
@@ -552,7 +631,7 @@ pub async fn provision_agent_access(
             let Some(domain) = app["domain"].as_str() else {
                 continue;
             };
-            if !domain.ends_with(&suffix) || domain == agent_hostname {
+            if !(domain.starts_with(&prefix) && domain.ends_with(&suffix_tld)) {
                 continue;
             }
             if desired.contains(domain) {
@@ -591,15 +670,21 @@ pub async fn delete_access_apps_for(http: &Client, cf: &CfCreds, agent_hostname:
     let Some(items) = resp["result"].as_array() else {
         return;
     };
-    let suffix = format!(".{agent_hostname}");
+    let (base, tld) = agent_hostname
+        .split_once('.')
+        .unwrap_or((agent_hostname, ""));
+    let prefix = format!("{base}-");
+    let suffix_tld = format!(".{tld}");
     for app in items {
         let Some(domain) = app["domain"].as_str() else {
             continue;
         };
+        // Match: the agent hostname itself, any path-scoped app
+        // under it, and flat-subdomain workload URLs of the shape
+        // `{base}-*.{tld}`.
         let matches_agent = domain == agent_hostname
             || domain.starts_with(&format!("{agent_hostname}/"))
-            || domain.ends_with(&suffix)
-            || domain.contains(&format!(".{agent_hostname}/"));
+            || (domain.starts_with(&prefix) && domain.ends_with(&suffix_tld));
         if !matches_agent {
             continue;
         }
@@ -613,5 +698,31 @@ pub async fn delete_access_apps_for(http: &Client, cf: &CfCreds, agent_hostname:
             )
             .await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn label_hostname_flattens_to_one_level() {
+        assert_eq!(
+            label_hostname("pr-144.devopsdefender.com", "term"),
+            "pr-144-term.devopsdefender.com"
+        );
+        assert_eq!(
+            label_hostname("dd-pr-144-agent-abc.devopsdefender.com", "gpu"),
+            "dd-pr-144-agent-abc-gpu.devopsdefender.com"
+        );
+        assert_eq!(
+            label_hostname("app.devopsdefender.com", "term"),
+            "app-term.devopsdefender.com"
+        );
+    }
+
+    #[test]
+    fn label_hostname_handles_dotless_hostname() {
+        assert_eq!(label_hostname("localhost", "term"), "localhost-term");
     }
 }

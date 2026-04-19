@@ -6,8 +6,11 @@
 //! responds with `{tunnel_token, hostname, agent_id, cp_hostname}`.
 //!
 //! Auth after registration:
-//!   - Browser routes (`/`, `/workload/*`, `/session/*`) are behind
-//!     CF Access with the same human policy as the CP dashboard.
+//!   - Browser routes (`/`, `/workload/*`) are behind CF Access with
+//!     the same human policy as the CP dashboard.
+//!   - Terminal is a separate `ttyd` workload published on
+//!     `term.<hostname>` — each connection spawns a fresh `/bin/sh`,
+//!     not tied to any deployment.
 //!   - `/deploy` and `/exec` are CF-Access-bypassed and gated in-code
 //!     by a GitHub Actions OIDC token — any CI workflow in the
 //!     `DD_OWNER` org can call them by presenting its per-job OIDC
@@ -18,7 +21,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use axum::extract::{Path, State, WebSocketUpgrade};
+use axum::extract::{Path, State};
 use axum::http::HeaderMap;
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
@@ -33,7 +36,6 @@ use crate::gh_oidc;
 use crate::html::{self, shell};
 use crate::ita;
 use crate::metrics;
-use crate::terminal;
 
 /// Re-mint interval. Intel ITA tokens typically expire in a few
 /// minutes; refresh well before so `/health` always serves a live
@@ -125,10 +127,9 @@ pub async fn run() -> Result<()> {
         .route("/", get(dashboard))
         .route("/health", get(health))
         .route("/workload/{id}", get(workload_page))
-        .route("/session/{app}", get(session_page))
-        .route("/ws/session/{app}", get(session_ws))
         .route("/deploy", post(deploy))
         .route("/exec", post(exec))
+        .route("/logs/{app}", get(logs))
         .with_state(state);
 
     let addr = format!("0.0.0.0:{}", cfg.common.port);
@@ -290,13 +291,8 @@ async fn dashboard(State(s): State<St>) -> Response {
         let id = d["id"].as_str().unwrap_or("");
         let app = d["app_name"].as_str().unwrap_or("unnamed");
         let image = d["image"].as_str().unwrap_or("");
-        let session = if status == "running" {
-            format!(r#"<a href="/session/{app}">shell</a>"#)
-        } else {
-            r#"<span class="dim">—</span>"#.into()
-        };
         rows.push_str(&format!(
-            r#"<tr><td><a href="/workload/{id}">{app}</a></td><td><span class="pill {cls}">{status}</span></td><td class="dim">{image}</td><td>{session}</td></tr>"#
+            r#"<tr><td><a href="/workload/{id}">{app}</a></td><td><span class="pill {cls}">{status}</span></td><td class="dim">{image}</td><td><a href="/workload/{id}">logs</a></td></tr>"#
         ));
     }
 
@@ -304,20 +300,27 @@ async fn dashboard(State(s): State<St>) -> Response {
         r#"<div class="empty">No workloads running</div>"#.to_string()
     } else {
         format!(
-            r#"<table><tr><th>app</th><th>status</th><th>image</th><th>session</th></tr>{rows}</table>"#
+            r#"<table><tr><th>app</th><th>status</th><th>image</th><th></th></tr>{rows}</table>"#
         )
     };
+
+    // `{hostname-base}-term.{tld}` is the ttyd subdomain provisioned
+    // at register time. Human-gated by CF Access; each click spawns
+    // a fresh /bin/sh inside this VM with no state carried from any
+    // workload. Flat shape so Universal SSL covers the cert.
+    let term_host = html::escape(&crate::cf::label_hostname(&s.hostname, "term"));
 
     let body = format!(
         r#"<h1>{hostname}</h1>
 <div class="sub">{vm} · {att}</div>
-<div class="meta"><span class="ok">healthy</span> · uptime {up} · {count} workload(s)</div>
+<div class="meta"><span class="ok">healthy</span> · uptime {up} · {count} workload(s) · <a href="https://{term_host}/" target="_blank">Terminal ↗</a></div>
 <div class="cards">
   <div class="card"><div class="label">CPU</div><div class="value green">{cpu}%</div></div>
   <div class="card"><div class="label">Memory</div><div class="value blue">{mu} / {mt}</div></div>
   <div class="card"><div class="label">Load 1m</div><div class="value mauve">{load:.2}</div></div>
 </div>
 <div class="section">Workloads</div>{table}"#,
+        term_host = term_host,
         hostname = html::escape(&s.hostname),
         vm = html::escape(&s.cfg.common.vm_name),
         att = html::escape(att),
@@ -373,13 +376,6 @@ async fn workload_page(State(s): State<St>, Path(id): Path<String>) -> Result<Re
             html::escape(error)
         )
     };
-    let session_link = if status == "running" {
-        format!(
-            r#"<p style="margin:12px 0"><a href="/session/{app}">Open terminal session</a></p>"#
-        )
-    } else {
-        String::new()
-    };
 
     let body = format!(
         r#"<div class="back"><a href="/">← dashboard</a></div>
@@ -391,7 +387,6 @@ async fn workload_page(State(s): State<St>, Path(id): Path<String>) -> Result<Re
   <div class="row"><span>Started</span><span>{started}</span></div>
   {err_row}
 </div>
-{session_link}
 <div class="section">Logs</div>
 <pre style="max-height:60vh">{logs}</pre>"#,
         app = html::escape(app),
@@ -406,7 +401,6 @@ async fn workload_page(State(s): State<St>, Path(id): Path<String>) -> Result<Re
         image = html::escape(image),
         started = html::escape(started),
         err_row = err_row,
-        session_link = session_link,
         logs = if log_text.is_empty() {
             "<span class=\"dim\">No logs</span>".into()
         } else {
@@ -420,11 +414,6 @@ async fn workload_page(State(s): State<St>, Path(id): Path<String>) -> Result<Re
         &body,
     ))
     .into_response())
-}
-
-async fn session_page(Path(app): Path<String>) -> Response {
-    let ws = format!("/ws/session/{}", urlencoding::encode(&app));
-    Html(terminal::page(&app, &ws)).into_response()
 }
 
 /// Extract + verify a GitHub Actions OIDC bearer token. The /deploy
@@ -544,6 +533,29 @@ fn default_exec_timeout() -> u64 {
     60
 }
 
+/// GET /logs/{app} — look up the EE deployment id for `app` and
+/// return EE's captured stdout. Gated by GH OIDC, same as /deploy
+/// and /exec. 404 if no deployment with that `app_name` exists —
+/// not a server error, callers often probe for optional workloads.
+async fn logs(
+    State(s): State<St>,
+    Path(app): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>> {
+    let _ = require_gh_oidc(&s, &headers).await?;
+    let list = s.ee.list().await?;
+    let id = list["deployments"]
+        .as_array()
+        .and_then(|a| {
+            a.iter()
+                .find(|d| d["app_name"].as_str() == Some(app.as_str()))
+        })
+        .and_then(|d| d["id"].as_str())
+        .map(String::from)
+        .ok_or(Error::NotFound)?;
+    Ok(Json(s.ee.logs(&id).await?))
+}
+
 async fn exec(
     State(s): State<St>,
     headers: HeaderMap,
@@ -551,17 +563,4 @@ async fn exec(
 ) -> Result<Json<serde_json::Value>> {
     let _ = require_gh_oidc(&s, &headers).await?;
     Ok(Json(s.ee.exec(&req.cmd, req.timeout_secs).await?))
-}
-
-async fn session_ws(
-    State(s): State<St>,
-    Path(app): Path<String>,
-    ws: WebSocketUpgrade,
-) -> Result<Response> {
-    let _ = app;
-    let vm = s.cfg.common.vm_name.clone();
-    let ee = s.ee.clone();
-    Ok(ws.on_upgrade(move |socket| async move {
-        terminal::bridge(socket, ee, &vm).await;
-    }))
 }
