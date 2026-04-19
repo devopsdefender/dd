@@ -82,22 +82,26 @@ runs:
         echo "app-name=$app_name" >> "$GITHUB_OUTPUT"
 
         echo "POST /deploy to $agent_host (app=$app_name, repo=$GITHUB_REPOSITORY)"
-        curl -fsS -X POST "https://${agent_host}/deploy" \
+        # Capture the body so we can show what EE said — the agent
+        # forwards EE's response verbatim and a non-2xx from the edge
+        # is the only signal curl -f catches.
+        body=$(curl -fsS -X POST "https://${agent_host}/deploy" \
           -H "Authorization: Bearer ${oidc}" \
           -H "Content-Type: application/json" \
-          -d "$spec"
-        echo
+          -d "$spec")
+        echo "agent response: $body"
 
         if [ "$WAIT_SECS" -gt 0 ]; then
           deadline=$(( $(date +%s) + WAIT_SECS ))
           while [ "$(date +%s)" -lt "$deadline" ]; do
-            if curl -fsS "https://${agent_host}/health" \
-              | jq -e --arg app "$app_name" '.deployments // [] | index($app)' >/dev/null; then
+            health=$(curl -fsS "https://${agent_host}/health" 2>/dev/null || echo '{}')
+            if echo "$health" | jq -e --arg app "$app_name" '.deployments // [] | index($app)' >/dev/null; then
               echo "$app_name visible on $agent_host"
               exit 0
             fi
             sleep 5
           done
-          echo "::error::$app_name never appeared in $agent_host /health within ${WAIT_SECS}s"
+          echo "::error::$app_name never appeared in /health within ${WAIT_SECS}s. Last deployments:"
+          echo "$health" | jq '.deployments // []'
           exit 1
         fi
