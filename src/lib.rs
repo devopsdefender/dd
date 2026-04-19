@@ -1,11 +1,11 @@
 pub mod agent;
-pub mod auth;
 pub mod cf;
 pub mod collector;
 pub mod config;
 pub mod cp;
 pub mod ee;
 pub mod error;
+pub mod gh_oidc;
 pub mod html;
 pub mod ita;
 pub mod metrics;

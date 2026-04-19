@@ -137,8 +137,10 @@ jobs:
             | tail -n +12 \
             | xargs -rI{} gh release delete {} --yes --cleanup-tag
 
-  # Per-PR ephemeral preview at pr-{N}.{domain}. No OAuth (browser login
-  # via /auth/pat). Cascades into dd-local-preview relaunch.
+  # Per-PR ephemeral preview at pr-{N}.{domain}. Browser auth is CF
+  # Access GitHub OAuth (public org membership) across all envs; there
+  # is no longer a preview-vs-prod auth difference. Cascades into
+  # dd-local-preview relaunch.
   deploy-preview:
     if: github.event_name == 'pull_request'
     needs: build
@@ -154,7 +156,6 @@ jobs:
       workload_identity_provider: 'projects/654815109728/locations/global/workloadIdentityPools/github-actions-pool/providers/github-provider'
       service_account: 'easyenclave-staging-ci@eestaging.iam.gserviceaccount.com'
       release_tag: ${{ needs.build.outputs.tag }}
-      oauth_enabled: false
       comment_on_pr: true
       ref: ${{ github.event.pull_request.head.ref }}
     secrets: inherit
@@ -182,7 +183,6 @@ jobs:
       workload_identity_provider: 'projects/779946350556/locations/global/workloadIdentityPools/github-actions-pool/providers/github-provider'
       service_account: 'easyenclave-production-ci@easyenclave.iam.gserviceaccount.com'
       release_tag: ${{ inputs.release_tag || 'latest' }}
-      oauth_enabled: true
       comment_on_pr: false
       ref: main
     secrets: inherit

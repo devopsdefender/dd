@@ -39,8 +39,12 @@ impl Common {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(8080);
+        // DD_OWNER must be a GitHub **organization** login — the CF
+        // Access policy uses the `github-organization` include rule,
+        // which is member-of-org only. A personal-user login here
+        // would produce a policy that silently matches nobody.
         let owner = std::env::var("DD_OWNER")
-            .map_err(|_| Error::Internal("DD_OWNER required (GitHub user or org)".into()))?;
+            .map_err(|_| Error::Internal("DD_OWNER required (GitHub organization login)".into()))?;
         let vm_name = std::env::var("DD_VM_NAME").unwrap_or_else(|_| {
             std::fs::read_to_string("/etc/hostname")
                 .ok()
@@ -88,10 +92,38 @@ impl Ita {
     }
 }
 
+/// CF Access configuration — one email that's always allowed in
+/// alongside GitHub org members. Required so the operator has a
+/// break-glass login path if org membership checks break.
+#[derive(Clone)]
+pub struct CfAccess {
+    pub admin_email: String,
+}
+
+impl CfAccess {
+    pub fn from_env() -> Result<Self> {
+        let admin_email = std::env::var("DD_ACCESS_ADMIN_EMAIL")
+            .map_err(|_| {
+                Error::Internal(
+                    "DD_ACCESS_ADMIN_EMAIL required (break-glass human login for CF Access)".into(),
+                )
+            })?
+            .trim()
+            .to_string();
+        if admin_email.is_empty() || !admin_email.contains('@') {
+            return Err(Error::Internal(
+                "DD_ACCESS_ADMIN_EMAIL must be a valid email address".into(),
+            ));
+        }
+        Ok(Self { admin_email })
+    }
+}
+
 /// Control-plane-mode config.
 pub struct Cp {
     pub common: Common,
     pub cf: CfCreds,
+    pub access: CfAccess,
     pub hostname: String,
     pub scrape_interval_secs: u64,
     pub ita: Ita,
@@ -101,6 +133,7 @@ impl Cp {
     pub fn from_env() -> Result<Self> {
         let common = Common::from_env()?;
         let cf = CfCreds::from_env()?;
+        let access = CfAccess::from_env()?;
         let hostname = std::env::var("DD_HOSTNAME")
             .map_err(|_| Error::Internal("DD_HOSTNAME required in CP mode".into()))?;
         let scrape_interval_secs = std::env::var("DD_SCRAPE_INTERVAL")
@@ -110,6 +143,7 @@ impl Cp {
         Ok(Self {
             common,
             cf,
+            access,
             hostname,
             scrape_interval_secs,
             ita: Ita::from_env()?,
@@ -117,11 +151,12 @@ impl Cp {
     }
 }
 
-/// Agent-mode config.
+/// Agent-mode config. No PAT — the agent authenticates to the CP with
+/// ITA attestation at /register and the CF Access service token
+/// (received in the register response) on subsequent calls.
 pub struct Agent {
     pub common: Common,
     pub cp_url: String,
-    pub pat: String,
     pub ee_socket: String,
     pub ita: Ita,
     /// Extra cloudflared ingress rules requested at register time,
@@ -139,15 +174,12 @@ impl Agent {
         let cp_url = std::env::var("DD_CP_URL").map_err(|_| {
             Error::Internal("DD_CP_URL required (e.g. https://app.devopsdefender.com)".into())
         })?;
-        let pat = std::env::var("DD_PAT")
-            .map_err(|_| Error::Internal("DD_PAT required (GitHub PAT for owner check)".into()))?;
         let ee_socket = std::env::var("EE_SOCKET_PATH")
             .unwrap_or_else(|_| "/var/lib/easyenclave/agent.sock".into());
         let extra_ingress = parse_extra_ingress()?;
         Ok(Self {
             common,
             cp_url,
-            pat,
             ee_socket,
             ita: Ita::from_env()?,
             extra_ingress,

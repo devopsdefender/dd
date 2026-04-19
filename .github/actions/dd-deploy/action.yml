@@ -1,0 +1,103 @@
+name: Deploy workload to a DD agent
+description: >-
+  Mint a per-job GitHub Actions OIDC token, discover the target agent's
+  current hostname from the DD control-plane's /api/agents, and POST
+  the workload JSON to the agent's /deploy endpoint. The agent verifies
+  the OIDC token (issuer = token.actions.githubusercontent.com,
+  repository_owner = DD_OWNER, audience match) entirely in-code — no
+  shared secrets to configure. The caller's job must declare
+  `permissions: id-token: write`.
+
+inputs:
+  cp-url:
+    description: 'Control-plane URL (e.g. https://app.devopsdefender.com)'
+    required: true
+  vm-name:
+    description: 'Target agent vm_name as reported on /api/agents (e.g. dd-local-prod)'
+    required: true
+  workload:
+    description: 'Path to the workload JSON spec to deploy'
+    required: true
+  audience:
+    description: 'OIDC audience the agent expects — must match gh_oidc::Verifier audience (default: dd-agent)'
+    required: false
+    default: dd-agent
+  wait-for-deployment-seconds:
+    description: 'Seconds to poll the agent /health waiting for app_name in deployments. 0 = skip wait.'
+    required: false
+    default: '120'
+
+outputs:
+  agent-host:
+    description: 'Hostname the workload was deployed to'
+    value: ${{ steps.deploy.outputs.agent-host }}
+  app-name:
+    description: 'app_name parsed from the workload JSON'
+    value: ${{ steps.deploy.outputs.app-name }}
+
+runs:
+  using: composite
+  steps:
+    - name: Deploy
+      id: deploy
+      shell: bash
+      env:
+        CP_URL: ${{ inputs.cp-url }}
+        VM_NAME: ${{ inputs.vm-name }}
+        WORKLOAD: ${{ inputs.workload }}
+        AUDIENCE: ${{ inputs.audience }}
+        WAIT_SECS: ${{ inputs.wait-for-deployment-seconds }}
+      run: |
+        set -euo pipefail
+
+        if [ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
+          echo "::error::id-token not available — the calling job needs 'permissions: id-token: write'"
+          exit 1
+        fi
+
+        # Discover the agent hostname on the CP. /api/agents is
+        # CF-Access-bypassed (public read).
+        agent_host=$(curl -fsS "${CP_URL}/api/agents" \
+          | jq -r --arg vm "$VM_NAME" '
+              [.[] | select(.vm_name == $vm and .status == "healthy")]
+              | sort_by(.last_seen) | reverse | .[0].hostname // empty')
+        if [ -z "$agent_host" ]; then
+          echo "::error::no healthy agent with vm_name=$VM_NAME"
+          exit 1
+        fi
+        echo "agent-host=$agent_host" >> "$GITHUB_OUTPUT"
+
+        # Mint an OIDC token scoped to the agent's expected audience.
+        oidc=$(curl -fsSL \
+          -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+          "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${AUDIENCE}" | jq -r .value)
+
+        # Compact + inspect the workload spec.
+        spec=$(jq -c . "$WORKLOAD")
+        app_name=$(echo "$spec" | jq -r '.app_name // empty')
+        if [ -z "$app_name" ]; then
+          echo "::error::$WORKLOAD has no .app_name"
+          exit 1
+        fi
+        echo "app-name=$app_name" >> "$GITHUB_OUTPUT"
+
+        echo "POST /deploy to $agent_host (app=$app_name, repo=$GITHUB_REPOSITORY)"
+        curl -fsS -X POST "https://${agent_host}/deploy" \
+          -H "Authorization: Bearer ${oidc}" \
+          -H "Content-Type: application/json" \
+          -d "$spec"
+        echo
+
+        if [ "$WAIT_SECS" -gt 0 ]; then
+          deadline=$(( $(date +%s) + WAIT_SECS ))
+          while [ "$(date +%s)" -lt "$deadline" ]; do
+            if curl -fsS "https://${agent_host}/health" \
+              | jq -e --arg app "$app_name" '.deployments // [] | index($app)' >/dev/null; then
+              echo "$app_name visible on $agent_host"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::$app_name never appeared in $agent_host /health within ${WAIT_SECS}s"
+          exit 1
+        fi

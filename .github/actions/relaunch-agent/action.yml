@@ -21,78 +21,68 @@ inputs:
   host:
     description: 'Public host address of the tdx2 node'
     required: true
-  dd-pat:
-    description: 'GitHub PAT the agent uses to talk to the CP'
-    required: true
   ita-api-key:
     description: 'Intel Trust Authority API key for attestation'
+    required: true
+  release-tag:
+    description: 'devopsdefender release tag the local agent should download (e.g. pr-abc123, latest)'
     required: true
 
 runs:
   using: composite
   steps:
-    # CP must be reachable before we SSH — on PR pushes we race with
-    # Release's deploy-preview standing up the pr-N CP. /health is public.
+    # curl's native --retry handles the CP-healthy wait. On PR pushes
+    # we race with Release's deploy-preview standing up the pr-N CP;
+    # /health is CF-bypassed. 60 attempts × 10s = 10 min budget.
     - name: Wait for CP to be healthy
       shell: bash
       env:
         URL: ${{ inputs.url }}
       run: |
-        for i in $(seq 1 60); do
-          if curl -fsS --max-time 5 "$URL/health" >/dev/null 2>&1; then
-            echo "CP $URL healthy after ${i} attempts"
-            exit 0
-          fi
-          echo "  waiting for $URL... (${i}/60)"
-          sleep 10
-        done
-        echo "::error::CP $URL never came up within 10 min"
-        exit 1
+        curl -fsS --retry 60 --retry-delay 10 --retry-all-errors \
+          --max-time 5 "$URL/health" >/dev/null
+        echo "CP $URL healthy"
 
-    # SSH in and relaunch the VM (destroy + redefine + start). Finishes
-    # in ~10 s — the baked config.iso's EE_BOOT_WORKLOADS drives the rest.
+    # appleboy/ssh-action owns key + known_hosts setup; we just hand
+    # it the script to run on the tdx2 host. dd-relaunch.sh finishes
+    # in ~10s — the baked config.iso's EE_BOOT_WORKLOADS drives the
+    # rest of the boot asynchronously.
     - name: ssh + relaunch VM
-      shell: bash
+      uses: appleboy/ssh-action@v1.2.0
       env:
-        SSH_KEY:        ${{ inputs.ssh-key }}
-        HOST:           ${{ inputs.host }}
-        DD_PAT:         ${{ inputs.dd-pat }}
+        KIND: ${{ inputs.kind }}
+        URL: ${{ inputs.url }}
+        REF: ${{ inputs.ref }}
+        RELEASE_TAG: ${{ inputs.release-tag }}
         DD_ITA_API_KEY: ${{ inputs.ita-api-key }}
-        KIND:           ${{ inputs.kind }}
-        URL:            ${{ inputs.url }}
-        REF:            ${{ inputs.ref }}
-      run: |
-        mkdir -p ~/.ssh
-        printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
-        chmod 600 ~/.ssh/id_ed25519
-        ssh-keyscan -H "$HOST" >> ~/.ssh/known_hosts 2>/dev/null
-        ssh -o BatchMode=yes -o StrictHostKeyChecking=yes \
-            -i ~/.ssh/id_ed25519 "tdx2@$HOST" \
-            "DD_PAT='$DD_PAT' DD_ITA_API_KEY='$DD_ITA_API_KEY' /home/tdx2/src/dd/apps/_infra/dd-relaunch.sh '$KIND' '$URL' '$REF'"
+      with:
+        host: ${{ inputs.host }}
+        username: tdx2
+        key: ${{ inputs.ssh-key }}
+        envs: KIND,URL,REF,RELEASE_TAG,DD_ITA_API_KEY
+        script: |
+          /home/tdx2/src/dd/apps/_infra/dd-relaunch.sh "$KIND" "$URL" "$REF" "$RELEASE_TAG"
 
     # Block until the freshly-booted agent VM registers with the CP.
-    # This is the "I can see the local agent deployment worked" signal
-    # that gates the whole release. 5-min budget covers a cold VM boot
-    # (~60s) + cloudflared tunnel (~30s) + agent startup + register —
-    # plenty of headroom. Doesn't probe openclaw/ollama readiness —
-    # that first-boot pays a 30-min npm-install tax and isn't part
-    # of the release gate.
+    # This is the "I can see the local agent deployment worked"
+    # signal that gates the whole release. 30 attempts × 10s = 5 min
+    # covers a cold VM boot (~60s) + cloudflared tunnel (~30s) +
+    # agent startup + register. This is a JSON-body predicate poll —
+    # no off-the-shelf action, so it's kept as a tight loop.
     - name: Verify agent registered with CP
       shell: bash
       env:
-        URL:    ${{ inputs.url }}
-        DD_PAT: ${{ inputs.dd-pat }}
-        KIND:   ${{ inputs.kind }}
+        URL: ${{ inputs.url }}
+        KIND: ${{ inputs.kind }}
       run: |
         vm="dd-local-$KIND"
-        started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-        AUTH=(-H "Authorization: Bearer $DD_PAT")
+        since=$(date -u +%Y-%m-%dT%H:%M:%SZ)
         for i in $(seq 1 30); do
-          host=$(curl -fsS --max-time 10 "${AUTH[@]}" "$URL/api/agents" 2>/dev/null \
-            | jq -r --arg since "$started_at" --arg vm "$vm" '
+          host=$(curl -fsS --max-time 10 "$URL/api/agents" 2>/dev/null \
+            | jq -r --arg since "$since" --arg vm "$vm" '
                 [.[] | select(.vm_name==$vm and .status=="healthy" and .last_seen > $since)]
-                | sort_by(.last_seen) | reverse | .[0].hostname // empty' 2>/dev/null || true)
-          if [ -n "$host" ] && [ "$host" != "null" ]; then
+                | sort_by(.last_seen) | reverse | .[0].hostname // empty' || true)
+          if [ -n "$host" ]; then
             echo "$vm registered at https://$host"
             exit 0
           fi
