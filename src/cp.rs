@@ -57,7 +57,17 @@ pub async fn run() -> Result<()> {
     // rule always resolve. CF Access gates this subdomain with the
     // same human policy as the CP dashboard.
     let cp_extras: Vec<(String, u16)> = vec![("term".into(), 7681)];
-    let tunnel = match cf::create(&http, &cfg.cf, &self_name, &cfg.hostname, &cp_extras).await {
+    let cp_claims: Vec<(String, u16)> = Vec::new();
+    let tunnel = match cf::create(
+        &http,
+        &cfg.cf,
+        &self_name,
+        &cfg.hostname,
+        &cp_extras,
+        &cp_claims,
+    )
+    .await
+    {
         Ok(t) => t,
         Err(e) => {
             eprintln!("cp: self-register failed: {e}");
@@ -156,6 +166,7 @@ pub async fn run() -> Result<()> {
             // target "control-plane".
             tunnel_id: String::new(),
             extras: Vec::new(),
+            claims: Vec::new(),
         },
     );
 
@@ -295,18 +306,37 @@ struct RegisterReq {
     env_label: String,
     owner: String,
     ita_token: String,
-    /// Optional per-workload ingress: each entry becomes
-    /// `{hostname_label}.{agent_hostname}` → `localhost:{port}` in the
-    /// agent's cloudflared tunnel config, in addition to the default
-    /// `{agent_hostname}` → `localhost:8080` dashboard rule.
+    /// Optional per-workload ingress. Each entry is either an auto
+    /// per-agent rule (`hostname_label`) or a vanity zone-apex claim
+    /// (`claim_hostname`). Exactly one field should be set per entry.
     #[serde(default)]
     extra_ingress: Vec<ExtraIngress>,
 }
 
 #[derive(Debug, Deserialize)]
 struct ExtraIngress {
-    hostname_label: String,
+    #[serde(default)]
+    hostname_label: Option<String>,
+    #[serde(default)]
+    claim_hostname: Option<String>,
     port: u16,
+}
+
+/// Split a mixed-variant extra_ingress list into (auto, claims)
+/// tuples, discarding malformed entries. Each valid entry has
+/// exactly one of `hostname_label` or `claim_hostname` set.
+#[allow(clippy::type_complexity)]
+fn split_extras(raw: &[ExtraIngress]) -> (Vec<(String, u16)>, Vec<(String, u16)>) {
+    let mut extras = Vec::new();
+    let mut claims = Vec::new();
+    for e in raw {
+        match (&e.hostname_label, &e.claim_hostname) {
+            (Some(l), None) if !l.is_empty() => extras.push((l.clone(), e.port)),
+            (None, Some(c)) if !c.is_empty() => claims.push((c.clone(), e.port)),
+            _ => {}
+        }
+    }
+    (extras, claims)
 }
 
 /// POST /register — the CF Access bypass app on this path lets anyone
@@ -344,12 +374,8 @@ async fn register(
     let http = reqwest::Client::new();
     let name = cf::agent_tunnel_name(&s.cfg.common.env_label);
     let agent_hostname = format!("{name}.{}", s.cfg.cf.domain);
-    let extras: Vec<(String, u16)> = req
-        .extra_ingress
-        .iter()
-        .map(|e| (e.hostname_label.clone(), e.port))
-        .collect();
-    let tunnel = cf::create(&http, &s.cfg.cf, &name, &agent_hostname, &extras).await?;
+    let (extras, claims) = split_extras(&req.extra_ingress);
+    let tunnel = cf::create(&http, &s.cfg.cf, &name, &agent_hostname, &extras, &claims).await?;
     if !tunnel.extra_hostnames.is_empty() {
         eprintln!(
             "cp: registered extra ingress for {}: {:?}",
@@ -358,6 +384,7 @@ async fn register(
     }
 
     let labels: Vec<String> = extras.iter().map(|(l, _)| l.clone()).collect();
+    let claim_names: Vec<String> = claims.iter().map(|(n, _)| n.clone()).collect();
     if let Err(e) = cf::provision_agent_access(
         &http,
         &s.cfg.cf,
@@ -366,6 +393,7 @@ async fn register(
         &s.cfg.common.owner,
         &s.cfg.access.admin_email,
         &labels,
+        &claim_names,
     )
     .await
     {
@@ -407,9 +435,10 @@ async fn register(
                 disks: Vec::new(),
                 ita: ita_claims,
                 // Seeded from the boot `extra_ingress`; runtime /deploy
-                // requests extend this list via /ingress/replace (below).
+                // requests extend these lists via /ingress/replace.
                 tunnel_id: tunnel.id.clone(),
                 extras: extras.clone(),
+                claims: claims.clone(),
             },
         );
     }
@@ -446,15 +475,33 @@ struct IngressReplaceReq {
 
 #[derive(Debug, Deserialize)]
 struct IngressPair {
-    hostname_label: String,
+    #[serde(default)]
+    hostname_label: Option<String>,
+    #[serde(default)]
+    claim_hostname: Option<String>,
     port: u16,
+}
+
+#[allow(clippy::type_complexity)]
+fn split_ingress_pairs(raw: &[IngressPair]) -> (Vec<(String, u16)>, Vec<(String, u16)>) {
+    let mut extras = Vec::new();
+    let mut claims = Vec::new();
+    for e in raw {
+        match (&e.hostname_label, &e.claim_hostname) {
+            (Some(l), None) if !l.is_empty() => extras.push((l.clone(), e.port)),
+            (None, Some(c)) if !c.is_empty() => claims.push((c.clone(), e.port)),
+            _ => {}
+        }
+    }
+    (extras, claims)
 }
 
 /// POST /ingress/replace — CF-Access-bypassed; authenticated by the
 /// same Intel ITA token the agent already refreshes for /health.
 /// The agent forwards its full current ingress list; the CP re-PUTs
 /// the tunnel config + CNAMEs and reconciles per-workload CF Access
-/// bypass apps (creates new, deletes stale).
+/// apps. Vanity claims that collide with another agent's ownership
+/// bubble up as an upstream error.
 async fn ingress_replace(
     State(s): State<St>,
     Json(req): Json<IngressReplaceReq>,
@@ -476,16 +523,14 @@ async fn ingress_replace(
         (agent.tunnel_id.clone(), agent.hostname.clone())
     };
 
-    let extras: Vec<(String, u16)> = req
-        .extras
-        .iter()
-        .map(|e| (e.hostname_label.clone(), e.port))
-        .collect();
+    let (extras, claims) = split_ingress_pairs(&req.extras);
 
     let http = reqwest::Client::new();
-    let hostnames = cf::update_ingress(&http, &s.cfg.cf, &tunnel_id, &hostname, &extras).await?;
+    let hostnames =
+        cf::update_ingress(&http, &s.cfg.cf, &tunnel_id, &hostname, &extras, &claims).await?;
 
     let labels: Vec<String> = extras.iter().map(|(l, _)| l.clone()).collect();
+    let claim_names: Vec<String> = claims.iter().map(|(n, _)| n.clone()).collect();
     if let Err(e) = cf::provision_agent_access(
         &http,
         &s.cfg.cf,
@@ -494,6 +539,7 @@ async fn ingress_replace(
         &s.cfg.common.owner,
         &s.cfg.access.admin_email,
         &labels,
+        &claim_names,
     )
     .await
     {
@@ -504,6 +550,7 @@ async fn ingress_replace(
         let mut store = s.store.lock().await;
         if let Some(agent) = store.get_mut(&req.agent_id) {
             agent.extras = extras;
+            agent.claims = claims;
         }
     }
 

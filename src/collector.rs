@@ -60,6 +60,12 @@ pub struct Agent {
     /// recovers this list from the agent's `/health` response.
     #[serde(default)]
     pub extras: Vec<(String, u16)>,
+    /// Vanity claims currently owned by this agent. Same lifecycle
+    /// as `extras`. The collector's orphan-GC path releases each of
+    /// these (deletes the CNAME + CF Access app) when this agent
+    /// goes dead so the next caller can claim the same hostname.
+    #[serde(default)]
+    pub claims: Vec<(String, u16)>,
 }
 
 pub type Store = Arc<Mutex<HashMap<String, Agent>>>;
@@ -166,7 +172,7 @@ async fn tick(
             eprintln!("cp: collector: {name} /health lacks ita_token — skipping");
             continue;
         };
-        let claims = match verifier.verify(token).await {
+        let ita_claims = match verifier.verify(token).await {
             Ok(c) => c,
             Err(e) => {
                 eprintln!("cp: collector: {name} ITA verify failed: {e}");
@@ -176,8 +182,11 @@ async fn tick(
         // Store key is the tunnel name (authoritative on the CP side),
         // NOT the agent's self-reported agent_id.
         let mut s = store.lock().await;
-        let extras = parse_extra_ingress(h)
-            .unwrap_or_else(|| s.get(name).map(|a| a.extras.clone()).unwrap_or_default());
+        let (extras, vanity_claims) = parse_extra_ingress(h).unwrap_or_else(|| {
+            s.get(name)
+                .map(|a| (a.extras.clone(), a.claims.clone()))
+                .unwrap_or_default()
+        });
         s.insert(
             name.clone(),
             Agent {
@@ -204,37 +213,70 @@ async fn tick(
                 memory_total_mb: h["memory_total_mb"].as_u64().unwrap_or(0),
                 nets: serde_json::from_value(h["nets"].clone()).unwrap_or_default(),
                 disks: serde_json::from_value(h["disks"].clone()).unwrap_or_default(),
-                ita: claims,
+                ita: ita_claims,
                 tunnel_id: tunnel_id.clone(),
                 extras,
+                claims: vanity_claims,
             },
         );
         drop(s);
         verified += 1;
     }
 
-    // Collect + delete dead entries from the store.
-    let dead: Vec<String> = {
+    // Snapshot dead entries + their claim state BEFORE removing them
+    // from the store, so the release path below has the tunnel_id and
+    // claim list to pass to CF.
+    let dead: Vec<(String, String, Vec<String>)> = {
         let s = store.lock().await;
         s.iter()
             .filter(|(_, a)| a.status == "dead")
-            .map(|(k, _)| k.clone())
+            .map(|(k, a)| {
+                (
+                    k.clone(),
+                    a.tunnel_id.clone(),
+                    a.claims.iter().map(|(n, _)| n.clone()).collect(),
+                )
+            })
             .collect()
     };
-    for k in &dead {
+    for (k, _, _) in &dead {
         store.lock().await.remove(k);
     }
 
     if !orphans.is_empty() {
         for (name, host) in &orphans {
             eprintln!("cp: GC dead tunnel {name}");
+            // Release any vanity claims this agent was holding so the
+            // next caller can register the same hostname. `release_claim`
+            // checks ownership before deleting, so it won't stomp on
+            // a takeover that already happened.
+            let claim_names: Vec<String> = dead
+                .iter()
+                .find(|(k, _, _)| k == name)
+                .map(|(_, _, claims)| claims.clone())
+                .unwrap_or_default();
+            let tunnel_id = dead
+                .iter()
+                .find(|(k, _, _)| k == name)
+                .map(|(_, tid, _)| tid.clone())
+                .unwrap_or_default();
+            for claim in &claim_names {
+                let domain = cf::claim_hostname(host, claim);
+                if let Err(e) = cf::release_claim(http, cf, &tunnel_id, &domain).await {
+                    eprintln!("cp: release_claim {domain} failed: {e}");
+                }
+            }
+
             cf::delete_by_name(http, cf, name).await;
             let _ = cf::delete_cname(http, cf, host).await;
             // Sweep the agent's CF Access apps — its human dashboard
-            // app and every workload-URL bypass under this hostname.
-            // Without this the account accumulates dead apps every
-            // STONITH cycle.
+            // app, every workload-URL bypass under this hostname, and
+            // the vanity-claim bypass apps at the zone apex.
             cf::delete_access_apps_for(http, cf, host).await;
+            for claim in &claim_names {
+                let domain = cf::claim_hostname(host, claim);
+                cf::delete_access_apps_for(http, cf, &domain).await;
+            }
         }
     }
 
@@ -281,20 +323,37 @@ async fn tick(
     );
 }
 
-fn parse_extra_ingress(h: &serde_json::Value) -> Option<Vec<(String, u16)>> {
-    h.get("extra_ingress")?.as_array().map(|items| {
-        items
-            .iter()
-            .filter_map(|item| {
-                let label = item.get("hostname_label")?.as_str()?;
-                let port = item.get("port")?.as_u64()?;
-                if label.is_empty() || port == 0 || port > u16::MAX as u64 {
-                    return None;
-                }
-                Some((label.to_string(), port as u16))
-            })
-            .collect()
-    })
+/// Split `/health.extra_ingress` entries into (auto-labeled,
+/// vanity-claims) — each entry has exactly one of `hostname_label`
+/// or `claim_hostname`. Returns `None` when the field is missing so
+/// callers can fall back to the cached values (avoids blanking the
+/// store during a scrape hiccup).
+#[allow(clippy::type_complexity)]
+fn parse_extra_ingress(h: &serde_json::Value) -> Option<(Vec<(String, u16)>, Vec<(String, u16)>)> {
+    let items = h.get("extra_ingress")?.as_array()?;
+    let mut extras = Vec::new();
+    let mut claims = Vec::new();
+    for item in items {
+        let Some(port) = item.get("port").and_then(|v| v.as_u64()) else {
+            continue;
+        };
+        if port == 0 || port > u16::MAX as u64 {
+            continue;
+        }
+        let port = port as u16;
+        if let Some(claim) = item.get("claim_hostname").and_then(|v| v.as_str()) {
+            if !claim.is_empty() {
+                claims.push((claim.to_string(), port));
+                continue;
+            }
+        }
+        if let Some(label) = item.get("hostname_label").and_then(|v| v.as_str()) {
+            if !label.is_empty() {
+                extras.push((label.to_string(), port));
+            }
+        }
+    }
+    Some((extras, claims))
 }
 
 async fn mark_stale_or_orphan(
@@ -342,10 +401,24 @@ mod tests {
             ]
         });
 
-        assert_eq!(
-            parse_extra_ingress(&h),
-            Some(vec![("gpu".into(), 8081), ("web".into(), 9000)])
-        );
+        let (extras, claims) = parse_extra_ingress(&h).unwrap();
+        assert_eq!(extras, vec![("gpu".into(), 8081), ("web".into(), 9000)]);
+        assert!(claims.is_empty());
+    }
+
+    #[test]
+    fn parses_mixed_auto_and_claim_entries() {
+        let h = serde_json::json!({
+            "extra_ingress": [
+                {"hostname_label": "gpu", "port": 8081},
+                {"claim_hostname": "nvidia-smi", "port": 8081},
+                {"hostname_label": "web", "port": 9000}
+            ]
+        });
+
+        let (extras, claims) = parse_extra_ingress(&h).unwrap();
+        assert_eq!(extras, vec![("gpu".into(), 8081), ("web".into(), 9000)]);
+        assert_eq!(claims, vec![("nvidia-smi".into(), 8081)]);
     }
 
     #[test]
@@ -356,10 +429,13 @@ mod tests {
                 {"hostname_label": "", "port": 8082},
                 {"hostname_label": "bad-zero", "port": 0},
                 {"hostname_label": "bad-wide", "port": 70000},
-                {"hostname_label": "bad-string", "port": "8083"}
+                {"hostname_label": "bad-string", "port": "8083"},
+                {"claim_hostname": "", "port": 8084}
             ]
         });
 
-        assert_eq!(parse_extra_ingress(&h), Some(vec![("gpu".into(), 8081)]));
+        let (extras, claims) = parse_extra_ingress(&h).unwrap();
+        assert_eq!(extras, vec![("gpu".into(), 8081)]);
+        assert!(claims.is_empty());
     }
 }

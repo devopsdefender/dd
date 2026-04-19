@@ -56,27 +56,41 @@ Add `env` to inject config:
 }
 ```
 
-Add `expose` to ask DD to route a public hostname to a workload's port:
+Add `expose` to ask DD to route a public hostname to a workload's port.
+Two shapes:
+
+**Per-agent (auto)** — URL is derived from the agent's UUID; good for
+anything that's naturally per-VM:
 
 ```json
-{
-  "app_name": "web-nvidia-smi",
-  "expose": { "hostname_label": "gpu", "port": 8081 },
-  "cmd": [...]
-}
+{ "expose": { "hostname_label": "my-label", "port": 8081 } }
 ```
 
-At agent boot, `apps/_infra/local-agents.sh` collects every `expose` entry
-into `DD_EXTRA_INGRESS`. dd-agent forwards them on `/register` and the CP
-prepends them to the agent's cloudflared tunnel ingress. A workload declaring
-`{"hostname_label": "gpu", "port": 8081}` becomes reachable at
-`gpu.<agent-hostname>` — in addition to the default dashboard at
-`<agent-hostname>`. easyenclave itself ignores the field; it's a DD-level
-hint about tunnel routing.
+Becomes `<agent-hostname-base>-my-label.devopsdefender.com` (one level
+deep, so Universal SSL covers it).
 
-Per-workload ingress is **boot-time only** today. Workloads POSTed later via
-`/deploy` don't get auto-exposed — declare your exposure on boot workloads in
-this tree.
+**Vanity claim** — a stable short URL directly under the zone apex.
+First agent to register the claim wins; DNS uniqueness arbitrates. If
+another agent tries to deploy the same spec, the CP returns 409.
+
+```json
+{ "expose": { "claim_hostname": "nvidia-smi", "port": 8081 } }
+```
+
+Becomes `nvidia-smi.devopsdefender.com`. When the owning agent dies,
+the CP's collector releases the claim so the next deploy can take it.
+
+At agent boot, `apps/_infra/local-agents.sh` collects every `expose`
+entry into `DD_EXTRA_INGRESS`. Claims are marked with a `@` prefix
+(`@nvidia-smi:8081`) to distinguish them from auto-labels. dd-agent
+parses the env var, splits into the two variants, and forwards both
+on `/register`. The CP prepends them to the agent's cloudflared
+tunnel ingress and provisions the CNAMEs + CF Access apps. Easyenclave
+itself ignores the field; it's a DD-level hint about tunnel routing.
+
+Per-workload ingress is boot-time **and** runtime — any workload
+POSTed via `/deploy` with an `expose` block also gets added to the
+agent's tunnel via `/ingress/replace`.
 
 ## Templates
 

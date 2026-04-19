@@ -78,14 +78,28 @@ bake() {
 }
 
 # Extract `expose` entries from a stream of baked workloads and emit
-# them as a comma-separated `label:port` string — the shape dd-agent
-# expects in $DD_EXTRA_INGRESS. Using plain text (not JSON) avoids
-# quote-escaping when the value gets substituted into the dd-agent
-# workload template's `"DD_EXTRA_INGRESS=${DD_EXTRA_INGRESS}"` env
-# entry: embedded `"` would close the outer JSON string early and
-# produce invalid JSON (jq: "Invalid numeric literal").
+# them as a comma-separated string — the shape dd-agent expects in
+# $DD_EXTRA_INGRESS. Two variants per entry:
+#
+#   label:port        — auto per-agent (e.g. `web:9000` routes
+#                       `<agent>-web.<domain>` to localhost:9000)
+#   @claim:port       — vanity zone-apex claim (e.g. `@nvidia-smi:8081`
+#                       routes `nvidia-smi.<domain>` to localhost:8081
+#                       on the first agent to register it)
+#
+# Using plain text (not JSON) avoids quote-escaping when the value
+# gets substituted into the dd-agent workload template's
+# `"DD_EXTRA_INGRESS=${DD_EXTRA_INGRESS}"` env entry: embedded `"`
+# would close the outer JSON string early and produce invalid JSON
+# (jq: "Invalid numeric literal").
 extract_extra_ingress() {
-  jq -rs 'map(select(.expose) | "\(.expose.hostname_label):\(.expose.port)") | join(",")'
+  jq -rs 'map(
+    select(.expose)
+    | if .expose.claim_hostname
+      then "@\(.expose.claim_hostname):\(.expose.port)"
+      else "\(.expose.hostname_label):\(.expose.port)"
+      end
+  ) | join(",")'
 }
 
 [ -r "$BASE" ] || { echo "missing $BASE" >&2; exit 1; }

@@ -60,6 +60,12 @@ struct St {
     /// agent forwards the full list on every /ingress/replace call
     /// so the CP's PUT is a straight replacement.
     extras: Arc<RwLock<Vec<(String, u16)>>>,
+    /// Live set of vanity zone-apex claims (`@name:port`). Same
+    /// lifecycle as `extras` — seeded from boot, appended by runtime
+    /// deploys. The CP rejects /ingress/replace with 409 if a claim
+    /// is already owned by another agent, so the local list can hold
+    /// unconfirmed claims momentarily until the next replace reconciles.
+    claims: Arc<RwLock<Vec<(String, u16)>>>,
     /// Verifier for GitHub Actions OIDC JWTs — the auth on /deploy
     /// and /exec. CI workflows in the DD_OWNER org can call them
     /// without any shared secret; anyone else is denied at claim
@@ -120,6 +126,7 @@ pub async fn run() -> Result<()> {
         started: Instant::now(),
         ita_token,
         extras: Arc::new(RwLock::new(cfg.extra_ingress.clone())),
+        claims: Arc::new(RwLock::new(cfg.claims.clone())),
         gh,
     };
 
@@ -152,10 +159,19 @@ struct Bootstrap {
 async fn register(cfg: &Cfg, ita_token: &str) -> Result<Bootstrap> {
     let http = reqwest::Client::new();
     let url = format!("{}/register", cfg.cp_url.trim_end_matches('/'));
+    // Each entry carries EITHER `hostname_label` (auto per-agent) OR
+    // `claim_hostname` (vanity zone-apex claim). The CP rejects the
+    // whole register with 409 if any claim collides with another
+    // live agent's claim — DNS uniqueness is the lock.
     let extra_ingress: Vec<serde_json::Value> = cfg
         .extra_ingress
         .iter()
         .map(|(label, port)| serde_json::json!({"hostname_label": label, "port": port}))
+        .chain(
+            cfg.claims
+                .iter()
+                .map(|(name, port)| serde_json::json!({"claim_hostname": name, "port": port})),
+        )
         .collect();
     let body = serde_json::json!({
         "vm_name": cfg.common.vm_name,
@@ -233,12 +249,22 @@ async fn health(State(s): State<St>) -> Json<serde_json::Value> {
         .unwrap_or_default();
     let m = metrics::collect().await;
     let ita_token = s.ita_token.read().await.clone();
+    // /health reports both auto-labeled extras and vanity claims
+    // under `extra_ingress` so the CP's collector can rebuild the
+    // per-agent state after a CP restart without a fresh /register.
     let extra_ingress: Vec<serde_json::Value> = s
         .extras
         .read()
         .await
         .iter()
         .map(|(label, port)| serde_json::json!({"hostname_label": label, "port": port}))
+        .chain(
+            s.claims
+                .read()
+                .await
+                .iter()
+                .map(|(name, port)| serde_json::json!({"claim_hostname": name, "port": port})),
+        )
         .collect();
 
     Json(serde_json::json!({
@@ -450,53 +476,93 @@ async fn deploy(
 
     let response = s.ee.deploy(spec).await?;
 
-    if let Some((label, port)) = expose {
-        if let Err(e) = push_extra_ingress(&s, label.clone(), port).await {
+    if let Some(entry) = expose {
+        if let Err(e) = push_extra_ingress(&s, entry).await {
             // Soft-fail: the workload is deployed, the owner just can't
             // reach it from the public internet yet. Better than failing
             // the whole /deploy and leaving the caller unsure whether
             // the process is running.
-            eprintln!(
-                "agent: /ingress/replace add {label}:{port} failed (workload still running): {e}"
-            );
+            eprintln!("agent: /ingress/replace failed (workload still running): {e}");
         }
     }
 
     Ok(Json(response))
 }
 
-/// Extract `expose.hostname_label` + `expose.port` from a DeployRequest
-/// JSON body. Returns None if the field is missing or malformed; the
-/// caller treats that as "no runtime ingress requested" and moves on.
-fn parse_expose(spec: &serde_json::Value) -> Option<(String, u16)> {
-    let expose = spec.get("expose")?;
-    let label = expose.get("hostname_label")?.as_str()?.to_string();
-    let port = expose.get("port")?.as_u64()?;
-    if label.is_empty() || port == 0 || port > u16::MAX as u64 {
-        return None;
-    }
-    Some((label, port as u16))
+/// Parsed form of a workload's `expose:` block. Each workload may
+/// declare at most one of these.
+enum ExposeEntry {
+    Auto { label: String, port: u16 },
+    Claim { name: String, port: u16 },
 }
 
-/// Append `(label, port)` to the live extras list (dedup by label —
-/// redeploying the same app_name with the same hostname_label is a
-/// no-op, not a duplicate rule) and POST the full list to the CP's
-/// /ingress/replace endpoint. The CP re-PUTs the tunnel config and
-/// upserts CNAMEs.
-async fn push_extra_ingress(s: &St, label: String, port: u16) -> Result<()> {
-    let extras = {
-        let mut guard = s.extras.write().await;
-        if let Some(existing) = guard.iter_mut().find(|(l, _)| *l == label) {
-            existing.1 = port;
-        } else {
-            guard.push((label, port));
+/// Extract `expose.hostname_label`/`expose.claim_hostname` + `expose.port`
+/// from a DeployRequest JSON body. Returns None if `expose` is missing
+/// or malformed; the caller treats that as "no runtime ingress
+/// requested" and moves on.
+fn parse_expose(spec: &serde_json::Value) -> Option<ExposeEntry> {
+    let expose = spec.get("expose")?;
+    let port = expose.get("port")?.as_u64()?;
+    if port == 0 || port > u16::MAX as u64 {
+        return None;
+    }
+    let port = port as u16;
+    if let Some(name) = expose.get("claim_hostname").and_then(|v| v.as_str()) {
+        if name.is_empty() {
+            return None;
         }
-        guard.clone()
-    };
+        return Some(ExposeEntry::Claim {
+            name: name.to_string(),
+            port,
+        });
+    }
+    if let Some(label) = expose.get("hostname_label").and_then(|v| v.as_str()) {
+        if label.is_empty() {
+            return None;
+        }
+        return Some(ExposeEntry::Auto {
+            label: label.to_string(),
+            port,
+        });
+    }
+    None
+}
 
-    let body_extras: Vec<serde_json::Value> = extras
+/// Upsert a workload expose entry (auto-labeled or vanity) into the
+/// live state and POST the full reconciled ingress to the CP's
+/// `/ingress/replace` endpoint. The CP re-PUTs the tunnel config,
+/// upserts CNAMEs, and provisions CF Access apps. Returns 409-like
+/// errors when a claim collides with another agent.
+async fn push_extra_ingress(s: &St, entry: ExposeEntry) -> Result<()> {
+    match entry {
+        ExposeEntry::Auto { label, port } => {
+            let mut guard = s.extras.write().await;
+            if let Some(existing) = guard.iter_mut().find(|(l, _)| *l == label) {
+                existing.1 = port;
+            } else {
+                guard.push((label, port));
+            }
+        }
+        ExposeEntry::Claim { name, port } => {
+            let mut guard = s.claims.write().await;
+            if let Some(existing) = guard.iter_mut().find(|(n, _)| *n == name) {
+                existing.1 = port;
+            } else {
+                guard.push((name, port));
+            }
+        }
+    }
+
+    let extras_snapshot = s.extras.read().await.clone();
+    let claims_snapshot = s.claims.read().await.clone();
+    let body_extras: Vec<serde_json::Value> = extras_snapshot
         .iter()
         .map(|(l, p)| serde_json::json!({"hostname_label": l, "port": p}))
+        .chain(
+            claims_snapshot
+                .iter()
+                .map(|(n, p)| serde_json::json!({"claim_hostname": n, "port": p})),
+        )
         .collect();
     let ita_token = s.ita_token.read().await.clone();
     let body = serde_json::json!({
@@ -519,7 +585,11 @@ async fn push_extra_ingress(s: &St, label: String, port: u16) -> Result<()> {
             "ingress/replace {url} → {status}: {text}"
         )));
     }
-    eprintln!("agent: ingress/replace ok ({} extras total)", extras.len());
+    eprintln!(
+        "agent: ingress/replace ok ({} auto + {} claims)",
+        extras_snapshot.len(),
+        claims_snapshot.len()
+    );
     Ok(())
 }
 

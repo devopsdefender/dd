@@ -159,13 +159,17 @@ pub struct Agent {
     pub cp_url: String,
     pub ee_socket: String,
     pub ita: Ita,
-    /// Extra cloudflared ingress rules requested at register time,
-    /// parsed from `DD_EXTRA_INGRESS` (a comma-separated list of
-    /// `label:port` pairs, e.g. `gpu:8081,web:9000`). The boot-workload
-    /// builder (`apps/_infra/local-agents.sh`) collects these from
-    /// `expose` hints on individual workload specs. Empty is fine —
-    /// the agent just gets the default dashboard rule.
+    /// Auto per-agent ingress rules from `DD_EXTRA_INGRESS` —
+    /// entries like `label:port`. Each becomes the URL
+    /// `<agent-base>-<label>.<domain>` after register.
     pub extra_ingress: Vec<(String, u16)>,
+    /// Vanity claim ingress rules from `DD_EXTRA_INGRESS` — entries
+    /// like `@name:port`. Each is a zone-apex claim the agent tries
+    /// to lock at register time; the first agent to ask wins, others
+    /// get 409 from the CP. Useful for stable short URLs
+    /// (`nvidia-smi.<domain>`) independent of any specific agent's
+    /// UUID.
+    pub claims: Vec<(String, u16)>,
 }
 
 impl Agent {
@@ -176,37 +180,46 @@ impl Agent {
         })?;
         let ee_socket = std::env::var("EE_SOCKET_PATH")
             .unwrap_or_else(|_| "/var/lib/easyenclave/agent.sock".into());
-        let extra_ingress = parse_extra_ingress()?;
+        let (extra_ingress, claims) = parse_extra_ingress()?;
         Ok(Self {
             common,
             cp_url,
             ee_socket,
             ita: Ita::from_env()?,
             extra_ingress,
+            claims,
         })
     }
 }
 
-/// Parse `DD_EXTRA_INGRESS` as a comma-separated list of `label:port`
-/// pairs — e.g. `"gpu:8081"` or `"gpu:8081,web:9000"`. Chosen over
-/// JSON to sidestep `"`-escaping when the value is substituted into
-/// the dd-agent workload template's `"DD_EXTRA_INGRESS=${…}"` env
-/// entry (embedded quotes would close the outer JSON string early).
-/// Empty / unset → empty Vec.
-fn parse_extra_ingress() -> Result<Vec<(String, u16)>> {
+/// Parse `DD_EXTRA_INGRESS` as a comma-separated list of entries,
+/// each either `label:port` (auto per-agent ingress) or
+/// `@claim:port` (vanity zone-apex claim). Returns a (extras,
+/// claims) pair. Chosen over JSON to sidestep `"`-escaping when
+/// the value is substituted into the dd-agent workload template's
+/// `"DD_EXTRA_INGRESS=${…}"` env entry.
+///
+/// Empty / unset → two empty Vecs.
+#[allow(clippy::type_complexity)]
+fn parse_extra_ingress() -> Result<(Vec<(String, u16)>, Vec<(String, u16)>)> {
     let raw = match std::env::var("DD_EXTRA_INGRESS") {
         Ok(s) if !s.trim().is_empty() => s,
-        _ => return Ok(Vec::new()),
+        _ => return Ok((Vec::new(), Vec::new())),
     };
-    let mut out = Vec::new();
+    let mut extras = Vec::new();
+    let mut claims = Vec::new();
     for entry in raw.split(',') {
         let entry = entry.trim();
         if entry.is_empty() {
             continue;
         }
-        let (label, port_s) = entry.split_once(':').ok_or_else(|| {
+        let (is_claim, rest) = match entry.strip_prefix('@') {
+            Some(r) => (true, r),
+            None => (false, entry),
+        };
+        let (name, port_s) = rest.split_once(':').ok_or_else(|| {
             Error::Internal(format!(
-                "DD_EXTRA_INGRESS entry {entry:?}: expected label:port"
+                "DD_EXTRA_INGRESS entry {entry:?}: expected label:port or @claim:port"
             ))
         })?;
         let port: u16 = port_s.parse().map_err(|e| {
@@ -214,14 +227,18 @@ fn parse_extra_ingress() -> Result<Vec<(String, u16)>> {
                 "DD_EXTRA_INGRESS entry {entry:?}: port must be u16 ({e})"
             ))
         })?;
-        if label.is_empty() {
+        if name.is_empty() {
             return Err(Error::Internal(format!(
-                "DD_EXTRA_INGRESS entry {entry:?}: empty label"
+                "DD_EXTRA_INGRESS entry {entry:?}: empty name"
             )));
         }
-        out.push((label.to_string(), port));
+        if is_claim {
+            claims.push((name.to_string(), port));
+        } else {
+            extras.push((name.to_string(), port));
+        }
     }
-    Ok(out)
+    Ok((extras, claims))
 }
 
 #[cfg(test)]
@@ -231,7 +248,8 @@ mod tests {
 
     static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
-    fn parse(s: &str) -> Result<Vec<(String, u16)>> {
+    #[allow(clippy::type_complexity)]
+    fn parse(s: &str) -> Result<(Vec<(String, u16)>, Vec<(String, u16)>)> {
         let _guard = ENV_LOCK
             .get_or_init(|| Mutex::new(()))
             .lock()
@@ -248,29 +266,38 @@ mod tests {
 
     #[test]
     fn empty_parses_to_empty_vec() {
-        assert!(parse("").unwrap().is_empty());
-        assert!(parse("   ").unwrap().is_empty());
+        let (e, c) = parse("").unwrap();
+        assert!(e.is_empty() && c.is_empty());
+        let (e, c) = parse("   ").unwrap();
+        assert!(e.is_empty() && c.is_empty());
     }
 
     #[test]
-    fn single_entry() {
-        assert_eq!(parse("gpu:8081").unwrap(), vec![("gpu".into(), 8081)]);
+    fn single_auto_entry() {
+        let (e, c) = parse("gpu:8081").unwrap();
+        assert_eq!(e, vec![("gpu".into(), 8081)]);
+        assert!(c.is_empty());
     }
 
     #[test]
-    fn multiple_entries() {
-        assert_eq!(
-            parse("gpu:8081,web:9000").unwrap(),
-            vec![("gpu".into(), 8081), ("web".into(), 9000)]
-        );
+    fn single_claim_entry() {
+        let (e, c) = parse("@nvidia-smi:8081").unwrap();
+        assert!(e.is_empty());
+        assert_eq!(c, vec![("nvidia-smi".into(), 8081)]);
+    }
+
+    #[test]
+    fn mixed_entries() {
+        let (e, c) = parse("gpu:8081,@nvidia-smi:8081,web:9000").unwrap();
+        assert_eq!(e, vec![("gpu".into(), 8081), ("web".into(), 9000)]);
+        assert_eq!(c, vec![("nvidia-smi".into(), 8081)]);
     }
 
     #[test]
     fn tolerates_whitespace_and_trailing_commas() {
-        assert_eq!(
-            parse("gpu:8081, , web:9000,").unwrap(),
-            vec![("gpu".into(), 8081), ("web".into(), 9000)]
-        );
+        let (e, c) = parse("gpu:8081, , web:9000,").unwrap();
+        assert_eq!(e, vec![("gpu".into(), 8081), ("web".into(), 9000)]);
+        assert!(c.is_empty());
     }
 
     #[test]
@@ -282,10 +309,12 @@ mod tests {
     #[test]
     fn missing_colon_errors() {
         assert!(parse("gpu").is_err());
+        assert!(parse("@claim").is_err());
     }
 
     #[test]
-    fn empty_label_errors() {
+    fn empty_name_errors() {
         assert!(parse(":8081").is_err());
+        assert!(parse("@:8081").is_err());
     }
 }

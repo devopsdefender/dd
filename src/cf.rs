@@ -78,17 +78,21 @@ async fn call(
     Ok(parsed)
 }
 
-/// Create (or recreate) a CF tunnel with ingress pointing at the local
-/// service on port 8080, a proxied CNAME for `hostname`, and one
-/// additional `{label}.{hostname}` → `localhost:{port}` ingress +
-/// CNAME per entry in `extras`. Extras are prepended to the ingress
-/// rules so they match before the primary wildcard catch-all.
+/// Create (or recreate) a CF tunnel with ingress pointing at the
+/// local service on port 8080, a proxied CNAME for `hostname`, one
+/// additional `{base}-{label}.{tld}` → `localhost:{port}` ingress +
+/// CNAME per entry in `extras`, and a zone-apex CNAME per entry in
+/// `claims` (POSTed without upsert — fails on conflict). Extras +
+/// claims are prepended to the ingress rules so they match before
+/// the primary wildcard catch-all.
+#[allow(clippy::too_many_arguments)]
 pub async fn create(
     http: &Client,
     cf: &CfCreds,
     name: &str,
     hostname: &str,
     extras: &[(String, u16)],
+    claims: &[(String, u16)],
 ) -> Result<Tunnel> {
     delete_by_name(http, cf, name).await;
 
@@ -111,7 +115,7 @@ pub async fn create(
         .ok_or_else(|| Error::Upstream("tunnel create: missing token".into()))?
         .to_string();
 
-    let extra_hostnames = apply_ingress(http, cf, &id, hostname, extras).await?;
+    let extra_hostnames = apply_ingress(http, cf, &id, hostname, extras, claims).await?;
 
     Ok(Tunnel {
         id,
@@ -133,8 +137,9 @@ pub async fn update_ingress(
     tunnel_id: &str,
     hostname: &str,
     extras: &[(String, u16)],
+    claims: &[(String, u16)],
 ) -> Result<Vec<String>> {
-    apply_ingress(http, cf, tunnel_id, hostname, extras).await
+    apply_ingress(http, cf, tunnel_id, hostname, extras, claims).await
 }
 
 /// Turn `(hostname="pr-144.devopsdefender.com", label="term")` into
@@ -151,16 +156,36 @@ pub fn label_hostname(hostname: &str, label: &str) -> String {
     }
 }
 
-/// Build the ingress array (extras first, then the primary
+/// Derive the zone apex from a tunnel hostname like
+/// `pr-144.devopsdefender.com`. Returns `"devopsdefender.com"`.
+/// Vanity claims live directly under this apex so the cert fits
+/// under Universal SSL.
+fn zone_apex(hostname: &str) -> &str {
+    hostname
+        .split_once('.')
+        .map(|(_, rest)| rest)
+        .unwrap_or(hostname)
+}
+
+/// Full vanity claim hostname, one level under the zone apex.
+/// e.g. `"nvidia-smi"` + `"pr-144.devopsdefender.com"` →
+/// `"nvidia-smi.devopsdefender.com"`.
+pub fn claim_hostname(tunnel_hostname: &str, claim: &str) -> String {
+    format!("{claim}.{}", zone_apex(tunnel_hostname))
+}
+
+/// Build the ingress array (extras + claims first, then the primary
 /// `hostname → localhost:8080` rule, then the 404 catch-all), PUT
-/// it to the tunnel, and upsert a CNAME for each hostname pointing
-/// at `{tunnel_id}.cfargotunnel.com`.
+/// it to the tunnel, upsert CNAMEs for the tunnel + auto-label
+/// hostnames, and POST-only CNAMEs for vanity claims (first caller
+/// wins; later callers get a conflict error bubbled up).
 async fn apply_ingress(
     http: &Client,
     cf: &CfCreds,
     tunnel_id: &str,
     hostname: &str,
     extras: &[(String, u16)],
+    claims: &[(String, u16)],
 ) -> Result<Vec<String>> {
     let mut ingress: Vec<serde_json::Value> = extras
         .iter()
@@ -170,6 +195,12 @@ async fn apply_ingress(
                 "service": format!("http://localhost:{port}"),
             })
         })
+        .chain(claims.iter().map(|(name, port)| {
+            serde_json::json!({
+                "hostname": claim_hostname(hostname, name),
+                "service": format!("http://localhost:{port}"),
+            })
+        }))
         .collect();
     ingress.push(serde_json::json!({
         "hostname": hostname,
@@ -190,13 +221,117 @@ async fn apply_ingress(
     .await?;
 
     upsert_cname(http, cf, tunnel_id, hostname).await?;
-    let mut extra_hostnames = Vec::with_capacity(extras.len());
+    let mut extra_hostnames = Vec::with_capacity(extras.len() + claims.len());
     for (label, _) in extras {
         let extra = label_hostname(hostname, label);
         upsert_cname(http, cf, tunnel_id, &extra).await?;
         extra_hostnames.push(extra);
     }
+    for (name, _) in claims {
+        let claim = claim_hostname(hostname, name);
+        // For existing claim CNAMEs that already point at THIS
+        // tunnel, a re-apply is idempotent (update in place). For a
+        // first-time claim we must not upsert — a stray PUT would
+        // silently hijack another agent's claim. Check ownership
+        // first; POST-only if absent; skip if foreign.
+        match find_record_id(http, cf, &claim).await? {
+            Some(rec_id) => {
+                let got = call(
+                    http,
+                    cf,
+                    Method::GET,
+                    &format!("/zones/{}/dns_records/{rec_id}", cf.zone_id),
+                    None,
+                )
+                .await?;
+                let content = got["result"]["content"].as_str().unwrap_or_default();
+                if content == format!("{tunnel_id}.cfargotunnel.com") {
+                    // Ours already; no-op.
+                    extra_hostnames.push(claim);
+                    continue;
+                }
+                return Err(Error::Upstream(format!(
+                    "claim {claim}: already owned by another tunnel"
+                )));
+            }
+            None => {
+                try_claim_cname(http, cf, tunnel_id, &claim).await?;
+                extra_hostnames.push(claim);
+            }
+        }
+    }
     Ok(extra_hostnames)
+}
+
+/// POST a fresh CNAME without upsert. Fails if a record for `hostname`
+/// already exists — CF returns success=false with code 81053 "record
+/// already exists" (or 81058 "conflicts"). Our `call()` promotes that
+/// to `Err(Upstream(...))` which the caller matches on. DNS
+/// uniqueness is the first-come-first-served lock for vanity claims
+/// — no separate registry, no race window.
+pub async fn try_claim_cname(
+    http: &Client,
+    cf: &CfCreds,
+    tunnel_id: &str,
+    hostname: &str,
+) -> Result<()> {
+    if find_record_id(http, cf, hostname).await?.is_some() {
+        // Already taken. Don't even attempt the POST; return a
+        // deterministic error so the CP can reject with 409.
+        return Err(Error::Upstream(format!(
+            "claim {hostname}: already owned by another tunnel"
+        )));
+    }
+    let content = format!("{tunnel_id}.cfargotunnel.com");
+    call(
+        http,
+        cf,
+        Method::POST,
+        &format!("/zones/{}/dns_records", cf.zone_id),
+        Some(serde_json::json!({
+            "type": "CNAME", "name": hostname, "content": content, "proxied": true,
+        })),
+    )
+    .await?;
+    Ok(())
+}
+
+/// Release a claim we previously owned. Delete the CNAME if it still
+/// points at our tunnel; otherwise leave it alone (another agent
+/// won the race and took it over).
+pub async fn release_claim(
+    http: &Client,
+    cf: &CfCreds,
+    tunnel_id: &str,
+    hostname: &str,
+) -> Result<()> {
+    let Some(id) = find_record_id(http, cf, hostname).await? else {
+        return Ok(());
+    };
+    // Only delete if the record still points at our tunnel. Don't
+    // stomp a claim that another agent legitimately took over.
+    let resp = call(
+        http,
+        cf,
+        Method::GET,
+        &format!("/zones/{}/dns_records/{id}", cf.zone_id),
+        None,
+    )
+    .await?;
+    let content = resp["result"]["content"].as_str().unwrap_or_default();
+    let expected = format!("{tunnel_id}.cfargotunnel.com");
+    if content != expected {
+        return Ok(());
+    }
+    let _ = call(
+        http,
+        cf,
+        Method::DELETE,
+        &format!("/zones/{}/dns_records/{id}", cf.zone_id),
+        None,
+    )
+    .await;
+    Ok(())
 }
 
 async fn upsert_cname(http: &Client, cf: &CfCreds, tunnel_id: &str, hostname: &str) -> Result<()> {
@@ -552,6 +687,7 @@ pub async fn provision_cp_access(
 ///     URLs are public by default (this is the nvidia-smi exemption).
 ///   - Any existing `*.{agent}.{domain}` app whose label is no longer
 ///     in `workload_labels` is deleted.
+#[allow(clippy::too_many_arguments)]
 pub async fn provision_agent_access(
     http: &Client,
     cf: &CfCreds,
@@ -560,9 +696,19 @@ pub async fn provision_agent_access(
     owner: &str,
     admin_email: &str,
     workload_labels: &[String],
+    workload_claims: &[String],
 ) -> Result<()> {
     let idp = github_idp_uuid(http, cf).await?;
     let human = human_policy(owner, admin_email, &idp);
+
+    // Vanity claims live directly under the zone apex; public-bypass
+    // app per claim, scoped to this env so reaps don't collide with
+    // other deployments. DNS uniqueness was already enforced at
+    // apply_ingress time — if we got here, this agent owns the claim.
+    for claim in workload_claims {
+        let domain = claim_hostname(agent_hostname, claim);
+        ensure_bypass_app(http, cf, &format!("dd-{env}-claim-{domain}"), &domain).await?;
+    }
 
     ensure_app(
         http,
