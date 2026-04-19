@@ -2,6 +2,6 @@
   "app_name": "nv",
   "cmd": [
     "/bin/busybox", "sh", "-c",
-    "/sbin/insmod /lib/modules/7.0.0-14-generic/kernel/nvidia-580srv-open/nvidia.ko NVreg_OpenRmEnableUnsupportedGpus=1 2>&1 && echo nv: loaded || echo nv: failed; sleep inf"
+    "/sbin/insmod /lib/modules/7.0.0-14-generic/kernel/nvidia-580srv-open/nvidia.ko NVreg_OpenRmEnableUnsupportedGpus=1 2>&1 && echo nv: loaded || echo nv: failed"
   ]
 }
