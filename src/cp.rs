@@ -227,6 +227,7 @@ pub async fn run() -> Result<()> {
         cp_ita_token,
     };
 
+    let webtmux = crate::webtmux::Manager::new();
     let app = Router::new()
         .route("/", get(fleet))
         .route("/health", get(health))
@@ -237,7 +238,8 @@ pub async fn run() -> Result<()> {
         .route("/api/agents", get(api_agents))
         .route("/cp/attest", get(cp_attest))
         .route("/cp/ita", get(cp_ita))
-        .with_state(state);
+        .with_state(state)
+        .merge(crate::webtmux::router(webtmux));
 
     let addr = format!("0.0.0.0:{}", cfg.common.port);
     eprintln!("cp: listening on {addr}");
@@ -564,7 +566,7 @@ async fn fleet(State(s): State<St>) -> Response {
 
     Html(shell(
         "DD Fleet",
-        &html::nav(&[("Fleet", "/", true)]),
+        &html::nav(&[("Fleet", "/", true), ("Terminal", "/term", false)]),
         &format!(
             r#"<h1>Fleet</h1><div class="sub">{host} · env {env} · {n} agent(s)</div>{table}"#,
             host = html::escape(&s.cfg.hostname),
@@ -720,7 +722,7 @@ async fn agent_detail(State(s): State<St>, Path(id): Path<String>) -> Response {
 
     Html(shell(
         &format!("DD — {}", a.vm_name),
-        &html::nav(&[("Fleet", "/", false)]),
+        &html::nav(&[("Fleet", "/", false), ("Terminal", "/term", false)]),
         &format!(
             r#"<div class="back"><a href="/">← fleet</a></div>
 <h1>{vm}</h1><div class="sub">{id} · {host}</div>
@@ -783,7 +785,7 @@ async fn agent_logs(State(s): State<St>, Path((id, app)): Path<(String, String)>
         .unwrap_or_default();
     Html(shell(
         &format!("{app} logs"),
-        &html::nav(&[("Fleet", "/", false)]),
+        &html::nav(&[("Fleet", "/", false), ("Terminal", "/term", false)]),
         &format!(
             r#"<div class="back"><a href="/agent/control-plane">← control-plane</a></div>
 <h1>{app}</h1><div class="sub">auto-refresh 2s</div>

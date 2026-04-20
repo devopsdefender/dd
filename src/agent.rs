@@ -123,6 +123,7 @@ pub async fn run() -> Result<()> {
         gh,
     };
 
+    let webtmux = crate::webtmux::Manager::new();
     let app = Router::new()
         .route("/", get(dashboard))
         .route("/health", get(health))
@@ -130,7 +131,8 @@ pub async fn run() -> Result<()> {
         .route("/deploy", post(deploy))
         .route("/exec", post(exec))
         .route("/logs/{app}", get(logs))
-        .with_state(state);
+        .with_state(state)
+        .merge(crate::webtmux::router(webtmux));
 
     let addr = format!("0.0.0.0:{}", cfg.common.port);
     eprintln!("agent: listening on {addr}");
@@ -334,7 +336,7 @@ async fn dashboard(State(s): State<St>) -> Response {
 
     Html(shell(
         &format!("DD — {}", s.cfg.common.vm_name),
-        &html::nav(&[("Dashboard", "/", true)]),
+        &html::nav(&[("Dashboard", "/", true), ("Terminal", "/term", false)]),
         &body,
     ))
     .into_response()
@@ -410,7 +412,7 @@ async fn workload_page(State(s): State<St>, Path(id): Path<String>) -> Result<Re
 
     Ok(Html(shell(
         &format!("DD — {app}"),
-        &html::nav(&[("Dashboard", "/", false)]),
+        &html::nav(&[("Dashboard", "/", false), ("Terminal", "/term", false)]),
         &body,
     ))
     .into_response())

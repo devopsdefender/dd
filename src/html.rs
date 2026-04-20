@@ -52,6 +52,20 @@ pub fn shell(title: &str, nav: &str, body: &str) -> String {
     )
 }
 
+/// Same page frame but the body lives outside the 1080px-capped `<main>`.
+/// Used by the terminal page where xterm.js wants the full viewport.
+pub fn shell_fullwidth(title: &str, nav: &str, body: &str) -> String {
+    format!(
+        r#"<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{title}</title><style>{CSS}
+html,body {{ height:100%; }}
+body {{ display:flex; flex-direction:column; }}
+.fullpage {{ flex:1; min-height:0; display:flex; }}
+</style></head><body>{nav}<div class="fullpage">{body}</div></body></html>"#
+    )
+}
+
 pub fn nav(items: &[(&str, &str, bool)]) -> String {
     let mut s = String::from(r#"<nav><span class="brand">DD</span>"#);
     for (label, href, active) in items {

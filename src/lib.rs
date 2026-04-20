@@ -10,3 +10,4 @@ pub mod html;
 pub mod ita;
 pub mod metrics;
 pub mod stonith;
+pub mod webtmux;
