@@ -475,7 +475,13 @@ async fn ensure_bypass_app(http: &Client, cf: &CfCreds, name: &str, domain: &str
 /// log viewer, future metrics panel). These get a human CF Access
 /// app, not a public bypass — otherwise exposing ttyd on a public
 /// subdomain would be a free shell for the internet.
-const ADMIN_LABELS: &[&str] = &["term"];
+///
+/// - `term` — ttyd workload (DD's built-in).
+/// - `block` — [bastion](https://github.com/devopsdefender/bastion)
+///   workload when deployed onto an agent via dd-deploy. Bastion is a
+///   block-aware web terminal; exposing it without auth is the same
+///   "free shell for the internet" risk.
+const ADMIN_LABELS: &[&str] = &["term", "block"];
 
 fn is_admin_label(label: &str) -> bool {
     ADMIN_LABELS.contains(&label)
