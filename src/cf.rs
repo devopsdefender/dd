@@ -504,6 +504,7 @@ pub async fn provision_cp_access(
     hostname: &str,
     owner: &str,
     admin_email: &str,
+    workload_labels: &[String],
 ) -> Result<()> {
     let idp = github_idp_uuid(http, cf).await?;
     let human = human_policy(owner, admin_email, &idp);
@@ -516,16 +517,71 @@ pub async fn provision_cp_access(
         vec![human.clone()],
     )
     .await?;
-    // CP's own ttyd subdomain — human-gated, same policy as root.
-    ensure_app(
+
+    // One CF Access app per CP-exposed workload label. Admin labels
+    // (from `ADMIN_LABELS` — e.g. the bastion terminal at `block`) get
+    // the human policy; anything else gets a public bypass.
+    let desired: std::collections::HashSet<String> = workload_labels
+        .iter()
+        .map(|l| label_hostname(hostname, l))
+        .collect();
+    for label in workload_labels {
+        let domain = label_hostname(hostname, label);
+        if is_admin_label(label) {
+            ensure_app(
+                http,
+                cf,
+                &format!("dd-{env}-cp-{label}"),
+                &domain,
+                vec![human_policy(owner, admin_email, &idp)],
+            )
+            .await?;
+        } else {
+            ensure_bypass_app(http, cf, &format!("dd-{env}-cp-{label}"), &domain).await?;
+        }
+    }
+
+    // Reap any stale workload apps under the CP's flat subdomain space
+    // that are no longer in the desired label set. Shape is
+    // `{base}-{label}.{tld}` — prefix+suffix match so we don't touch
+    // the CP's own root human app or any bypass-path apps.
+    let (base, tld) = hostname.split_once('.').unwrap_or((hostname, ""));
+    let prefix = format!("{base}-");
+    let suffix_tld = format!(".{tld}");
+    if let Ok(resp) = call(
         http,
         cf,
-        &format!("dd-{env}-cp-term"),
-        &label_hostname(hostname, "term"),
-        vec![human],
+        Method::GET,
+        &format!("/accounts/{}/access/apps?per_page=1000", cf.account_id),
+        None,
     )
-    .await?;
-    for (suffix, label) in [
+    .await
+    {
+        if let Some(items) = resp["result"].as_array() {
+            for app in items {
+                let Some(domain) = app["domain"].as_str() else {
+                    continue;
+                };
+                if !(domain.starts_with(&prefix) && domain.ends_with(&suffix_tld)) {
+                    continue;
+                }
+                if desired.contains(domain) {
+                    continue;
+                }
+                if let Some(id) = app["id"].as_str() {
+                    let _ = call(
+                        http,
+                        cf,
+                        Method::DELETE,
+                        &format!("/accounts/{}/access/apps/{id}", cf.account_id),
+                        None,
+                    )
+                    .await;
+                }
+            }
+        }
+    }
+    for (path_suffix, label) in [
         ("/health", "health"),
         ("/cp/attest", "attest"),
         ("/api/agents", "api-agents"),
@@ -536,7 +592,7 @@ pub async fn provision_cp_access(
             http,
             cf,
             &format!("dd-{env}-cp-{label}"),
-            &format!("{hostname}{suffix}"),
+            &format!("{hostname}{path_suffix}"),
         )
         .await?;
     }

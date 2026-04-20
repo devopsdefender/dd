@@ -87,6 +87,13 @@ pub async fn run() -> Result<()> {
     // Provision CF Access apps — one human app + bypass paths for
     // endpoints gated in-code. Fatal on any failure; the CP refuses
     // to start without edge auth configured.
+    //
+    // Workload labels (for flat `{base}-{label}.{tld}` subdomains) come
+    // straight from the CP's extras list. Admin labels get the human
+    // policy; others get bypass. Stale apps under this CP's subdomain
+    // space (e.g. a `term.<host>` left over from a previous deploy)
+    // get reaped inside `provision_cp_access`.
+    let cp_labels: Vec<String> = cp_extras.iter().map(|(l, _)| l.clone()).collect();
     if let Err(e) = cf::provision_cp_access(
         &http,
         &cfg.cf,
@@ -94,6 +101,7 @@ pub async fn run() -> Result<()> {
         &cfg.hostname,
         &cfg.common.owner,
         &cfg.access.admin_email,
+        &cp_labels,
     )
     .await
     {
