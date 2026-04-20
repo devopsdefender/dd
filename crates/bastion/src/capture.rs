@@ -65,6 +65,12 @@ fn default_stdout() -> String {
 /// process crash).
 pub async fn spawn_listener(path: impl AsRef<Path>) -> std::io::Result<()> {
     let path: PathBuf = path.as_ref().to_path_buf();
+    // `bind(2)` on a unix socket ENOENTs if the parent dir is missing.
+    // On the DD agent VM, `/run/ee/` is the conventional capture-socket
+    // dir but nothing creates it — so we do it ourselves. Idempotent.
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
     // Unix sockets linger after the owning process dies; clean up
     // before rebinding.
     if tokio::fs::metadata(&path).await.is_ok() {

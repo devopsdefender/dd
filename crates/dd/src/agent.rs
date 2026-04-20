@@ -131,6 +131,7 @@ pub async fn run() -> Result<()> {
         .route("/deploy", post(deploy))
         .route("/exec", post(exec))
         .route("/logs/{app}", get(logs))
+        .fallback(log_unmatched)
         .with_state(state);
 
     let addr = format!("0.0.0.0:{}", cfg.common.port);
@@ -217,6 +218,23 @@ fn spawn_cloudflared(token: String) {
             }
         }
     });
+}
+
+/// 404 with a log line. Without this, a request to a path nobody
+/// registered (e.g. caused by a proxy rewrite, or a typo'd CI URL)
+/// would silently get axum's default 404 — and on the dd-deploy
+/// side, curl doesn't see a body, so the symptom looks like "empty
+/// 200". Logging the unmatched method+path gives us ground truth
+/// for whether a request reached dd-agent at all.
+async fn log_unmatched(
+    method: axum::http::Method,
+    uri: axum::http::Uri,
+) -> (axum::http::StatusCode, Json<serde_json::Value>) {
+    eprintln!("agent: 404 {} {}", method, uri.path());
+    (
+        axum::http::StatusCode::NOT_FOUND,
+        Json(serde_json::json!({"code":"NOT_FOUND","message":"unmatched route"})),
+    )
 }
 
 // ── Routes ──────────────────────────────────────────────────────────────
@@ -438,6 +456,13 @@ async fn deploy(
     headers: HeaderMap,
     Json(spec): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>> {
+    // Log entry *before* auth so we can tell CF-Access-intercepts
+    // (no handler entry at all) from OIDC failures (entry + reject).
+    eprintln!(
+        "agent: /deploy entered (has_auth={}, app={})",
+        headers.contains_key(axum::http::header::AUTHORIZATION),
+        spec.get("app_name").and_then(|v| v.as_str()).unwrap_or("?")
+    );
     let claims = require_gh_oidc(&s, &headers).await?;
     eprintln!(
         "agent: /deploy by {} (repo={}, ref={})",
