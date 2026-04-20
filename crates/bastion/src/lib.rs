@@ -149,17 +149,34 @@ struct Session {
     kind: String,
     title: String,
     created_at_ms: u64,
-    master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
-    writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    /// Present for shell sessions; `None` for workloads (no PTY).
+    master: Option<Arc<Mutex<Box<dyn MasterPty + Send>>>>,
+    /// Present for shell sessions; `None` for workloads (stdin is
+    /// silently dropped, since the workload is already running with
+    /// its own stdin from EE).
+    writer: Option<Arc<Mutex<Box<dyn Write + Send>>>>,
     ring: Arc<Mutex<VecDeque<u8>>>,
     blocks: Arc<RwLock<VecDeque<BlockRecord>>>,
     next_seq: Arc<Mutex<u64>>,
     tx: broadcast::Sender<Event>,
+    /// Per-lifetime accumulator for workload sessions. Holds the
+    /// `argv`, `started_at_ms`, and raw stdout/stderr bytes until
+    /// `exit`, when they're finalized into a single `BlockRecord`.
+    workload_ctx: Option<Arc<Mutex<WorkloadCtx>>>,
     /// PID of the spawned shell so `Manager::remove` can SIGHUP it.
     /// The waiter thread owns the `Child` handle; we track the PID
     /// separately to avoid a lock contest with `wait()`. `None` for
     /// workload sessions.
     pid: Option<u32>,
+}
+
+/// State that a workload session accumulates between `spawn` and
+/// `exit` on the EE capture socket. On `exit` this becomes a single
+/// `BlockRecord` whose `output_b64` covers the whole lifetime.
+struct WorkloadCtx {
+    argv: Vec<String>,
+    started_at_ms: u64,
+    output: Vec<u8>,
 }
 
 impl Session {
@@ -278,6 +295,134 @@ impl Manager {
             false
         }
     }
+
+    /// Register a workload session for EE-captured process output.
+    ///
+    /// Called from [`crate::capture`] on each `spawn` record. The
+    /// returned session has no PTY, no writer, and no pid — WebSocket
+    /// subscribers get replay + live `Raw` bytes + a final
+    /// `BlockRecord` once [`Self::workload_exit`] fires.
+    ///
+    /// Idempotent on duplicate ids: the existing session is returned
+    /// unchanged so a reconnecting capture socket doesn't orphan
+    /// state. (The EE side gives each spawn a unique `<app>-<ms>` id
+    /// so collisions only happen when something reruns the record.)
+    pub async fn register_workload(&self, id: String, argv: Vec<String>, _cwd: Option<String>) {
+        {
+            let g = self.inner.read().await;
+            if g.contains_key(&id) {
+                return;
+            }
+        }
+        let (tx, _rx) = broadcast::channel(BROADCAST_CAP);
+        let started_at_ms = now_ms();
+        let title = argv.first().cloned().unwrap_or_else(|| id.clone());
+        let session = Arc::new(Session {
+            id: id.clone(),
+            kind: "workload".into(),
+            title,
+            created_at_ms: started_at_ms,
+            master: None,
+            writer: None,
+            ring: Arc::new(Mutex::new(VecDeque::with_capacity(RING_CAP))),
+            blocks: Arc::new(RwLock::new(VecDeque::with_capacity(BLOCKS_CAP))),
+            next_seq: Arc::new(Mutex::new(0)),
+            tx,
+            workload_ctx: Some(Arc::new(Mutex::new(WorkloadCtx {
+                argv,
+                started_at_ms,
+                output: Vec::new(),
+            }))),
+            pid: None,
+        });
+        self.inner.write().await.insert(id, session);
+    }
+
+    /// Append a chunk of captured stdout/stderr bytes to a workload
+    /// session: updates the rolling ring so reconnects replay it,
+    /// appends to the per-lifetime accumulator (capped at `RING_CAP`
+    /// — older bytes drop from the front), and broadcasts raw bytes
+    /// to live WS subscribers.
+    ///
+    /// Silent no-op for unknown ids or shell sessions.
+    pub async fn workload_out(&self, id: &str, bytes: &[u8]) {
+        let Some(session) = self.get(id).await else {
+            return;
+        };
+        let Some(ctx) = session.workload_ctx.as_ref() else {
+            return;
+        };
+        {
+            let mut ring = session.ring.lock().await;
+            let n = bytes.len();
+            if ring.len() + n > RING_CAP {
+                let drop_n = ring.len() + n - RING_CAP;
+                for _ in 0..drop_n.min(ring.len()) {
+                    ring.pop_front();
+                }
+            }
+            ring.extend(bytes.iter().copied());
+        }
+        {
+            let mut g = ctx.lock().await;
+            g.output.extend_from_slice(bytes);
+            if g.output.len() > RING_CAP {
+                let drop_n = g.output.len() - RING_CAP;
+                g.output.drain(..drop_n);
+            }
+        }
+        let _ = session.tx.send(Event::Raw(Arc::new(bytes.to_vec())));
+    }
+
+    /// Finalize a workload session: commit one `BlockRecord`
+    /// (`kind = "workload"`, `command = argv.join(" ")`) covering the
+    /// process lifetime, then broadcast a terminal `Exit`.
+    ///
+    /// The session remains in the manager so later reconnects can
+    /// replay its block; process exit is end-of-writes, not
+    /// end-of-readers. Silent no-op for unknown or non-workload ids.
+    pub async fn workload_exit(&self, id: &str, code: i32) {
+        let Some(session) = self.get(id).await else {
+            return;
+        };
+        let Some(ctx) = session.workload_ctx.as_ref() else {
+            return;
+        };
+        let (command, started_at_ms, output) = {
+            let mut g = ctx.lock().await;
+            (
+                g.argv.join(" "),
+                g.started_at_ms,
+                std::mem::take(&mut g.output),
+            )
+        };
+        let output_b64 = base64::engine::general_purpose::STANDARD.encode(&output);
+        let seq = {
+            let mut g = session.next_seq.lock().await;
+            let s = *g;
+            *g += 1;
+            s
+        };
+        let block = BlockRecord {
+            session_id: session.id.clone(),
+            kind: "workload".into(),
+            seq,
+            started_at_ms,
+            ended_at_ms: now_ms(),
+            command,
+            output_b64,
+            exit_code: code,
+        };
+        {
+            let mut blocks = session.blocks.write().await;
+            while blocks.len() >= BLOCKS_CAP {
+                blocks.pop_front();
+            }
+            blocks.push_back(block.clone());
+        }
+        let _ = session.tx.send(Event::Block(Arc::new(block)));
+        let _ = session.tx.send(Event::Exit(code));
+    }
 }
 
 fn short_id() -> String {
@@ -339,12 +484,13 @@ async fn spawn_session(
         kind: "shell".into(),
         title,
         created_at_ms,
-        master: Arc::new(Mutex::new(pair.master)),
-        writer: Arc::new(Mutex::new(writer)),
+        master: Some(Arc::new(Mutex::new(pair.master))),
+        writer: Some(Arc::new(Mutex::new(writer))),
         ring: Arc::new(Mutex::new(VecDeque::with_capacity(RING_CAP))),
         blocks: Arc::new(RwLock::new(VecDeque::with_capacity(BLOCKS_CAP))),
         next_seq: Arc::new(Mutex::new(0)),
         tx,
+        workload_ctx: None,
         pid,
     });
 
@@ -695,12 +841,15 @@ async fn ws_loop(mut socket: WebSocket, id: String, m: Manager) {
     let writer = session.writer.clone();
     let master = session.master.clone();
 
-    // Inbound: stdin bytes and control JSON.
+    // Inbound: stdin bytes and control JSON. For workload sessions,
+    // `writer` and `master` are `None`: stdin bytes from the browser
+    // are silently dropped, and resize is a no-op. Workloads don't
+    // have a PTY; they're view-only.
     let inbound = async move {
         while let Some(Ok(msg)) = stream.next().await {
             match msg {
                 Message::Binary(bytes) => {
-                    let w = writer.clone();
+                    let Some(w) = writer.clone() else { continue };
                     let _ = tokio::task::spawn_blocking(move || {
                         let mut g = w.blocking_lock();
                         let _ = g.write_all(&bytes);
@@ -713,7 +862,8 @@ async fn ws_loop(mut socket: WebSocket, id: String, m: Manager) {
                     };
                     match msg {
                         ClientMsg::Resize(r) => {
-                            let g = master.lock().await;
+                            let Some(m) = master.as_ref() else { continue };
+                            let g = m.lock().await;
                             let _ = g.resize(PtySize {
                                 rows: r.rows.max(4),
                                 cols: r.cols.max(8),
@@ -839,14 +989,15 @@ mod tests {
             kind: "shell".into(),
             title: "t".into(),
             created_at_ms: 0,
-            master: Arc::new(Mutex::new(make_fake_master())),
-            writer: Arc::new(Mutex::new(
+            master: Some(Arc::new(Mutex::new(make_fake_master()))),
+            writer: Some(Arc::new(Mutex::new(
                 Box::new(std::io::sink()) as Box<dyn Write + Send>
-            )),
+            ))),
             ring: Arc::new(Mutex::new(VecDeque::new())),
             blocks: Arc::new(RwLock::new(VecDeque::new())),
             next_seq: Arc::new(Mutex::new(0)),
             tx: broadcast::channel::<Event>(8).0,
+            workload_ctx: None,
             pid: None,
         });
         let mut parser = Parser::new();
@@ -866,6 +1017,44 @@ mod tests {
         let b = &blocks[0];
         assert_eq!(b.command, "echo hi");
         assert_eq!(b.exit_code, 0);
+    }
+
+    #[tokio::test]
+    async fn workload_lifecycle_commits_one_block() {
+        let m = Manager::new();
+        m.register_workload(
+            "cloudflared-1".into(),
+            vec!["cloudflared".into(), "tunnel".into()],
+            None,
+        )
+        .await;
+        m.workload_out("cloudflared-1", b"INF starting\n").await;
+        m.workload_out("cloudflared-1", b"INF connected\n").await;
+        m.workload_exit("cloudflared-1", 0).await;
+
+        let sessions = m.list().await;
+        let w = sessions
+            .iter()
+            .find(|s| s.id == "cloudflared-1")
+            .expect("workload session registered");
+        assert_eq!(w.kind, "workload");
+        assert_eq!(w.title, "cloudflared");
+        assert_eq!(w.next_seq, 1);
+
+        let session = m.get("cloudflared-1").await.expect("session");
+        let blocks = session.blocks.read().await;
+        assert_eq!(blocks.len(), 1);
+        let b = &blocks[0];
+        assert_eq!(b.kind, "workload");
+        assert_eq!(b.command, "cloudflared tunnel");
+        assert_eq!(b.exit_code, 0);
+        let output = base64::engine::general_purpose::STANDARD
+            .decode(&b.output_b64)
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "INF starting\nINF connected\n"
+        );
     }
 
     fn make_fake_master() -> Box<dyn MasterPty + Send> {

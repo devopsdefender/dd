@@ -39,8 +39,10 @@ async fn main() -> std::io::Result<()> {
         }
     }
 
+    let mgr = bastion::Manager::new();
+
     if let Some(path) = capture_socket {
-        if let Err(e) = bastion::capture::spawn_listener(&path).await {
+        if let Err(e) = bastion::capture::spawn_listener(&path, mgr.clone()).await {
             // Non-fatal: if EE isn't configured to emit yet, the socket
             // just stays quiet. But if bind itself fails (e.g. bad
             // path, permissions), surface it.
@@ -50,7 +52,6 @@ async fn main() -> std::io::Result<()> {
 
     let addr = format!("{bind}:{port}");
     eprintln!("bastion: listening on http://{addr}/");
-    let mgr = bastion::Manager::new();
     let app: Router = bastion::router(mgr);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     axum::serve(listener, app)
