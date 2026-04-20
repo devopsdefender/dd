@@ -238,6 +238,7 @@ pub async fn run() -> Result<()> {
 
     let app = Router::new()
         .route("/", get(fleet))
+        .route("/bastion", get(bastion_aggregator))
         .route("/health", get(health))
         .route("/register", post(register))
         .route("/ingress/replace", post(ingress_replace))
@@ -573,7 +574,7 @@ async fn fleet(State(s): State<St>) -> Response {
 
     Html(shell(
         "DD Fleet",
-        &html::nav(&[("Fleet", "/", true)]),
+        &html::nav(&[("Fleet", "/", true), ("Bastion", "/bastion", false)]),
         &format!(
             r#"<h1>Fleet</h1><div class="sub">{host} · env {env} · {n} agent(s)</div>{table}"#,
             host = html::escape(&s.cfg.hostname),
@@ -604,6 +605,96 @@ async fn api_agents(State(s): State<St>) -> Result<Json<Vec<serde_json::Value>>>
             })
             .collect(),
     ))
+}
+
+/// Fleet-wide bastion launcher. Sidebar of every registered agent
+/// (plus the CP itself); clicking an agent swaps the main iframe to
+/// that agent's block.<hostname> bastion. Each iframe inherits its
+/// own CF Access cookie, so first click on a new agent prompts login;
+/// same-session revisits are silent.
+///
+/// This is the v0.4 first slice of the unified bastion view —
+/// the follow-up replaces iframes with cross-origin WSS + a unified
+/// IndexedDB so block history searches span the fleet.
+async fn bastion_aggregator(State(s): State<St>) -> Response {
+    let agents = s.store.lock().await.clone();
+    let mut by_id: Vec<_> = agents.into_iter().collect();
+    by_id.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut rows = String::new();
+    let mut first_url: Option<String> = None;
+    for (_, a) in &by_id {
+        let block_host = cf::label_hostname(&a.hostname, "block");
+        let url = format!("https://{}/", block_host);
+        if first_url.is_none() {
+            first_url = Some(url.clone());
+        }
+        let cls = if a.status == "healthy" { "ok" } else { "dim" };
+        rows.push_str(&format!(
+            r#"<li class="row" data-url="{url}" tabindex="0"><div class="vm">{vm}</div><div class="host {cls}">{host}</div></li>"#,
+            url = html::escape(&url),
+            vm = html::escape(&a.vm_name),
+            cls = cls,
+            host = html::escape(&block_host),
+        ));
+    }
+
+    let initial_src = first_url.unwrap_or_default();
+    let nav_html = html::nav(&[("Fleet", "/", false), ("Bastion", "/bastion", true)]);
+    let body = format!(
+        r#"<style>
+body {{ overflow: hidden; }}
+main {{ max-width: none; margin: 0; padding: 0; }}
+.aggregator {{ position: fixed; inset: 48px 0 0 0; display: flex; }}
+.aside {{ width: 300px; border-right: 1px solid #313244; background: #181825; overflow-y: auto; }}
+.aside ul {{ list-style: none; padding: 8px; }}
+.aside .row {{ padding: 10px 12px; border-radius: 6px; cursor: pointer; margin-bottom: 2px; }}
+.aside .row:hover {{ background: #313244; }}
+.aside .row.active {{ background: #45475a; }}
+.aside .vm {{ color: #cdd6f4; font-size: 13px; font-weight: 600; }}
+.aside .host {{ color: #6c7086; font-size: 11px; margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+.aside .host.ok {{ color: #a6e3a1; }}
+.frame {{ flex: 1; background: #11111b; }}
+.frame iframe {{ width: 100%; height: 100%; border: 0; display: block; }}
+.empty {{ color: #585b70; padding: 24px; }}
+</style>
+<div class="aggregator">
+  <aside class="aside">
+    <ul id="agents">
+      {rows_fallback}
+    </ul>
+  </aside>
+  <section class="frame">
+    <iframe id="frame" src="{src}"></iframe>
+  </section>
+</div>
+<script>
+(() => {{
+  const list = document.getElementById('agents');
+  const frame = document.getElementById('frame');
+  function pick(li) {{
+    if (!li || !li.dataset.url) return;
+    for (const x of list.querySelectorAll('.row.active')) x.classList.remove('active');
+    li.classList.add('active');
+    if (frame.src !== li.dataset.url) frame.src = li.dataset.url;
+  }}
+  list.addEventListener('click', (e) => {{
+    const li = e.target.closest('.row');
+    if (li) pick(li);
+  }});
+  // Auto-pick the first agent so the sidebar highlight matches the iframe.
+  pick(list.querySelector('.row'));
+}})();
+</script>"#,
+        rows_fallback = if rows.is_empty() {
+            r#"<li class="empty">No agents registered</li>"#.to_string()
+        } else {
+            rows
+        },
+        src = html::escape(&initial_src),
+    );
+
+    Html(shell("DD Bastion", &nav_html, &body)).into_response()
 }
 
 async fn agent_detail(State(s): State<St>, Path(id): Path<String>) -> Response {
@@ -729,7 +820,7 @@ async fn agent_detail(State(s): State<St>, Path(id): Path<String>) -> Response {
 
     Html(shell(
         &format!("DD — {}", a.vm_name),
-        &html::nav(&[("Fleet", "/", false)]),
+        &html::nav(&[("Fleet", "/", false), ("Bastion", "/bastion", false)]),
         &format!(
             r#"<div class="back"><a href="/">← fleet</a></div>
 <h1>{vm}</h1><div class="sub">{id} · {host}</div>
@@ -792,7 +883,7 @@ async fn agent_logs(State(s): State<St>, Path((id, app)): Path<(String, String)>
         .unwrap_or_default();
     Html(shell(
         &format!("{app} logs"),
-        &html::nav(&[("Fleet", "/", false)]),
+        &html::nav(&[("Fleet", "/", false), ("Bastion", "/bastion", false)]),
         &format!(
             r#"<div class="back"><a href="/agent/control-plane">← control-plane</a></div>
 <h1>{app}</h1><div class="sub">auto-refresh 2s</div>
