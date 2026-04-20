@@ -1,0 +1,10 @@
+{
+  "app_name": "bastion",
+  "github_release": {
+    "repo": "devopsdefender/bastion",
+    "asset": "bastion.x86_64",
+    "rename": "bastion"
+  },
+  "expose": { "hostname_label": "block", "port": 7681 },
+  "cmd": ["bastion", "serve", "--port", "7681", "--bind", "0.0.0.0"]
+}

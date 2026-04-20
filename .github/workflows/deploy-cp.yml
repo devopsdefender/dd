@@ -135,7 +135,7 @@ jobs:
           EE_BOOT_WORKLOADS=$({
             bake apps/cloudflared/workload.json
             bake apps/dd-management/workload.json.tmpl
-            bake apps/ttyd/workload.json
+            bake apps/bastion/workload.json
           } | jq -cs '.')
 
           jq -c -n \

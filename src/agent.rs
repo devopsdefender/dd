@@ -8,9 +8,10 @@
 //! Auth after registration:
 //!   - Browser routes (`/`, `/workload/*`) are behind CF Access with
 //!     the same human policy as the CP dashboard.
-//!   - Terminal is a separate `ttyd` workload published on
-//!     `term.<hostname>` — each connection spawns a fresh `/bin/sh`,
-//!     not tied to any deployment.
+//!   - Terminal is a separate `bastion` workload published on
+//!     `block.<hostname>` — block-aware web terminal (persistent
+//!     sessions + OSC 133 command history), not tied to any
+//!     deployment. See https://github.com/devopsdefender/bastion.
 //!   - `/deploy` and `/exec` are CF-Access-bypassed and gated in-code
 //!     by a GitHub Actions OIDC token — any CI workflow in the
 //!     `DD_OWNER` org can call them by presenting its per-job OIDC
@@ -304,11 +305,11 @@ async fn dashboard(State(s): State<St>) -> Response {
         )
     };
 
-    // `{hostname-base}-term.{tld}` is the ttyd subdomain provisioned
-    // at register time. Human-gated by CF Access; each click spawns
-    // a fresh /bin/sh inside this VM with no state carried from any
-    // workload. Flat shape so Universal SSL covers the cert.
-    let term_host = html::escape(&crate::cf::label_hostname(&s.hostname, "term"));
+    // `{hostname-base}-block.{tld}` is the bastion subdomain provisioned
+    // at register time. Human-gated by CF Access; the block-aware
+    // terminal UI (persistent per-session, OSC 133 command history)
+    // lives there. Flat shape so Universal SSL covers the cert.
+    let term_host = html::escape(&crate::cf::label_hostname(&s.hostname, "block"));
 
     let body = format!(
         r#"<h1>{hostname}</h1>
