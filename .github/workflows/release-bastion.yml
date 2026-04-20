@@ -1,0 +1,69 @@
+name: Release bastion
+
+# Triggered by `bastion-v*` tag push. Rebuilds just the `bastion`
+# binary (from `crates/bastion/`) and publishes it as a release asset.
+# Does NOT redeploy CP/agent — that's the other release pipeline.
+#
+# A separate workflow (called manually or from another automation)
+# can then pick up this release and dd-deploy it onto live agents, so
+# a bastion bug fix doesn't trigger DD fleet churn.
+
+on:
+  push:
+    tags:
+      - 'bastion-v*'
+  workflow_dispatch: {}
+
+concurrency:
+  group: release-bastion-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install musl tools
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build bastion
+        run: cargo build --release -p bastion-term --bin bastion --target x86_64-unknown-linux-musl
+
+      - name: Rename for release
+        run: |
+          cp target/x86_64-unknown-linux-musl/release/bastion \
+             target/x86_64-unknown-linux-musl/release/bastion.x86_64
+
+      - name: Attest bastion binary
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: target/x86_64-unknown-linux-musl/release/bastion.x86_64
+          subject-name: bastion.x86_64
+
+      - name: Publish release (rerun-safe)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          BINARY=target/x86_64-unknown-linux-musl/release/bastion.x86_64
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$BINARY" --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$TAG" \
+              --title "$TAG" \
+              --notes "bastion built from ${GITHUB_SHA}" \
+              --repo "$GITHUB_REPOSITORY" \
+              "$BINARY"
+          fi

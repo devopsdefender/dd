@@ -1,0 +1,336 @@
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css" />
+<script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.min.js"></script>
+<style>
+  .fullpage { gap: 0; }
+  #sidebar {
+    width: 280px; border-right: 1px solid #313244; background: #181825;
+    display: flex; flex-direction: column; min-height: 0;
+  }
+  #sidebar .hdr {
+    display: flex; align-items: center; gap: 8px;
+    padding: 12px 14px; border-bottom: 1px solid #313244;
+    color: #a6adc8; font-size: 12px; text-transform: uppercase;
+  }
+  #sidebar .hdr .grow { flex: 1; }
+  #sidebar button.icon {
+    padding: 2px 10px; font-size: 16px; line-height: 1;
+    background: #313244; color: #cdd6f4;
+  }
+  #sidebar button.icon:hover { background: #45475a; }
+  #sessions { list-style: none; overflow-y: auto; flex: 1; padding: 6px; }
+  #sessions li.session { margin-bottom: 4px; }
+  #sessions .ses-row {
+    display: flex; align-items: center; gap: 6px;
+    padding: 6px 8px; border-radius: 4px; cursor: pointer;
+    color: #cdd6f4; font-size: 13px;
+  }
+  #sessions .ses-row:hover { background: #313244; }
+  #sessions li.session.active > .ses-row { background: #45475a; }
+  #sessions .ses-row .t { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #sessions .ses-row .x { color: #6c7086; padding: 0 4px; font-size: 14px; }
+  #sessions .ses-row .x:hover { color: #f38ba8; }
+  .blocks { list-style: none; padding: 2px 6px 6px 18px; }
+  .blocks li {
+    font-size: 11px; color: #a6adc8; padding: 3px 6px;
+    border-left: 2px solid #313244; cursor: pointer;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .blocks li:hover { border-left-color: #89b4fa; color: #cdd6f4; }
+  .blocks li.ok { border-left-color: #a6e3a133; }
+  .blocks li.fail { border-left-color: #f38ba888; }
+  #sessions .cat-hdr {
+    color: #89b4fa; font-size: 10px; font-weight: 700;
+    text-transform: uppercase; letter-spacing: 0.6px;
+    padding: 10px 10px 4px; border-bottom: 1px solid #31324466;
+    margin-top: 6px;
+  }
+  #sessions .cat-hdr:first-child { margin-top: 0; }
+  #sessions .cat-empty {
+    color: #585b70; font-size: 11px; font-style: italic;
+    padding: 4px 10px 6px;
+  }
+  #main { flex: 1; min-width: 0; display: flex; flex-direction: column; background: #11111b; }
+  #term { flex: 1; padding: 8px; min-height: 0; }
+  #empty {
+    flex: 1; display: flex; align-items: center; justify-content: center;
+    color: #585b70; font-size: 13px;
+  }
+</style>
+<aside id="sidebar">
+  <div class="hdr">
+    <span class="grow">Sessions</span>
+    <button class="icon" id="new" title="New session">+</button>
+  </div>
+  <ul id="sessions"></ul>
+</aside>
+<section id="main">
+  <div id="empty">No session selected.</div>
+  <div id="term" style="display:none"></div>
+</section>
+<script>
+(() => {
+  const DB_NAME = "bastion-blocks";
+  const DB_STORE = "blocks";
+  const AGENT_ID = location.hostname; // id of the node we're talking to
+  // Mount-point-agnostic: the router is nested under whatever path the
+  // host app chose. We compute all API URLs relative to the page's own
+  // pathname so bastion works at `/`, `/term`, `/anything/deeper`, etc.
+  const BASE = location.pathname.replace(/\/$/, "");
+  let db;
+
+  function openDb() {
+    return new Promise((res, rej) => {
+      const req = indexedDB.open(DB_NAME, 1);
+      req.onupgradeneeded = () => {
+        const s = req.result.createObjectStore(DB_STORE, { keyPath: ["agent", "session", "seq"] });
+        s.createIndex("by-session", ["agent", "session"]);
+      };
+      req.onsuccess = () => res(req.result);
+      req.onerror = () => rej(req.error);
+    });
+  }
+
+  async function saveBlock(b) {
+    const tx = db.transaction(DB_STORE, "readwrite");
+    tx.objectStore(DB_STORE).put({
+      agent: AGENT_ID, session: b.session_id, seq: b.seq,
+      started_at_ms: b.started_at_ms, ended_at_ms: b.ended_at_ms,
+      command: b.command, output_b64: b.output_b64, exit_code: b.exit_code,
+    });
+    return new Promise((r) => { tx.oncomplete = r; tx.onerror = r; });
+  }
+
+  async function loadBlocks(sessionId) {
+    const tx = db.transaction(DB_STORE, "readonly");
+    const idx = tx.objectStore(DB_STORE).index("by-session");
+    const range = IDBKeyRange.only([AGENT_ID, sessionId]);
+    return new Promise((res) => {
+      const out = [];
+      const req = idx.openCursor(range);
+      req.onsuccess = () => {
+        const c = req.result;
+        if (c) { out.push(c.value); c.continue(); } else { res(out); }
+      };
+      req.onerror = () => res(out);
+    });
+  }
+
+  // --- UI state ---
+  const state = {
+    sessions: new Map(), // id -> { info, blocks: [], term, ws, fit }
+    active: null,
+  };
+
+  const $sessions = document.getElementById("sessions");
+  const $new = document.getElementById("new");
+  const $term = document.getElementById("term");
+  const $empty = document.getElementById("empty");
+
+  async function apiList() {
+    const r = await fetch(`${BASE}/api/sessions`);
+    return r.json();
+  }
+  async function apiCreate(title) {
+    const r = await fetch(`${BASE}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ title: title || "shell" }),
+    });
+    return r.json();
+  }
+  async function apiKill(id) {
+    await fetch(`${BASE}/api/sessions/${id}`, { method: "DELETE" });
+  }
+
+  // Sidebar categories, rendered in this order. Unknown kinds fall
+  // into an "Other" bucket at the bottom.
+  const CATEGORIES = [
+    { key: "shell",    label: "Shells" },
+    { key: "workload", label: "Workloads" },
+    { key: "claude",   label: "Claude" },
+    { key: "codex",    label: "Codex" },
+  ];
+
+  function renderSidebar() {
+    $sessions.innerHTML = "";
+    const buckets = new Map();
+    for (const cat of CATEGORIES) buckets.set(cat.key, []);
+    const other = [];
+    for (const [id, s] of state.sessions) {
+      const k = (s.info && s.info.kind) || "shell";
+      if (buckets.has(k)) buckets.get(k).push([id, s]);
+      else other.push([id, s]);
+    }
+    for (const cat of CATEGORIES) {
+      const hdr = document.createElement("li");
+      hdr.className = "cat-hdr";
+      hdr.textContent = cat.label;
+      $sessions.appendChild(hdr);
+      const items = buckets.get(cat.key);
+      if (items.length === 0) {
+        const empty = document.createElement("li");
+        empty.className = "cat-empty";
+        empty.textContent = cat.key === "shell"
+          ? "No shells — click + to create one"
+          : "None";
+        $sessions.appendChild(empty);
+        continue;
+      }
+      for (const [id, s] of items) renderSessionRow(id, s, cat.key);
+    }
+    if (other.length) {
+      const hdr = document.createElement("li");
+      hdr.className = "cat-hdr";
+      hdr.textContent = "Other";
+      $sessions.appendChild(hdr);
+      for (const [id, s] of other) renderSessionRow(id, s, "other");
+    }
+  }
+
+  function renderSessionRow(id, s, kind) {
+    const li = document.createElement("li");
+    li.className = "session" + (id === state.active ? " active" : "");
+    const row = document.createElement("div");
+    row.className = "ses-row";
+    const t = document.createElement("span");
+    t.className = "t";
+    t.textContent = s.info.title || id.slice(0, 8);
+    row.appendChild(t);
+    // Only shells get a close button — workloads/other are managed by
+    // the source (EE capture, OSC 7771 adapter, etc.).
+    if (kind === "shell") {
+      const x = document.createElement("span");
+      x.className = "x";
+      x.textContent = "×";
+      x.title = "Close";
+      row.appendChild(x);
+      x.addEventListener("click", async (e) => {
+        e.stopPropagation();
+        await apiKill(id);
+        destroySession(id);
+      });
+    }
+    li.appendChild(row);
+    const blocks = document.createElement("ul");
+    blocks.className = "blocks";
+    for (const b of s.blocks.slice(-50)) {
+      const bli = document.createElement("li");
+      bli.className = b.exit_code === 0 ? "ok" : "fail";
+      bli.textContent = (b.command || "(no command)").slice(0, 80);
+      bli.title = "exit " + b.exit_code;
+      blocks.appendChild(bli);
+    }
+    li.appendChild(blocks);
+    row.addEventListener("click", () => activate(id));
+    $sessions.appendChild(li);
+  }
+
+  function destroySession(id) {
+    const s = state.sessions.get(id);
+    if (!s) return;
+    try { s.ws && s.ws.close(); } catch {}
+    try { s.term && s.term.dispose(); } catch {}
+    state.sessions.delete(id);
+    if (state.active === id) {
+      state.active = null;
+      $empty.style.display = "";
+      $term.style.display = "none";
+    }
+    renderSidebar();
+  }
+
+  async function activate(id) {
+    if (state.active === id) return;
+    state.active = id;
+    $empty.style.display = "none";
+    $term.style.display = "";
+    const s = state.sessions.get(id);
+    // Mount xterm on demand.
+    if (!s.term) {
+      const term = new Terminal({
+        fontFamily: "JetBrains Mono, ui-monospace, monospace",
+        fontSize: 13,
+        theme: { background: "#11111b", foreground: "#cdd6f4" },
+        cursorBlink: true,
+        scrollback: 5000,
+      });
+      const fit = new FitAddon.FitAddon();
+      term.loadAddon(fit);
+      s.term = term; s.fit = fit;
+    }
+    // Swap the mounted element by re-opening.
+    $term.innerHTML = "";
+    s.term.open($term);
+    s.fit.fit();
+    // Connect if needed.
+    if (!s.ws || s.ws.readyState >= 2) {
+      openWs(id);
+    }
+    renderSidebar();
+  }
+
+  function openWs(id) {
+    const s = state.sessions.get(id);
+    const proto = location.protocol === "https:" ? "wss:" : "ws:";
+    const ws = new WebSocket(`${proto}//${location.host}${BASE}/ws/${id}`);
+    ws.binaryType = "arraybuffer";
+    s.ws = ws;
+    ws.onopen = () => {
+      const have_up_to = s.blocks.length ? s.blocks[s.blocks.length - 1].seq : -1;
+      ws.send(JSON.stringify({ type: "hello", have_up_to }));
+      const { cols, rows } = s.term;
+      ws.send(JSON.stringify({ type: "resize", cols, rows }));
+    };
+    ws.onmessage = (ev) => {
+      if (typeof ev.data === "string") {
+        let msg; try { msg = JSON.parse(ev.data); } catch { return; }
+        if (msg.type === "block") {
+          // Dedupe by seq.
+          if (!s.blocks.some((b) => b.seq === msg.seq)) {
+            s.blocks.push(msg);
+            saveBlock(msg);
+          }
+          renderSidebar();
+        } else if (msg.type === "exit") {
+          s.term.writeln("\r\n\x1b[2m[exited " + msg.code + "]\x1b[0m");
+        }
+      } else {
+        s.term.write(new Uint8Array(ev.data));
+      }
+    };
+    s.term.onData((d) => {
+      if (ws.readyState === 1) ws.send(new TextEncoder().encode(d));
+    });
+    const onResize = () => {
+      s.fit.fit();
+      if (ws.readyState === 1) {
+        ws.send(JSON.stringify({ type: "resize", cols: s.term.cols, rows: s.term.rows }));
+      }
+    };
+    window.addEventListener("resize", onResize);
+    s.term.onResize(({ cols, rows }) => {
+      if (ws.readyState === 1) ws.send(JSON.stringify({ type: "resize", cols, rows }));
+    });
+  }
+
+  async function bootstrap() {
+    db = await openDb();
+    const list = await apiList();
+    for (const info of list) {
+      const blocks = await loadBlocks(info.id);
+      state.sessions.set(info.id, { info, blocks, term: null, ws: null, fit: null });
+    }
+    renderSidebar();
+  }
+
+  $new.addEventListener("click", async () => {
+    const info = await apiCreate();
+    state.sessions.set(info.id, { info, blocks: [], term: null, ws: null, fit: null });
+    renderSidebar();
+    activate(info.id);
+  });
+
+  bootstrap();
+})();
+</script>

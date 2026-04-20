@@ -1,0 +1,20 @@
+{
+  "app_name": "bastion",
+  "github_release": {
+    "repo": "devopsdefender/dd",
+    "asset": "bastion.x86_64",
+    "rename": "bastion",
+    "tag": "${DD_RELEASE_TAG}"
+  },
+  "expose": { "hostname_label": "block", "port": 7681 },
+  "cmd": [
+    "bastion",
+    "serve",
+    "--port",
+    "7681",
+    "--bind",
+    "0.0.0.0",
+    "--capture-socket",
+    "/run/ee/capture.sock"
+  ]
+}
