@@ -192,15 +192,9 @@ impl Session {
 // Manager
 // ---------------------------------------------------------------------
 
-/// A function that wraps the SPA body in HTML chrome (title + whatever
-/// nav/branding the host app wants). Called with `(title, body_html)`,
-/// must return the complete HTML document string.
-pub type ShellFn = Arc<dyn Fn(&str, &str) -> String + Send + Sync>;
-
 #[derive(Clone)]
 pub struct Manager {
     inner: Arc<RwLock<std::collections::HashMap<String, Arc<Session>>>>,
-    shell: ShellFn,
 }
 
 impl Default for Manager {
@@ -210,22 +204,10 @@ impl Default for Manager {
 }
 
 impl Manager {
-    /// New manager with the default (minimal dark-themed) HTML shell.
     pub fn new() -> Self {
         Self {
             inner: Arc::new(RwLock::new(Default::default())),
-            shell: Arc::new(default_shell),
         }
-    }
-
-    /// Replace the HTML chrome. Useful when embedding bastion inside a
-    /// host app that has its own nav / branding.
-    pub fn with_shell<F>(mut self, f: F) -> Self
-    where
-        F: Fn(&str, &str) -> String + Send + Sync + 'static,
-    {
-        self.shell = Arc::new(f);
-        self
     }
 
     async fn list(&self) -> Vec<SessionInfo> {
@@ -591,16 +573,33 @@ fn finalize_block(
 ///     .nest("/term", bastion::router(bastion::Manager::new()));
 /// ```
 pub fn router(manager: Manager) -> Router {
+    // CF Access gates each bastion origin; this layer just tells the
+    // browser that cross-origin responses from the CP's `/bastion`
+    // aggregator (served on the same `.devopsdefender.com` session
+    // domain) are legitimate and the CF Access cookie may ride along.
+    let cors = tower_http::cors::CorsLayer::new()
+        .allow_credentials(true)
+        .allow_headers(tower_http::cors::AllowHeaders::mirror_request())
+        .allow_methods(tower_http::cors::AllowMethods::mirror_request())
+        .allow_origin(tower_http::cors::AllowOrigin::predicate(|origin, _req| {
+            origin
+                .to_str()
+                .ok()
+                .and_then(|s| s.strip_prefix("https://"))
+                .is_some_and(|host| host.ends_with(".devopsdefender.com"))
+        }));
+
     Router::new()
         .route("/", get(page))
         .route("/api/sessions", get(list_sessions).post(create_session))
         .route("/api/sessions/{id}", delete(kill_session))
         .route("/ws/{id}", get(ws_upgrade))
+        .layer(cors)
         .with_state(manager)
 }
 
-async fn page(State(m): State<Manager>) -> impl IntoResponse {
-    Html((m.shell)("Terminal", PAGE_BODY))
+async fn page() -> impl IntoResponse {
+    Html(SPA_HTML)
 }
 
 #[derive(Deserialize)]
@@ -792,35 +791,39 @@ async fn ws_loop(mut socket: WebSocket, id: String, m: Manager) {
 }
 
 // ---------------------------------------------------------------------
-// SPA (inline for M1)
+// SPA (Svelte + Vite, single-file bundle)
 // ---------------------------------------------------------------------
 
-const PAGE_BODY: &str = include_str!("page.html");
+/// Built SPA — a self-contained HTML document with inlined JS + CSS.
+/// The source lives in `crates/bastion/web/`; `npm run build` produces
+/// `web/dist/index.html`. Included at compile time so the bastion
+/// binary ships with its own frontend, no asset handler required.
+const SPA_HTML: &str = include_str!("../web/dist/index.html");
 
-/// Default chrome: wraps the SPA body in a minimal dark-themed HTML
-/// shell. Apps that want their own nav/branding pass
-/// [`router_with_shell`] a custom `fn(title, body_html) -> String`.
-fn default_shell(title: &str, body: &str) -> String {
-    format!(
-        r#"<!DOCTYPE html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{title}</title>
-<style>
-  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
-  html, body {{ height: 100%; background: #1e1e2e; color: #cdd6f4;
-                font-family: 'JetBrains Mono', ui-monospace, monospace; }}
-  body {{ display: flex; flex-direction: column; }}
-  header {{ padding: 10px 16px; border-bottom: 1px solid #313244;
-            font-weight: 600; color: #89b4fa; font-size: 13px; }}
-  .fullpage {{ flex: 1; min-height: 0; display: flex; }}
-  a {{ color: #89b4fa; text-decoration: none; }}
-  a:hover {{ text-decoration: underline; }}
-</style></head>
-<body>
-<header>bastion</header>
-<div class="fullpage">{body}</div>
-</body></html>"#
+/// Return an HTML page that renders the unified sidebar across every
+/// agent in `agents`. Each entry is `(vm_name, origin)` where `origin`
+/// is the bastion base URL (e.g. `https://dd-prod-agent-…-block.devopsdefender.com`).
+/// The CP's `/bastion` handler calls this with its fleet catalog to
+/// produce a one-sidebar, every-node view.
+///
+/// Injects `window.__DD_AGENTS__ = [...]` before the SPA's `<script>`
+/// tag so the SPA enters unified mode instead of the single-node
+/// default. If `agents` is empty, the SPA falls back to single-node
+/// mode and queries its own origin — identical behaviour to hitting
+/// `GET /`.
+pub fn aggregator_body(agents: &[(String, String)]) -> String {
+    let agents_json = serde_json::to_string(
+        &agents
+            .iter()
+            .map(|(vm, origin)| serde_json::json!({"vm_name": vm, "origin": origin}))
+            .collect::<Vec<_>>(),
     )
+    .unwrap_or_else(|_| "[]".into());
+    let preamble = format!("<script>window.__DD_AGENTS__ = {agents_json};</script>");
+    // Vite emits a well-formed `<head>…</head>`; splice the preamble
+    // in right before the closing tag so it runs before the SPA
+    // module script kicks off its `loadSessions()` fan-out on mount.
+    SPA_HTML.replacen("</head>", &format!("{preamble}</head>"), 1)
 }
 
 // ---------------------------------------------------------------------
