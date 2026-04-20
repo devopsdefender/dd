@@ -93,12 +93,23 @@ pub async fn create(
     delete_by_name(http, cf, name).await;
 
     let secret = base64::engine::general_purpose::STANDARD.encode(uuid::Uuid::new_v4().as_bytes());
+    // `config_src: "cloudflare"` marks the tunnel as dashboard/API-managed
+    // so cloudflared won't try to push its (empty) local config at connect
+    // time. Without this, cloudflared 2026.3.0 logs
+    // `ERR unable to send local configuration … Invalid ConfigurationSource
+    // change` and the tunnel never registers a connection — the CP's
+    // /health endpoint stays unreachable and `Wait for agent health`
+    // times out.
     let resp = call(
         http,
         cf,
         Method::POST,
         &format!("/accounts/{}/cfd_tunnel", cf.account_id),
-        Some(serde_json::json!({"name": name, "tunnel_secret": secret})),
+        Some(serde_json::json!({
+            "name": name,
+            "tunnel_secret": secret,
+            "config_src": "cloudflare",
+        })),
     )
     .await?;
 
