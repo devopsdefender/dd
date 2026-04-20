@@ -81,7 +81,7 @@ jobs:
           cargo build --release -p devopsdefender --target x86_64-unknown-linux-musl
           cargo build --release -p bastion-term --bin bastion --target x86_64-unknown-linux-musl
           # Rename bastion to bastion.x86_64 so the release asset name
-          # matches `apps/bastion/workload.json`'s `github_release.asset`.
+          # matches `apps/bastion/workload.json.tmpl`'s `github_release.asset`.
           cp target/x86_64-unknown-linux-musl/release/bastion \
              target/x86_64-unknown-linux-musl/release/bastion.x86_64
 
