@@ -52,11 +52,12 @@ pub async fn run() -> Result<()> {
     eprintln!("cp: self-provisioning tunnel for {}", cfg.hostname);
     let http = reqwest::Client::new();
     let self_name = cf::cp_tunnel_name(&cfg.common.env_label);
-    // `term.<hostname>` routes to the ttyd workload on port 7681.
-    // The CP boot set always includes ttyd, so the CNAME + ingress
+    // `block.<hostname>` routes to the bastion workload on port 7681.
+    // The CP boot set always includes bastion, so the CNAME + ingress
     // rule always resolve. CF Access gates this subdomain with the
-    // same human policy as the CP dashboard.
-    let cp_extras: Vec<(String, u16)> = vec![("term".into(), 7681)];
+    // same human policy as the CP dashboard (see `ADMIN_LABELS` in
+    // cf.rs for the gating decision).
+    let cp_extras: Vec<(String, u16)> = vec![("block".into(), 7681)];
     let tunnel = match cf::create(&http, &cfg.cf, &self_name, &cfg.hostname, &cp_extras).await {
         Ok(t) => t,
         Err(e) => {
@@ -86,6 +87,13 @@ pub async fn run() -> Result<()> {
     // Provision CF Access apps — one human app + bypass paths for
     // endpoints gated in-code. Fatal on any failure; the CP refuses
     // to start without edge auth configured.
+    //
+    // Workload labels (for flat `{base}-{label}.{tld}` subdomains) come
+    // straight from the CP's extras list. Admin labels get the human
+    // policy; others get bypass. Stale apps under this CP's subdomain
+    // space (e.g. a `term.<host>` left over from a previous deploy)
+    // get reaped inside `provision_cp_access`.
+    let cp_labels: Vec<String> = cp_extras.iter().map(|(l, _)| l.clone()).collect();
     if let Err(e) = cf::provision_cp_access(
         &http,
         &cfg.cf,
@@ -93,6 +101,7 @@ pub async fn run() -> Result<()> {
         &cfg.hostname,
         &cfg.common.owner,
         &cfg.access.admin_email,
+        &cp_labels,
     )
     .await
     {
@@ -666,12 +675,12 @@ async fn agent_detail(State(s): State<St>, Path(id): Path<String>) -> Response {
         )
     };
 
-    // `{hostname-base}-term.{tld}` is the ttyd subdomain (CP's own
+    // `{hostname-base}-block.{tld}` is the bastion subdomain (CP's own
     // tunnel publishes it; agents publish it via their register-time
     // `extra_ingress`). Flat shape so Universal SSL covers the cert.
-    // Human-gated by CF Access; each click spawns a fresh `/bin/sh`
-    // with no carry-over from any deployment.
-    let term_host = html::escape(&cf::label_hostname(&a.hostname, "term"));
+    // Human-gated by CF Access; the block-aware terminal lives there,
+    // persistent per-session with OSC 133 command history.
+    let term_host = html::escape(&cf::label_hostname(&a.hostname, "block"));
     let extra = if is_cp {
         format!(
             r#"<p><a href="https://{term_host}/" target="_blank">Terminal ↗</a> · <a href="/cp/attest">raw quote</a> · <a href="/cp/ita">ITA token</a></p>"#
