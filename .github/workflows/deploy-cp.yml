@@ -138,9 +138,13 @@ jobs:
             bake apps/bastion/workload.json.tmpl
           } | jq -cs '.')
 
+          # EE_CAPTURE_SOCKET tells EE (post-capture-socket patch) to tee
+          # every spawned workload's stdio to this unix socket. Bastion
+          # binds and reads it. Unpatched EE images ignore the variable,
+          # so landing this is safe before the EE image catches up.
           jq -c -n \
             --arg workloads "$EE_BOOT_WORKLOADS" \
-            '{ "EE_BOOT_WORKLOADS": $workloads, "EE_OWNER": "devopsdefender" }' \
+            '{ "EE_BOOT_WORKLOADS": $workloads, "EE_OWNER": "devopsdefender", "EE_CAPTURE_SOCKET": "/run/ee/capture.sock" }' \
             > /tmp/ee-config.json
 
           gcloud compute instances create "$VM_NAME" \
