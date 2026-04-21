@@ -10,14 +10,27 @@ use crate::error::{Error, Result};
 
 pub struct Ee {
     path: String,
+    /// Boot token minted by easyenclave and handed to dd-agent via
+    /// `EE_TOKEN`. When set, every socket request carries
+    /// `"token": "<hex>"` so EE's seal (easyenclave#80) accepts us.
+    /// On unpatched EE images the field is ignored as an unknown key;
+    /// makes this change forward-compatible either direction.
+    token: Option<String>,
 }
 
 impl Ee {
     pub fn new(path: impl Into<String>) -> Self {
-        Self { path: path.into() }
+        Self {
+            path: path.into(),
+            token: std::env::var("EE_TOKEN").ok().filter(|s| !s.is_empty()),
+        }
     }
 
-    async fn call(&self, req: serde_json::Value) -> Result<serde_json::Value> {
+    async fn call(&self, mut req: serde_json::Value) -> Result<serde_json::Value> {
+        if let Some(token) = &self.token {
+            req["token"] = serde_json::Value::String(token.clone());
+        }
+
         let stream = UnixStream::connect(&self.path)
             .await
             .map_err(|e| Error::Upstream(format!("EE connect {}: {e}", self.path)))?;
@@ -76,7 +89,10 @@ impl Ee {
             .await
             .map_err(|e| Error::Upstream(format!("EE attach {}: {e}", self.path)))?;
 
-        let req = serde_json::json!({"method": "attach", "cmd": cmd});
+        let mut req = serde_json::json!({"method": "attach", "cmd": cmd});
+        if let Some(token) = &self.token {
+            req["token"] = serde_json::Value::String(token.clone());
+        }
         let mut buf = serde_json::to_vec(&req)?;
         buf.push(b'\n');
         stream.write_all(&buf).await?;
