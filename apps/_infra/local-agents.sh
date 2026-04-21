@@ -134,7 +134,11 @@ build_config_iso() {
     bake "$REPO_ROOT/apps/podman-static/workload.json"
     bake "$REPO_ROOT/apps/podman-bootstrap/workload.json"
     bake "$REPO_ROOT/apps/cloudflared/workload.json"
-    bake "$REPO_ROOT/apps/bastion/workload.json.tmpl"
+    # Bastion's template references ${DD_CP_URL} so its SPA can fan
+    # out cross-origin to every agent in the fleet.
+    DD_CP_URL="$cp" \
+      DD_RELEASE_TAG="$DD_RELEASE_TAG" \
+      bake "$REPO_ROOT/apps/bastion/workload.json.tmpl"
   })
 
   local extra_ingress

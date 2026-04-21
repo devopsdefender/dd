@@ -214,6 +214,12 @@ impl Session {
 #[derive(Clone)]
 pub struct Manager {
     inner: Arc<RwLock<std::collections::HashMap<String, Arc<Session>>>>,
+    /// Optional CP URL. When set, `GET /` fetches the CP's
+    /// `/api/agents` at request time and injects
+    /// `window.__DD_AGENTS__` so the SPA fans out to every agent
+    /// in the fleet. Absent → single-node fallback.
+    cp_url: Option<Arc<str>>,
+    http: reqwest::Client,
 }
 
 impl Default for Manager {
@@ -226,7 +232,22 @@ impl Manager {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(RwLock::new(Default::default())),
+            cp_url: None,
+            http: reqwest::Client::new(),
         }
+    }
+
+    /// Point this bastion at a control-plane so `GET /` serves the
+    /// cross-node aggregator SPA instead of single-node. The CP's
+    /// `/api/agents` endpoint is CF-Access-bypassed, so no auth
+    /// token is needed here. On fetch failure we degrade gracefully
+    /// to single-node — no panic, no crash.
+    pub fn with_cp_url(mut self, url: impl Into<String>) -> Self {
+        let url = url.into();
+        if !url.is_empty() {
+            self.cp_url = Some(Arc::from(url));
+        }
+        self
     }
 
     async fn list(&self) -> Vec<SessionInfo> {
@@ -746,8 +767,71 @@ pub fn router(manager: Manager) -> Router {
         .with_state(manager)
 }
 
-async fn page() -> impl IntoResponse {
-    Html(SPA_HTML)
+async fn page(State(m): State<Manager>) -> impl IntoResponse {
+    // No CP configured → serve the raw single-node SPA. That's the
+    // `bastion serve` local-dev path and any embedder that didn't
+    // wire `with_cp_url`.
+    let Some(cp_url) = m.cp_url.as_deref() else {
+        return Html(SPA_HTML.to_string());
+    };
+
+    // Try to fetch the live agent catalog. CP's `/api/agents` is
+    // CF-Access-bypassed, so no credentials. 2-second ceiling keeps
+    // a wedged CP from wedging every page load.
+    match fetch_agents(&m.http, cp_url).await {
+        Ok(agents) if !agents.is_empty() => Html(aggregator_body(&agents)),
+        Ok(_) => Html(SPA_HTML.to_string()), // empty list → single-node fallback
+        Err(e) => {
+            eprintln!("bastion: fetch CP {cp_url}/api/agents failed: {e} — single-node fallback");
+            Html(SPA_HTML.to_string())
+        }
+    }
+}
+
+/// Fetch CP's `/api/agents` and shape it into the `(vm_name, origin)`
+/// tuples that [`aggregator_body`] expects. The CP returns objects
+/// with a `hostname` field (the agent's own CF-tunneled hostname);
+/// bastion's subdomain is `{base}-block.{tld}`, computed via the
+/// same label-flatten rule that DD's `cf::label_hostname` uses.
+async fn fetch_agents(
+    http: &reqwest::Client,
+    cp_url: &str,
+) -> Result<Vec<(String, String)>, String> {
+    let url = format!("{}/api/agents", cp_url.trim_end_matches('/'));
+    let resp = http
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(2))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if !resp.status().is_success() {
+        return Err(format!("status {}", resp.status()));
+    }
+    let body: Vec<serde_json::Value> = resp.json().await.map_err(|e| e.to_string())?;
+    let mut out: Vec<(String, String)> = body
+        .into_iter()
+        .filter_map(|a| {
+            let vm = a.get("vm_name").and_then(|v| v.as_str())?.to_string();
+            let host = a.get("hostname").and_then(|v| v.as_str())?.to_string();
+            let block = label_hostname(&host, "block");
+            Some((vm, format!("https://{block}")))
+        })
+        .collect();
+    // Sort so rows render in stable order regardless of CP
+    // iteration order.
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(out)
+}
+
+/// Turn `("pr-172.devopsdefender.com", "block")` into
+/// `"pr-172-block.devopsdefender.com"`. Duplicates the logic from
+/// DD's `crates/dd/src/cf.rs::label_hostname` — bastion can't depend
+/// on the DD crate (would create a cycle), so the rule is vendored.
+fn label_hostname(hostname: &str, label: &str) -> String {
+    match hostname.split_once('.') {
+        Some((base, rest)) => format!("{base}-{label}.{rest}"),
+        None => format!("{hostname}-{label}"),
+    }
 }
 
 #[derive(Deserialize)]

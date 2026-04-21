@@ -118,6 +118,7 @@ dependencies = [
  "futures-util",
  "libc",
  "portable-pty",
+ "reqwest",
  "serde",
  "serde_json",
  "tempfile",
