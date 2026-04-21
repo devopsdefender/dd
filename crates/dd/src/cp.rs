@@ -291,6 +291,7 @@ pub async fn run() -> Result<()> {
         .route("/cp/attest", get(cp_attest))
         .route("/cp/ita", get(cp_ita))
         .route("/cp/noise/attest", get(cp_noise_attest))
+        .route("/noise/rpc", get(noise_rpc_upgrade))
         .with_state(state);
 
     let addr = format!("0.0.0.0:{}", cfg.common.port);
@@ -552,29 +553,41 @@ struct IngressPair {
 /// The agent forwards its full current ingress list; the CP re-PUTs
 /// the tunnel config + CNAMEs and reconciles per-workload CF Access
 /// bypass apps (creates new, deletes stale).
+///
+/// Retained alongside the new Noise RPC path so agents built before
+/// the m2m migration still work. Once every agent has a pinned
+/// pubkey, this endpoint becomes removable.
 async fn ingress_replace(
     State(s): State<St>,
     Json(req): Json<IngressReplaceReq>,
 ) -> Result<Json<serde_json::Value>> {
     // ITA is the auth — any failure → 401.
     let _claims = s.verifier.verify(&req.ita_token).await?;
+    do_ingress_replace(&s, &req.agent_id, req.extras).await
+}
 
+/// Pure ingress-replace logic with no auth check. Called by both the
+/// HTTP+ITA path (above) and the Noise RPC path (below); they each
+/// own their own auth.
+async fn do_ingress_replace(
+    s: &St,
+    agent_id: &str,
+    extras_in: Vec<IngressPair>,
+) -> Result<Json<serde_json::Value>> {
     let (tunnel_id, hostname) = {
         let store = s.store.lock().await;
-        let agent = store.get(&req.agent_id).ok_or(Error::NotFound)?;
+        let agent = store.get(agent_id).ok_or(Error::NotFound)?;
         if agent.tunnel_id.is_empty() {
             // Control-plane pseudo-entry, or an older store entry that
             // pre-dates the tunnel_id field. Either way, nothing to update.
             return Err(Error::BadRequest(format!(
-                "{} has no tunnel — runtime ingress applies only to agent tunnels",
-                req.agent_id
+                "{agent_id} has no tunnel — runtime ingress applies only to agent tunnels"
             )));
         }
         (agent.tunnel_id.clone(), agent.hostname.clone())
     };
 
-    let extras: Vec<(String, u16)> = req
-        .extras
+    let extras: Vec<(String, u16)> = extras_in
         .iter()
         .map(|e| (e.hostname_label.clone(), e.port))
         .collect();
@@ -594,21 +607,82 @@ async fn ingress_replace(
     )
     .await
     {
-        eprintln!("cp: provision_agent_access on /ingress/replace failed: {e}");
+        eprintln!("cp: provision_agent_access on ingress_replace failed: {e}");
     }
 
     {
         let mut store = s.store.lock().await;
-        if let Some(agent) = store.get_mut(&req.agent_id) {
+        if let Some(agent) = store.get_mut(agent_id) {
             agent.extras = extras;
         }
     }
 
-    eprintln!("cp: ingress/replace {} → {:?}", req.agent_id, hostnames);
+    eprintln!("cp: ingress/replace {agent_id} → {hostnames:?}");
     Ok(Json(serde_json::json!({
-        "agent_id": req.agent_id,
+        "agent_id": agent_id,
         "extra_hostnames": hostnames,
     })))
+}
+
+/// GET /noise/rpc — authenticated by the Noise_IK handshake's pinned
+/// pubkey. Currently supports one op: `ingress_replace`. Others
+/// (`api_agents`, `heartbeat`) migrate on follow-up PRs.
+async fn noise_rpc_upgrade(
+    ws: axum::extract::ws::WebSocketUpgrade,
+    State(s): State<St>,
+) -> axum::response::Response {
+    ws.on_upgrade(move |socket| noise_rpc_loop(socket, s))
+}
+
+async fn noise_rpc_loop(socket: axum::extract::ws::WebSocket, s: St) {
+    let Some(key) = s.noise.clone() else {
+        eprintln!("cp: /noise/rpc but no key configured; closing");
+        return;
+    };
+    crate::noise_rpc::serve(socket, &key, move |peer_pubkey, req| async move {
+        dispatch_m2m_rpc(&s, peer_pubkey, req).await
+    })
+    .await;
+}
+
+/// Dispatch one decrypted m2m RPC. Verifies the peer pubkey matches
+/// the pinned key for the claimed `agent_id` before doing any work.
+async fn dispatch_m2m_rpc(s: &St, peer: [u8; 32], req: serde_json::Value) -> serde_json::Value {
+    let op = req
+        .get("op")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let agent_id = req
+        .get("agent_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let pinned = s.agent_pubkeys.get(&agent_id).await;
+    match pinned {
+        Some(pk) if pk == peer => {}
+        Some(_) => return err("peer pubkey mismatch"),
+        None => return err(&format!("agent_id {agent_id} not enrolled")),
+    }
+
+    match op.as_str() {
+        "ingress_replace" => {
+            let extras: Vec<IngressPair> = req
+                .get("extras")
+                .and_then(|v| serde_json::from_value(v.clone()).ok())
+                .unwrap_or_default();
+            match do_ingress_replace(s, &agent_id, extras).await {
+                Ok(Json(data)) => serde_json::json!({"ok": true, "data": data}),
+                Err(e) => err(&format!("{e}")),
+            }
+        }
+        other => err(&format!("unknown op: {other}")),
+    }
+}
+
+fn err(msg: &str) -> serde_json::Value {
+    serde_json::json!({"ok": false, "error": msg})
 }
 
 /// Mint the CP's own ITA token at startup. Fatal on any failure —
