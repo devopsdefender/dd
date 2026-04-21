@@ -787,6 +787,7 @@ pub fn router(manager: Manager) -> Router {
         .route("/api/sessions/{id}", delete(kill_session))
         .route("/ws/{id}", get(ws_upgrade))
         .route("/noise/ws", get(noise_ws_upgrade))
+        .route("/noise/shell/{id}", get(noise_shell_upgrade))
         .layer(cors)
         .with_state(manager)
 }
@@ -1073,6 +1074,297 @@ async fn ws_loop(mut socket: WebSocket, id: String, m: Manager) {
         _ = inbound => {},
         _ = outbound => {},
     }
+}
+
+// ---------------------------------------------------------------------
+// /noise/shell/{id} — Noise_IK-tunneled PTY streaming
+//
+// Mirrors `/ws/{id}` but every frame rides inside a Noise_IK
+// transport. Inside the encrypted tunnel we use a 1-byte type tag so
+// we don't pay base64 overhead on the high-volume stdout stream:
+//   0x01 <bytes>      — raw PTY data (stdin client→server or
+//                       stdout server→client)
+//   0x02 <json-bytes> — control frame (resize/hello/block/exit/...)
+// ---------------------------------------------------------------------
+
+const NOISE_FRAME_RAW: u8 = 0x01;
+const NOISE_FRAME_CTRL: u8 = 0x02;
+
+async fn noise_shell_upgrade(
+    ws: WebSocketUpgrade,
+    Path(id): Path<String>,
+    State(m): State<Manager>,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| noise_shell_loop(socket, id, m))
+}
+
+async fn noise_shell_loop(mut socket: WebSocket, id: String, m: Manager) {
+    use futures_util::StreamExt;
+
+    let Some(noise_key) = m.noise.clone() else {
+        let _ = socket
+            .send(Message::Text(
+                r#"{"error":"noise_not_configured"}"#.to_string().into(),
+            ))
+            .await;
+        return;
+    };
+
+    // Drive the IK handshake first. Same dance as /noise/ws.
+    let mut responder = match noise_tunnel::Responder::new(noise_key.secret_bytes()) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("bastion/noise-shell: responder init: {e}");
+            return;
+        }
+    };
+    let msg1 = match socket.recv().await {
+        Some(Ok(Message::Binary(b))) => b,
+        other => {
+            eprintln!("bastion/noise-shell: expected binary msg1, got {other:?}");
+            return;
+        }
+    };
+    if let Err(e) = responder.read_msg1(&msg1) {
+        eprintln!("bastion/noise-shell: msg1 read: {e}");
+        return;
+    }
+    let peer_pub = responder
+        .peer_pubkey()
+        .map(|p| format!("{}…", &crate::noise::hex_encode(&p)[..16]))
+        .unwrap_or_else(|| "?".into());
+    let msg2 = match responder.write_msg2(&[]) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("bastion/noise-shell: msg2 write: {e}");
+            return;
+        }
+    };
+    if socket.send(Message::Binary(msg2.into())).await.is_err() {
+        return;
+    }
+    let transport = match responder.into_transport() {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("bastion/noise-shell: transport xition: {e}");
+            return;
+        }
+    };
+    eprintln!("bastion/noise-shell: tunnel up for session {id} (peer={peer_pub})");
+
+    // Wrap the transport + split socket eagerly so the not-found and
+    // replay paths use the same Arc<Mutex> dispatch as the hot loops.
+    let transport = Arc::new(Mutex::new(transport));
+    let (sink, mut stream) = socket.split();
+    let sink = Arc::new(Mutex::new(sink));
+
+    let Some(session) = m.get(&id).await else {
+        noise_send_ctrl(
+            &sink,
+            &transport,
+            &serde_json::json!({"type":"error","code":"not_found"}),
+        )
+        .await;
+        return;
+    };
+
+    // Replay: current ring + blocks + ready, same as ws_loop but
+    // through the encrypted channel.
+    {
+        let ring_bytes: Vec<u8> = session.ring.lock().await.iter().copied().collect();
+        if !ring_bytes.is_empty() {
+            noise_send_raw(&sink, &transport, &ring_bytes).await;
+        }
+        let blocks = session.blocks.read().await;
+        for b in blocks.iter() {
+            noise_send_ctrl(
+                &sink,
+                &transport,
+                &serde_json::json!({
+                    "type": "block",
+                    "session_id": b.session_id,
+                    "kind": b.kind,
+                    "seq": b.seq,
+                    "started_at_ms": b.started_at_ms,
+                    "ended_at_ms": b.ended_at_ms,
+                    "command": b.command,
+                    "output_b64": b.output_b64,
+                    "exit_code": b.exit_code,
+                }),
+            )
+            .await;
+        }
+        let seq = *session.next_seq.lock().await;
+        noise_send_ctrl(
+            &sink,
+            &transport,
+            &serde_json::json!({"type":"ready","seq":seq}),
+        )
+        .await;
+    }
+
+    let mut rx = session.tx.subscribe();
+    let writer = session.writer.clone();
+    let master = session.master.clone();
+    let transport_in = transport.clone();
+
+    let inbound = async move {
+        while let Some(Ok(msg)) = stream.next().await {
+            let Message::Binary(cipher) = msg else {
+                if matches!(msg, Message::Close(_)) {
+                    break;
+                }
+                // Plaintext text frames are invalid once the tunnel
+                // is up; drop them.
+                continue;
+            };
+            let plain = {
+                let mut t = transport_in.lock().await;
+                match t.recv(&cipher) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("bastion/noise-shell: decrypt: {e}");
+                        break;
+                    }
+                }
+            };
+            if plain.is_empty() {
+                continue;
+            }
+            match plain[0] {
+                NOISE_FRAME_RAW => {
+                    let Some(w) = writer.clone() else { continue };
+                    let bytes = plain[1..].to_vec();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        let mut g = w.blocking_lock();
+                        let _ = g.write_all(&bytes);
+                    })
+                    .await;
+                }
+                NOISE_FRAME_CTRL => {
+                    let Ok(msg) = serde_json::from_slice::<ClientMsg>(&plain[1..]) else {
+                        continue;
+                    };
+                    match msg {
+                        ClientMsg::Resize(r) => {
+                            let Some(m) = master.as_ref() else { continue };
+                            let g = m.lock().await;
+                            let _ = g.resize(PtySize {
+                                rows: r.rows.max(4),
+                                cols: r.cols.max(8),
+                                pixel_width: 0,
+                                pixel_height: 0,
+                            });
+                        }
+                        ClientMsg::Hello(_) => {}
+                    }
+                }
+                _ => {} // Unknown frame type — ignore.
+            }
+        }
+    };
+
+    let sink_out = sink.clone();
+    let transport_out = transport.clone();
+    let outbound = async move {
+        loop {
+            let ev = match rx.recv().await {
+                Ok(e) => e,
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(_) => break,
+            };
+            let ok = match ev {
+                Event::Raw(bytes) => noise_send_raw(&sink_out, &transport_out, &bytes).await,
+                Event::Block(b) => {
+                    noise_send_ctrl(
+                        &sink_out,
+                        &transport_out,
+                        &serde_json::json!({
+                            "type": "block",
+                            "session_id": b.session_id,
+                            "kind": b.kind,
+                            "seq": b.seq,
+                            "started_at_ms": b.started_at_ms,
+                            "ended_at_ms": b.ended_at_ms,
+                            "command": b.command,
+                            "output_b64": b.output_b64,
+                            "exit_code": b.exit_code,
+                        }),
+                    )
+                    .await
+                }
+                Event::Exit(code) => {
+                    noise_send_ctrl(
+                        &sink_out,
+                        &transport_out,
+                        &serde_json::json!({"type":"exit","code":code}),
+                    )
+                    .await;
+                    false
+                }
+            };
+            if !ok {
+                break;
+            }
+        }
+    };
+
+    tokio::select! {
+        _ = inbound => {},
+        _ = outbound => {},
+    }
+}
+
+/// Encrypt + send a raw-bytes frame (PTY stdout). Returns `false` if
+/// the sink has died so the caller can break its loop.
+async fn noise_send_raw(
+    sink: &Arc<Mutex<futures_util::stream::SplitSink<WebSocket, Message>>>,
+    transport: &Arc<Mutex<noise_tunnel::Transport>>,
+    bytes: &[u8],
+) -> bool {
+    let mut framed = Vec::with_capacity(bytes.len() + 1);
+    framed.push(NOISE_FRAME_RAW);
+    framed.extend_from_slice(bytes);
+    let cipher = {
+        let mut t = transport.lock().await;
+        match t.send(&framed) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("bastion/noise-shell: encrypt raw: {e}");
+                return false;
+            }
+        }
+    };
+    use futures_util::SinkExt;
+    let mut s = sink.lock().await;
+    s.send(Message::Binary(cipher.into())).await.is_ok()
+}
+
+/// Encrypt + send a JSON control frame (block, exit, ready, ...).
+async fn noise_send_ctrl(
+    sink: &Arc<Mutex<futures_util::stream::SplitSink<WebSocket, Message>>>,
+    transport: &Arc<Mutex<noise_tunnel::Transport>>,
+    payload: &serde_json::Value,
+) -> bool {
+    let Ok(json) = serde_json::to_vec(payload) else {
+        return false;
+    };
+    let mut framed = Vec::with_capacity(json.len() + 1);
+    framed.push(NOISE_FRAME_CTRL);
+    framed.extend_from_slice(&json);
+    let cipher = {
+        let mut t = transport.lock().await;
+        match t.send(&framed) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("bastion/noise-shell: encrypt ctrl: {e}");
+                return false;
+            }
+        }
+    };
+    use futures_util::SinkExt;
+    let mut s = sink.lock().await;
+    s.send(Message::Binary(cipher.into())).await.is_ok()
 }
 
 // ---------------------------------------------------------------------

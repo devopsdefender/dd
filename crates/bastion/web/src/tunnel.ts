@@ -144,3 +144,118 @@ function decodeHex(hex: string): Uint8Array {
   }
   return out;
 }
+
+// -----------------------------------------------------------------
+// Shell (PTY) streaming — parallel to Tunnel but purpose-built for
+// the bidirectional byte stream xterm.js consumes.
+// -----------------------------------------------------------------
+
+/// In-tunnel frame type tag — must match the server-side constants
+/// `NOISE_FRAME_RAW` + `NOISE_FRAME_CTRL` in `crates/bastion/src/lib.rs`.
+const FRAME_RAW = 0x01;
+const FRAME_CTRL = 0x02;
+
+/// A WebSocket-shaped bidirectional Noise tunnel for a single PTY
+/// session. `sendRaw` writes PTY stdin; inbound raw frames go to
+/// `onRaw` (xterm.write). JSON control frames (resize / hello from
+/// the client, block / exit / ready from the server) use the ctrl
+/// channel.
+export class ShellTunnel {
+  private rawHandlers: Array<(bytes: Uint8Array) => void> = [];
+  private ctrlHandlers: Array<(msg: any) => void> = [];
+  private closed = false;
+
+  constructor(
+    private socket: WebSocket,
+    private transport: Transport,
+  ) {
+    socket.addEventListener("message", (ev) => this.onFrame(ev));
+    socket.addEventListener("close", () => this.onClose());
+    socket.addEventListener("error", () => this.onClose());
+  }
+
+  private onFrame(ev: MessageEvent): void {
+    if (!(ev.data instanceof ArrayBuffer)) return;
+    let plain: Uint8Array;
+    try {
+      plain = this.transport.recv(new Uint8Array(ev.data));
+    } catch (e) {
+      console.warn("shell-tunnel: decrypt failed", e);
+      this.close();
+      return;
+    }
+    if (plain.length === 0) return;
+    const tag = plain[0];
+    const body = plain.slice(1);
+    if (tag === FRAME_RAW) {
+      for (const cb of this.rawHandlers) cb(body);
+    } else if (tag === FRAME_CTRL) {
+      let msg: any;
+      try {
+        msg = JSON.parse(new TextDecoder().decode(body));
+      } catch {
+        return;
+      }
+      for (const cb of this.ctrlHandlers) cb(msg);
+    }
+  }
+
+  private onClose(): void {
+    if (this.closed) return;
+    this.closed = true;
+    for (const cb of this.ctrlHandlers) cb({ type: "close" });
+  }
+
+  sendRaw(bytes: Uint8Array): void {
+    if (this.closed) return;
+    const framed = new Uint8Array(bytes.length + 1);
+    framed[0] = FRAME_RAW;
+    framed.set(bytes, 1);
+    this.socket.send(this.transport.send(framed));
+  }
+
+  sendCtrl(msg: any): void {
+    if (this.closed) return;
+    const json = new TextEncoder().encode(JSON.stringify(msg));
+    const framed = new Uint8Array(json.length + 1);
+    framed[0] = FRAME_CTRL;
+    framed.set(json, 1);
+    this.socket.send(this.transport.send(framed));
+  }
+
+  onRaw(cb: (bytes: Uint8Array) => void): void {
+    this.rawHandlers.push(cb);
+  }
+
+  onCtrl(cb: (msg: any) => void): void {
+    this.ctrlHandlers.push(cb);
+  }
+
+  close(): void {
+    this.closed = true;
+    try {
+      this.socket.close();
+    } catch {
+      // already closed
+    }
+  }
+}
+
+/// Open a Noise-tunneled shell stream for one session. Use when
+/// cross-origin + CF-Access-bypassed /noise/shell/{id} is available;
+/// for same-origin loads the plain `/ws/{id}` is still cheaper.
+export async function openShellTunnel(
+  origin: string,
+  serverPubkeyHex: string,
+  sessionId: string,
+): Promise<ShellTunnel> {
+  const trimmed = origin.replace(/\/+$/, "");
+  const wssUrl =
+    trimmed.replace(/^http(s)?:/, (m) => (m === "http:" ? "ws:" : "wss:")) +
+    `/noise/shell/${encodeURIComponent(sessionId)}`;
+  const seed = loadIdentitySeed();
+  const client = keypairFromSeed(seed);
+  const serverPub = decodeHex(serverPubkeyHex);
+  const { socket, transport } = await connectNoise(wssUrl, client, serverPub);
+  return new ShellTunnel(socket, transport);
+}

@@ -24,8 +24,14 @@ export interface Row {
   origin: string;
   info: SessionInfo;
   blocks: BlockRecord[];
-  /// Live WS to the owning origin. `null` until first activation.
+  /// Plain `/ws/{id}` WebSocket — used for same-origin loads where
+  /// CF Access already covers the upgrade. `null` until first
+  /// activation, or when the row is served over the Noise shell
+  /// tunnel instead.
   ws: WebSocket | null;
+  /// Noise-tunneled PTY stream for cross-origin enclaves. Mutually
+  /// exclusive with `ws` — whichever was opened first wins.
+  shell: import("./tunnel").ShellTunnel | null;
   /// xterm.js instance. `null` until first activation.
   term: import("@xterm/xterm").Terminal | null;
   fit: import("@xterm/addon-fit").FitAddon | null;
@@ -181,6 +187,7 @@ async function fetchDdEnclave(c: Connector): Promise<Row[]> {
     info,
     blocks: [],
     ws: null,
+    shell: null,
     term: null,
     fit: null,
   }));
@@ -212,6 +219,7 @@ export async function createShell(c: Connector): Promise<void> {
       info,
       blocks: [],
       ws: null,
+      shell: null,
       term: null,
       fit: null,
     });
@@ -268,6 +276,11 @@ export function destroyRow(id: RowId): void {
   if (!row) return;
   try {
     row.ws?.close();
+  } catch {
+    // Already closed; nothing to do.
+  }
+  try {
+    row.shell?.close();
   } catch {
     // Already closed; nothing to do.
   }
