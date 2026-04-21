@@ -1,0 +1,65 @@
+name: Relaunch local TDX CP
+description: >-
+  SSH into the tdx2 host and recreate the `dd-local-{env}-cp` libvirt
+  domain for this env (prod / pr-N / staging). Mirrors relaunch-agent,
+  but boots dd-management instead of dd-agent. Used by deploy-cp.yml's
+  `target: ssh` branch as a drop-in replacement for GCE VM creation.
+
+inputs:
+  env:
+    description: 'DD_ENV the CP serves (e.g. pr-42, staging)'
+    required: true
+  hostname:
+    description: 'Where the CP claims its CF tunnel (e.g. pr-42.devopsdefender.com)'
+    required: true
+  ref:
+    description: 'Git ref whose apps/ tree the host should check out'
+    required: true
+  ssh-key:
+    description: 'Private SSH key for tdx2@host'
+    required: true
+  host:
+    description: 'Public host address of the tdx2 node'
+    required: true
+  cf-api-token:
+    description: 'Cloudflare API token (tunnel + DNS + Access scopes)'
+    required: true
+  cf-account-id:
+    description: 'Cloudflare account id'
+    required: true
+  cf-zone-id:
+    description: 'Cloudflare zone id for the apex domain'
+    required: true
+  admin-email:
+    description: 'Break-glass email for CF Access human policy'
+    required: true
+  ita-api-key:
+    description: 'Intel Trust Authority API key'
+    required: true
+  release-tag:
+    description: 'devopsdefender release tag (e.g. pr-abc123, latest)'
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: ssh + relaunch CP VM
+      uses: appleboy/ssh-action@v1.2.0
+      env:
+        ENV_LABEL:              ${{ inputs.env }}
+        CP_HOSTNAME:            ${{ inputs.hostname }}
+        REF:                    ${{ inputs.ref }}
+        RELEASE_TAG:            ${{ inputs.release-tag }}
+        CLOUDFLARE_API_TOKEN:   ${{ inputs.cf-api-token }}
+        CLOUDFLARE_ACCOUNT_ID:  ${{ inputs.cf-account-id }}
+        CLOUDFLARE_ZONE_ID:     ${{ inputs.cf-zone-id }}
+        DD_ACCESS_ADMIN_EMAIL:  ${{ inputs.admin-email }}
+        DD_ITA_API_KEY:         ${{ inputs.ita-api-key }}
+      with:
+        host: ${{ inputs.host }}
+        username: tdx2
+        key: ${{ inputs.ssh-key }}
+        envs: ENV_LABEL,CP_HOSTNAME,REF,RELEASE_TAG,CLOUDFLARE_API_TOKEN,CLOUDFLARE_ACCOUNT_ID,CLOUDFLARE_ZONE_ID,DD_ACCESS_ADMIN_EMAIL,DD_ITA_API_KEY
+        script: |
+          /home/tdx2/src/dd/apps/_infra/dd-relaunch-cp.sh \
+            "$ENV_LABEL" "$CP_HOSTNAME" "$REF" "$RELEASE_TAG"

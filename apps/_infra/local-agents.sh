@@ -130,6 +130,11 @@ build_config_iso() {
   # Boot is: nvidia driver (GPU only), podman runtime, cloudflared.
   local bare_workloads
   bare_workloads=$({
+    # mount-data runs first so `/dev/vdc` is at `/data` by the time
+    # podman-bootstrap reaches its `mountpoint -q` wait (both spawn
+    # concurrently but EE's pre-fetch serializes binary downloads
+    # before boot-loop).
+    bake "$REPO_ROOT/apps/mount-data/workload.json"
     [ "$with_gpu" = "yes" ] && bake "$REPO_ROOT/apps/nv/workload.json"
     bake "$REPO_ROOT/apps/podman-static/workload.json"
     bake "$REPO_ROOT/apps/podman-bootstrap/workload.json"
@@ -169,20 +174,65 @@ build_config_iso() {
 
   # ext4 — EE rootfs has no iso9660 module.
   truncate -s 4M "$out"
-  mkfs.ext4 -q -d "$tmp" "$out"
+  # `-O ^has_journal` — 4 MB is below ext4's journal min (~8 MB),
+  # silences "Filesystem too small for a journal". Config volume is
+  # read-only so journaling isn't needed anyway.
+  mkfs.ext4 -q -O ^has_journal -d "$tmp" "$out"
   echo "  wrote $out (env=$env, gpu=$with_gpu, extra_ingress=$extra_ingress)"
 }
 
 build_overlay() {
   # $1=name
+  #
+  # Just the root overlay — small, sparse, tracks EE boot state.
+  # Real workload storage (podman images, HF model weights) lives on
+  # a SEPARATE workload.qcow2 mounted at /dev/vdc inside the VM and
+  # sized per the DD capacity rule — see `build_workload_disk`.
   local name="$1"
   local overlay="$IMG_DIR/dd-local-$name.qcow2"
   if [ -f "$overlay" ]; then
     echo "  overlay $overlay already exists (reusing)"
     return
   fi
-  qemu-img create -q -F qcow2 -b "$BASE" -f qcow2 "$overlay" 10G
-  echo "  wrote $overlay (backing $BASE)"
+  qemu-img create -q -F qcow2 -b "$BASE" -f qcow2 "$overlay" 20G
+  echo "  wrote $overlay (20G sparse, backing $BASE)"
+}
+
+build_workload_disk() {
+  # $1=name   $2=size-spec (e.g. 160G, 1920G)
+  #
+  # Persistent podman/model storage as a separate qcow2, ext4-formatted
+  # so EE's `mount-data` workload can mount it at `/data` (where
+  # podman-bootstrap looks for overlay driver backing).
+  # Sparse — the 1.92 TB GPU disk occupies <1 MB until something
+  # actually writes. Uses qemu-nbd + mkfs.ext4 for one-time format.
+  local name="$1" size="${2:-160G}"
+  local disk="$IMG_DIR/dd-local-$name-workload.qcow2"
+  if [ -f "$disk" ]; then
+    echo "  workload disk $disk already exists (reusing)"
+    return
+  fi
+  qemu-img create -q -f qcow2 "$disk" "$size"
+  # Load nbd + pick first free /dev/nbdN. Idempotent.
+  sudo modprobe nbd max_part=8 2>/dev/null || true
+  local nbd
+  for n in /dev/nbd*; do
+    [ -b "$n" ] || continue
+    [ -s "/sys/block/$(basename "$n")/pid" ] && continue
+    nbd="$n"
+    break
+  done
+  [ -n "$nbd" ] || { echo "no free /dev/nbd*"; exit 1; }
+  sudo qemu-nbd --connect="$nbd" "$disk"
+  # Retry — qemu-nbd returns before the device is fully ready for IO.
+  for _ in 1 2 3 4 5; do
+    if sudo mkfs.ext4 -q -L workload "$nbd" 2>/dev/null; then
+      break
+    fi
+    sleep 1
+  done
+  sudo qemu-nbd --disconnect "$nbd" >/dev/null
+  echo "  wrote $disk ($size ext4, label=workload)"
 }
 
 render_domain_xml() {
@@ -200,17 +250,48 @@ render_domain_xml() {
   # Rewrite disk paths to this agent's overlay + config.
   sed -i "s|$IMG_DIR/$BASE_DOMAIN.qcow2|$IMG_DIR/dd-local-$name.qcow2|g" "$out"
   sed -i "s|$IMG_DIR/$BASE_DOMAIN-config.iso|$IMG_DIR/dd-local-$name-config.iso|g" "$out"
+
+  # Inject the workload disk as /dev/vdc right after the config iso
+  # (vdb). podman-bootstrap waits for a `mountpoint` at
+  # /data — mount-data satisfies that from
+  # this disk. Without it, podman falls back to vfs-on-tmpfs and can't
+  # hold a single modern container image.
+  python3 - "$out" "$IMG_DIR/dd-local-$name-workload.qcow2" <<'PY'
+import re, sys
+xml_path, disk_path = sys.argv[1], sys.argv[2]
+with open(xml_path) as f: x = f.read()
+new_disk = (
+    f"    <disk type='file' device='disk'>\n"
+    f"      <driver name='qemu' type='qcow2'/>\n"
+    f"      <source file='{disk_path}'/>\n"
+    f"      <target dev='vdc' bus='virtio'/>\n"
+    f"    </disk>\n"
+)
+# Append after the last existing <disk>..</disk> block so bus/slot
+# assignment stays libvirt's job (no <address> specified).
+x = re.sub(r"(</disk>\n)(?=(?:(?!</disk>).)*?</devices>)", r"\1" + new_disk, x, count=1, flags=re.DOTALL)
+with open(xml_path, "w") as f: f.write(x)
+PY
   # Rewrite the serial/console log file — base XML points at
   # /var/log/ee-local.log, which libvirt opens exclusively. Two VMs
   # sharing the same path collide with "Device or resource busy".
   sed -i "s|/var/log/ee-local\\.log|/var/log/ee-local-$name.log|g" "$out"
 
-  # Size the VM for the workload. Base easyenclave-local is 4 GiB /
-  # 2 vCPU — fine for a bare agent. The demo workloads are modest
-  # (web-nvidia-smi just runs nvidia-smi on demand + one apt-get at
-  # boot for netcat). Host has 243 GiB / 64 cores.
-  local mem_kib=8388608   # 8 GiB
-  local vcpus=8
+  # Size the VM per the DD capacity rule. Host has 243 GiB / 64 vCPU
+  # so even the GPU-prod shape leaves room for a CP VM + several
+  # preview agents concurrently.
+  #
+  #   preview (no GPU):  RAM =  16 GiB, vCPU =  4
+  #   prod    (H100):    RAM =  98 GiB, vCPU = 16
+  #                      (RAM = VRAM + 4 = 94 + 4 = 98 per the rule)
+  local mem_kib vcpus
+  if [ "$with_gpu" = "yes" ]; then
+    mem_kib=102760448   # 98 GiB
+    vcpus=16
+  else
+    mem_kib=16777216    # 16 GiB
+    vcpus=4
+  fi
   sed -i -E "s|<memory unit='KiB'>[0-9]+</memory>|<memory unit='KiB'>$mem_kib</memory>|" "$out"
   sed -i -E "s|<currentMemory unit='KiB'>[0-9]+</currentMemory>|<currentMemory unit='KiB'>$mem_kib</currentMemory>|" "$out"
   sed -i -E "s|<vcpu placement='static'>[0-9]+</vcpu>|<vcpu placement='static'>$vcpus</vcpu>|" "$out"
@@ -244,6 +325,16 @@ define_agent() {
 
   echo "== dd-local-$name → $cp (env=$env_label, gpu=$with_gpu) =="
   build_overlay "$name"
+  # Workload disk (/dev/vdc, ext4, mounted at /data by the mount-data
+  # boot workload). Sized per the DD capacity rule:
+  #   prod (H100):   10 × (RAM+VRAM) = 10 × 192 = 1.92 TB
+  #   preview:       10 × RAM        = 10 × 16  =  160 GB
+  # Sparse qcow2, so only grows with actual writes.
+  if [ "$with_gpu" = "yes" ]; then
+    build_workload_disk "$name" 1920G
+  else
+    build_workload_disk "$name" 160G
+  fi
   build_config_iso "$name" "$cp" "$env_label" "$with_gpu"
   local xml
   xml=$(render_domain_xml "$name" "$with_gpu")
