@@ -1,0 +1,55 @@
+name: Deploy workload
+
+# Generic workload deployer — run any `apps/*/workload.json{,.tmpl}`
+# on the production GPU agent (or any other DD agent you have access
+# to) via the existing `dd-deploy` composite action.
+#
+# The agent's `/deploy` endpoint is gated by GitHub Actions OIDC, so
+# deploying a new workload HAS to originate from a workflow run; you
+# can't hit it from your laptop. This workflow is that entry point —
+# one dispatchable for the whole apps tree, not a separate workflow
+# per app.
+#
+# Usage:
+#   gh workflow run deploy-workload.yml \
+#     -f workload=apps/vllm/workload.json \
+#     -f vm-name=dd-local-prod
+
+on:
+  workflow_dispatch:
+    inputs:
+      workload:
+        description: 'Path to workload JSON (e.g. apps/vllm/workload.json)'
+        required: true
+        type: string
+      vm-name:
+        description: 'Target agent vm_name as seen on /api/agents'
+        required: false
+        type: string
+        default: dd-local-prod
+      cp-url:
+        description: 'CP URL the dd-deploy action discovers the agent through'
+        required: false
+        type: string
+        default: https://app.devopsdefender.com
+      wait-seconds:
+        description: 'Seconds to wait for the deployment to show up in /health'
+        required: false
+        type: string
+        default: '600'
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Deploy ${{ inputs.workload }} to ${{ inputs.vm-name }}
+        uses: ./.github/actions/dd-deploy
+        with:
+          cp-url: ${{ inputs.cp-url }}
+          vm-name: ${{ inputs.vm-name }}
+          workload: ${{ inputs.workload }}
+          wait-for-deployment-seconds: ${{ inputs.wait-seconds }}

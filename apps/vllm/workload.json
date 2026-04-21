@@ -1,0 +1,8 @@
+{
+  "app_name": "vllm",
+  "expose": { "hostname_label": "vllm", "port": 8000 },
+  "cmd": [
+    "/bin/busybox", "sh", "-c",
+    "until [ -x /var/lib/easyenclave/bin/podman ]; do sleep 2; done\nexec /var/lib/easyenclave/bin/podman run --rm --name vllm --network=host --ipc=host --device=/dev/nvidia0 --device=/dev/nvidiactl --device=/dev/nvidia-uvm --device=/dev/nvidia-uvm-tools docker.io/vllm/vllm-openai:latest --model Qwen/Qwen2.5-0.5B-Instruct --host 0.0.0.0 --port 8000 --gpu-memory-utilization 0.6 --max-model-len 4096"
+  ]
+}
