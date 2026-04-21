@@ -131,15 +131,19 @@ pub async fn run() -> Result<()> {
         .route("/deploy", post(deploy))
         .route("/exec", post(exec))
         .route("/logs/{app}", get(logs))
+        .route("/api/agents", get(api_agents_proxy))
         .fallback(log_unmatched)
         .with_state(state);
 
     let addr = format!("0.0.0.0:{}", cfg.common.port);
     eprintln!("agent: listening on {addr}");
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-    axum::serve(listener, app)
-        .await
-        .map_err(|e| Error::Internal(e.to_string()))
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await
+    .map_err(|e| Error::Internal(e.to_string()))
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -580,6 +584,38 @@ async fn logs(
         .map(String::from)
         .ok_or(Error::NotFound)?;
     Ok(Json(s.ee.logs(&id).await?))
+}
+
+/// GET /api/agents — loopback-only proxy to the CP's same-named
+/// endpoint. Uses this agent's own ITA token as the Bearer, so the
+/// CP's ITA verifier accepts the call without needing a GH OIDC
+/// JWT or service token. Bastion on this VM calls
+/// `http://localhost:8080/api/agents` to get the fleet catalog
+/// without having to cross-origin to the CP's public hostname.
+async fn api_agents_proxy(
+    State(s): State<St>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
+) -> Result<Json<serde_json::Value>> {
+    if !peer.ip().is_loopback() {
+        return Err(Error::Unauthorized);
+    }
+    let token = s.ita_token.read().await.clone();
+    let url = format!("{}/api/agents", s.cfg.cp_url.trim_end_matches('/'));
+    let resp = reqwest::Client::new()
+        .get(&url)
+        .bearer_auth(&token)
+        .timeout(std::time::Duration::from_secs(3))
+        .send()
+        .await
+        .map_err(|e| Error::Upstream(format!("cp /api/agents: {e}")))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(Error::Upstream(format!(
+            "cp /api/agents → {status}: {body}"
+        )));
+    }
+    Ok(Json(resp.json().await?))
 }
 
 async fn exec(

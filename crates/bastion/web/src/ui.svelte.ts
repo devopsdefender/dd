@@ -1,87 +1,130 @@
 import type { Agent, BlockRecord, SessionInfo } from "./types";
+import type { Connector } from "./connectors";
+import { listConnectors, seedFromAgents, addConnector } from "./connectors";
+import { loadIdentitySeed, fingerprint } from "./identity";
 
-/// Composite key so session ids from different agents can't collide.
-export type RowId = string; // `${vm_name}/${session_id}`
+/// Composite key so session ids from different connectors can't collide.
+export type RowId = string; // `${connector.label}/${session_id}`
 
 export interface Row {
-  /// Node this session lives on.
-  agent: Agent;
+  /// Connector this session came from. The SPA keeps a direct
+  /// reference (rather than a connector id) so row operations don't
+  /// need to re-look-up the connector.
+  connector: Connector;
+  /// Origin this row's WS/API calls target. For `dd-enclave` this
+  /// comes from `connector.config.origin`; future kinds (SSH,
+  /// Anthropic) compute it differently.
+  origin: string;
   info: SessionInfo;
   blocks: BlockRecord[];
-  /// Live WS to the owning agent. `null` until first activation.
+  /// Live WS to the owning origin. `null` until first activation.
   ws: WebSocket | null;
   /// xterm.js instance. `null` until first activation.
   term: import("@xterm/xterm").Terminal | null;
   fit: import("@xterm/addon-fit").FitAddon | null;
 }
 
-function rowKey(agent: Agent, sessionId: string): RowId {
-  return `${agent.vm_name}/${sessionId}`;
+function rowKey(connector: Connector, sessionId: string): RowId {
+  return `${connector.label}/${sessionId}`;
 }
 
-/// Svelte 5 runes-based reactive ui. One flat Map of rows, keyed by
-/// `${vm_name}/${id}`, populated by fan-out in unified mode or a single
-/// fetch in single-node mode.
-///
-/// Named `ui` (not `state`) to avoid ambiguity with Svelte's `$state`
-/// rune when consumers also use runes locally.
+/// Svelte 5 runes-based reactive UI state. One flat Map of rows plus
+/// the client-held connector list. Named `ui` (not `state`) to avoid
+/// ambiguity with Svelte's `$state` rune when consumers also use
+/// runes locally.
 export const ui = $state<{
   rows: Map<RowId, Row>;
   active: RowId | null;
-  agents: Agent[];
-  unified: boolean;
+  connectors: Connector[];
+  /// Short visual device-id fingerprint — rendered in the sidebar
+  /// header. Derived from the identity seed persisted in
+  /// localStorage (see `identity.ts`).
+  deviceFp: string;
+  /// True once the first `bootstrap()` call finishes. UI can use
+  /// this to show a spinner on initial load.
+  ready: boolean;
 }>({
   rows: new Map(),
   active: null,
-  agents: [],
-  unified: false,
+  connectors: [],
+  deviceFp: "",
+  ready: false,
 });
 
-/// Agents to query. In unified mode comes from `window.__DD_AGENTS__`;
-/// otherwise a single-element list representing the current origin.
-export function resolveAgents(): Agent[] {
+/// One-time setup at app load: mint/load the device identity, pull
+/// the connector list from IndexedDB (seed on first run from the
+/// server-injected `__DD_AGENTS__`), and fan out to each connector
+/// to populate `ui.rows`.
+export async function bootstrap(): Promise<void> {
+  ui.deviceFp = fingerprint(loadIdentitySeed());
   if (window.__DD_AGENTS__ && window.__DD_AGENTS__.length > 0) {
-    ui.unified = true;
-    return window.__DD_AGENTS__;
+    await seedFromAgents(window.__DD_AGENTS__);
   }
-  ui.unified = false;
-  return [{ vm_name: location.hostname, origin: location.origin }];
+  await refreshConnectors();
+  ui.ready = true;
 }
 
-export async function loadSessions(): Promise<void> {
-  ui.agents = resolveAgents();
+/// Reload connectors from IndexedDB and re-fetch sessions from each.
+/// Called after add/remove.
+export async function refreshConnectors(): Promise<void> {
+  ui.connectors = await listConnectors();
+  await reloadSessions();
+}
+
+async function reloadSessions(): Promise<void> {
   const all = await Promise.all(
-    ui.agents.map(async (agent): Promise<Row[]> => {
-      try {
-        const resp = await fetch(`${agent.origin}/api/sessions`, {
-          credentials: "include",
-        });
-        if (!resp.ok) return [];
-        const sessions: SessionInfo[] = await resp.json();
-        return sessions.map((info) => ({
-          agent,
-          info,
-          blocks: [],
-          ws: null,
-          term: null,
-          fit: null,
-        }));
-      } catch {
-        return [];
+    ui.connectors.map(async (c): Promise<Row[]> => {
+      if (c.kind === "dd-enclave") {
+        return fetchDdEnclave(c);
       }
-    })
+      // Every other connector kind is a Phase-3 TODO. Keep the row
+      // for sidebar discoverability but don't try to fetch.
+      return [];
+    }),
   );
   const next = new Map<RowId, Row>();
   for (const bucket of all) {
     for (const row of bucket) {
-      next.set(rowKey(row.agent, row.info.id), row);
+      next.set(rowKey(row.connector, row.info.id), row);
     }
   }
   ui.rows = next;
 }
 
-export async function createShell(agent: Agent): Promise<void> {
-  const resp = await fetch(`${agent.origin}/api/sessions`, {
+/// Fetch an enclave's live sessions. Cross-origin failures
+/// (CF-Access bounce, CORS reject, offline) degrade to "no rows" for
+/// that enclave rather than propagating — the sidebar still shows
+/// every connector the user configured, just empty for unreachable
+/// ones. Phase 2 replaces this with a Noise_KK channel that isn't
+/// subject to the same browser same-origin rules.
+async function fetchDdEnclave(c: Connector): Promise<Row[]> {
+  const origin = (c.config.origin as string | undefined) ?? "";
+  if (!origin) return [];
+  try {
+    const resp = await fetch(`${origin}/api/sessions`, {
+      credentials: "include",
+    });
+    if (!resp.ok) return [];
+    const sessions: SessionInfo[] = await resp.json();
+    return sessions.map((info) => ({
+      connector: c,
+      origin,
+      info,
+      blocks: [],
+      ws: null,
+      term: null,
+      fit: null,
+    }));
+  } catch {
+    return [];
+  }
+}
+
+export async function createShell(c: Connector): Promise<void> {
+  if (c.kind !== "dd-enclave") return;
+  const origin = (c.config.origin as string | undefined) ?? "";
+  if (!origin) return;
+  const resp = await fetch(`${origin}/api/sessions`, {
     method: "POST",
     credentials: "include",
     headers: { "content-type": "application/json" },
@@ -89,10 +132,11 @@ export async function createShell(agent: Agent): Promise<void> {
   });
   if (!resp.ok) return;
   const info: SessionInfo = await resp.json();
-  const id = rowKey(agent, info.id);
+  const id = rowKey(c, info.id);
   const rows = new Map(ui.rows);
   rows.set(id, {
-    agent,
+    connector: c,
+    origin,
     info,
     blocks: [],
     ws: null,
@@ -104,8 +148,12 @@ export async function createShell(agent: Agent): Promise<void> {
 }
 
 export async function killShell(row: Row): Promise<void> {
+  if (row.connector.kind !== "dd-enclave") {
+    destroyRow(rowKey(row.connector, row.info.id));
+    return;
+  }
   try {
-    await fetch(`${row.agent.origin}/api/sessions/${row.info.id}`, {
+    await fetch(`${row.origin}/api/sessions/${row.info.id}`, {
       method: "DELETE",
       credentials: "include",
     });
@@ -113,7 +161,7 @@ export async function killShell(row: Row): Promise<void> {
     // Not fatal — the session might be gone already; the UI cleanup
     // below runs either way.
   }
-  destroyRow(rowKey(row.agent, row.info.id));
+  destroyRow(rowKey(row.connector, row.info.id));
 }
 
 export function destroyRow(id: RowId): void {
@@ -136,3 +184,6 @@ export function destroyRow(id: RowId): void {
     ui.active = null;
   }
 }
+
+/// Re-export for the sidebar's "Add enclave" dialog.
+export { addConnector };
