@@ -547,6 +547,22 @@ pub async fn provision_cp_access(
                 vec![human_policy(owner, admin_email, &idp)],
             )
             .await?;
+            // Bastion's Noise-tunneled endpoints authenticate via the
+            // Noise_IK handshake — CF Access would otherwise 302 the
+            // WS upgrade (no session cookie on a cross-origin WS from
+            // a different bastion), which kills the handshake. Path-
+            // scoped bypasses ride alongside the root human policy.
+            if label == "block" {
+                for (suffix, bypass_label) in [("/attest", "attest"), ("/noise", "noise")] {
+                    ensure_bypass_app(
+                        http,
+                        cf,
+                        &format!("dd-{env}-cp-{label}-{bypass_label}"),
+                        &format!("{domain}{suffix}"),
+                    )
+                    .await?;
+                }
+            }
         } else {
             ensure_bypass_app(http, cf, &format!("dd-{env}-cp-{label}"), &domain).await?;
         }
@@ -675,6 +691,22 @@ pub async fn provision_agent_access(
                 vec![human_policy(owner, admin_email, &idp)],
             )
             .await?;
+            // Path-scoped bypasses for the Noise tunnel (mirrors the
+            // CP-side wiring in `provision_cp_access`). Without these,
+            // a browser loading the aggregator on the CP's block can't
+            // open a cross-origin Noise WS to an agent's block —
+            // CF Access 302s the upgrade.
+            if label == "block" {
+                for (suffix, bypass_label) in [("/attest", "attest"), ("/noise", "noise")] {
+                    ensure_bypass_app(
+                        http,
+                        cf,
+                        &format!("dd-{env}-workload-{domain}-{bypass_label}"),
+                        &format!("{domain}{suffix}"),
+                    )
+                    .await?;
+                }
+            }
         } else {
             ensure_bypass_app(http, cf, &format!("dd-{env}-workload-{domain}"), &domain).await?;
         }
