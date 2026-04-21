@@ -121,6 +121,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tower-http",
  "uuid",
  "vte",
 ]
@@ -248,6 +249,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "base64",
+ "bastion-term",
  "chrono",
  "futures-util",
  "jsonwebtoken",

@@ -1,31 +1,34 @@
-//! EE capture listener (scaffold).
+//! EE capture listener.
 //!
 //! Listens on a unix-domain socket for line-delimited JSON records
 //! emitted by a patched easyenclave on each spawned workload's stdout
 //! and stderr. Records look like:
 //!
 //! ```json
-//! {"type":"spawn","id":"cloudflared-1735...","argv":[...],"cwd":"/"}
+//! {"type":"spawn","id":"cloudflared-1735...","argv":[...],"cwd":null}
 //! {"type":"out","id":"cloudflared-1735...","s":"stdout","b":"INF ..."}
 //! {"type":"out","id":"cloudflared-1735...","s":"stderr","b":"..."}
 //! {"type":"exit","id":"cloudflared-1735...","code":0}
 //! ```
 //!
-//! **Status**: this file is a scaffold. It binds the socket, accepts
-//! connections, and parses each record into [`CaptureRecord`] — but
-//! it does not yet create [`crate::SessionInfo`]-shaped workload
-//! sessions inside the [`crate::Manager`]. That comes in a follow-up
-//! once upstream `easyenclave` is actually emitting these frames and
-//! the SPA sidebar is ready to render the "Workloads" category.
+//! Each connection is one workload lifetime. Records are dispatched
+//! straight into [`crate::Manager`] as workload sessions:
 //!
-//! For now the listener just logs each parsed event to stderr so we
-//! can verify the socket contract end-to-end once EE lands its patch.
+//! - `spawn` → [`crate::Manager::register_workload`]
+//! - `out`   → [`crate::Manager::workload_out`]
+//! - `exit`  → [`crate::Manager::workload_exit`]
+//!
+//! so the SPA sidebar's "Workloads" category populates live. Wire
+//! contract upstream is documented in easyenclave's `capture.rs`
+//! module.
 
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
+
+use crate::Manager;
 
 /// One event over the EE capture socket.
 #[derive(Debug, Clone, Deserialize)]
@@ -57,14 +60,21 @@ fn default_stdout() -> String {
 }
 
 /// Remove any stale socket at `path`, bind a fresh one, and spawn a
-/// task that accepts connections and dispatches records.
+/// task that accepts connections and dispatches records into
+/// `manager` as workload sessions.
 ///
 /// Returns an error if the socket path's parent directory doesn't
 /// exist or binding fails. A stale socket from a previous run is
 /// removed automatically (unix sockets aren't self-cleaning on
 /// process crash).
-pub async fn spawn_listener(path: impl AsRef<Path>) -> std::io::Result<()> {
+pub async fn spawn_listener(path: impl AsRef<Path>, manager: Manager) -> std::io::Result<()> {
     let path: PathBuf = path.as_ref().to_path_buf();
+    // `bind(2)` on a unix socket ENOENTs if the parent dir is missing.
+    // On the DD agent VM, `/run/ee/` is the conventional capture-socket
+    // dir but nothing creates it — so we do it ourselves. Idempotent.
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
     // Unix sockets linger after the owning process dies; clean up
     // before rebinding.
     if tokio::fs::metadata(&path).await.is_ok() {
@@ -77,7 +87,7 @@ pub async fn spawn_listener(path: impl AsRef<Path>) -> std::io::Result<()> {
         loop {
             match listener.accept().await {
                 Ok((stream, _)) => {
-                    tokio::spawn(handle_connection(stream));
+                    tokio::spawn(handle_connection(stream, manager.clone()));
                 }
                 Err(e) => {
                     eprintln!("capture: accept error: {e}");
@@ -89,7 +99,7 @@ pub async fn spawn_listener(path: impl AsRef<Path>) -> std::io::Result<()> {
     Ok(())
 }
 
-async fn handle_connection(stream: UnixStream) {
+async fn handle_connection(stream: UnixStream, manager: Manager) {
     let reader = BufReader::new(stream);
     let mut lines = reader.lines();
     loop {
@@ -100,7 +110,7 @@ async fn handle_connection(stream: UnixStream) {
                     continue;
                 }
                 match serde_json::from_str::<CaptureRecord>(line) {
-                    Ok(record) => handle_record(record),
+                    Ok(record) => handle_record(record, &manager).await,
                     Err(e) => eprintln!("capture: parse error ({e}) on line: {line}"),
                 }
             }
@@ -113,23 +123,20 @@ async fn handle_connection(stream: UnixStream) {
     }
 }
 
-fn handle_record(record: CaptureRecord) {
-    // Scaffold: just log. Next PR wires these into `Manager` as
-    // workload-kind sessions with their own ring buffer and block
-    // stream so they render in the SPA sidebar alongside shells.
+async fn handle_record(record: CaptureRecord, manager: &Manager) {
     match record {
         CaptureRecord::Spawn { id, argv, cwd } => {
-            eprintln!(
-                "capture: spawn id={id} argv={:?} cwd={:?}",
-                argv,
-                cwd.as_deref()
-            );
+            manager.register_workload(id, argv, cwd).await;
         }
-        CaptureRecord::Out { id, s, b } => {
-            eprintln!("capture: out id={id} stream={s} bytes_len={}", b.len());
+        CaptureRecord::Out { id, s: _, b } => {
+            // EE sends lines without the trailing newline; replace it
+            // so the rolling ring produces readable replay in xterm.js.
+            let mut bytes = b.into_bytes();
+            bytes.push(b'\n');
+            manager.workload_out(&id, &bytes).await;
         }
         CaptureRecord::Exit { id, code } => {
-            eprintln!("capture: exit id={id} code={code}");
+            manager.workload_exit(&id, code).await;
         }
     }
 }
