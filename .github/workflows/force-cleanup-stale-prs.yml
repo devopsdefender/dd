@@ -1,0 +1,148 @@
+name: Force cleanup stale PR envs
+
+# Batch-reap CF Access apps, tunnels, DNS CNAMEs, and GCE VMs for
+# every `pr-N` env whose PR is not currently OPEN. Complements
+# cleanup.yml's `reap-merged-pr-previews` (which reaps VMs + tunnels
+# + DNS) by ALSO sweeping Access apps — cleanup.yml missed those,
+# and after enough failed PR deploys the account accumulates
+# hundreds of dangling apps (~6 per PR).
+#
+# Triggers:
+#   - workflow_dispatch — manual "go fix my CF state" button
+#   - schedule (daily)  — so this doesn't pile up again
+#
+# Dry-run flag: pass `apply=false` (default true to match the
+# dispatch semantics — manual invocation is intentional).
+
+on:
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: 'Actually delete (false = dry-run)'
+        type: boolean
+        default: false
+  schedule:
+    # Daily at 08:00 UTC — offset from cleanup.yml's 6-hourly so
+    # logs don't collide. This sweeps apps that cleanup.yml doesn't.
+    - cron: '0 8 * * *'
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  reap:
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - name: Sweep stale pr-* envs (CF Access apps + tunnels + DNS)
+        env:
+          CF_API_TOKEN:   ${{ secrets.DD_CP_CF_API_TOKEN }}
+          CF_ACCOUNT_ID:  ${{ secrets.DD_CP_CF_ACCOUNT_ID }}
+          CF_ZONE_ID:     ${{ secrets.DD_CP_CF_ZONE_ID }}
+          GH_TOKEN:       ${{ github.token }}
+          # On schedule runs there are no inputs — default to apply
+          # so the cron actually reaps. Dispatch runs can override
+          # via the checkbox.
+          APPLY: ${{ github.event_name == 'workflow_dispatch' && inputs.apply || 'true' }}
+        run: |
+          set -euo pipefail
+          AUTH=(-H "Authorization: Bearer $CF_API_TOKEN")
+
+          echo "Fetching Access apps, tunnels, DNS CNAMEs..."
+          apps=$(curl -fsS "${AUTH[@]}" \
+            "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/access/apps?per_page=1000")
+          tunnels=$(curl -fsS "${AUTH[@]}" \
+            "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/cfd_tunnel?is_deleted=false&per_page=200")
+          dns=$(curl -fsS "${AUTH[@]}" \
+            "https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/dns_records?per_page=500&type=CNAME")
+
+          # Unique set of pr-N envs named anywhere (apps, tunnels,
+          # or DNS). We extract `pr-N` regardless of the surrounding
+          # name structure so we catch `dd-pr-42-cp`, `pr-42-term`,
+          # `pr-42-block.devopsdefender.com/attest`, etc.
+          envs=$( {
+            echo "$apps"    | jq -r '.result[].name // empty'
+            echo "$tunnels" | jq -r '.result[].name // empty'
+            echo "$dns"     | jq -r '.result[].name // empty'
+          } | grep -oE 'pr-[0-9]+' | sort -u )
+
+          if [ -z "$envs" ]; then
+            echo "No pr-* resources to consider."
+            exit 0
+          fi
+
+          total_apps=0 total_tun=0 total_dns=0 total_envs=0
+
+          for env in $envs; do
+            pr="${env#pr-}"
+            state=$(gh pr view "$pr" --repo "${{ github.repository }}" \
+              --json state --jq .state 2>/dev/null || echo UNKNOWN)
+            if [ "$state" = "OPEN" ]; then
+              echo "== $env — PR #$pr OPEN, skipping =="
+              continue
+            fi
+
+            # Match by prefix — `dd-pr-N-*` for apps/tunnels, and
+            # `pr-N.` / `pr-N-` for DNS.
+            env_apps=$(echo "$apps" | jq -r --arg p "dd-$env-" \
+              '.result[] | select(.name | startswith($p)) | "\(.id) \(.name)"')
+            env_tuns=$(echo "$tunnels" | jq -r --arg p "dd-$env-" \
+              '.result[] | select(.name | startswith($p)) | "\(.id) \(.name)"')
+            env_dns=$(echo "$dns" | jq -r --arg dot "$env." --arg dash "$env-" \
+              '.result[] | select((.name | startswith($dot)) or (.name | startswith($dash))) | "\(.id) \(.name)"')
+
+            a=$(printf '%s\n' "$env_apps" | grep -c . || true)
+            t=$(printf '%s\n' "$env_tuns" | grep -c . || true)
+            d=$(printf '%s\n' "$env_dns"  | grep -c . || true)
+
+            if [ $((a + t + d)) -eq 0 ]; then
+              continue
+            fi
+
+            echo "== $env — PR #$pr $state — apps=$a tunnels=$t dns=$d =="
+            [ -n "$env_apps" ] && echo "$env_apps" | sed 's/^/  app /'
+            [ -n "$env_tuns" ] && echo "$env_tuns" | sed 's/^/  tun /'
+            [ -n "$env_dns"  ] && echo "$env_dns"  | sed 's/^/  dns /'
+
+            total_envs=$((total_envs + 1))
+            total_apps=$((total_apps + a))
+            total_tun=$((total_tun + t))
+            total_dns=$((total_dns + d))
+
+            if [ "$APPLY" != "true" ]; then
+              continue
+            fi
+
+            # Delete. Each is best-effort — we don't want one stale
+            # entry to abort the sweep.
+            [ -n "$env_apps" ] && echo "$env_apps" | while read -r id name; do
+              [ -z "$id" ] && continue
+              curl -fsS -X DELETE "${AUTH[@]}" \
+                "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/access/apps/$id" \
+                >/dev/null 2>&1 && echo "  - app $name" || echo "  ! app $name FAILED"
+            done
+            [ -n "$env_tuns" ] && echo "$env_tuns" | while read -r id name; do
+              [ -z "$id" ] && continue
+              # Tunnel must have connections deleted first or the
+              # delete returns 400.
+              curl -fsS -X DELETE "${AUTH[@]}" \
+                "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/cfd_tunnel/$id/connections" \
+                >/dev/null 2>&1 || true
+              curl -fsS -X DELETE "${AUTH[@]}" \
+                "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/cfd_tunnel/$id" \
+                >/dev/null 2>&1 && echo "  - tun $name" || echo "  ! tun $name FAILED"
+            done
+            [ -n "$env_dns" ] && echo "$env_dns" | while read -r id name; do
+              [ -z "$id" ] && continue
+              curl -fsS -X DELETE "${AUTH[@]}" \
+                "https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/dns_records/$id" \
+                >/dev/null 2>&1 && echo "  - dns $name" || echo "  ! dns $name FAILED"
+            done
+          done
+
+          echo ""
+          echo "Summary: $total_envs stale envs, $total_apps apps, $total_tun tunnels, $total_dns DNS records"
+          if [ "$APPLY" != "true" ]; then
+            echo "(dry-run — re-dispatch with apply=true to delete)"
+          fi
