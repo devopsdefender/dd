@@ -1,0 +1,7 @@
+{
+  "app_name": "mount-models",
+  "cmd": [
+    "/bin/busybox", "sh", "-c",
+    "set -e; if [ -b /dev/vdc ]; then mkdir -p /var/lib/easyenclave/ollama; mount -t ext4 /dev/vdc /var/lib/easyenclave/ollama && echo mount-models: mounted /dev/vdc on /var/lib/easyenclave/ollama; else echo mount-models: no /dev/vdc, skipping; fi"
+  ]
+}
