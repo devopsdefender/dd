@@ -64,6 +64,19 @@ impl Ee {
             .await
     }
 
+    /// TDX attestation with caller-supplied 64-byte `REPORT_DATA`
+    /// (base64). Used to bind the Noise static pubkey into the
+    /// quote so a client can verify `sha256(noise_pubkey)` matches
+    /// the hardware-attested value. `data` must be ≤64 bytes; EE
+    /// rejects longer.
+    pub async fn attest_with_report_data(&self, data_b64: &str) -> Result<serde_json::Value> {
+        self.call(serde_json::json!({
+            "method": "attest",
+            "report_data_b64": data_b64,
+        }))
+        .await
+    }
+
     /// Deploy a workload at runtime. Spec is a workload object
     /// (`app_name`, `github_release`/`cmd`, `env`, ...) — we just set
     /// `method` and forward.

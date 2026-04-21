@@ -200,11 +200,16 @@ jobs:
               exit 1
             fi
 
-            if curl -fsS "${AGENT_URL}/health" >/dev/null 2>&1; then
-              echo "Agent healthy at ${AGENT_URL}"
+            # `-f` only fails on 4xx/5xx — a CF Access 302 login redirect
+            # passes and we falsely report "healthy" before the CP has
+            # actually come up. Insist on 200 explicitly so the serial
+            # streamer keeps running until we see a real origin response.
+            CODE=$(curl -s -o /dev/null -w '%{http_code}' "${AGENT_URL}/health" || echo "000")
+            if [ "$CODE" = "200" ]; then
+              echo "Agent healthy at ${AGENT_URL} (HTTP 200)"
               exit 0
             fi
-            echo "  waiting for tunnel... (${i}/60)"
+            echo "  waiting for tunnel (got HTTP ${CODE})... (${i}/60)"
             sleep 5
           done
           echo "::error::Agent not healthy within 5 minutes"

@@ -66,6 +66,13 @@ struct St {
     /// without any shared secret; anyone else is denied at claim
     /// check.
     gh: Arc<gh_oidc::Verifier>,
+    /// Long-term Noise static keypair for m2m RPC. `None` when
+    /// `DD_NOISE_KEY_DIR` isn't set or the key couldn't be loaded.
+    noise_key: Option<Arc<dd_common::noise_static::NoiseStatic>>,
+    /// CP's pinned pubkey, learned at registration and persisted on
+    /// disk. `None` during the migration window where the CP side
+    /// hasn't been given a key yet.
+    cp_noise_pubkey: Option<[u8; 32]>,
 }
 
 pub async fn run() -> Result<()> {
@@ -81,9 +88,71 @@ pub async fn run() -> Result<()> {
     let initial_token = mint_ita(&cfg, &ee).await?;
     eprintln!("agent: ITA token minted");
 
+    // Load or mint the agent's long-term Noise static keypair if a
+    // dir is configured. During the m2m migration window this is
+    // optional — an agent without a key registers as before and the
+    // CP skips pinning it.
+    let noise_key: Option<Arc<dd_common::noise_static::NoiseStatic>> =
+        match std::env::var("DD_NOISE_KEY_DIR")
+            .ok()
+            .filter(|s| !s.is_empty())
+        {
+            Some(dir) => match crate::noise_m2m::load_static(std::path::Path::new(&dir)) {
+                Ok(k) => {
+                    eprintln!(
+                        "agent: noise static key {:?} ({}…)",
+                        k.source(),
+                        &k.public_hex()[..16]
+                    );
+                    Some(k)
+                }
+                Err(e) => {
+                    eprintln!("agent: noise key load failed at {dir}: {e}");
+                    None
+                }
+            },
+            None => None,
+        };
+    let noise_pubkey_hex = noise_key.as_ref().map(|k| k.public_hex());
+
     eprintln!("agent: registering with {}", cfg.cp_url);
-    let b = register(&cfg, &initial_token).await?;
+    let b = register(&cfg, &initial_token, noise_pubkey_hex.as_deref()).await?;
     eprintln!("agent: registered as {}", b.hostname);
+
+    // Pin the CP's pubkey for future m2m handshakes. Silently ignored
+    // if the CP didn't advertise one (migration window).
+    let mut cp_noise_pubkey: Option<[u8; 32]> = None;
+    if let (Some(hex), Some(dir)) = (
+        b.cp_noise_pubkey_hex.as_deref(),
+        std::env::var("DD_NOISE_KEY_DIR")
+            .ok()
+            .filter(|s| !s.is_empty()),
+    ) {
+        match crate::noise_m2m::decode_pubkey(hex) {
+            Ok(pk) => {
+                cp_noise_pubkey = Some(pk);
+                if let Err(e) = crate::noise_m2m::save_cp_pubkey(std::path::Path::new(&dir), &pk) {
+                    eprintln!("agent: save CP noise pubkey: {e}");
+                } else {
+                    eprintln!(
+                        "agent: pinned CP noise pubkey ({}…)",
+                        &hex[..hex.len().min(16)]
+                    );
+                }
+            }
+            Err(e) => eprintln!("agent: CP noise pubkey decode: {e}"),
+        }
+    }
+    // Fall back to the on-disk cache if the CP didn't advertise one
+    // this boot but did previously.
+    if cp_noise_pubkey.is_none() {
+        if let Some(dir) = std::env::var("DD_NOISE_KEY_DIR")
+            .ok()
+            .filter(|s| !s.is_empty())
+        {
+            cp_noise_pubkey = crate::noise_m2m::load_cp_pubkey(std::path::Path::new(&dir));
+        }
+    }
 
     spawn_cloudflared(b.tunnel_token);
 
@@ -122,6 +191,8 @@ pub async fn run() -> Result<()> {
         ita_token,
         extras: Arc::new(RwLock::new(cfg.extra_ingress.clone())),
         gh,
+        noise_key,
+        cp_noise_pubkey,
     };
 
     let app = Router::new()
@@ -153,9 +224,15 @@ struct Bootstrap {
     agent_id: String,
     #[allow(dead_code)]
     cp_hostname: String,
+    /// CP's long-term Noise static pubkey (hex), advertised so the
+    /// agent can pin it for future m2m handshakes. Absent in
+    /// migration-window deployments where the CP hasn't been given
+    /// a key dir yet.
+    #[serde(default)]
+    cp_noise_pubkey_hex: Option<String>,
 }
 
-async fn register(cfg: &Cfg, ita_token: &str) -> Result<Bootstrap> {
+async fn register(cfg: &Cfg, ita_token: &str, noise_pubkey_hex: Option<&str>) -> Result<Bootstrap> {
     let http = reqwest::Client::new();
     let url = format!("{}/register", cfg.cp_url.trim_end_matches('/'));
     let extra_ingress: Vec<serde_json::Value> = cfg
@@ -169,6 +246,7 @@ async fn register(cfg: &Cfg, ita_token: &str) -> Result<Bootstrap> {
         "owner": cfg.common.owner,
         "ita_token": ita_token,
         "extra_ingress": extra_ingress,
+        "noise_pubkey_hex": noise_pubkey_hex,
     });
     // /register is CF-Access-bypassed; ITA attestation is the gate.
     let resp = http
@@ -528,6 +606,39 @@ async fn push_extra_ingress(s: &St, label: String, port: u16) -> Result<()> {
         .iter()
         .map(|(l, p)| serde_json::json!({"hostname_label": l, "port": p}))
         .collect();
+
+    // Prefer Noise RPC when both sides have pinned keys — closes out
+    // the ITA-bearer-on-every-call pattern. The HTTP+ITA path below
+    // stays live as a migration fallback for any agent/CP pair
+    // where one side doesn't have a key yet.
+    if let (Some(key), Some(pk)) = (s.noise_key.as_ref(), s.cp_noise_pubkey.as_ref()) {
+        let wss = http_to_wss(&s.cfg.cp_url) + "/noise/rpc";
+        let req = serde_json::json!({
+            "op": "ingress_replace",
+            "agent_id": s.agent_id,
+            "extras": body_extras.clone(),
+        });
+        match crate::noise_rpc::call(&wss, key, pk, req).await {
+            Ok(resp) if resp.get("ok").and_then(|v| v.as_bool()) == Some(true) => {
+                eprintln!(
+                    "agent: ingress/replace (noise) ok ({} extras total)",
+                    extras.len()
+                );
+                return Ok(());
+            }
+            Ok(resp) => {
+                let msg = resp
+                    .get("error")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+                eprintln!("agent: ingress/replace (noise) rejected: {msg} — falling back to HTTP");
+            }
+            Err(e) => {
+                eprintln!("agent: ingress/replace (noise) error: {e} — falling back to HTTP");
+            }
+        }
+    }
+
     let ita_token = s.ita_token.read().await.clone();
     let body = serde_json::json!({
         "agent_id": s.agent_id,
@@ -549,8 +660,23 @@ async fn push_extra_ingress(s: &St, label: String, port: u16) -> Result<()> {
             "ingress/replace {url} → {status}: {text}"
         )));
     }
-    eprintln!("agent: ingress/replace ok ({} extras total)", extras.len());
+    eprintln!(
+        "agent: ingress/replace (http) ok ({} extras total)",
+        extras.len()
+    );
     Ok(())
+}
+
+/// Convert an http(s) URL to a ws(s) URL for WebSocket upgrade. Keeps
+/// the host/port/path intact; only the scheme changes.
+fn http_to_wss(url: &str) -> String {
+    if let Some(rest) = url.strip_prefix("https://") {
+        format!("wss://{}", rest.trim_end_matches('/'))
+    } else if let Some(rest) = url.strip_prefix("http://") {
+        format!("ws://{}", rest.trim_end_matches('/'))
+    } else {
+        url.trim_end_matches('/').to_string()
+    }
 }
 
 #[derive(Debug, Deserialize)]

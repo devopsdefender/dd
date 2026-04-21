@@ -4,6 +4,7 @@
   import { FitAddon } from "@xterm/addon-fit";
   import type { BlockRecord } from "../types";
   import { ui } from "../ui.svelte";
+  import { openShellTunnel } from "../tunnel";
 
   interface Props {
     rowId: string;
@@ -44,7 +45,17 @@
     // the real dimensions.
     fit!.fit();
 
-    if (!row.ws || row.ws.readyState >= WebSocket.CLOSING) {
+    // Open the shell stream if we haven't already. Prefer the Noise
+    // tunnel when the connector has a cached server pubkey (cross-
+    // origin enclaves); fall back to plain /ws/{id} for same-origin.
+    const pubkey = row.connector.config.serverNoisePubkeyHex as
+      | string
+      | undefined;
+    const noiseWanted =
+      pubkey && row.origin.replace(/\/+$/, "") !== location.origin;
+    if (noiseWanted) {
+      if (!row.shell) openNoiseShell();
+    } else if (!row.ws || row.ws.readyState >= WebSocket.CLOSING) {
       openWs();
     }
 
@@ -122,6 +133,59 @@
       if (ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({ type: "resize", cols, rows }));
       }
+    });
+  }
+
+  async function openNoiseShell() {
+    const row = ui.rows.get(rowId);
+    if (!row) return;
+    const term = row.term!;
+    const pubkey = row.connector.config.serverNoisePubkeyHex as
+      | string
+      | undefined;
+    if (!pubkey) return;
+
+    let shell;
+    try {
+      shell = await openShellTunnel(row.origin, pubkey, row.info.id);
+    } catch (e) {
+      console.warn(`noise-shell: open ${row.origin}/${row.info.id}`, e);
+      // Hard fail here — falling back to plain /ws would re-trigger
+      // the CORS/CF-Access wall we set up Noise to bypass.
+      term.writeln(`\r\n\x1b[2m[tunnel unavailable]\x1b[0m`);
+      return;
+    }
+    row.shell = shell;
+
+    shell.onCtrl((msg) => {
+      if (msg.type === "block") {
+        const b = msg as unknown as BlockRecord;
+        if (!row.blocks.some((x) => x.seq === b.seq)) {
+          row.blocks = [...row.blocks, b];
+        }
+      } else if (msg.type === "exit") {
+        term.writeln(`\r\n\x1b[2m[exited ${msg.code}]\x1b[0m`);
+      } else if (msg.type === "error" && msg.code === "not_found") {
+        term.writeln(`\r\n\x1b[2m[session not found]\x1b[0m`);
+      }
+    });
+    shell.onRaw((bytes) => {
+      term.write(bytes);
+    });
+
+    shell.sendCtrl({
+      type: "hello",
+      have_up_to: row.blocks.length
+        ? row.blocks[row.blocks.length - 1].seq
+        : -1,
+    });
+    shell.sendCtrl({ type: "resize", cols: term.cols, rows: term.rows });
+
+    term.onData((d) => {
+      shell.sendRaw(new TextEncoder().encode(d));
+    });
+    term.onResize(({ cols, rows }) => {
+      shell.sendCtrl({ type: "resize", cols, rows });
     });
   }
 </script>
