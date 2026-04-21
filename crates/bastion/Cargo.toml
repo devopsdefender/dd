@@ -32,6 +32,9 @@ tower-http = { version = "0.6", features = ["cors"] }
 uuid = { version = "1", features = ["v4"] }
 vte = "0.13"
 
+[dev-dependencies]
+tempfile = "3"
+
 [[example]]
 name = "standalone"
 path = "examples/standalone.rs"

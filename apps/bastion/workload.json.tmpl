@@ -6,6 +6,7 @@
     "rename": "bastion",
     "tag": "${DD_RELEASE_TAG}"
   },
+  "inherit_token": true,
   "expose": { "hostname_label": "block", "port": 7681 },
   "cmd": [
     "bastion",
@@ -15,6 +16,8 @@
     "--bind",
     "0.0.0.0",
     "--capture-socket",
-    "/run/ee/capture.sock"
+    "/run/ee/capture.sock",
+    "--ee-socket",
+    "/var/lib/easyenclave/agent.sock"
   ]
 }

@@ -45,6 +45,8 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub mod capture;
+pub mod ee;
+pub mod ee_sync;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, State};
@@ -142,32 +144,32 @@ enum Event {
     Exit(i32),
 }
 
-struct Session {
-    id: String,
+pub struct Session {
+    pub(crate) id: String,
     /// "shell" for PTY-backed interactive sessions; "workload" for
     /// EE-captured process-lifetime records (no PTY, no stdin).
-    kind: String,
-    title: String,
-    created_at_ms: u64,
+    pub kind: String,
+    pub(crate) title: String,
+    pub(crate) created_at_ms: u64,
     /// Present for shell sessions; `None` for workloads (no PTY).
-    master: Option<Arc<Mutex<Box<dyn MasterPty + Send>>>>,
+    pub(crate) master: Option<Arc<Mutex<Box<dyn MasterPty + Send>>>>,
     /// Present for shell sessions; `None` for workloads (stdin is
     /// silently dropped, since the workload is already running with
     /// its own stdin from EE).
-    writer: Option<Arc<Mutex<Box<dyn Write + Send>>>>,
-    ring: Arc<Mutex<VecDeque<u8>>>,
-    blocks: Arc<RwLock<VecDeque<BlockRecord>>>,
-    next_seq: Arc<Mutex<u64>>,
-    tx: broadcast::Sender<Event>,
+    pub(crate) writer: Option<Arc<Mutex<Box<dyn Write + Send>>>>,
+    pub ring: Arc<Mutex<VecDeque<u8>>>,
+    pub blocks: Arc<RwLock<VecDeque<BlockRecord>>>,
+    pub(crate) next_seq: Arc<Mutex<u64>>,
+    pub(crate) tx: broadcast::Sender<Event>,
     /// Per-lifetime accumulator for workload sessions. Holds the
     /// `argv`, `started_at_ms`, and raw stdout/stderr bytes until
     /// `exit`, when they're finalized into a single `BlockRecord`.
-    workload_ctx: Option<Arc<Mutex<WorkloadCtx>>>,
+    pub(crate) workload_ctx: Option<Arc<Mutex<WorkloadCtx>>>,
     /// PID of the spawned shell so `Manager::remove` can SIGHUP it.
     /// The waiter thread owns the `Child` handle; we track the PID
     /// separately to avoid a lock contest with `wait()`. `None` for
     /// workload sessions.
-    pid: Option<u32>,
+    pub(crate) pid: Option<u32>,
 }
 
 /// State that a workload session accumulates between `spawn` and
@@ -232,7 +234,7 @@ impl Manager {
         g.values().map(|s| s.info()).collect()
     }
 
-    async fn get(&self, id: &str) -> Option<Arc<Session>> {
+    pub(crate) async fn get(&self, id: &str) -> Option<Arc<Session>> {
         self.inner.read().await.get(id).cloned()
     }
 
