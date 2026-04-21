@@ -91,14 +91,18 @@ async fn main() -> std::io::Result<()> {
         }
     }
 
-    if let Some(path) = ee_socket {
+    if let Some(path) = ee_socket.as_deref().filter(|s| !s.is_empty()) {
         // Pull-based bootstrap: on startup (and every 30s after),
         // query EE's `list` + `logs` over its unix socket and seed
         // the Manager so boot workloads render with their history.
         // Requires `inherit_token: true` in the workload spec so the
         // Tier-1 seal lets us talk to EE.
         eprintln!("bastion: ee_sync polling {path}");
-        bastion::ee_sync::start(mgr.clone(), &path);
+        bastion::ee_sync::start(mgr.clone(), path);
+        // Also remember the path so /attest can mint a TDX quote
+        // bound to the Noise pubkey (Phase 2d). Same socket, different
+        // EE method.
+        mgr = mgr.with_ee_socket(path);
     }
 
     let addr = format!("{bind}:{port}");

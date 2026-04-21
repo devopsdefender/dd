@@ -1023,9 +1023,36 @@ async fn cp_noise_attest(State(s): State<St>) -> axum::response::Response {
         )
             .into_response();
     };
-    Json(serde_json::json!({
+
+    // Bind sha256(pubkey) into the TDX quote's REPORT_DATA. EE pads
+    // the 32-byte digest to 64 bytes internally; clients re-hash the
+    // advertised pubkey and compare after ITA verify.
+    let pk = key.public().as_bytes();
+    let digest = {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(pk);
+        let d = h.finalize();
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&d);
+        out
+    };
+    use base64::Engine as _;
+    let report_data_b64 = base64::engine::general_purpose::STANDARD.encode(digest);
+
+    let mut body = serde_json::json!({
         "noise_pubkey_hex": key.public_hex(),
         "source": format!("{:?}", key.source()).to_lowercase(),
-    }))
-    .into_response()
+    });
+    match s.ee.attest_with_report_data(&report_data_b64).await {
+        Ok(v) if v.get("ok").and_then(|b| b.as_bool()) == Some(true) => {
+            if let Some(q) = v.get("quote_b64").and_then(|q| q.as_str()) {
+                body["tdx_quote_b64"] = serde_json::Value::String(q.to_string());
+                body["report_data_b64"] = serde_json::Value::String(report_data_b64);
+            }
+        }
+        Ok(v) => eprintln!("cp: /cp/noise/attest EE said {v}"),
+        Err(e) => eprintln!("cp: /cp/noise/attest EE error: {e}"),
+    }
+    Json(body).into_response()
 }

@@ -232,6 +232,13 @@ pub struct Manager {
     /// standalone dev / local-embedder mode — `/attest` then
     /// responds 404.
     noise: Option<Arc<noise::NoiseStatic>>,
+    /// Path to easyenclave's unix socket. When set, `/attest`
+    /// fetches a fresh TDX quote with `REPORT_DATA = sha256(noise_pubkey)`
+    /// and includes it in the response so clients can verify the
+    /// pubkey came from a genuine enclave (Phase 2d). Absent →
+    /// `/attest` still returns the pubkey, just without an
+    /// attached quote.
+    ee_socket: Option<Arc<str>>,
 }
 
 impl Default for Manager {
@@ -247,6 +254,7 @@ impl Manager {
             cp_url: None,
             http: reqwest::Client::new(),
             noise: None,
+            ee_socket: None,
         }
     }
 
@@ -269,6 +277,18 @@ impl Manager {
     /// returns 404.
     pub fn with_noise_key(mut self, key: noise::NoiseStatic) -> Self {
         self.noise = Some(Arc::new(key));
+        self
+    }
+
+    /// Point at easyenclave's unix socket so `/attest` can return a
+    /// TDX quote with `REPORT_DATA = sha256(noise_pubkey)`. Clients
+    /// / auditors use this to verify the advertised pubkey came from
+    /// a genuine enclave rather than a MITM serving its own key.
+    pub fn with_ee_socket(mut self, path: impl Into<String>) -> Self {
+        let p = path.into();
+        if !p.is_empty() {
+            self.ee_socket = Some(Arc::from(p));
+        }
         self
     }
 
@@ -794,9 +814,16 @@ pub fn router(manager: Manager) -> Router {
 
 /// GET /attest — returns this bastion's long-term Noise static
 /// pubkey. Clients pin the returned `noise_pubkey_hex` and use it
-/// as the responder key for Phase 2b's Noise_KK handshake. Phase
-/// 2d will add the TDX attestation quote to the response body so
-/// clients can verify the pubkey came from a genuine enclave.
+/// as the responder key for the Noise_IK handshake.
+///
+/// When an easyenclave socket is configured (`with_ee_socket`), the
+/// response also carries a TDX attestation quote whose REPORT_DATA
+/// is `sha256(noise_pubkey)`. Clients / auditors submit the quote
+/// to Intel Trust Authority; a successful verify proves the advertised
+/// pubkey came from a genuinely-measured enclave rather than a MITM
+/// serving its own key. Quote mint failures don't fail the endpoint
+/// — the pubkey is still useful for transport encryption even without
+/// the attestation, and callers can retry.
 ///
 /// 404 when no Noise keypair is configured (standalone dev,
 /// embedders that didn't call `Manager::with_noise_key`).
@@ -810,11 +837,59 @@ async fn attest(State(m): State<Manager>) -> impl IntoResponse {
         )
             .into_response();
     };
-    Json(serde_json::json!({
+
+    // Bind sha256(pubkey) into the TDX quote's REPORT_DATA. SHA-256
+    // is 32 bytes; EE pads to 64 internally. Client verifies by
+    // re-hashing the cached pubkey and comparing against the quote's
+    // REPORT_DATA field after ITA verification.
+    let quote = attach_noise_quote(&m, key.public().as_bytes()).await;
+
+    let mut body = serde_json::json!({
         "noise_pubkey_hex": key.public_hex(),
         "source": format!("{:?}", key.source()).to_lowercase(),
-    }))
-    .into_response()
+    });
+    if let Some((quote_b64, report_data_b64)) = quote {
+        body["tdx_quote_b64"] = serde_json::Value::String(quote_b64);
+        body["report_data_b64"] = serde_json::Value::String(report_data_b64);
+    }
+    Json(body).into_response()
+}
+
+/// Mint a TDX quote binding `sha256(noise_pubkey)` into REPORT_DATA.
+/// Returns `(quote_b64, report_data_b64)` on success, or `None` if no
+/// EE socket is configured or the socket call failed — the caller
+/// downgrades gracefully by omitting the fields from the response.
+async fn attach_noise_quote(m: &Manager, pubkey_bytes: &[u8]) -> Option<(String, String)> {
+    let ee_path = m.ee_socket.as_ref()?;
+    // SHA-256 over the raw 32-byte pubkey. Domain separation isn't
+    // needed: REPORT_DATA is scoped to this bastion's quote and the
+    // client verifies both halves against the same pubkey.
+    let digest = {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(pubkey_bytes);
+        let d = h.finalize();
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&d);
+        out
+    };
+    use base64::Engine as _;
+    let report_data_b64 = base64::engine::general_purpose::STANDARD.encode(digest);
+    let ee = crate::ee::EeClient::new(ee_path.as_ref());
+    match ee.attest_with_report_data(&report_data_b64).await {
+        Ok(v) if v.get("ok").and_then(|b| b.as_bool()) == Some(true) => {
+            let q = v.get("quote_b64")?.as_str()?.to_string();
+            Some((q, report_data_b64))
+        }
+        Ok(v) => {
+            eprintln!("bastion: /attest EE said {v}");
+            None
+        }
+        Err(e) => {
+            eprintln!("bastion: /attest EE error: {e}");
+            None
+        }
+    }
 }
 
 async fn page(State(m): State<Manager>) -> impl IntoResponse {
