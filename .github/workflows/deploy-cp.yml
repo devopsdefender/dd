@@ -29,13 +29,15 @@ on:
         required: true
         type: string
       workload_identity_provider:
-        description: 'GCP Workload Identity Federation provider resource name'
-        required: true
+        description: 'GCP Workload Identity Federation provider resource name (required only for target=gcp)'
+        required: false
         type: string
+        default: ''
       service_account:
-        description: 'GCP service account email'
-        required: true
+        description: 'GCP service account email (required only for target=gcp)'
+        required: false
         type: string
+        default: ''
       release_tag:
         description: 'devopsdefender release tag to deploy (e.g. "latest", "pr-abc123")'
         required: true
@@ -55,6 +57,11 @@ on:
         required: false
         type: string
         default: main
+      target:
+        description: 'Where the CP runs: "ssh" (libvirt VM on the tdx2 baremetal, default) or "gcp" (fresh TDX VM on GCE)'
+        required: false
+        type: string
+        default: ssh
 
 concurrency:
   group: deploy-cp-${{ inputs.env }}
@@ -75,13 +82,35 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # GCP auth only configured on target=gcp. SSH deploys don't
+      # touch GCE at all — their state lives on the tdx2 baremetal
+      # (libvirt domains) and in Cloudflare (tunnels + Access apps).
       - uses: google-github-actions/auth@v2
+        if: inputs.target == 'gcp'
         with:
           workload_identity_provider: ${{ inputs.workload_identity_provider }}
           service_account: ${{ inputs.service_account }}
       - uses: google-github-actions/setup-gcloud@v2
+        if: inputs.target == 'gcp'
+
+      - name: Relaunch SSH CP VM (target=ssh)
+        if: inputs.target == 'ssh'
+        uses: ./.github/actions/relaunch-cp
+        with:
+          env: ${{ inputs.env }}
+          hostname: ${{ inputs.hostname }}
+          ref: ${{ inputs.ref }}
+          ssh-key:       ${{ secrets.DD_LOCAL_SSH_KEY }}
+          host:          ${{ secrets.DD_LOCAL_HOST }}
+          cf-api-token:  ${{ secrets.DD_CP_CF_API_TOKEN }}
+          cf-account-id: ${{ secrets.DD_CP_CF_ACCOUNT_ID }}
+          cf-zone-id:    ${{ secrets.DD_CP_CF_ZONE_ID }}
+          admin-email:   ${{ vars.DD_ACCESS_ADMIN_EMAIL || secrets.DD_ACCESS_ADMIN_EMAIL }}
+          ita-api-key:   ${{ secrets.DD_ITA_API_KEY }}
+          release-tag:   ${{ inputs.release_tag }}
 
       - name: Create TDX VM (boots from easyenclave, fetches dd from GitHub releases)
+        if: inputs.target == 'gcp'
         env:
           GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
           DD_DOMAIN: ${{ vars.DD_CF_DOMAIN || 'devopsdefender.com' }}
@@ -165,7 +194,8 @@ jobs:
           rm -f /tmp/ee-config.json
           echo "VM: $VM_NAME ($DD_HOSTNAME, release $DD_RELEASE_TAG)"
 
-      - name: Wait for agent health (streams serial console)
+      - name: Wait for CP health (streams GCE serial console)
+        if: inputs.target == 'gcp'
         env:
           AGENT_URL: https://${{ inputs.hostname }}
           GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
@@ -210,6 +240,28 @@ jobs:
           echo "::error::Agent not healthy within 5 minutes"
           echo "--- final serial tail ---"
           tail -80 /tmp/serial.log | sed 's/^/[serial] /'
+          exit 1
+
+      - name: Wait for CP health (SSH CP — no serial stream, just poll)
+        if: inputs.target == 'ssh'
+        env:
+          AGENT_URL: https://${{ inputs.hostname }}
+        run: |
+          # SSH CP boot fires asynchronously via `virsh start` on the
+          # tdx2 host. We only own the outside view here — poll for a
+          # real 200 on /health (not a CF Access 302 false-positive).
+          # Serial console lives at /var/log/ee-local-${env}-cp.log
+          # on the tdx2 host if you need to tail it manually.
+          for i in $(seq 1 60); do
+            CODE=$(curl -s -o /dev/null -w '%{http_code}' "${AGENT_URL}/health" || echo "000")
+            if [ "$CODE" = "200" ]; then
+              echo "CP healthy at ${AGENT_URL} (HTTP 200)"
+              exit 0
+            fi
+            echo "  waiting for tunnel (got HTTP ${CODE})... (${i}/60)"
+            sleep 5
+          done
+          echo "::error::CP not healthy within 5 minutes (SSH target)"
           exit 1
 
       - name: Verify NEW VM via TDX attestation
@@ -388,6 +440,7 @@ jobs:
       # force-delete) behind the user-facing outputs (PR comment,
       # relaunched local agent).
       - name: Verify STONITH halted prior VM(s) in this env
+        if: inputs.target == 'gcp'
         env:
           GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
         run: |
