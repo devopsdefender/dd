@@ -1,6 +1,12 @@
 import type { Agent, BlockRecord, SessionInfo } from "./types";
 import type { Connector } from "./connectors";
-import { listConnectors, seedFromAgents, addConnector } from "./connectors";
+import {
+  listConnectors,
+  seedFromAgents,
+  addConnector,
+  fetchAttest,
+  patchConnectorConfig,
+} from "./connectors";
 import { loadIdentitySeed, fingerprint } from "./identity";
 
 /// Composite key so session ids from different connectors can't collide.
@@ -54,14 +60,44 @@ export const ui = $state<{
 /// One-time setup at app load: mint/load the device identity, pull
 /// the connector list from IndexedDB (seed on first run from the
 /// server-injected `__DD_AGENTS__`), and fan out to each connector
-/// to populate `ui.rows`.
+/// to populate `ui.rows`. Also kicks off a background `/attest`
+/// fetch per enclave so Phase 2b's Noise_KK handshake has the
+/// server pubkey ready.
 export async function bootstrap(): Promise<void> {
   ui.deviceFp = fingerprint(loadIdentitySeed());
   if (window.__DD_AGENTS__ && window.__DD_AGENTS__.length > 0) {
     await seedFromAgents(window.__DD_AGENTS__);
   }
   await refreshConnectors();
+  // Fire-and-forget — attest can be slow/cross-origin-blocked and
+  // the sidebar shouldn't wait for it. Phase 2b will gate session
+  // connections on the pubkey being cached.
+  void refreshAttest();
   ui.ready = true;
+}
+
+/// Fetch `/attest` for every `dd-enclave` connector and merge the
+/// returned Noise pubkey into its config. Idempotent; runs quietly
+/// in the background on bootstrap. Console-logs the pubkey so
+/// Phase 2a can be visually verified before Phase 2b wires it up.
+async function refreshAttest(): Promise<void> {
+  for (const c of ui.connectors) {
+    if (c.kind !== "dd-enclave") continue;
+    const origin = c.config.origin as string | undefined;
+    if (!origin) continue;
+    const attest = await fetchAttest(origin);
+    if (!attest) continue;
+    const known = c.config.serverNoisePubkeyHex as string | undefined;
+    if (known === attest.noise_pubkey_hex) continue;
+    console.log(
+      `bastion: ${c.label} noise pubkey ${attest.noise_pubkey_hex.slice(0, 16)}… (${attest.source})`,
+    );
+    await patchConnectorConfig(c.id, {
+      serverNoisePubkeyHex: attest.noise_pubkey_hex,
+    });
+  }
+  // Re-read so `ui.connectors` has the patched config for Phase 2b.
+  ui.connectors = await listConnectors();
 }
 
 /// Reload connectors from IndexedDB and re-fetch sessions from each.

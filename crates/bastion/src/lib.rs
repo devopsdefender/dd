@@ -47,6 +47,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub mod capture;
 pub mod ee;
 pub mod ee_sync;
+pub mod noise;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, State};
@@ -220,6 +221,12 @@ pub struct Manager {
     /// in the fleet. Absent → single-node fallback.
     cp_url: Option<Arc<str>>,
     http: reqwest::Client,
+    /// Long-term Noise static keypair. Clients fetch the pubkey
+    /// via `GET /attest` and pin it; Phase 2b runs a Noise_KK
+    /// handshake keyed by this + a client static key. Absent in
+    /// standalone dev / local-embedder mode — `/attest` then
+    /// responds 404.
+    noise: Option<Arc<noise::NoiseStatic>>,
 }
 
 impl Default for Manager {
@@ -234,6 +241,7 @@ impl Manager {
             inner: Arc::new(RwLock::new(Default::default())),
             cp_url: None,
             http: reqwest::Client::new(),
+            noise: None,
         }
     }
 
@@ -247,6 +255,15 @@ impl Manager {
         if !url.is_empty() {
             self.cp_url = Some(Arc::from(url));
         }
+        self
+    }
+
+    /// Attach the persistent Noise static keypair. When set, `GET
+    /// /attest` returns `{noise_pubkey_hex}` so clients can pin it
+    /// before Phase 2b's Noise_KK handshake. Absent → `/attest`
+    /// returns 404.
+    pub fn with_noise_key(mut self, key: noise::NoiseStatic) -> Self {
+        self.noise = Some(Arc::new(key));
         self
     }
 
@@ -760,11 +777,37 @@ pub fn router(manager: Manager) -> Router {
 
     Router::new()
         .route("/", get(page))
+        .route("/attest", get(attest))
         .route("/api/sessions", get(list_sessions).post(create_session))
         .route("/api/sessions/{id}", delete(kill_session))
         .route("/ws/{id}", get(ws_upgrade))
         .layer(cors)
         .with_state(manager)
+}
+
+/// GET /attest — returns this bastion's long-term Noise static
+/// pubkey. Clients pin the returned `noise_pubkey_hex` and use it
+/// as the responder key for Phase 2b's Noise_KK handshake. Phase
+/// 2d will add the TDX attestation quote to the response body so
+/// clients can verify the pubkey came from a genuine enclave.
+///
+/// 404 when no Noise keypair is configured (standalone dev,
+/// embedders that didn't call `Manager::with_noise_key`).
+async fn attest(State(m): State<Manager>) -> impl IntoResponse {
+    let Some(key) = m.noise.as_ref() else {
+        return (
+            axum::http::StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "noise key not configured"
+            })),
+        )
+            .into_response();
+    };
+    Json(serde_json::json!({
+        "noise_pubkey_hex": key.public_hex(),
+        "source": format!("{:?}", key.source()).to_lowercase(),
+    }))
+    .into_response()
 }
 
 async fn page(State(m): State<Manager>) -> impl IntoResponse {

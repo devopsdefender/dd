@@ -8,7 +8,7 @@ use axum::Router;
 async fn main() -> std::io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.get(1).map(|s| s.as_str()) != Some("serve") {
-        eprintln!("usage: bastion serve [--port N] [--bind ADDR] [--capture-socket PATH] [--ee-socket PATH] [--cp-url URL]");
+        eprintln!("usage: bastion serve [--port N] [--bind ADDR] [--capture-socket PATH] [--ee-socket PATH] [--cp-url URL] [--noise-key PATH]");
         std::process::exit(2);
     }
 
@@ -17,6 +17,7 @@ async fn main() -> std::io::Result<()> {
     let mut capture_socket: Option<String> = None;
     let mut ee_socket: Option<String> = None;
     let mut cp_url: Option<String> = None;
+    let mut noise_key_path: Option<String> = None;
     let mut i = 2;
     while i < args.len() {
         match args[i].as_str() {
@@ -42,6 +43,10 @@ async fn main() -> std::io::Result<()> {
                 cp_url = args.get(i + 1).cloned();
                 i += 2;
             }
+            "--noise-key" => {
+                noise_key_path = args.get(i + 1).cloned();
+                i += 2;
+            }
             other => {
                 eprintln!("bastion: unknown arg {other}");
                 std::process::exit(2);
@@ -56,6 +61,25 @@ async fn main() -> std::io::Result<()> {
         // failures fall through to single-node rendering.
         eprintln!("bastion: cross-node aggregator against CP {url}");
         mgr = mgr.with_cp_url(url);
+    }
+    if let Some(path) = noise_key_path.as_deref().filter(|s| !s.is_empty()) {
+        // Load (or mint on first boot) the long-term Noise static
+        // keypair. Exposed via `GET /attest` so clients can pin the
+        // pubkey for Phase 2b's Noise_KK handshake.
+        match bastion::noise::NoiseStatic::load_or_generate(path) {
+            Ok(key) => {
+                eprintln!(
+                    "bastion: noise static key {:?} ({}…)",
+                    key.source(),
+                    &key.public_hex()[..16]
+                );
+                mgr = mgr.with_noise_key(key);
+            }
+            Err(e) => {
+                eprintln!("bastion: noise key load at {path}: {e}");
+                std::process::exit(1);
+            }
+        }
     }
 
     if let Some(path) = capture_socket {
