@@ -48,6 +48,14 @@ struct St {
     /// GH OIDC verifier for `/api/agents` callers (CI, humans). Same
     /// audience as dd-agent, shared owner claim.
     gh: Arc<crate::gh_oidc::Verifier>,
+    /// CP's long-term Noise static keypair — exposed via `/attest`
+    /// and used to authenticate m2m connections from agents.
+    /// `None` when `--noise-key-dir` wasn't passed (local dev).
+    noise: Option<Arc<dd_common::noise_static::NoiseStatic>>,
+    /// `agent_id → pinned Noise pubkey` — populated at registration.
+    /// Future m2m endpoints (Phase 2c+) consult this before accepting
+    /// a handshake.
+    agent_pubkeys: crate::noise_m2m::AgentRegistry,
 }
 
 pub async fn run() -> Result<()> {
@@ -234,6 +242,31 @@ pub async fn run() -> Result<()> {
 
     let gh = crate::gh_oidc::Verifier::new(cfg.common.owner.clone(), "dd-agent".into());
 
+    // Load or mint the CP's long-term Noise static keypair if
+    // `DD_NOISE_KEY_DIR` is set. Optional for local dev; mandatory in
+    // prod because the fleet m2m cutover relies on it.
+    let noise: Option<Arc<dd_common::noise_static::NoiseStatic>> =
+        match std::env::var("DD_NOISE_KEY_DIR")
+            .ok()
+            .filter(|s| !s.is_empty())
+        {
+            Some(dir) => match crate::noise_m2m::load_static(std::path::Path::new(&dir)) {
+                Ok(key) => {
+                    eprintln!(
+                        "cp: noise static key {:?} ({}…)",
+                        key.source(),
+                        &key.public_hex()[..16]
+                    );
+                    Some(key)
+                }
+                Err(e) => {
+                    eprintln!("cp: noise key load failed at {dir}: {e}");
+                    None
+                }
+            },
+            None => None,
+        };
+
     let state = St {
         cfg: cfg.clone(),
         ee,
@@ -242,6 +275,8 @@ pub async fn run() -> Result<()> {
         verifier,
         cp_ita_token,
         gh,
+        noise,
+        agent_pubkeys: crate::noise_m2m::AgentRegistry::new(),
     };
 
     let app = Router::new()
@@ -255,6 +290,7 @@ pub async fn run() -> Result<()> {
         .route("/api/agents", get(api_agents))
         .route("/cp/attest", get(cp_attest))
         .route("/cp/ita", get(cp_ita))
+        .route("/cp/noise/attest", get(cp_noise_attest))
         .with_state(state);
 
     let addr = format!("0.0.0.0:{}", cfg.common.port);
@@ -326,6 +362,12 @@ struct RegisterReq {
     /// `{agent_hostname}` → `localhost:8080` dashboard rule.
     #[serde(default)]
     extra_ingress: Vec<ExtraIngress>,
+    /// Agent's long-term Noise static pubkey (hex). Optional during
+    /// the m2m migration — agents built before Phase 2b still send
+    /// only `ita_token` and fall through to the old auth path. Once
+    /// every agent carries a key, the ITA bearer paths are removed.
+    #[serde(default)]
+    noise_pubkey_hex: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -439,13 +481,43 @@ async fn register(
         );
     }
 
+    // Pin the agent's Noise pubkey if it presented one. Mismatch (the
+    // same agent_id re-registering under a fresh key) is rejected —
+    // operators must `forget` the old pin before accepting a new one.
+    if let Some(hex) = req.noise_pubkey_hex.as_deref() {
+        match crate::noise_m2m::decode_pubkey(hex) {
+            Ok(pk) => match s.agent_pubkeys.pin(&name, pk).await {
+                Ok(crate::noise_m2m::PinOutcome::Fresh) => {
+                    eprintln!(
+                        "cp: pinned noise pubkey for {} ({}…)",
+                        name,
+                        &hex.get(..16).unwrap_or(hex)
+                    );
+                }
+                Ok(crate::noise_m2m::PinOutcome::Reused) => {}
+                Err(e) => {
+                    return Err(Error::BadRequest(format!("noise pubkey: {e}")));
+                }
+            },
+            Err(e) => {
+                return Err(Error::BadRequest(format!("noise_pubkey_hex: {e}")));
+            }
+        }
+    }
+
     eprintln!("cp: registered {} as {}", req.vm_name, agent_hostname);
+
+    // Include CP's noise pubkey so the agent can pin it for future
+    // m2m handshakes. `null` during the migration window when
+    // `DD_NOISE_KEY_DIR` is unset.
+    let cp_noise_pubkey = s.noise.as_ref().map(|k| k.public_hex());
 
     Ok(Json(serde_json::json!({
         "tunnel_token": tunnel.token,
         "hostname": tunnel.hostname,
         "agent_id": name,
         "cp_hostname": s.cfg.hostname,
+        "cp_noise_pubkey_hex": cp_noise_pubkey,
     })))
 }
 
@@ -934,4 +1006,26 @@ async fn cp_ita(State(s): State<St>) -> Result<Json<serde_json::Value>> {
         "token": token,
         "claims": claims,
     })))
+}
+
+/// GET /cp/noise/attest — the CP's long-term Noise static pubkey.
+/// Agents cache this on first contact and use it as the responder
+/// key for m2m Noise_IK handshakes. Matches the shape of bastion's
+/// own `/attest` so Phase 2d's TDX-quote-binds-pubkey upgrade works
+/// the same way here.
+///
+/// 404 when `DD_NOISE_KEY_DIR` wasn't set at startup (local-dev CP).
+async fn cp_noise_attest(State(s): State<St>) -> axum::response::Response {
+    let Some(key) = s.noise.as_ref() else {
+        return (
+            axum::http::StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "noise key not configured"})),
+        )
+            .into_response();
+    };
+    Json(serde_json::json!({
+        "noise_pubkey_hex": key.public_hex(),
+        "source": format!("{:?}", key.source()).to_lowercase(),
+    }))
+    .into_response()
 }

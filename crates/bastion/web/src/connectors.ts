@@ -122,3 +122,47 @@ export async function addDdEnclave(
   await addConnector(c);
   return c;
 }
+
+/// Fetch a DD enclave's long-term Noise pubkey via `GET /attest`.
+/// Returns `null` on any error (cross-origin CF-Access bounce,
+/// connector offline, server missing `--noise-key`). Phase 2b uses
+/// the returned pubkey as the responder static for the Noise_KK
+/// handshake; Phase 2d adds a TDX quote to the same response that
+/// binds the pubkey into `REPORT_DATA` so clients can verify.
+export async function fetchAttest(
+  origin: string,
+): Promise<{ noise_pubkey_hex: string; source: string } | null> {
+  try {
+    const resp = await fetch(`${origin}/attest`, { credentials: "include" });
+    if (!resp.ok) return null;
+    const body = await resp.json();
+    if (typeof body?.noise_pubkey_hex !== "string") return null;
+    return {
+      noise_pubkey_hex: body.noise_pubkey_hex,
+      source: typeof body?.source === "string" ? body.source : "unknown",
+    };
+  } catch {
+    return null;
+  }
+}
+
+/// Merge `patch` into an existing connector's `config` and persist.
+/// Used by the attest cache to remember server Noise pubkeys across
+/// page loads. Silent no-op if the connector isn't in IDB.
+export async function patchConnectorConfig(
+  id: string,
+  patch: Record<string, unknown>,
+): Promise<void> {
+  const db = await openDb();
+  const existing: Connector | undefined = await new Promise(
+    (resolve, reject) => {
+      const tx = db.transaction(DB_STORE, "readonly");
+      const req = tx.objectStore(DB_STORE).get(id);
+      req.onsuccess = () => resolve(req.result as Connector | undefined);
+      req.onerror = () => reject(req.error);
+    },
+  );
+  if (!existing) return;
+  existing.config = { ...existing.config, ...patch };
+  await addConnector(existing);
+}

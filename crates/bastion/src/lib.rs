@@ -48,6 +48,12 @@ pub mod capture;
 pub mod ee;
 pub mod ee_sync;
 
+/// Re-export so `bastion::noise::NoiseStatic` + `bastion::noise_tunnel::*`
+/// continue to work after the primitives moved into `dd-common` (shared
+/// with the CP / agent m2m path).
+pub use dd_common::noise_static as noise;
+pub use dd_common::noise_tunnel;
+
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, State};
 use axum::response::{Html, IntoResponse};
@@ -220,6 +226,12 @@ pub struct Manager {
     /// in the fleet. Absent → single-node fallback.
     cp_url: Option<Arc<str>>,
     http: reqwest::Client,
+    /// Long-term Noise static keypair. Clients fetch the pubkey
+    /// via `GET /attest` and pin it; Phase 2b runs a Noise_KK
+    /// handshake keyed by this + a client static key. Absent in
+    /// standalone dev / local-embedder mode — `/attest` then
+    /// responds 404.
+    noise: Option<Arc<noise::NoiseStatic>>,
 }
 
 impl Default for Manager {
@@ -234,6 +246,7 @@ impl Manager {
             inner: Arc::new(RwLock::new(Default::default())),
             cp_url: None,
             http: reqwest::Client::new(),
+            noise: None,
         }
     }
 
@@ -247,6 +260,15 @@ impl Manager {
         if !url.is_empty() {
             self.cp_url = Some(Arc::from(url));
         }
+        self
+    }
+
+    /// Attach the persistent Noise static keypair. When set, `GET
+    /// /attest` returns `{noise_pubkey_hex}` so clients can pin it
+    /// before Phase 2b's Noise_KK handshake. Absent → `/attest`
+    /// returns 404.
+    pub fn with_noise_key(mut self, key: noise::NoiseStatic) -> Self {
+        self.noise = Some(Arc::new(key));
         self
     }
 
@@ -760,11 +782,38 @@ pub fn router(manager: Manager) -> Router {
 
     Router::new()
         .route("/", get(page))
+        .route("/attest", get(attest))
         .route("/api/sessions", get(list_sessions).post(create_session))
         .route("/api/sessions/{id}", delete(kill_session))
         .route("/ws/{id}", get(ws_upgrade))
+        .route("/noise/ws", get(noise_ws_upgrade))
         .layer(cors)
         .with_state(manager)
+}
+
+/// GET /attest — returns this bastion's long-term Noise static
+/// pubkey. Clients pin the returned `noise_pubkey_hex` and use it
+/// as the responder key for Phase 2b's Noise_KK handshake. Phase
+/// 2d will add the TDX attestation quote to the response body so
+/// clients can verify the pubkey came from a genuine enclave.
+///
+/// 404 when no Noise keypair is configured (standalone dev,
+/// embedders that didn't call `Manager::with_noise_key`).
+async fn attest(State(m): State<Manager>) -> impl IntoResponse {
+    let Some(key) = m.noise.as_ref() else {
+        return (
+            axum::http::StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "noise key not configured"
+            })),
+        )
+            .into_response();
+    };
+    Json(serde_json::json!({
+        "noise_pubkey_hex": key.public_hex(),
+        "source": format!("{:?}", key.source()).to_lowercase(),
+    }))
+    .into_response()
 }
 
 async fn page(State(m): State<Manager>) -> impl IntoResponse {
@@ -1024,6 +1073,190 @@ async fn ws_loop(mut socket: WebSocket, id: String, m: Manager) {
         _ = inbound => {},
         _ = outbound => {},
     }
+}
+
+// ---------------------------------------------------------------------
+// /noise/ws — Noise_IK-tunneled JSON RPC
+// ---------------------------------------------------------------------
+
+/// JSON-over-Noise request/response envelope. Every request carries an
+/// `id` so the client can correlate responses on a single multiplexed
+/// tunnel. `op` discriminates the call; payload fields are flattened.
+///
+/// Phase 2b scope: `sessions.list` / `sessions.create` / `sessions.delete`
+/// only. Phase 2c will add `shell.open` / `shell.input` / `shell.resize`
+/// for tunneling the terminal WS body.
+#[derive(Debug, Deserialize)]
+struct NoiseReq {
+    id: u64,
+    #[serde(flatten)]
+    body: NoiseReqBody,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+enum NoiseReqBody {
+    SessionsList,
+    SessionsCreate {
+        title: Option<String>,
+    },
+    SessionsDelete {
+        session_id: String,
+    },
+    /// Heartbeat — response echoes the current server time. Lets the
+    /// client tell "tunnel alive" from "app hung."
+    Ping,
+}
+
+#[derive(Debug, Serialize)]
+struct NoiseResp {
+    id: u64,
+    #[serde(flatten)]
+    body: NoiseRespBody,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum NoiseRespBody {
+    Sessions(Vec<SessionInfo>),
+    Session(SessionInfo),
+    Ok,
+    Err { msg: String },
+    Pong { server_time_ms: u64 },
+}
+
+async fn noise_ws_upgrade(ws: WebSocketUpgrade, State(m): State<Manager>) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| noise_ws_loop(socket, m))
+}
+
+async fn noise_ws_loop(mut socket: WebSocket, m: Manager) {
+    let Some(noise_key) = m.noise.clone() else {
+        // No server key configured. Close with an unencrypted text
+        // frame so the client can log a sensible error rather than
+        // staring at a silent drop.
+        let _ = socket
+            .send(Message::Text(
+                r#"{"error":"noise_not_configured"}"#.to_string().into(),
+            ))
+            .await;
+        return;
+    };
+
+    // Drive the IK handshake first. Client sends msg1, server
+    // responds with msg2, both enter transport mode.
+    let mut responder = match noise_tunnel::Responder::new(noise_key.secret_bytes()) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("bastion/noise: responder init: {e}");
+            return;
+        }
+    };
+
+    let msg1 = match socket.recv().await {
+        Some(Ok(Message::Binary(b))) => b,
+        other => {
+            eprintln!("bastion/noise: expected binary msg1, got {other:?}");
+            return;
+        }
+    };
+    if let Err(e) = responder.read_msg1(&msg1) {
+        eprintln!("bastion/noise: msg1 read: {e}");
+        return;
+    }
+    let peer_pub = responder
+        .peer_pubkey()
+        .map(|p| format!("{}…", &crate::noise::hex_encode(&p)[..16]))
+        .unwrap_or_else(|| "?".into());
+    let msg2 = match responder.write_msg2(&[]) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("bastion/noise: msg2 write: {e}");
+            return;
+        }
+    };
+    if socket.send(Message::Binary(msg2.into())).await.is_err() {
+        return;
+    }
+    let mut transport = match responder.into_transport() {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("bastion/noise: transport xition: {e}");
+            return;
+        }
+    };
+    eprintln!("bastion/noise: tunnel up (peer={peer_pub})");
+
+    // Serve requests on the encrypted stream. Each inbound binary
+    // frame is one decrypted JSON `NoiseReq`; response is one frame.
+    while let Some(frame) = socket.recv().await {
+        let Ok(Message::Binary(cipher)) = frame else {
+            continue;
+        };
+        let plain = match transport.recv(&cipher) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("bastion/noise: decrypt: {e}");
+                break;
+            }
+        };
+        let resp = dispatch_noise_req(&m, &plain).await;
+        let resp_bytes = match serde_json::to_vec(&resp) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("bastion/noise: encode resp: {e}");
+                break;
+            }
+        };
+        let ct = match transport.send(&resp_bytes) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("bastion/noise: encrypt: {e}");
+                break;
+            }
+        };
+        if socket.send(Message::Binary(ct.into())).await.is_err() {
+            break;
+        }
+    }
+}
+
+async fn dispatch_noise_req(m: &Manager, plain: &[u8]) -> NoiseResp {
+    let req: NoiseReq = match serde_json::from_slice(plain) {
+        Ok(r) => r,
+        Err(e) => {
+            return NoiseResp {
+                id: 0,
+                body: NoiseRespBody::Err {
+                    msg: format!("bad request: {e}"),
+                },
+            };
+        }
+    };
+    let body = match req.body {
+        NoiseReqBody::SessionsList => NoiseRespBody::Sessions(m.list().await),
+        NoiseReqBody::SessionsCreate { title } => {
+            let t = title.unwrap_or_else(|| "shell".to_string());
+            match m.create(t).await {
+                Ok(s) => NoiseRespBody::Session(s.info()),
+                Err(e) => NoiseRespBody::Err {
+                    msg: format!("create: {e}"),
+                },
+            }
+        }
+        NoiseReqBody::SessionsDelete { session_id } => {
+            if m.remove(&session_id).await {
+                NoiseRespBody::Ok
+            } else {
+                NoiseRespBody::Err {
+                    msg: "not_found".to_string(),
+                }
+            }
+        }
+        NoiseReqBody::Ping => NoiseRespBody::Pong {
+            server_time_ms: now_ms(),
+        },
+    };
+    NoiseResp { id: req.id, body }
 }
 
 // ---------------------------------------------------------------------

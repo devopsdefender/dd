@@ -81,9 +81,59 @@ pub async fn run() -> Result<()> {
     let initial_token = mint_ita(&cfg, &ee).await?;
     eprintln!("agent: ITA token minted");
 
+    // Load or mint the agent's long-term Noise static keypair if a
+    // dir is configured. During the m2m migration window this is
+    // optional — an agent without a key registers as before and the
+    // CP skips pinning it.
+    let noise_key: Option<Arc<dd_common::noise_static::NoiseStatic>> =
+        match std::env::var("DD_NOISE_KEY_DIR")
+            .ok()
+            .filter(|s| !s.is_empty())
+        {
+            Some(dir) => match crate::noise_m2m::load_static(std::path::Path::new(&dir)) {
+                Ok(k) => {
+                    eprintln!(
+                        "agent: noise static key {:?} ({}…)",
+                        k.source(),
+                        &k.public_hex()[..16]
+                    );
+                    Some(k)
+                }
+                Err(e) => {
+                    eprintln!("agent: noise key load failed at {dir}: {e}");
+                    None
+                }
+            },
+            None => None,
+        };
+    let noise_pubkey_hex = noise_key.as_ref().map(|k| k.public_hex());
+
     eprintln!("agent: registering with {}", cfg.cp_url);
-    let b = register(&cfg, &initial_token).await?;
+    let b = register(&cfg, &initial_token, noise_pubkey_hex.as_deref()).await?;
     eprintln!("agent: registered as {}", b.hostname);
+
+    // Pin the CP's pubkey for future m2m handshakes. Silently ignored
+    // if the CP didn't advertise one (migration window).
+    if let (Some(hex), Some(dir)) = (
+        b.cp_noise_pubkey_hex.as_deref(),
+        std::env::var("DD_NOISE_KEY_DIR")
+            .ok()
+            .filter(|s| !s.is_empty()),
+    ) {
+        match crate::noise_m2m::decode_pubkey(hex) {
+            Ok(pk) => {
+                if let Err(e) = crate::noise_m2m::save_cp_pubkey(std::path::Path::new(&dir), &pk) {
+                    eprintln!("agent: save CP noise pubkey: {e}");
+                } else {
+                    eprintln!(
+                        "agent: pinned CP noise pubkey ({}…)",
+                        &hex[..hex.len().min(16)]
+                    );
+                }
+            }
+            Err(e) => eprintln!("agent: CP noise pubkey decode: {e}"),
+        }
+    }
 
     spawn_cloudflared(b.tunnel_token);
 
@@ -153,9 +203,15 @@ struct Bootstrap {
     agent_id: String,
     #[allow(dead_code)]
     cp_hostname: String,
+    /// CP's long-term Noise static pubkey (hex), advertised so the
+    /// agent can pin it for future m2m handshakes. Absent in
+    /// migration-window deployments where the CP hasn't been given
+    /// a key dir yet.
+    #[serde(default)]
+    cp_noise_pubkey_hex: Option<String>,
 }
 
-async fn register(cfg: &Cfg, ita_token: &str) -> Result<Bootstrap> {
+async fn register(cfg: &Cfg, ita_token: &str, noise_pubkey_hex: Option<&str>) -> Result<Bootstrap> {
     let http = reqwest::Client::new();
     let url = format!("{}/register", cfg.cp_url.trim_end_matches('/'));
     let extra_ingress: Vec<serde_json::Value> = cfg
@@ -169,6 +225,7 @@ async fn register(cfg: &Cfg, ita_token: &str) -> Result<Bootstrap> {
         "owner": cfg.common.owner,
         "ita_token": ita_token,
         "extra_ingress": extra_ingress,
+        "noise_pubkey_hex": noise_pubkey_hex,
     });
     // /register is CF-Access-bypassed; ITA attestation is the gate.
     let resp = http
