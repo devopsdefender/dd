@@ -135,11 +135,9 @@ jobs:
           EE_BOOT_WORKLOADS=$({
             bake apps/cloudflared/workload.json
             bake apps/dd-management/workload.json.tmpl
-            # Bastion's template references ${DD_CP_URL} so its SPA can
-            # fan out cross-origin to every agent. On the CP itself the
-            # CP URL is its own public hostname.
-            DD_CP_URL="https://${DD_HOSTNAME}" \
-              bake apps/bastion/workload.json.tmpl
+            # Bastion hits localhost:8080 for the agent catalog (CP
+            # itself on this VM), so DD_CP_URL isn't needed in its env.
+            bake apps/bastion/workload.json.tmpl
           } | jq -cs '.')
 
           # EE_CAPTURE_SOCKET tells EE (post-capture-socket patch) to tee

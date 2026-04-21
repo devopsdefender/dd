@@ -134,10 +134,10 @@ build_config_iso() {
     bake "$REPO_ROOT/apps/podman-static/workload.json"
     bake "$REPO_ROOT/apps/podman-bootstrap/workload.json"
     bake "$REPO_ROOT/apps/cloudflared/workload.json"
-    # Bastion's template references ${DD_CP_URL} so its SPA can fan
-    # out cross-origin to every agent in the fleet.
-    DD_CP_URL="$cp" \
-      DD_RELEASE_TAG="$DD_RELEASE_TAG" \
+    # Bastion hits localhost:8080 for the agent catalog — on the CP
+    # that's dd-management, on an agent that's dd-agent's /api/agents
+    # proxy. Only DD_RELEASE_TAG needs to be in the bake env.
+    DD_RELEASE_TAG="$DD_RELEASE_TAG" \
       bake "$REPO_ROOT/apps/bastion/workload.json.tmpl"
   })
 
