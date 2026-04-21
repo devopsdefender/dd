@@ -1118,11 +1118,21 @@ struct NoiseResp {
 #[derive(Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum NoiseRespBody {
-    Sessions(Vec<SessionInfo>),
-    Session(SessionInfo),
+    /// Named `sessions` field so serde's `#[serde(tag)]` internal-
+    /// tagging works (it can't internally-tag a bare `Vec`).
+    Sessions {
+        sessions: Vec<SessionInfo>,
+    },
+    Session {
+        session: SessionInfo,
+    },
     Ok,
-    Err { msg: String },
-    Pong { server_time_ms: u64 },
+    Err {
+        msg: String,
+    },
+    Pong {
+        server_time_ms: u64,
+    },
 }
 
 async fn noise_ws_upgrade(ws: WebSocketUpgrade, State(m): State<Manager>) -> impl IntoResponse {
@@ -1233,11 +1243,13 @@ async fn dispatch_noise_req(m: &Manager, plain: &[u8]) -> NoiseResp {
         }
     };
     let body = match req.body {
-        NoiseReqBody::SessionsList => NoiseRespBody::Sessions(m.list().await),
+        NoiseReqBody::SessionsList => NoiseRespBody::Sessions {
+            sessions: m.list().await,
+        },
         NoiseReqBody::SessionsCreate { title } => {
             let t = title.unwrap_or_else(|| "shell".to_string());
             match m.create(t).await {
-                Ok(s) => NoiseRespBody::Session(s.info()),
+                Ok(s) => NoiseRespBody::Session { session: s.info() },
                 Err(e) => NoiseRespBody::Err {
                     msg: format!("create: {e}"),
                 },

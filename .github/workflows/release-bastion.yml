@@ -51,6 +51,7 @@ jobs:
         working-directory: crates/bastion/web
         run: |
           npm ci
+          npm test
           npm run build
 
       - name: Build bastion

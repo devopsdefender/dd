@@ -106,9 +106,9 @@ impl Responder {
     /// Caller is responsible for having done one read + one write
     /// in order before calling; `snow` panics otherwise.
     pub fn into_transport(self) -> Result<Transport, snow::Error> {
-        let peer = self
-            .peer_pubkey()
-            .ok_or(snow::Error::State(snow::error::StateProblem::MissingKeyMaterial))?;
+        let peer = self.peer_pubkey().ok_or(snow::Error::State(
+            snow::error::StateProblem::MissingKeyMaterial,
+        ))?;
         let state = self.state.into_transport_mode()?;
         Ok(Transport {
             state,
