@@ -124,27 +124,53 @@ export async function createShell(c: Connector): Promise<void> {
   if (c.kind !== "dd-enclave") return;
   const origin = (c.config.origin as string | undefined) ?? "";
   if (!origin) return;
-  const resp = await fetch(`${origin}/api/sessions`, {
-    method: "POST",
-    credentials: "include",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ title: "shell" }),
+  try {
+    const resp = await fetch(`${origin}/api/sessions`, {
+      method: "POST",
+      credentials: "include",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ title: "shell" }),
+    });
+    if (!resp.ok) {
+      console.warn(`createShell: ${origin} → ${resp.status}`);
+      return;
+    }
+    const info: SessionInfo = await resp.json();
+    const id = rowKey(c, info.id);
+    const rows = new Map(ui.rows);
+    rows.set(id, {
+      connector: c,
+      origin,
+      info,
+      blocks: [],
+      ws: null,
+      term: null,
+      fit: null,
+    });
+    ui.rows = rows;
+    ui.active = id;
+  } catch (e) {
+    // Cross-origin + CF Access fails here with a TypeError before
+    // fetch even reaches the origin. Swallow it — the sidebar falls
+    // back to "no new shell, try again" rather than throwing a red
+    // Uncaught (in promise) from a click handler.
+    console.warn(`createShell: ${origin} cross-origin blocked`, e);
+  }
+}
+
+/// Pick the enclave to create new shells on. Same-origin first —
+/// clicking "+" on an agent's bastion creates a shell on THAT
+/// agent, not on whichever connector happens to be first in the
+/// list (usually the CP, which fails CORS from an agent origin).
+/// Falls back to the first `dd-enclave` connector if none match.
+export function pickShellConnector(): Connector | null {
+  const here = location.origin;
+  const dd = ui.connectors.filter((c) => c.kind === "dd-enclave");
+  const sameOrigin = dd.find((c) => {
+    const o = c.config.origin as string | undefined;
+    return typeof o === "string" && o.replace(/\/+$/, "") === here;
   });
-  if (!resp.ok) return;
-  const info: SessionInfo = await resp.json();
-  const id = rowKey(c, info.id);
-  const rows = new Map(ui.rows);
-  rows.set(id, {
-    connector: c,
-    origin,
-    info,
-    blocks: [],
-    ws: null,
-    term: null,
-    fit: null,
-  });
-  ui.rows = rows;
-  ui.active = id;
+  return sameOrigin ?? dd[0] ?? null;
 }
 
 export async function killShell(row: Row): Promise<void> {

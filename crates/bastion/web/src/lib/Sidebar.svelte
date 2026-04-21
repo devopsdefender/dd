@@ -4,9 +4,10 @@
     createShell,
     killShell,
     refreshConnectors,
+    pickShellConnector,
   } from "../ui.svelte";
   import type { Row } from "../ui.svelte";
-  import type { Connector, ConnectorKind } from "../connectors";
+  import type { ConnectorKind } from "../connectors";
   import { addDdEnclave } from "../connectors";
 
   // Rendered in this order; unknown kinds fall into "Other".
@@ -89,12 +90,6 @@
     return `${row.connector.label} · ${t}`;
   }
 
-  /// Pick the enclave to create new shells on. Default: first
-  /// `dd-enclave` connector. (Future: a last-used preference.)
-  function pickNewShellConnector(): Connector | null {
-    return ui.connectors.find((c) => c.kind === "dd-enclave") ?? null;
-  }
-
   let grouped = $derived(groupRows(ui.rows));
   let menuOpen = $state(false);
   let addingEnclave = $state(false);
@@ -128,7 +123,7 @@
         class="icon"
         title="New shell / add connector"
         onclick={() => {
-          const c = pickNewShellConnector();
+          const c = pickShellConnector();
           if (menuOpen) {
             menuOpen = false;
           } else if (c) {
