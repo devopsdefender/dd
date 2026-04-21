@@ -13,11 +13,26 @@
 //! idempotent on `id`), so running this concurrently with the push
 //! listener is safe.
 
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
+
+use tokio::sync::Mutex;
 
 use crate::ee::{Deployment, EeClient};
 use crate::Manager;
+
+/// Per-loop state so consecutive polls don't re-register the same
+/// workloads or re-feed the same log bytes. `seeded` tracks ids
+/// we've already backfilled output for; `status` tracks last-seen
+/// status so we only `workload_exit` on the transition edge (not
+/// every time EE keeps reporting a completed workload).
+#[derive(Default)]
+pub struct SyncState {
+    seeded: HashSet<String>,
+    status: HashMap<String, String>,
+}
 
 /// Default `tail` for the per-workload log backfill. 1000 lines is
 /// typically more than `RING_CAP` / line would be anyway, and EE
@@ -49,9 +64,11 @@ fn status_to_code(status: &str) -> i32 {
 }
 
 /// Run one pull cycle: for every deployment EE knows about, make
-/// sure the [`Manager`] has a matching workload session (registered,
-/// log-seeded, and possibly exit-committed). Safe to call repeatedly.
-pub async fn sync_once(manager: &Manager, ee: &EeClient) {
+/// sure the [`Manager`] has a matching workload session. Uses
+/// `state` to avoid re-feeding log bytes or re-registering rows on
+/// every tick — a first-time deployment gets its full backfill,
+/// subsequent polls are cheap no-ops unless the status transitions.
+pub async fn sync_once(manager: &Manager, ee: &EeClient, state: &Mutex<SyncState>) {
     let deployments = match ee.list().await {
         Ok(v) => v,
         Err(e) => {
@@ -60,11 +77,16 @@ pub async fn sync_once(manager: &Manager, ee: &EeClient) {
         }
     };
     for dep in deployments {
-        register_and_fill(manager, ee, &dep).await;
+        register_and_fill(manager, ee, &dep, state).await;
     }
 }
 
-async fn register_and_fill(manager: &Manager, ee: &EeClient, dep: &Deployment) {
+async fn register_and_fill(
+    manager: &Manager,
+    ee: &EeClient,
+    dep: &Deployment,
+    state: &Mutex<SyncState>,
+) {
     // argv from EE's `source` (either "owner/repo@tag" or
     // "program args…") — we don't have the real argv on EE's side,
     // so this is the best label we can give the sidebar.
@@ -75,24 +97,45 @@ async fn register_and_fill(manager: &Manager, ee: &EeClient, dep: &Deployment) {
         .split_whitespace()
         .map(String::from)
         .collect();
-    let id = format!("{}-{}", dep.app_name, dep.id);
-    manager.register_workload(id.clone(), argv, None).await;
+    // Stable sidebar key — one row per app_name regardless of how
+    // many times EE has restarted the workload. Using the EE
+    // deployment UUID would spin up a fresh row on every restart
+    // and, worse, duplicate with the push-side `{app}-{epoch_ms}`
+    // id that the capture socket uses for live records.
+    let id = dep.app_name.clone();
 
-    // Seed the per-lifetime accumulator with the file tail EE has
-    // captured so far. This is what makes cloudflared / podman /
-    // the whole boot set show real history instead of just a name.
-    match ee.logs(&dep.id, BACKFILL_TAIL).await {
-        Ok(lines) => {
-            for line in lines {
-                let mut bytes = line.into_bytes();
-                bytes.push(b'\n');
-                manager.workload_out(&id, &bytes).await;
+    let needs_seed = {
+        let mut s = state.lock().await;
+        s.seeded.insert(id.clone())
+    };
+    if needs_seed {
+        manager.register_workload(id.clone(), argv, None).await;
+        // One-shot backfill on first sighting. On subsequent polls
+        // we skip this entirely — the Manager's ring buffer is
+        // already primed, and live updates (if any) come through
+        // the push path.
+        match ee.logs(&dep.id, BACKFILL_TAIL).await {
+            Ok(lines) => {
+                for line in lines {
+                    let mut bytes = line.into_bytes();
+                    bytes.push(b'\n');
+                    manager.workload_out(&id, &bytes).await;
+                }
             }
+            Err(e) => eprintln!("ee_sync: logs({}) failed: {e}", dep.id),
         }
-        Err(e) => eprintln!("ee_sync: logs({}) failed: {e}", dep.id),
     }
 
-    if is_terminal(&dep.status) {
+    // Only commit an exit block on the edge — the first time we see
+    // this deployment land in a terminal status. Repeated polls of
+    // an already-terminal workload would otherwise re-emit exits.
+    let prev_status = {
+        let mut s = state.lock().await;
+        s.status.insert(id.clone(), dep.status.clone())
+    };
+    let just_terminated =
+        is_terminal(&dep.status) && prev_status.as_deref() != Some(dep.status.as_str());
+    if just_terminated {
         manager
             .workload_exit(&id, status_to_code(&dep.status))
             .await;
@@ -105,11 +148,12 @@ async fn register_and_fill(manager: &Manager, ee: &EeClient, dep: &Deployment) {
 /// blocking on EE round-trips.
 pub fn start(manager: Manager, socket_path: impl AsRef<Path>) {
     let ee = EeClient::new(socket_path);
+    let state = Arc::new(Mutex::new(SyncState::default()));
     tokio::spawn(async move {
-        sync_once(&manager, &ee).await;
+        sync_once(&manager, &ee, &state).await;
         loop {
             tokio::time::sleep(POLL_INTERVAL).await;
-            sync_once(&manager, &ee).await;
+            sync_once(&manager, &ee, &state).await;
         }
     });
 }
@@ -196,37 +240,63 @@ mod tests {
 
         let manager = Manager::new();
         let ee = EeClient::new(&sock);
-        sync_once(&manager, &ee).await;
+        let state = Mutex::new(SyncState::default());
 
-        // Both workloads registered.
+        // First poll: registers + backfills.
+        sync_once(&manager, &ee, &state).await;
+
+        // Stable id is just app_name — no per-poll suffix, no
+        // duplication with the push path, no churn on restart.
         let cf = manager
-            .get("cloudflared-dep-a")
+            .get("cloudflared")
             .await
             .expect("cloudflared session registered");
         let pod = manager
-            .get("podman-static-dep-b")
+            .get("podman-static")
             .await
             .expect("podman-static session registered");
         assert_eq!(cf.kind, "workload");
         assert_eq!(pod.kind, "workload");
 
-        // Log lines were fed in (observable via the ring buffer —
-        // we don't assert exact bytes, just presence).
-        let ring = cf.ring.lock().await;
-        let ring_bytes: Vec<u8> = ring.iter().copied().collect();
-        let ring_str = String::from_utf8_lossy(&ring_bytes);
+        // Log lines fed into the ring on first-sighting backfill.
+        let ring_after_first = {
+            let ring = cf.ring.lock().await;
+            ring.iter().copied().collect::<Vec<u8>>()
+        };
+        let ring_str = String::from_utf8_lossy(&ring_after_first);
         assert!(ring_str.contains("cf line 1"));
         assert!(ring_str.contains("cf line 2"));
 
-        // Terminal status (`completed` on podman-static) committed
-        // an exit block.
-        let pod_blocks = pod.blocks.read().await;
-        assert_eq!(pod_blocks.len(), 1, "podman-static got exit block");
-        assert_eq!(pod_blocks[0].exit_code, 0);
+        // Terminal status → one exit block committed.
+        {
+            let pod_blocks = pod.blocks.read().await;
+            assert_eq!(pod_blocks.len(), 1, "podman-static got exit block");
+            assert_eq!(pod_blocks[0].exit_code, 0);
+        }
+        {
+            let cf_blocks = cf.blocks.read().await;
+            assert_eq!(cf_blocks.len(), 0, "cloudflared still running");
+        }
 
-        // Non-terminal status (`running` on cloudflared) did not
-        // commit an exit block.
-        let cf_blocks = cf.blocks.read().await;
-        assert_eq!(cf_blocks.len(), 0, "cloudflared still running, no block");
+        // Second poll: the dedup guard means no double-registering,
+        // no re-feeding bytes, no re-emitting exit.
+        sync_once(&manager, &ee, &state).await;
+
+        let ring_after_second = {
+            let ring = cf.ring.lock().await;
+            ring.iter().copied().collect::<Vec<u8>>()
+        };
+        assert_eq!(
+            ring_after_first, ring_after_second,
+            "ring must not grow on repeat polls"
+        );
+        {
+            let pod_blocks = pod.blocks.read().await;
+            assert_eq!(
+                pod_blocks.len(),
+                1,
+                "repeat poll must not re-emit exit block"
+            );
+        }
     }
 }
