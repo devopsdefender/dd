@@ -41,10 +41,14 @@ jobs:
           CF_ACCOUNT_ID:  ${{ secrets.DD_CP_CF_ACCOUNT_ID }}
           CF_ZONE_ID:     ${{ secrets.DD_CP_CF_ZONE_ID }}
           GH_TOKEN:       ${{ github.token }}
-          # On schedule runs there are no inputs — default to apply
-          # so the cron actually reaps. Dispatch runs can override
-          # via the checkbox.
-          APPLY: ${{ github.event_name == 'workflow_dispatch' && inputs.apply || 'true' }}
+          # Schedule runs → always apply (that's the point of the cron).
+          # Dispatch runs → respect the `apply` checkbox.
+          #
+          # GH Actions expression gotcha: `false && x || y` reduces to `y`,
+          # so a naive `event == 'workflow_dispatch' && inputs.apply || 'true'`
+          # becomes `'true'` whenever the dispatcher un-checks the box.
+          # Use explicit schedule branch to avoid that.
+          APPLY: ${{ github.event_name == 'schedule' || inputs.apply }}
         run: |
           set -euo pipefail
           AUTH=(-H "Authorization: Bearer $CF_API_TOKEN")
@@ -89,8 +93,15 @@ jobs:
               '.result[] | select(.name | startswith($p)) | "\(.id) \(.name)"')
             env_tuns=$(echo "$tunnels" | jq -r --arg p "dd-$env-" \
               '.result[] | select(.name | startswith($p)) | "\(.id) \(.name)"')
-            env_dns=$(echo "$dns" | jq -r --arg dot "$env." --arg dash "$env-" \
-              '.result[] | select((.name | startswith($dot)) or (.name | startswith($dash))) | "\(.id) \(.name)"')
+            # DNS match forms for env `pr-42`:
+            #   - `pr-42.devopsdefender.com`            CP hostname
+            #   - `pr-42-gpu.devopsdefender.com`        CP workload labels
+            #   - `dd-pr-42-agent-{uuid}.devopsdefender.com`  agent tunnels
+            # The `dd-{env}-` prefix catches the agent CNAMEs that were
+            # invisible to the earlier narrower matcher (→ 0 DNS reaped
+            # in prod despite ~200 dangling records).
+            env_dns=$(echo "$dns" | jq -r --arg dot "$env." --arg dash "$env-" --arg dd "dd-$env-" \
+              '.result[] | select((.name | startswith($dot)) or (.name | startswith($dash)) or (.name | startswith($dd))) | "\(.id) \(.name)"')
 
             a=$(printf '%s\n' "$env_apps" | grep -c . || true)
             t=$(printf '%s\n' "$env_tuns" | grep -c . || true)
@@ -142,7 +153,94 @@ jobs:
           done
 
           echo ""
-          echo "Summary: $total_envs stale envs, $total_apps apps, $total_tun tunnels, $total_dns DNS records"
+          echo "Closed-PR sweep: $total_envs stale envs, $total_apps apps, $total_tun tunnels, $total_dns DNS records"
+
+          # ── Orphan agent-hostname sweep (prod + all envs) ──────────
+          # Agent tunnels + their associated Access apps + DNS CNAMEs
+          # are all named with a per-relaunch UUID
+          # (`dd-{env}-agent-{uuid}`). Every agent relaunch mints a
+          # fresh UUID; the old tunnel gets STONITH'd but its Access
+          # apps and DNS records typically stay behind forever. This
+          # is how production accumulates orphans even though the CP's
+          # own apps (deterministic names) are fine.
+          #
+          # Rule: if an Access app or DNS record references an
+          # `dd-{env}-agent-{uuid}` hostname that DOESN'T match any
+          # currently-live tunnel, it's orphaned → reap.
+          echo ""
+          echo "Orphan agent-hostname sweep..."
+
+          live_tunnel_names=$(echo "$tunnels" | jq -r '.result[].name' \
+            | grep -E '^dd-[a-zA-Z0-9-]+-agent-' | sort -u)
+          # Live hostnames as they appear in app / DNS names — same
+          # UUID, different formatting (hostname = tunnel name + TLD).
+          live_hostnames=$(for t in $live_tunnel_names; do
+            echo "$t.devopsdefender.com"
+          done | sort -u)
+
+          # Agent Access apps: name matches `dd-{env}-agent-{hostname}-{suffix}`
+          # (where hostname contains the full tunnel name). Pull out
+          # the hostname and check it against the live set.
+          orphan_apps=$(echo "$apps" | jq -r \
+            '.result[] | select(.name | test("^dd-[a-zA-Z0-9-]+-agent-dd-[a-zA-Z0-9-]+-agent-")) | "\(.id) \(.name)"' \
+            | while read -r id name; do
+                # Extract: strip `dd-{env}-agent-` prefix → left with
+                # `dd-{env}-agent-{uuid}.devopsdefender.com[-suffix]`.
+                # Grep for the first devopsdefender.com match.
+                host=$(echo "$name" | grep -oE 'dd-[a-zA-Z0-9-]+-agent-[a-f0-9-]+\.devopsdefender\.com' | head -1)
+                [ -z "$host" ] && continue
+                if ! echo "$live_hostnames" | grep -qx "$host"; then
+                    echo "$id $name"
+                fi
+            done)
+
+          # Agent DNS records: name is `dd-{env}-agent-{uuid}.devopsdefender.com`
+          # or `{label}.dd-{env}-agent-{uuid}.devopsdefender.com`.
+          orphan_dns=$(echo "$dns" | jq -r \
+            '.result[] | select(.name | test("dd-[a-zA-Z0-9-]+-agent-[a-f0-9-]+\\.devopsdefender\\.com")) | "\(.id) \(.name)"' \
+            | while read -r id name; do
+                host=$(echo "$name" | grep -oE 'dd-[a-zA-Z0-9-]+-agent-[a-f0-9-]+\.devopsdefender\.com' | head -1)
+                [ -z "$host" ] && continue
+                if ! echo "$live_hostnames" | grep -qx "$host"; then
+                    echo "$id $name"
+                fi
+            done)
+
+          # Agent tunnels whose prefix doesn't match any LIVE agent
+          # name. (We only consider tunnels not already reaped by the
+          # closed-PR sweep above — so this is mainly production
+          # leftovers where the PR side is CLOSED check doesn't apply.)
+          #
+          # A tunnel is "orphan" if no connection exists for it AND
+          # its env doesn't have another more-recent tunnel with the
+          # same prefix. Simpler: check `conns` count via the API
+          # when reaping; don't prune here for now since tunnels with
+          # no connections are cheap.
+
+          oa=$(printf '%s\n' "$orphan_apps" | grep -c . || true)
+          od=$(printf '%s\n' "$orphan_dns"  | grep -c . || true)
+
+          echo "Orphan-agent: apps=$oa dns=$od"
+          [ -n "$orphan_apps" ] && echo "$orphan_apps" | sed 's/^/  app /'
+          [ -n "$orphan_dns"  ] && echo "$orphan_dns"  | sed 's/^/  dns /'
+
+          if [ "$APPLY" = "true" ]; then
+            [ -n "$orphan_apps" ] && echo "$orphan_apps" | while read -r id name; do
+              [ -z "$id" ] && continue
+              curl -fsS -X DELETE "${AUTH[@]}" \
+                "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/access/apps/$id" \
+                >/dev/null 2>&1 && echo "  - app $name" || echo "  ! app $name FAILED"
+            done
+            [ -n "$orphan_dns" ] && echo "$orphan_dns" | while read -r id name; do
+              [ -z "$id" ] && continue
+              curl -fsS -X DELETE "${AUTH[@]}" \
+                "https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/dns_records/$id" \
+                >/dev/null 2>&1 && echo "  - dns $name" || echo "  ! dns $name FAILED"
+            done
+          fi
+
+          echo ""
+          echo "FINAL: closed-PR($total_apps apps, $total_tun tunnels, $total_dns dns) + orphan-agent($oa apps, $od dns)"
           if [ "$APPLY" != "true" ]; then
             echo "(dry-run — re-dispatch with apply=true to delete)"
           fi
