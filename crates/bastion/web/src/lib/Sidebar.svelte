@@ -1,7 +1,13 @@
 <script lang="ts">
-  import { ui, createShell, killShell } from "../ui.svelte";
+  import {
+    ui,
+    createShell,
+    killShell,
+    refreshConnectors,
+  } from "../ui.svelte";
   import type { Row } from "../ui.svelte";
-  import type { Agent } from "../types";
+  import type { Connector, ConnectorKind } from "../connectors";
+  import { addDdEnclave } from "../connectors";
 
   // Rendered in this order; unknown kinds fall into "Other".
   const CATEGORIES: { key: string; label: string }[] = [
@@ -9,6 +15,51 @@
     { key: "workload", label: "Workloads" },
     { key: "claude", label: "Claude" },
     { key: "codex", label: "Codex" },
+  ];
+
+  // Placeholder "+" menu items. Each one names the discovery story
+  // so the next PR knows what it's meant to auto-populate:
+  // - ssh-host: read ~/.ssh/known_hosts + ~/.ssh/config on the user's
+  //   side (web: paste/upload; Tauri: file read).
+  // - anthropic: one API key → list conversations via API.
+  // - github: one OAuth token → events feed → blocks.
+  // - local-shell: Tauri-only native PTY.
+  const ADD_OPTIONS: {
+    kind: ConnectorKind | "local-shell";
+    label: string;
+    hint: string;
+    enabled: boolean;
+  }[] = [
+    {
+      kind: "dd-enclave",
+      label: "Add DD enclave…",
+      hint: "By block URL; or let CP discover for you.",
+      enabled: true,
+    },
+    {
+      kind: "ssh-host",
+      label: "Add SSH host",
+      hint: "Discovers from ~/.ssh/known_hosts + ~/.ssh/config.",
+      enabled: false,
+    },
+    {
+      kind: "anthropic",
+      label: "Add Anthropic conversations",
+      hint: "Paste an API key; list conversations via API.",
+      enabled: false,
+    },
+    {
+      kind: "github",
+      label: "Add GitHub activity",
+      hint: "OAuth token → events feed → blocks.",
+      enabled: false,
+    },
+    {
+      kind: "local-shell",
+      label: "Add local shell",
+      hint: "Tauri-only; opens a native PTY on this device.",
+      enabled: false,
+    },
   ];
 
   type Grouped = Map<string, [string, Row][]>;
@@ -28,28 +79,110 @@
     return { by, other };
   }
 
-  /// Label for a row in the sidebar. In unified mode, prefix with
-  /// the agent's `vm_name` so the user sees which node it lives on.
+  /// Label for a row in the sidebar — connector's label (usually
+  /// the agent's vm_name) + the session's title/id. When the user
+  /// only has one connector this is a bit verbose, but it's the
+  /// right default once they add ssh/anthropic/etc. alongside.
   function rowLabel(row: Row): string {
     const t = row.info.title || row.info.id.slice(0, 8);
-    return ui.unified ? `${row.agent.vm_name} · ${t}` : t;
+    if (ui.connectors.length <= 1) return t;
+    return `${row.connector.label} · ${t}`;
   }
 
-  function pickNewShellAgent(): Agent {
-    // Unified mode: create on the CP itself (first entry of __DD_AGENTS__
-    // by convention, since cp.rs puts CP at index 0). Falls back to
-    // location.origin in single-node mode.
-    return ui.agents[0];
+  /// Pick the enclave to create new shells on. Default: first
+  /// `dd-enclave` connector. (Future: a last-used preference.)
+  function pickNewShellConnector(): Connector | null {
+    return ui.connectors.find((c) => c.kind === "dd-enclave") ?? null;
   }
 
   let grouped = $derived(groupRows(ui.rows));
+  let menuOpen = $state(false);
+  let addingEnclave = $state(false);
+  let newEnclaveUrl = $state("");
+
+  async function submitEnclave(e: Event) {
+    e.preventDefault();
+    if (!newEnclaveUrl.trim()) return;
+    try {
+      await addDdEnclave(newEnclaveUrl);
+      newEnclaveUrl = "";
+      addingEnclave = false;
+      menuOpen = false;
+      await refreshConnectors();
+    } catch (err) {
+      console.error("add enclave failed:", err);
+    }
+  }
 </script>
 
 <aside class="sidebar">
   <div class="hdr">
     <span class="grow">Sessions</span>
-    <button class="icon" title="New shell" onclick={() => createShell(pickNewShellAgent())}>+</button>
+    {#if ui.deviceFp}
+      <span class="fp" title="Device identity (first 4 bytes)">
+        {ui.deviceFp}
+      </span>
+    {/if}
+    <div class="menu-wrap">
+      <button
+        class="icon"
+        title="New shell / add connector"
+        onclick={() => {
+          const c = pickNewShellConnector();
+          if (menuOpen) {
+            menuOpen = false;
+          } else if (c) {
+            createShell(c);
+          } else {
+            menuOpen = true;
+          }
+        }}
+        oncontextmenu={(e) => {
+          e.preventDefault();
+          menuOpen = !menuOpen;
+        }}>+</button>
+      {#if menuOpen}
+        <div class="menu" role="menu">
+          <div class="menu-head">Add connector</div>
+          {#each ADD_OPTIONS as opt}
+            <button
+              class="menu-item"
+              class:disabled={!opt.enabled}
+              disabled={!opt.enabled}
+              title={opt.hint}
+              onclick={() => {
+                if (opt.kind === "dd-enclave") {
+                  addingEnclave = true;
+                }
+              }}
+            >
+              {opt.label}
+              {#if !opt.enabled}<span class="todo">TODO</span>{/if}
+            </button>
+          {/each}
+        </div>
+      {/if}
+    </div>
   </div>
+
+  {#if addingEnclave}
+    <form class="add-form" onsubmit={submitEnclave}>
+      <label for="enclave-url">Enclave URL</label>
+      <input
+        id="enclave-url"
+        type="url"
+        placeholder="https://dd-…-block.devopsdefender.com"
+        bind:value={newEnclaveUrl}
+      />
+      <div class="add-actions">
+        <button type="submit">Add</button>
+        <button type="button" onclick={() => { addingEnclave = false; }}>
+          Cancel
+        </button>
+      </div>
+    </form>
+  {/if}
+
   <ul class="list">
     {#each CATEGORIES as cat}
       {@const items = grouped.by.get(cat.key) ?? []}
@@ -65,8 +198,7 @@
               <button
                 class="t"
                 onclick={() => (ui.active = id)}
-                title={rowLabel(row)}
-              >
+                title={rowLabel(row)}>
                 {rowLabel(row)}
               </button>
               {#if row.info.kind === "shell"}
@@ -74,14 +206,15 @@
                   class="x"
                   title="Close"
                   onclick={() => killShell(row)}
-                  aria-label="Close session"
-                >×</button>
+                  aria-label="Close session">×</button>
               {/if}
             </div>
             {#if row.blocks.length > 0}
               <ul class="blocks">
                 {#each row.blocks.slice(-50) as b (b.seq)}
-                  <li class={b.exit_code === 0 ? "ok" : "fail"} title={`exit ${b.exit_code}`}>
+                  <li
+                    class={b.exit_code === 0 ? "ok" : "fail"}
+                    title={`exit ${b.exit_code}`}>
                     {(b.command || "(no command)").slice(0, 80)}
                   </li>
                 {/each}
@@ -99,8 +232,9 @@
             <button
               class="t"
               onclick={() => (ui.active = id)}
-              title={rowLabel(row)}
-            >{rowLabel(row)}</button>
+              title={rowLabel(row)}>
+              {rowLabel(row)}
+            </button>
           </div>
         </li>
       {/each}
@@ -118,6 +252,7 @@
     min-height: 0;
   }
   .hdr {
+    position: relative;
     display: flex;
     align-items: center;
     gap: 8px;
@@ -128,6 +263,15 @@
     text-transform: uppercase;
   }
   .hdr .grow { flex: 1; }
+  .hdr .fp {
+    font-family: ui-monospace, monospace;
+    font-size: 10px;
+    color: #6c7086;
+    padding: 1px 6px;
+    border: 1px solid #313244;
+    border-radius: 3px;
+    letter-spacing: 0.6px;
+  }
   button.icon {
     padding: 2px 10px;
     font-size: 16px;
@@ -139,6 +283,93 @@
     cursor: pointer;
   }
   button.icon:hover { background: #45475a; }
+  .menu-wrap { position: relative; }
+  .menu {
+    position: absolute;
+    top: 28px;
+    right: 0;
+    background: #181825;
+    border: 1px solid #313244;
+    border-radius: 4px;
+    padding: 4px;
+    min-width: 220px;
+    z-index: 10;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+  }
+  .menu-head {
+    color: #89b4fa;
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.6px;
+    padding: 6px 8px 4px;
+  }
+  .menu-item {
+    all: unset;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    width: 100%;
+    padding: 6px 8px;
+    border-radius: 3px;
+    color: #cdd6f4;
+    font-size: 12px;
+    cursor: pointer;
+    text-transform: none;
+    box-sizing: border-box;
+  }
+  .menu-item:hover:not(.disabled) { background: #313244; }
+  .menu-item.disabled {
+    color: #585b70;
+    cursor: not-allowed;
+  }
+  .menu-item .todo {
+    margin-left: auto;
+    font-size: 9px;
+    color: #f9e2af;
+    background: #45452344;
+    padding: 1px 4px;
+    border-radius: 2px;
+    letter-spacing: 0.4px;
+  }
+  .add-form {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 12px 14px;
+    background: #1e1e2e;
+    border-bottom: 1px solid #313244;
+  }
+  .add-form label {
+    color: #a6adc8;
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.6px;
+  }
+  .add-form input {
+    background: #11111b;
+    color: #cdd6f4;
+    border: 1px solid #313244;
+    border-radius: 3px;
+    padding: 6px 8px;
+    font-size: 12px;
+    font-family: ui-monospace, monospace;
+  }
+  .add-form input:focus {
+    outline: none;
+    border-color: #89b4fa;
+  }
+  .add-actions { display: flex; gap: 6px; }
+  .add-actions button {
+    flex: 1;
+    padding: 6px 8px;
+    border: 0;
+    border-radius: 3px;
+    background: #313244;
+    color: #cdd6f4;
+    font-size: 11px;
+    cursor: pointer;
+  }
+  .add-actions button[type="submit"] { background: #89b4fa; color: #11111b; }
   .list {
     list-style: none;
     margin: 0;

@@ -76,8 +76,8 @@
     const row = ui.rows.get(rowId);
     if (!row) return;
     const term = row.term!;
-    const proto = row.agent.origin.startsWith("https:") ? "wss:" : "ws:";
-    const base = row.agent.origin.replace(/^https?:/, proto);
+    const proto = row.origin.startsWith("https:") ? "wss:" : "ws:";
+    const base = row.origin.replace(/^https?:/, proto);
     const ws = new WebSocket(`${base}/ws/${row.info.id}`);
     ws.binaryType = "arraybuffer";
     row.ws = ws;

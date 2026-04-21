@@ -2,9 +2,9 @@
   import { onMount } from "svelte";
   import Sidebar from "./lib/Sidebar.svelte";
   import TerminalPane from "./lib/TerminalPane.svelte";
-  import { ui, loadSessions } from "./ui.svelte";
+  import { ui, bootstrap } from "./ui.svelte";
 
-  onMount(loadSessions);
+  onMount(bootstrap);
 
   // Snapshot the row IDs — iterating the Map directly in `{#each}`
   // creates new [key, value] tuples every render and defeats keyed
@@ -22,7 +22,16 @@
       </div>
     {/each}
     {#if !ui.active}
-      <div class="empty">No session selected.</div>
+      <div class="empty">
+        {#if !ui.ready}
+          Loading…
+        {:else if ui.connectors.length === 0}
+          No connectors yet. Click <kbd>+</kbd> in the sidebar to add
+          one.
+        {:else}
+          No session selected.
+        {/if}
+      </div>
     {/if}
   </main>
 </div>
@@ -74,5 +83,13 @@
     justify-content: center;
     color: #585b70;
     font-size: 13px;
+    text-align: center;
+    padding: 24px;
+  }
+  kbd {
+    background: #313244;
+    padding: 1px 6px;
+    border-radius: 3px;
+    font-size: 11px;
   }
 </style>
