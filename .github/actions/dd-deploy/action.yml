@@ -55,14 +55,22 @@ runs:
           exit 1
         fi
 
-        # Discover the agent hostname on the CP. /api/agents is
-        # CF-Access-bypassed (public read). Curl's native --retry
+        # Mint the GH OIDC token first — `/api/agents` now requires
+        # Authorization (repository_owner must match DD_OWNER), same
+        # as `/deploy`. Audience matches what the agent verifier
+        # expects; the CP reuses that.
+        oidc=$(curl -fsSL \
+          -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+          "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${AUDIENCE}" | jq -r .value)
+
+        # Discover the agent hostname on the CP. Curl's native --retry
         # absorbs the transient 5xx (notably CF 530 "origin
         # unreachable") that reliably hits right after an agent
         # relaunch — the edge is momentarily between routes. ~30 s
         # of retries, no bash loop.
         agent_host=$(curl -fsS \
           --retry 6 --retry-delay 5 --retry-all-errors \
+          -H "Authorization: Bearer ${oidc}" \
           "${CP_URL}/api/agents" \
           | jq -r --arg vm "$VM_NAME" '
               [.[] | select(.vm_name == $vm and .status == "healthy")]
@@ -72,11 +80,6 @@ runs:
           exit 1
         fi
         echo "agent-host=$agent_host" >> "$GITHUB_OUTPUT"
-
-        # Mint an OIDC token scoped to the agent's expected audience.
-        oidc=$(curl -fsSL \
-          -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
-          "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${AUDIENCE}" | jq -r .value)
 
         # Compact + inspect the workload spec.
         spec=$(jq -c . "$WORKLOAD")

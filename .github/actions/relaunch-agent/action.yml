@@ -77,8 +77,19 @@ runs:
       run: |
         vm="dd-local-$KIND"
         since=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+        # Mint a GH OIDC token for the /api/agents bearer auth. The
+        # calling job must grant `id-token: write` in its
+        # permissions block.
+        if [ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
+          echo "::error::id-token not available — caller needs 'permissions: id-token: write'"
+          exit 1
+        fi
+        oidc=$(curl -fsSL \
+          -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+          "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=dd-agent" | jq -r .value)
         for i in $(seq 1 30); do
-          host=$(curl -fsS --max-time 10 "$URL/api/agents" 2>/dev/null \
+          host=$(curl -fsS --max-time 10 -H "Authorization: Bearer ${oidc}" \
+            "$URL/api/agents" 2>/dev/null \
             | jq -r --arg since "$since" --arg vm "$vm" '
                 [.[] | select(.vm_name==$vm and .status=="healthy" and .last_seen > $since)]
                 | sort_by(.last_seen) | reverse | .[0].hostname // empty' || true)

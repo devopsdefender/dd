@@ -45,6 +45,9 @@ struct St {
     verifier: Arc<ita::Verifier>,
     /// The CP's own ITA token. Refreshed by a background task.
     cp_ita_token: Arc<RwLock<String>>,
+    /// GH OIDC verifier for `/api/agents` callers (CI, humans). Same
+    /// audience as dd-agent, shared owner claim.
+    gh: Arc<crate::gh_oidc::Verifier>,
 }
 
 pub async fn run() -> Result<()> {
@@ -229,6 +232,8 @@ pub async fn run() -> Result<()> {
         Duration::from_secs(cfg.scrape_interval_secs),
     ));
 
+    let gh = crate::gh_oidc::Verifier::new(cfg.common.owner.clone(), "dd-agent".into());
+
     let state = St {
         cfg: cfg.clone(),
         ee,
@@ -236,6 +241,7 @@ pub async fn run() -> Result<()> {
         started: Instant::now(),
         verifier,
         cp_ita_token,
+        gh,
     };
 
     let app = Router::new()
@@ -254,9 +260,16 @@ pub async fn run() -> Result<()> {
     let addr = format!("0.0.0.0:{}", cfg.common.port);
     eprintln!("cp: listening on {addr}");
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-    axum::serve(listener, app)
-        .await
-        .map_err(|e| Error::Internal(e.to_string()))
+    // `into_make_service_with_connect_info` so handlers can see the
+    // peer socket address via the `ConnectInfo` extractor. Used by
+    // `api_agents` to grant auth-free access to same-VM loopback
+    // callers (bastion + dd-management proxy paths).
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await
+    .map_err(|e| Error::Internal(e.to_string()))
 }
 
 fn spawn_cloudflared(token: String) {
@@ -619,9 +632,30 @@ async fn bastion_aggregator(State(s): State<St>) -> Response {
 
 /// GET /api/agents — JSON list of
 /// `{agent_id, vm_name, hostname, status, last_seen}`.
-/// Used by the Local Agents workflow's HTTPS step to discover a
-/// specific agent's tunnel hostname after it re-registers.
-async fn api_agents(State(s): State<St>) -> Result<Json<Vec<serde_json::Value>>> {
+///
+/// Gated three ways, any of which succeeds:
+/// 1. **Loopback** (`127.0.0.1`, `::1`) — same-VM callers (bastion
+///    workload, dd-agent's own proxy). Trust is anchored by EE's
+///    Tier-1 seal: a process on the VM at all is already a workload
+///    EE spawned and gave the shared `EE_TOKEN` env to.
+/// 2. **GH OIDC** — CI action (`dd-deploy`, etc.) presents a GitHub
+///    Actions OIDC JWT as `Authorization: Bearer <jwt>`; we verify
+///    against GitHub's JWKS and require `repository_owner ==
+///    DD_OWNER`. Matches the pattern dd-agent uses for `/deploy` +
+///    `/exec`.
+/// 3. **ITA** — dd-agent's `/api/agents` proxy forwards its own
+///    Intel-attested ITA token so cross-VM calls from any attested
+///    DD agent in the fleet succeed.
+///
+/// Without one of those, respond with 401.
+async fn api_agents(
+    State(s): State<St>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    headers: axum::http::HeaderMap,
+) -> Result<Json<Vec<serde_json::Value>>> {
+    if !agents_auth_ok(&s, peer, &headers).await {
+        return Err(Error::Unauthorized);
+    }
     let agents = s.store.lock().await.clone();
     Ok(Json(
         agents
@@ -637,6 +671,42 @@ async fn api_agents(State(s): State<St>) -> Result<Json<Vec<serde_json::Value>>>
             })
             .collect(),
     ))
+}
+
+/// Accept the request if the caller is on the loopback interface
+/// (same-VM trust — bastion / dd-agent-proxy) or presents a valid
+/// bearer that verifies as either a GitHub Actions OIDC token for
+/// this owner, or a fresh Intel-signed ITA token for this CP. See
+/// [`api_agents`] for the full policy.
+async fn agents_auth_ok(
+    s: &St,
+    peer: std::net::SocketAddr,
+    headers: &axum::http::HeaderMap,
+) -> bool {
+    if peer.ip().is_loopback() {
+        return true;
+    }
+    let bearer = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| {
+            s.strip_prefix("Bearer ")
+                .or_else(|| s.strip_prefix("bearer "))
+        })
+        .map(str::trim)
+        .filter(|t| !t.is_empty());
+    let Some(token) = bearer else {
+        return false;
+    };
+    if let Ok(claims) = s.gh.verify(token).await {
+        if claims.repository_owner == s.cfg.common.owner {
+            return true;
+        }
+    }
+    if s.verifier.verify(token).await.is_ok() {
+        return true;
+    }
+    false
 }
 
 async fn agent_detail(State(s): State<St>, Path(id): Path<String>) -> Response {

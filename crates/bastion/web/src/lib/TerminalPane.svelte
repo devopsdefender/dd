@@ -12,6 +12,7 @@
 
   let mount: HTMLDivElement | undefined = $state();
   let onResize: (() => void) | null = null;
+  let fitRef: FitAddon | null = null;
 
   onMount(() => {
     const row = ui.rows.get(rowId);
@@ -37,6 +38,10 @@
     }
     mount.innerHTML = "";
     term.open(mount);
+    fitRef = fit!;
+    // Initial fit — safe even while slot is hidden; when the slot
+    // flips to `display:flex`, the `$effect` below refits against
+    // the real dimensions.
     fit!.fit();
 
     if (!row.ws || row.ws.readyState >= WebSocket.CLOSING) {
@@ -47,6 +52,22 @@
     window.addEventListener("resize", onResize);
   });
 
+  // Re-fit + focus whenever this row becomes the active one. The
+  // slot is `display:none` when hidden, so its dimensions are 0×0
+  // and any fit done while hidden produces a 0-col terminal. This
+  // effect catches the visibility flip and re-measures.
+  $effect(() => {
+    if (ui.active === rowId && fitRef) {
+      // Defer one frame so the CSS layout pass sees the new
+      // `.active` class and gives the slot real dimensions.
+      queueMicrotask(() => {
+        fitRef?.fit();
+        const row = ui.rows.get(rowId);
+        row?.term?.focus();
+      });
+    }
+  });
+
   onDestroy(() => {
     if (onResize) window.removeEventListener("resize", onResize);
   });
@@ -55,8 +76,8 @@
     const row = ui.rows.get(rowId);
     if (!row) return;
     const term = row.term!;
-    const proto = row.agent.origin.startsWith("https:") ? "wss:" : "ws:";
-    const base = row.agent.origin.replace(/^https?:/, proto);
+    const proto = row.origin.startsWith("https:") ? "wss:" : "ws:";
+    const base = row.origin.replace(/^https?:/, proto);
     const ws = new WebSocket(`${base}/ws/${row.info.id}`);
     ws.binaryType = "arraybuffer";
     row.ws = ws;
