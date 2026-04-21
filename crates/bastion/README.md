@@ -43,14 +43,15 @@ async fn main() -> std::io::Result<()> {
 }
 ```
 
-Custom HTML chrome:
+The SPA is a Svelte 5 + Vite bundle rebuilt by `npm run build` in
+`crates/bastion/web/` and inlined into the Rust binary via
+`include_str!`. No asset handler, no CDN; the bastion binary ships
+with its own frontend.
 
-```rust
-let mgr = bastion::Manager::new().with_shell(|title, body| {
-    format!("<!doctype html><html><title>{title}</title>\
-            <body><h1>my app</h1>{body}</body></html>")
-});
-```
+Cross-node unified view: `bastion::aggregator_body(&[(vm_name, origin), ...])`
+returns an HTML document that injects `window.__DD_AGENTS__`, making
+the SPA fan out `fetch`/`wss` to every listed agent and merge the
+results into one sidebar. Used by DD's control-plane `/bastion` route.
 
 See `examples/standalone.rs` for a runnable demo.
 

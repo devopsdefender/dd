@@ -38,6 +38,21 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # The Svelte+Vite SPA at crates/bastion/web/ is inlined into the
+      # Rust binary via `include_str!`. Build it before cargo so
+      # `dist/index.html` is fresh.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: crates/bastion/web/package-lock.json
+
+      - name: Build bastion SPA
+        working-directory: crates/bastion/web
+        run: |
+          npm ci
+          npm run build
+
       - name: Build bastion
         run: cargo build --release -p bastion-term --bin bastion --target x86_64-unknown-linux-musl
 

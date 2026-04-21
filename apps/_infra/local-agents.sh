@@ -155,6 +155,12 @@ build_config_iso() {
   {
     echo "EE_OWNER=devopsdefender"
     echo "EE_BOOT_WORKLOADS=$workloads"
+    # Tells EE (>= capture-socket patch) to tee every spawned workload's
+    # stdio to this unix socket. Bastion binds + listens on it; unpatched
+    # EE images ignore the variable. Keeps the boot-of-the-listener ≠
+    # boot-of-the-writer race non-fatal: EE falls back to running without
+    # capture when the socket isn't there yet.
+    echo "EE_CAPTURE_SOCKET=/run/ee/capture.sock"
   } > "$tmp/agent.env"
 
   # ext4 — EE rootfs has no iso9660 module.

@@ -18,6 +18,8 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use tokio::sync::{Mutex, RwLock};
 
+use bastion;
+
 use crate::cf;
 use crate::collector::{self, Store};
 use crate::config::Cp as Cfg;
@@ -238,6 +240,7 @@ pub async fn run() -> Result<()> {
 
     let app = Router::new()
         .route("/", get(fleet))
+        .route("/bastion", get(bastion_aggregator))
         .route("/health", get(health))
         .route("/register", post(register))
         .route("/ingress/replace", post(ingress_replace))
@@ -573,7 +576,7 @@ async fn fleet(State(s): State<St>) -> Response {
 
     Html(shell(
         "DD Fleet",
-        &html::nav(&[("Fleet", "/", true)]),
+        &html::nav(&[("Fleet", "/", true), ("Bastion", "/bastion", false)]),
         &format!(
             r#"<h1>Fleet</h1><div class="sub">{host} · env {env} · {n} agent(s)</div>{table}"#,
             host = html::escape(&s.cfg.hostname),
@@ -582,6 +585,36 @@ async fn fleet(State(s): State<St>) -> Response {
         ),
     ))
     .into_response()
+}
+
+/// GET /bastion — fleet-wide bastion SPA. Builds the list of
+/// `(vm_name, block-origin)` pairs from the agent catalog (plus the
+/// CP itself), and returns bastion's Svelte SPA with
+/// `window.__DD_AGENTS__` preloaded so it fans out cross-origin to
+/// every node and renders one unified sidebar. CF Access's shared
+/// session-domain cookie on `.devopsdefender.com` makes the browser
+/// send credentials on every `fetch`/`wss` across subdomains.
+async fn bastion_aggregator(State(s): State<St>) -> Response {
+    let mut agents: Vec<(String, String)> = Vec::new();
+
+    // CP itself — has a bastion workload at `block.<cp-hostname>`.
+    let cp_block = cf::label_hostname(&s.cfg.hostname, "block");
+    agents.push((
+        format!("cp ({})", s.cfg.common.env_label),
+        format!("https://{cp_block}"),
+    ));
+
+    // Every registered agent, sorted for stable ordering.
+    let store = s.store.lock().await;
+    let mut by_vm: Vec<_> = store.values().cloned().collect();
+    drop(store);
+    by_vm.sort_by(|a, b| a.vm_name.cmp(&b.vm_name));
+    for a in &by_vm {
+        let block = cf::label_hostname(&a.hostname, "block");
+        agents.push((a.vm_name.clone(), format!("https://{block}")));
+    }
+
+    Html(bastion::aggregator_body(&agents)).into_response()
 }
 
 /// GET /api/agents — JSON list of
@@ -729,7 +762,7 @@ async fn agent_detail(State(s): State<St>, Path(id): Path<String>) -> Response {
 
     Html(shell(
         &format!("DD — {}", a.vm_name),
-        &html::nav(&[("Fleet", "/", false)]),
+        &html::nav(&[("Fleet", "/", false), ("Bastion", "/bastion", false)]),
         &format!(
             r#"<div class="back"><a href="/">← fleet</a></div>
 <h1>{vm}</h1><div class="sub">{id} · {host}</div>
@@ -792,7 +825,7 @@ async fn agent_logs(State(s): State<St>, Path((id, app)): Path<(String, String)>
         .unwrap_or_default();
     Html(shell(
         &format!("{app} logs"),
-        &html::nav(&[("Fleet", "/", false)]),
+        &html::nav(&[("Fleet", "/", false), ("Bastion", "/bastion", false)]),
         &format!(
             r#"<div class="back"><a href="/agent/control-plane">← control-plane</a></div>
 <h1>{app}</h1><div class="sub">auto-refresh 2s</div>
