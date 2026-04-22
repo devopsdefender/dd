@@ -104,9 +104,10 @@ jobs:
 
   # RUNNING pr-N VMs whose PR is merged or closed are leaked compute —
   # neither STONITH (waits for a new deploy) nor pr-teardown.yml (waits
-  # for branch-delete) reaches them. This finds them and tears them
-  # down like a branch-delete would have: VM + CF tunnel + DNS CNAME.
-  reap-merged-pr-previews:
+  # for branch-delete) reaches them. Also sweeps Access apps + orphan
+  # agent hostnames (Access apps + DNS pointing at dead tunnels) which
+  # accumulate across agent relaunches regardless of PR state.
+  reap-stale-pr-envs:
     runs-on: ubuntu-latest
     environment: staging
     permissions:
@@ -119,7 +120,7 @@ jobs:
           workload_identity_provider: 'projects/654815109728/locations/global/workloadIdentityPools/github-actions-pool/providers/github-provider'
           service_account: 'easyenclave-staging-ci@eestaging.iam.gserviceaccount.com'
       - uses: google-github-actions/setup-gcloud@v2
-      - name: Reap RUNNING pr-N VMs whose PR is closed or merged
+      - name: Sweep stale pr-* envs + orphan agent hostnames
         env:
           GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
           CF_API_TOKEN:   ${{ secrets.DD_CP_CF_API_TOKEN }}
@@ -128,71 +129,169 @@ jobs:
           DD_DOMAIN:      ${{ vars.DD_CF_DOMAIN || 'devopsdefender.com' }}
           GH_TOKEN:       ${{ github.token }}
         run: |
-          # Unique set of pr-N envs currently RUNNING.
-          envs=$(gcloud compute instances list \
+          set -euo pipefail
+          AUTH=(-H "Authorization: Bearer $CF_API_TOKEN")
+
+          echo "Fetching Access apps, tunnels, DNS CNAMEs..."
+          apps=$(curl -fsS "${AUTH[@]}" \
+            "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/access/apps?per_page=1000")
+          tunnels=$(curl -fsS "${AUTH[@]}" \
+            "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/cfd_tunnel?is_deleted=false&per_page=200")
+          dns=$(curl -fsS "${AUTH[@]}" \
+            "https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/dns_records?per_page=500&type=CNAME")
+
+          # Unique set of pr-N envs named anywhere (apps, tunnels, DNS,
+          # or RUNNING VMs). Extract `pr-N` regardless of surrounding
+          # name structure so we catch `dd-pr-42-cp`, `pr-42-term`,
+          # `pr-42-block.devopsdefender.com/attest`, etc.
+          vm_envs=$(gcloud compute instances list \
             --project="$GCP_PROJECT_ID" \
             --filter='labels.devopsdefender=managed AND labels.dd_env~"^pr-" AND status=RUNNING' \
             --format='value(labels.dd_env)' | sort -u)
-          if [ -z "$envs" ]; then
-            echo "No RUNNING dd-pr-* VMs to consider."
-            exit 0
-          fi
+          envs=$( {
+            echo "$apps"    | jq -r '.result[].name // empty'
+            echo "$tunnels" | jq -r '.result[].name // empty'
+            echo "$dns"     | jq -r '.result[].name // empty'
+            echo "$vm_envs"
+          } | grep -oE 'pr-[0-9]+' | sort -u )
+
+          total_apps=0 total_tun=0 total_dns=0 total_vms=0 total_envs=0
 
           for env in $envs; do
             pr="${env#pr-}"
             state=$(gh pr view "$pr" --repo "${{ github.repository }}" \
-              --json state --jq .state 2>/dev/null || echo "UNKNOWN")
+              --json state --jq .state 2>/dev/null || echo UNKNOWN)
             if [ "$state" = "OPEN" ]; then
-              echo "pr-$pr still OPEN — leaving RUNNING VMs alone."
+              echo "== $env — PR #$pr OPEN, skipping =="
               continue
             fi
             if [ "$state" = "UNKNOWN" ]; then
-              echo "::warning::could not resolve state for pr-$pr (gh pr view failed); leaving alone"
+              echo "::warning::could not resolve state for pr-$pr; leaving alone"
               continue
             fi
-            echo "pr-$pr is $state — tearing down preview env $env"
 
-            # VMs
-            vms=$(gcloud compute instances list \
+            # Match by prefix — `dd-pr-N-*` for apps/tunnels.
+            env_apps=$(echo "$apps" | jq -r --arg p "dd-$env-" \
+              '.result[] | select(.name | startswith($p)) | "\(.id) \(.name)"')
+            env_tuns=$(echo "$tunnels" | jq -r --arg p "dd-$env-" \
+              '.result[] | select(.name | startswith($p)) | "\(.id) \(.name)"')
+            # DNS match forms for env `pr-42`:
+            #   - `pr-42.devopsdefender.com`            CP hostname
+            #   - `pr-42-gpu.devopsdefender.com`        CP workload labels
+            #   - `dd-pr-42-agent-{uuid}.devopsdefender.com`  agent tunnels
+            env_dns=$(echo "$dns" | jq -r --arg dot "$env." --arg dash "$env-" --arg dd "dd-$env-" \
+              '.result[] | select((.name | startswith($dot)) or (.name | startswith($dash)) or (.name | startswith($dd))) | "\(.id) \(.name)"')
+            env_vms=$(gcloud compute instances list \
               --project="$GCP_PROJECT_ID" \
               --filter="labels.devopsdefender=managed AND labels.dd_env=$env" \
               --format='value(name)')
-            if [ -n "$vms" ]; then
-              echo "  deleting VMs: $(echo "$vms" | tr '\n' ' ')"
+
+            a=$(printf '%s\n' "$env_apps" | grep -c . || true)
+            t=$(printf '%s\n' "$env_tuns" | grep -c . || true)
+            d=$(printf '%s\n' "$env_dns"  | grep -c . || true)
+            v=$(printf '%s\n' "$env_vms"  | grep -c . || true)
+
+            if [ $((a + t + d + v)) -eq 0 ]; then
+              continue
+            fi
+
+            echo "== $env — PR #$pr $state — apps=$a tunnels=$t dns=$d vms=$v =="
+            total_envs=$((total_envs + 1))
+            total_apps=$((total_apps + a))
+            total_tun=$((total_tun + t))
+            total_dns=$((total_dns + d))
+            total_vms=$((total_vms + v))
+
+            # VMs
+            if [ -n "$env_vms" ]; then
+              echo "  deleting VMs: $(echo "$env_vms" | tr '\n' ' ')"
               # shellcheck disable=SC2086
-              gcloud compute instances delete $vms \
-                --project="$GCP_PROJECT_ID" --zone="$GCP_ZONE" --quiet
+              gcloud compute instances delete $env_vms \
+                --project="$GCP_PROJECT_ID" --zone="$GCP_ZONE" --quiet || true
             fi
 
-            # CF tunnels — named `dd-{env}-{uuid}`.
-            resp=$(curl -fsS \
-              -H "Authorization: Bearer $CF_API_TOKEN" \
-              "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/cfd_tunnel?is_deleted=false&per_page=200")
-            ids=$(echo "$resp" | jq -r --arg prefix "dd-$env-" \
-              '.result[] | select(.name | startswith($prefix)) | .id')
-            for id in $ids; do
-              echo "  deleting tunnel $id"
-              curl -fsS -X DELETE \
-                -H "Authorization: Bearer $CF_API_TOKEN" \
-                "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/cfd_tunnel/$id/connections" \
-                >/dev/null || true
-              curl -fsS -X DELETE \
-                -H "Authorization: Bearer $CF_API_TOKEN" \
-                "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/cfd_tunnel/$id" \
-                >/dev/null || echo "::warning::tunnel $id delete failed (may already be gone)"
+            # Apps / tunnels / DNS — best-effort each; one failure
+            # shouldn't abort the sweep.
+            [ -n "$env_apps" ] && echo "$env_apps" | while read -r id name; do
+              [ -z "$id" ] && continue
+              curl -fsS -X DELETE "${AUTH[@]}" \
+                "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/access/apps/$id" \
+                >/dev/null 2>&1 && echo "  - app $name" || echo "  ! app $name FAILED"
             done
-
-            # DNS CNAME for pr-N.{domain}
-            hostname="$env.$DD_DOMAIN"
-            record_id=$(curl -fsS \
-              -H "Authorization: Bearer $CF_API_TOKEN" \
-              "https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/dns_records?type=CNAME&name=$hostname" \
-              | jq -r '.result[0].id // empty')
-            if [ -n "$record_id" ]; then
-              echo "  deleting CNAME $hostname ($record_id)"
-              curl -fsS -X DELETE \
-                -H "Authorization: Bearer $CF_API_TOKEN" \
-                "https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/dns_records/$record_id" \
-                >/dev/null
-            fi
+            [ -n "$env_tuns" ] && echo "$env_tuns" | while read -r id name; do
+              [ -z "$id" ] && continue
+              # Tunnel delete is 400 if connections still attached.
+              curl -fsS -X DELETE "${AUTH[@]}" \
+                "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/cfd_tunnel/$id/connections" \
+                >/dev/null 2>&1 || true
+              curl -fsS -X DELETE "${AUTH[@]}" \
+                "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/cfd_tunnel/$id" \
+                >/dev/null 2>&1 && echo "  - tun $name" || echo "  ! tun $name FAILED"
+            done
+            [ -n "$env_dns" ] && echo "$env_dns" | while read -r id name; do
+              [ -z "$id" ] && continue
+              curl -fsS -X DELETE "${AUTH[@]}" \
+                "https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/dns_records/$id" \
+                >/dev/null 2>&1 && echo "  - dns $name" || echo "  ! dns $name FAILED"
+            done
           done
+
+          echo ""
+          echo "Closed-PR sweep: $total_envs envs, $total_apps apps, $total_tun tunnels, $total_dns dns, $total_vms vms"
+
+          # ── Orphan agent-hostname sweep (prod + all envs) ──────────
+          # Agent tunnels + their associated Access apps + DNS CNAMEs
+          # are all named with a per-relaunch UUID
+          # (`dd-{env}-agent-{uuid}`). Every agent relaunch mints a
+          # fresh UUID; the old tunnel gets STONITH'd but its Access
+          # apps and DNS records typically stay behind forever. This
+          # is how production accumulates orphans even though the CP's
+          # own apps (deterministic names) are fine.
+          echo ""
+          echo "Orphan agent-hostname sweep..."
+
+          live_tunnel_names=$(echo "$tunnels" | jq -r '.result[].name' \
+            | grep -E '^dd-[a-zA-Z0-9-]+-agent-' | sort -u)
+          live_hostnames=$(for t in $live_tunnel_names; do
+            echo "$t.$DD_DOMAIN"
+          done | sort -u)
+
+          orphan_apps=$(echo "$apps" | jq -r \
+            '.result[] | select(.name | test("^dd-[a-zA-Z0-9-]+-agent-dd-[a-zA-Z0-9-]+-agent-")) | "\(.id) \(.name)"' \
+            | while read -r id name; do
+                host=$(echo "$name" | grep -oE 'dd-[a-zA-Z0-9-]+-agent-[a-f0-9-]+\.devopsdefender\.com' | head -1)
+                [ -z "$host" ] && continue
+                if ! echo "$live_hostnames" | grep -qx "$host"; then
+                    echo "$id $name"
+                fi
+            done)
+
+          orphan_dns=$(echo "$dns" | jq -r \
+            '.result[] | select(.name | test("dd-[a-zA-Z0-9-]+-agent-[a-f0-9-]+\\.devopsdefender\\.com")) | "\(.id) \(.name)"' \
+            | while read -r id name; do
+                host=$(echo "$name" | grep -oE 'dd-[a-zA-Z0-9-]+-agent-[a-f0-9-]+\.devopsdefender\.com' | head -1)
+                [ -z "$host" ] && continue
+                if ! echo "$live_hostnames" | grep -qx "$host"; then
+                    echo "$id $name"
+                fi
+            done)
+
+          oa=$(printf '%s\n' "$orphan_apps" | grep -c . || true)
+          od=$(printf '%s\n' "$orphan_dns"  | grep -c . || true)
+          echo "Orphan-agent: apps=$oa dns=$od"
+
+          [ -n "$orphan_apps" ] && echo "$orphan_apps" | while read -r id name; do
+            [ -z "$id" ] && continue
+            curl -fsS -X DELETE "${AUTH[@]}" \
+              "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/access/apps/$id" \
+              >/dev/null 2>&1 && echo "  - app $name" || echo "  ! app $name FAILED"
+          done
+          [ -n "$orphan_dns" ] && echo "$orphan_dns" | while read -r id name; do
+            [ -z "$id" ] && continue
+            curl -fsS -X DELETE "${AUTH[@]}" \
+              "https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/dns_records/$id" \
+              >/dev/null 2>&1 && echo "  - dns $name" || echo "  ! dns $name FAILED"
+          done
+
+          echo ""
+          echo "FINAL: closed-PR($total_apps apps, $total_tun tunnels, $total_dns dns, $total_vms vms) + orphan-agent($oa apps, $od dns)"

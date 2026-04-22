@@ -96,7 +96,7 @@ jobs:
           DD_ENV: ${{ steps.pr.outputs.dd_env }}
         run: |
           # Tunnels are named `dd-{DD_ENV}-{uuid}` (see
-          # crates/dd/src/cf.rs). List all tunnels with the
+          # src/cf.rs). List all tunnels with the
           # dd-{DD_ENV}- prefix and delete each.
           resp=$(curl -fsS \
             -H "Authorization: Bearer ${CF_API_TOKEN}" \
