@@ -139,7 +139,9 @@ fn try_configfs_tsm_quote(pubkey: &[u8; 32]) -> anyhow::Result<Vec<u8>> {
     let dir = base.join("ee-proxy");
     fs::create_dir_all(&dir)?;
     {
-        let mut inblob = fs::OpenOptions::new().write(true).open(dir.join("inblob"))?;
+        let mut inblob = fs::OpenOptions::new()
+            .write(true)
+            .open(dir.join("inblob"))?;
         inblob.write_all(&report_data)?;
     }
     let outblob = fs::read(dir.join("outblob"))?;
