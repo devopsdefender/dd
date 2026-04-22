@@ -336,12 +336,14 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "snow",
  "sysinfo",
  "tempfile",
  "thiserror",
  "tokio",
  "urlencoding",
  "uuid",
+ "x25519-dalek",
 ]
 
 [[package]]
@@ -364,27 +366,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
-]
-
-[[package]]
-name = "ee-proxy"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "base64",
- "futures-util",
- "hex",
- "libc",
- "rand 0.8.5",
- "serde",
- "serde_json",
- "snow",
- "tempfile",
- "thiserror",
- "tokio",
- "tracing",
- "x25519-dalek",
 ]
 
 [[package]]
@@ -1766,19 +1747,7 @@ checksum = "63e71662fa4b2a2c3a26f570f037eb95bb1f85397f3cd8076caed2f026a6d100"
 dependencies = [
  "log",
  "pin-project-lite",
- "tracing-attributes",
  "tracing-core",
-]
-
-[[package]]
-name = "tracing-attributes"
-version = "0.1.31"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7490cfa5ec963746568740651ac6781f701c9c5ea257c58e057f3ba8cf69e8da"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
 ]
 
 [[package]]

@@ -1,9 +1,9 @@
 //! Unix-socket client for easyenclave's agent socket.
 //!
-//! Wire protocol: one request/response per TCP-like unix stream.
-//! Each request is a single line of JSON (`{"method": "...", ...}`)
-//! terminated by `\n`; the response is one line of JSON. `EE_TOKEN`
-//! (if present at boot) is injected into every request envelope.
+//! Wire protocol: one request/response per unix stream. Each request
+//! is a single line of JSON (`{"method": "...", ...}`) terminated by
+//! `\n`; the response is one line of JSON. `EE_TOKEN` (if present in
+//! the process env at boot) is injected into every request envelope.
 
 use std::path::PathBuf;
 
@@ -52,9 +52,6 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::UnixListener;
 
-    /// Spawn a fake EE agent socket that echoes each request back with
-    /// its captured `token` field visible, so tests can assert the
-    /// proxy injected it.
     async fn spawn_echo(path: PathBuf) {
         let listener = UnixListener::bind(&path).unwrap();
         tokio::spawn(async move {
@@ -77,7 +74,6 @@ mod tests {
                 });
             }
         });
-        // Give the listener a beat to bind.
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
 
@@ -86,7 +82,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("ee.sock");
         spawn_echo(sock.clone()).await;
-
         let agent = EeAgent::new(sock.clone(), Some("deadbeef".into()));
         let resp = agent
             .call(serde_json::json!({"method": "list"}))
@@ -101,7 +96,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("ee.sock");
         spawn_echo(sock.clone()).await;
-
         let agent = EeAgent::new(sock.clone(), None);
         let resp = agent
             .call(serde_json::json!({"method": "list"}))

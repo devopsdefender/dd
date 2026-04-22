@@ -592,9 +592,11 @@ pub async fn provision_cp_access(
     }
     for (path_suffix, label) in [
         ("/health", "health"),
-        ("/cp/attest", "attest"),
         ("/api/agents", "api-agents"),
         ("/api/v1/devices/trusted", "api-devices-trusted"),
+        ("/api/v1/admin/export", "api-admin-export"),
+        ("/attest", "noise-attest"),
+        ("/noise/ws", "noise-ws"),
         ("/register", "register"),
         ("/ingress/replace", "ingress"),
     ] {

@@ -10,4 +10,5 @@ pub mod gh_oidc;
 pub mod html;
 pub mod ita;
 pub mod metrics;
+pub mod noise_gateway;
 pub mod stonith;

@@ -26,6 +26,7 @@ use crate::error::{Error, Result};
 use crate::html::{self, shell};
 use crate::ita;
 use crate::metrics;
+use crate::noise_gateway;
 use crate::stonith;
 
 /// Re-mint interval for the CP's own ITA token. The CP isn't scraped
@@ -55,16 +56,52 @@ pub async fn run() -> Result<()> {
     let cfg = Arc::new(Cfg::from_env()?);
     let ee = Arc::new(Ee::new("/var/lib/easyenclave/agent.sock"));
 
-    eprintln!("cp: self-provisioning tunnel for {}", cfg.hostname);
     let http = reqwest::Client::new();
+
+    // Stage 1: mint + verify our own ITA token before touching CF.
+    // We need the token as a Bearer for the hydrate call below; if
+    // the old CP is still serving at `cfg.hostname`, it'll verify
+    // our ITA and hand over its state.
+    let verifier = ita::Verifier::new(cfg.ita.jwks_url.clone(), cfg.ita.issuer.clone());
+    eprintln!("cp: ITA verifier enabled (issuer={})", cfg.ita.issuer);
+    let initial_token = match mint_cp_ita(&cfg, &ee).await {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("cp: ITA mint failed: {e}");
+            stonith::poweroff();
+        }
+    };
+    let cp_claims_initial = match verifier.verify(&initial_token).await {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("cp: ITA self-verify failed: {e}");
+            stonith::poweroff();
+        }
+    };
+    eprintln!(
+        "cp: own ITA verified mrtd={} tcb={}",
+        cp_claims_initial.mrtd.as_deref().unwrap_or("?"),
+        cp_claims_initial.tcb_status.as_deref().unwrap_or("?")
+    );
+
+    // Stage 2: hydrate state from the predecessor CP if one is live
+    // at `cfg.hostname`. DNS hasn't flipped yet — any existing CNAME
+    // still points at the old CP's tunnel, so this GET lands on the
+    // old CP. Tolerant of failure (first boot, old CP already dead,
+    // stale code without `/api/v1/admin/export`).
+    let store: Store = Arc::new(Mutex::new(HashMap::new()));
+    let trust = noise_gateway::new_trust_handle();
+    let devices = crate::devices::Store::load(cfg.devices_path.clone(), trust.clone())
+        .await
+        .map_err(|e| Error::Internal(format!("devices store load: {e}")))?;
+    hydrate_from_peer(&http, &cfg.hostname, &initial_token, &devices, &store).await;
+
+    // Stage 3: create our own tunnel. `cf::create` upserts the CNAME
+    // for `cfg.hostname` → our tunnel id; traffic moves to us the
+    // moment CF's edge propagates that change.
+    eprintln!("cp: self-provisioning tunnel for {}", cfg.hostname);
     let self_name = cf::cp_tunnel_name(&cfg.common.env_label);
-    // `block.<hostname>` routes to the ttyd workload on port 7681;
-    // `ee.<hostname>` routes to the ee-proxy workload on port 7682.
-    // Both are in the CP boot set, so the CNAME + ingress always
-    // resolve. `block` is admin-gated (human CF Access); `ee` is
-    // bypassed at the edge because Noise+TDX-attest authenticates
-    // the session cryptographically — see ADMIN_LABELS in cf.rs.
-    let cp_extras: Vec<(String, u16)> = vec![("block".into(), 7681), ("ee".into(), 7682)];
+    let cp_extras: Vec<(String, u16)> = vec![("block".into(), 7681)];
     let tunnel = match cf::create(&http, &cfg.cf, &self_name, &cfg.hostname, &cp_extras).await {
         Ok(t) => t,
         Err(e) => {
@@ -87,19 +124,21 @@ pub async fn run() -> Result<()> {
         });
     }
 
-    tokio::spawn(stonith::self_watchdog(cfg.cf.clone(), tunnel.id.clone()));
+    // Graceful shutdown signal. The watchdog triggers it when the
+    // tunnel's been reaped by a successor CP; axum::serve below
+    // awaits it and drains in-flight connections before exiting.
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
+    tokio::spawn(stonith::self_watchdog(
+        cfg.cf.clone(),
+        tunnel.id.clone(),
+        shutdown_tx.clone(),
+    ));
 
-    let store: Store = Arc::new(Mutex::new(HashMap::new()));
-
-    // Provision CF Access apps — one human app + bypass paths for
-    // endpoints gated in-code. Fatal on any failure; the CP refuses
-    // to start without edge auth configured.
-    //
-    // Workload labels (for flat `{base}-{label}.{tld}` subdomains) come
-    // straight from the CP's extras list. Admin labels get the human
-    // policy; others get bypass. Stale apps under this CP's subdomain
-    // space (e.g. a `term.<host>` left over from a previous deploy)
-    // get reaped inside `provision_cp_access`.
+    // Stage 4: provision CF Access apps for our own tunnel. Workload
+    // labels (e.g. `block` for ttyd) get the human policy; the
+    // paths in the bypass list (`/register`, `/api/agents`,
+    // `/api/v1/devices/trusted`, `/api/v1/admin/export`, `/attest`,
+    // `/noise/ws`, …) are CF-bypassed with in-code gating.
     let cp_labels: Vec<String> = cp_extras.iter().map(|(l, _)| l.clone()).collect();
     if let Err(e) = cf::provision_cp_access(
         &http,
@@ -116,32 +155,6 @@ pub async fn run() -> Result<()> {
         stonith::poweroff();
     }
     eprintln!("cp: CF Access ready");
-
-    // ITA verifier — required.
-    let verifier = ita::Verifier::new(cfg.ita.jwks_url.clone(), cfg.ita.issuer.clone());
-    eprintln!("cp: ITA verifier enabled (issuer={})", cfg.ita.issuer);
-
-    // Mint + verify our own ITA token. Any failure is fatal —
-    // attestation is mandatory.
-    let initial_token = match mint_cp_ita(&cfg, &ee).await {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("cp: ITA mint failed: {e}");
-            stonith::poweroff();
-        }
-    };
-    let cp_claims = match verifier.verify(&initial_token).await {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("cp: ITA self-verify failed: {e}");
-            stonith::poweroff();
-        }
-    };
-    eprintln!(
-        "cp: own ITA verified mrtd={} tcb={}",
-        cp_claims.mrtd.as_deref().unwrap_or("?"),
-        cp_claims.tcb_status.as_deref().unwrap_or("?")
-    );
     let cp_ita_token = Arc::new(RwLock::new(initial_token));
 
     // Seed the CP into the store before the collector starts ticking.
@@ -165,7 +178,7 @@ pub async fn run() -> Result<()> {
             memory_total_mb: cp_m.mem_total_mb,
             nets: cp_m.nets,
             disks: cp_m.disks,
-            ita: cp_claims,
+            ita: cp_claims_initial,
             // CP doesn't take per-workload runtime ingress — its own tunnel
             // only routes `DD_HOSTNAME → localhost:8080`. tunnel_id stays
             // empty so the runtime-ingress endpoint rejects attempts to
@@ -236,15 +249,24 @@ pub async fn run() -> Result<()> {
 
     let gh = crate::gh_oidc::Verifier::new(cfg.common.owner.clone(), "dd-agent".into());
 
-    let devices =
-        crate::devices::Store::load(cfg.devices_path.clone(), cfg.runtime_trust_path.clone())
+    // Noise gateway state. `devices` already loaded in Stage 2 + any
+    // inherited records merged in; `trust` is already populated.
+    let attestor = Arc::new(
+        noise_gateway::attest::Attestor::load_or_mint(&cfg.noise_key_path)
             .await
-            .map_err(|e| Error::Internal(format!("devices store load: {e}")))?;
-    eprintln!(
-        "cp: loaded {} device(s) from {}",
-        devices.list().await.len(),
-        cfg.devices_path.display()
+            .map_err(|e| Error::Internal(format!("noise keypair: {e}")))?,
     );
+    eprintln!("cp: noise_pubkey={}", hex::encode(attestor.public_key()));
+    let ee_token = std::env::var("EE_TOKEN").ok();
+    let upstream = Arc::new(noise_gateway::upstream::EeAgent::new(
+        std::path::PathBuf::from(noise_gateway::upstream::DEFAULT_EE_AGENT_SOCK),
+        ee_token,
+    ));
+    let ng_state = noise_gateway::State {
+        attest: attestor,
+        trust: trust.clone(),
+        upstream,
+    };
 
     let state = St {
         cfg: cfg.clone(),
@@ -265,15 +287,15 @@ pub async fn run() -> Result<()> {
         .route("/agent/{id}", get(agent_detail))
         .route("/agent/{id}/logs/{app}", get(agent_logs))
         .route("/api/agents", get(api_agents))
-        .route("/api/v1/devices", get(list_devices).post(create_device))
+        .route("/api/v1/devices", post(create_device))
         .route("/api/v1/devices/trusted", get(list_trusted_devices))
         .route(
             "/api/v1/devices/{pubkey}",
             axum::routing::delete(revoke_device),
         )
-        .route("/cp/attest", get(cp_attest))
-        .route("/cp/ita", get(cp_ita))
-        .with_state(state);
+        .route("/api/v1/admin/export", get(export_state))
+        .with_state(state)
+        .merge(noise_gateway::router(ng_state));
 
     let addr = format!("0.0.0.0:{}", cfg.common.port);
     eprintln!("cp: listening on {addr}");
@@ -286,6 +308,10 @@ pub async fn run() -> Result<()> {
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
+    .with_graceful_shutdown(async move {
+        let _ = shutdown_rx.recv().await;
+        eprintln!("cp: graceful shutdown signaled; draining in-flight requests");
+    })
     .await
     .map_err(|e| Error::Internal(e.to_string()))
 }
@@ -317,11 +343,87 @@ fn spawn_cloudflared(token: String) {
     });
 }
 
+/// Try to pull devices + agent snapshot from a predecessor CP still
+/// serving at `hostname`. The CNAME hasn't flipped yet when this runs,
+/// so any existing DNS record still points at the old CP's tunnel.
+/// Failures (first boot, DNS miss, old code, timeout) are logged and
+/// swallowed — deploy still proceeds as if fresh.
+async fn hydrate_from_peer(
+    http: &reqwest::Client,
+    hostname: &str,
+    ita_token: &str,
+    devices: &crate::devices::Store,
+    agents: &Store,
+) {
+    let url = format!("https://{hostname}/api/v1/admin/export");
+    let resp = match http
+        .get(&url)
+        .bearer_auth(ita_token)
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("cp: hydrate skipped ({url}): {e}");
+            return;
+        }
+    };
+    let status = resp.status();
+    if !status.is_success() {
+        eprintln!("cp: hydrate skipped — {url} → {status}");
+        return;
+    }
+    let body: serde_json::Value = match resp.json().await {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("cp: hydrate parse failed ({url}): {e}");
+            return;
+        }
+    };
+
+    let mut imported_devices = 0usize;
+    if let Some(arr) = body.get("devices").cloned() {
+        match serde_json::from_value::<Vec<crate::devices::Device>>(arr) {
+            Ok(devs) => {
+                let n = devs.len();
+                if let Err(e) = devices.import_merge(devs).await {
+                    eprintln!("cp: hydrate devices.import_merge: {e}");
+                } else {
+                    imported_devices = n;
+                }
+            }
+            Err(e) => eprintln!("cp: hydrate devices shape mismatch: {e}"),
+        }
+    }
+
+    let mut imported_agents = 0usize;
+    if let Some(arr) = body.get("agents").cloned() {
+        match serde_json::from_value::<Vec<collector::Agent>>(arr) {
+            Ok(ags) => {
+                let mut store = agents.lock().await;
+                for a in ags {
+                    store.insert(a.agent_id.clone(), a);
+                    imported_agents += 1;
+                }
+            }
+            Err(e) => eprintln!("cp: hydrate agents shape mismatch: {e}"),
+        }
+    }
+
+    eprintln!(
+        "cp: hydrated from {hostname} — {imported_devices} device(s), {imported_agents} agent(s)"
+    );
+}
+
 // ── Routes ──────────────────────────────────────────────────────────────
 
-async fn health(State(s): State<St>) -> Json<serde_json::Value> {
+async fn health(
+    State(s): State<St>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Json<serde_json::Value> {
     let agents = s.store.lock().await;
-    Json(serde_json::json!({
+    let mut body = serde_json::json!({
         "ok": true,
         "service": "cp",
         "hostname": s.cfg.hostname,
@@ -329,14 +431,25 @@ async fn health(State(s): State<St>) -> Json<serde_json::Value> {
         "uptime_secs": s.started.elapsed().as_secs(),
         "agent_count": agents.len(),
         "healthy_count": agents.values().filter(|a| a.status == "healthy").count(),
-    }))
+    });
+    // `?verbose=1` folds in the CP's current ITA token so operators
+    // can inspect the CP VM's TDX measurement without a second route
+    // (the old `/cp/ita` + `/cp/attest` paths were removed; the
+    // Noise gateway's `/attest` is the public quote surface).
+    if q.get("verbose").map(|v| v.as_str()) == Some("1") {
+        if let Some(obj) = body.as_object_mut() {
+            obj.insert(
+                "cp_ita".into(),
+                serde_json::Value::String(s.cp_ita_token.read().await.clone()),
+            );
+        }
+    }
+    Json(body)
 }
 
 #[derive(Debug, Deserialize)]
 struct RegisterReq {
     vm_name: String,
-    env_label: String,
-    owner: String,
     ita_token: String,
     /// Optional per-workload ingress: each entry becomes
     /// `{hostname_label}.{agent_hostname}` → `localhost:{port}` in the
@@ -355,26 +468,14 @@ struct ExtraIngress {
 /// POST /register — the CF Access bypass app on this path lets anyone
 /// reach it; the real gate is ITA attestation in-code. We verify the
 /// agent's Intel-signed quote, create its tunnel, provision its CF
-/// Access apps (human dashboard + per-workload bypass URLs), and
-/// return the tunnel token + shared CF Access service token pair so
-/// the agent can authenticate future M2M calls.
+/// Access apps, and return the tunnel token. `owner` / `env_label`
+/// used to be in the body for double-check; they're implicit now —
+/// the CP authoritatively owns them from its config and the ITA
+/// token authenticates the agent regardless.
 async fn register(
     State(s): State<St>,
     Json(req): Json<RegisterReq>,
 ) -> Result<Json<serde_json::Value>> {
-    if req.owner != s.cfg.common.owner {
-        return Err(Error::BadRequest(format!(
-            "owner mismatch: got {} expected {}",
-            req.owner, s.cfg.common.owner
-        )));
-    }
-    if req.env_label != s.cfg.common.env_label {
-        return Err(Error::BadRequest(format!(
-            "env_label mismatch: got {} expected {}",
-            req.env_label, s.cfg.common.env_label
-        )));
-    }
-
     // ITA is mandatory. Any failure → 401.
     let ita_claims = s.verifier.verify(&req.ita_token).await?;
     eprintln!(
@@ -463,7 +564,6 @@ async fn register(
         "tunnel_token": tunnel.token,
         "hostname": tunnel.hostname,
         "agent_id": name,
-        "cp_hostname": s.cfg.hostname,
     })))
 }
 
@@ -620,24 +720,45 @@ async fn fleet(State(s): State<St>) -> Response {
 
 // ── Devices API ─────────────────────────────────────────────────────────
 //
-// Paired client-device X25519 pubkeys that the ee-proxy workload is
-// allowed to let through the Noise_IK handshake. Behind the CP's human
-// CF Access app (same policy as `/`) — no in-code auth, CF checks the
-// session cookie at the edge.
+// Paired client-device X25519 pubkeys that the local Noise gateway
+// accepts during the handshake. POST + DELETE are behind the CP's
+// human CF Access app (admin enrollment); the machine-readable
+// `/trusted` view is edge-bypassed for cross-VM agent polls.
 
-/// GET /api/v1/devices — list all devices (including revoked ones, so
-/// operators can audit). Behind CF Access (human admin).
-async fn list_devices(State(s): State<St>) -> Json<serde_json::Value> {
-    let devices = s.devices.list().await;
-    Json(serde_json::json!({ "devices": devices }))
+/// GET /api/v1/admin/export — full state snapshot for a successor CP
+/// to hydrate from during a zero-downtime deploy. Returns the
+/// device registry (full records, including revoked) and the live
+/// agents HashMap. CF-Access-bypassed at the edge; gated in-code by
+/// a valid owner-scoped ITA Bearer (any attested enclave in the
+/// fleet can authenticate). The new CP calls this against the old
+/// CP's still-pointed DNS before flipping CNAMEs.
+async fn export_state(
+    State(s): State<St>,
+    headers: axum::http::HeaderMap,
+) -> Result<Json<serde_json::Value>> {
+    let bearer = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .ok_or(Error::Unauthorized)?;
+    // Any owner-scoped ITA token is OK for v0; tighten to a pinned
+    // MRTD list once we stop rotating measurements every dev push.
+    let _ = s.verifier.verify(bearer).await?;
+
+    let devices = s.devices.export_full().await;
+    let agents: Vec<collector::Agent> = s.store.lock().await.values().cloned().collect();
+    Ok(Json(serde_json::json!({
+        "devices": devices,
+        "agents": agents,
+    })))
 }
 
 /// GET /api/v1/devices/trusted — minimal, machine-readable view:
 /// `{ "pubkeys": ["<hex>", ...] }` with only currently-trusted keys.
 /// CF-Access-bypassed at the edge so cross-VM dd-agent callers can
 /// reach it; gated in-code by the same three-way policy as
-/// `/api/agents`. This is the agent's poll target for syncing its
-/// local `trusted-devices.json`.
+/// `/api/agents`. This is the agent's poll target for mirroring the
+/// trust list into its in-memory `TrustHandle`.
 async fn list_trusted_devices(
     State(s): State<St>,
     axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
@@ -863,7 +984,7 @@ async fn agent_detail(State(s): State<St>, Path(id): Path<String>) -> Response {
     let term_host = html::escape(&cf::label_hostname(&a.hostname, "block"));
     let extra = if is_cp {
         format!(
-            r#"<p><a href="https://{term_host}/" target="_blank">Terminal ↗</a> · <a href="/cp/attest">raw quote</a> · <a href="/cp/ita">ITA token</a></p>"#
+            r#"<p><a href="https://{term_host}/" target="_blank">Terminal ↗</a> · <a href="/attest">attest</a> · <a href="/health?verbose=1">ita</a></p>"#
         )
     } else {
         format!(
@@ -982,33 +1103,4 @@ async fn agent_logs(State(s): State<St>, Path((id, app)): Path<(String, String)>
         ),
     ))
     .into_response()
-}
-
-async fn cp_attest(
-    State(s): State<St>,
-    Query(q): Query<HashMap<String, String>>,
-) -> Result<Json<serde_json::Value>> {
-    // EE base64-decodes the nonce; synthesize one if the caller didn't
-    // pass one (browser-click from the dashboard).
-    let nonce = q
-        .get("nonce")
-        .cloned()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| {
-            use base64::Engine;
-            base64::engine::general_purpose::STANDARD.encode(uuid::Uuid::new_v4().as_bytes())
-        });
-    Ok(Json(s.ee.attest(&nonce).await?))
-}
-
-/// GET /cp/ita — the CP's own ITA token, minted + self-verified at
-/// startup. External verifiers can confirm the CP VM's TDX measurement
-/// by decoding it against Intel's JWKS.
-async fn cp_ita(State(s): State<St>) -> Result<Json<serde_json::Value>> {
-    let token = s.cp_ita_token.read().await.clone();
-    let claims = s.verifier.verify(&token).await?;
-    Ok(Json(serde_json::json!({
-        "token": token,
-        "claims": claims,
-    })))
 }
