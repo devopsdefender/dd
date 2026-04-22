@@ -3,6 +3,7 @@ pub mod cf;
 pub mod collector;
 pub mod config;
 pub mod cp;
+pub mod devices;
 pub mod ee;
 pub mod error;
 pub mod gh_oidc;

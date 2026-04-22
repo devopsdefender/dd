@@ -8,10 +8,9 @@
 //! Auth after registration:
 //!   - Browser routes (`/`, `/workload/*`) are behind CF Access with
 //!     the same human policy as the CP dashboard.
-//!   - Terminal is a separate `bastion` workload published on
-//!     `block.<hostname>` — block-aware web terminal (persistent
-//!     sessions + OSC 133 command history), not tied to any
-//!     deployment. See https://github.com/devopsdefender/bastion.
+//!   - Terminal is a separate `ttyd` workload published on
+//!     `block.<hostname>` — a plain web shell, not tied to any
+//!     deployment.
 //!   - `/deploy` and `/exec` are CF-Access-bypassed and gated in-code
 //!     by a GitHub Actions OIDC token — any CI workflow in the
 //!     `DD_OWNER` org can call them by presenting its per-job OIDC
@@ -42,6 +41,10 @@ use crate::metrics;
 /// minutes; refresh well before so `/health` always serves a live
 /// token to the CP's collector.
 const ITA_REFRESH: Duration = Duration::from_secs(180);
+
+/// Poll interval for syncing the device trust list from the CP.
+/// Tuned so a revoke propagates within ~30s.
+const DEVICES_POLL: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 struct St {
@@ -111,6 +114,25 @@ pub async fn run() -> Result<()> {
         });
     }
 
+    // Background poll for the device trust list. Writes
+    // `/run/ee-proxy/trusted-devices.json` on every refresh so the
+    // locally-running ee-proxy can consume the current set without an
+    // HTTP hop. Revocations propagate within ~DEVICES_POLL.
+    {
+        let cp_url = cfg.cp_url.clone();
+        let token = ita_token.clone();
+        tokio::spawn(async move {
+            let http = reqwest::Client::new();
+            let out_path: std::path::PathBuf = crate::devices::RUNTIME_TRUST_PATH.into();
+            loop {
+                if let Err(e) = sync_trusted_devices(&http, &cp_url, &token, &out_path).await {
+                    eprintln!("agent: device sync failed: {e}");
+                }
+                tokio::time::sleep(DEVICES_POLL).await;
+            }
+        });
+    }
+
     let gh = gh_oidc::Verifier::new(cfg.common.owner.clone(), "dd-agent".into());
 
     let state = St {
@@ -144,6 +166,48 @@ pub async fn run() -> Result<()> {
     )
     .await
     .map_err(|e| Error::Internal(e.to_string()))
+}
+
+/// Pull the CP's device registry and write a minimal
+/// `{"pubkeys": [...]}` view — only non-revoked pubkeys — to
+/// `out_path` atomically. `ee-proxy` re-reads this file every
+/// ~10s so revocations take effect without restart.
+async fn sync_trusted_devices(
+    http: &reqwest::Client,
+    cp_url: &str,
+    ita_token: &Arc<RwLock<String>>,
+    out_path: &std::path::Path,
+) -> Result<()> {
+    // `/api/v1/devices/trusted` is CF-Access-bypassed (see
+    // `cf::provision_cp_access`) so cross-VM agents can reach it over
+    // the public tunnel. Auth is in-code: loopback / GH-OIDC / ITA,
+    // same three-way policy as `/api/agents`. The agent presents its
+    // fresh ITA token as a Bearer.
+    let url = format!("{}/api/v1/devices/trusted", cp_url.trim_end_matches('/'));
+    let token = ita_token.read().await.clone();
+    let resp = http
+        .get(&url)
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(|e| Error::Upstream(format!("devices GET {url}: {e}")))?;
+    if !resp.status().is_success() {
+        return Err(Error::Upstream(format!(
+            "devices GET {url} → {}",
+            resp.status()
+        )));
+    }
+    // The response shape already matches what ee-proxy's `--trust-file`
+    // parses — `{ "pubkeys": ["<hex>", ...] }`. Re-serialize compact.
+    let body: serde_json::Value = resp.json().await?;
+    let bytes = serde_json::to_vec(&body)?;
+    if let Some(parent) = out_path.parent() {
+        tokio::fs::create_dir_all(parent).await.ok();
+    }
+    let tmp = out_path.with_extension("json.tmp");
+    tokio::fs::write(&tmp, &bytes).await?;
+    tokio::fs::rename(&tmp, out_path).await?;
+    Ok(())
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -327,10 +391,9 @@ async fn dashboard(State(s): State<St>) -> Response {
         )
     };
 
-    // `{hostname-base}-block.{tld}` is the bastion subdomain provisioned
-    // at register time. Human-gated by CF Access; the block-aware
-    // terminal UI (persistent per-session, OSC 133 command history)
-    // lives there. Flat shape so Universal SSL covers the cert.
+    // `{hostname-base}-block.{tld}` is the ttyd subdomain provisioned
+    // at register time. Human-gated by CF Access. Flat shape so
+    // Universal SSL covers the cert.
     let term_host = html::escape(&crate::cf::label_hostname(&s.hostname, "block"));
 
     let body = format!(

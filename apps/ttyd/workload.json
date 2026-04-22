@@ -5,7 +5,7 @@
     "asset": "ttyd.x86_64",
     "rename": "ttyd"
   },
-  "expose": { "hostname_label": "term", "port": 7681 },
+  "expose": { "hostname_label": "block", "port": 7681 },
   "cmd": ["ttyd", "-W", "-p", "7681", "/bin/sh"]
 }
 

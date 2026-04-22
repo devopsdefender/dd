@@ -96,8 +96,8 @@ jobs:
           DD_ENV: ${{ steps.pr.outputs.dd_env }}
         run: |
           # Tunnels are named `dd-{DD_ENV}-{uuid}` (see
-          # dd-common/src/tunnel.rs::create_agent_tunnel). List all
-          # tunnels with the dd-{DD_ENV}- prefix and delete each.
+          # crates/dd/src/cf.rs). List all tunnels with the
+          # dd-{DD_ENV}- prefix and delete each.
           resp=$(curl -fsS \
             -H "Authorization: Bearer ${CF_API_TOKEN}" \
             "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/cfd_tunnel?is_deleted=false&per_page=200")

@@ -139,11 +139,9 @@ build_config_iso() {
     bake "$REPO_ROOT/apps/podman-static/workload.json"
     bake "$REPO_ROOT/apps/podman-bootstrap/workload.json"
     bake "$REPO_ROOT/apps/cloudflared/workload.json"
-    # Bastion hits localhost:8080 for the agent catalog — on the CP
-    # that's dd-management, on an agent that's dd-agent's /api/agents
-    # proxy. Only DD_RELEASE_TAG needs to be in the bake env.
+    bake "$REPO_ROOT/apps/ttyd/workload.json"
     DD_RELEASE_TAG="$DD_RELEASE_TAG" \
-      bake "$REPO_ROOT/apps/bastion/workload.json.tmpl"
+      bake "$REPO_ROOT/apps/ee-proxy/workload.json.tmpl"
   })
 
   local extra_ingress
@@ -164,11 +162,11 @@ build_config_iso() {
   {
     echo "EE_OWNER=devopsdefender"
     echo "EE_BOOT_WORKLOADS=$workloads"
-    # Tells EE (>= capture-socket patch) to tee every spawned workload's
-    # stdio to this unix socket. Bastion binds + listens on it; unpatched
-    # EE images ignore the variable. Keeps the boot-of-the-listener ≠
-    # boot-of-the-writer race non-fatal: EE falls back to running without
-    # capture when the socket isn't there yet.
+    # EE capture-socket tee target. Kept for forward compatibility: a
+    # future workload (e.g. an attested proxy) can bind + listen on it.
+    # Unpatched EE images ignore the variable; patched EE falls back to
+    # running without capture when nothing is listening, so the
+    # boot-of-the-listener ≠ boot-of-the-writer race is non-fatal.
     echo "EE_CAPTURE_SOCKET=/run/ee/capture.sock"
   } > "$tmp/agent.env"
 

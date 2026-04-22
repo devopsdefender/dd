@@ -127,6 +127,14 @@ pub struct Cp {
     pub hostname: String,
     pub scrape_interval_secs: u64,
     pub ita: Ita,
+    /// Source-of-truth file for the device registry (JSON). Survives
+    /// CP restart; mutations fsync through to disk.
+    pub devices_path: std::path::PathBuf,
+    /// Runtime view written on every mutation so the locally-running
+    /// ee-proxy workload can consume it without an HTTP hop. Fixed to
+    /// ee-proxy's default (`/run/ee-proxy/trusted-devices.json`) but
+    /// overridable for tests.
+    pub runtime_trust_path: std::path::PathBuf,
 }
 
 impl Cp {
@@ -140,6 +148,12 @@ impl Cp {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(30);
+        let devices_path = std::env::var("DD_CP_DEVICES_PATH")
+            .unwrap_or_else(|_| "/var/lib/devopsdefender/devices.json".into())
+            .into();
+        let runtime_trust_path = std::env::var("DD_CP_RUNTIME_TRUST_PATH")
+            .unwrap_or_else(|_| crate::devices::RUNTIME_TRUST_PATH.into())
+            .into();
         Ok(Self {
             common,
             cf,
@@ -147,6 +161,8 @@ impl Cp {
             hostname,
             scrape_interval_secs,
             ita: Ita::from_env()?,
+            devices_path,
+            runtime_trust_path,
         })
     }
 }
