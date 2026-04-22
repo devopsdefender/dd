@@ -1,10 +1,14 @@
 //! Types shared between the `devopsdefender` binary (CP + agent modes)
 //! and the `bastion` binary (block-aware terminal + workload-capture).
 //!
-//! Today this is just [`BlockRecord`] — the wire shape for a single
-//! segmented event, shared so the CP (which will eventually aggregate
-//! across nodes) and bastion (which emits) can deserialize the same
-//! JSON without duplicating the type.
+//! - [`BlockRecord`] — the wire shape for a single segmented event.
+//! - [`noise_tunnel`] — Noise_IK handshake primitive used by both
+//!   browser↔bastion tunnels and CP↔agent m2m.
+//! - [`noise_static`] — persistent X25519 keypair shared as the
+//!   Noise "static" key for every long-lived identity.
+
+pub mod noise_static;
+pub mod noise_tunnel;
 
 use serde::{Deserialize, Serialize};
 
