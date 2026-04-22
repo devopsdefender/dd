@@ -282,11 +282,14 @@ PY
   # preview agents concurrently.
   #
   #   preview (no GPU):  RAM =  16 GiB, vCPU =  4
-  #   prod    (H100):    RAM =  98 GiB, vCPU = 16
-  #                      (RAM = VRAM + 4 = 94 + 4 = 98 per the rule)
+  #   prod    (H100):    RAM =  32 GiB, vCPU = 16
   local mem_kib vcpus
   if [ "$with_gpu" = "yes" ]; then
-    mem_kib=102760448   # 98 GiB
+    # Capped at 32 GiB to stay under the VFIO RAM-discard listener
+    # limit (16M mappings; TDX guest_memfd discards at 4 KiB, so 64 GiB
+    # is the hard ceiling and 32 GiB leaves headroom for device
+    # regions). Raise via 1 GiB hugepages on the host before bumping.
+    mem_kib=33554432    # 32 GiB
     vcpus=16
   else
     mem_kib=16777216    # 16 GiB
