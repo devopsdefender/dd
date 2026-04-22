@@ -102,35 +102,54 @@ async fn persist_key(key_file: &Path, bytes: &[u8; 32]) -> anyhow::Result<()> {
 }
 
 /// Generate a TDX quote over `report_data` derived from the given
-/// X25519 pubkey. On Linux this drives `configfs-tsm`; elsewhere we
-/// return an error (the proxy is only deployed in Linux enclaves).
-#[cfg(target_os = "linux")]
+/// X25519 pubkey. Drives `configfs-tsm` when available (Linux + TDX
+/// kernel); otherwise returns a placeholder and logs a warning. The
+/// graceful fallback is what lets `cargo test` and dev runs on
+/// non-TDX hosts succeed — the placeholder quote will fail ITA
+/// verification, which is exactly what you want off-enclave.
 fn tdx_quote(pubkey: &[u8; 32]) -> anyhow::Result<Vec<u8>> {
+    match try_configfs_tsm_quote(pubkey) {
+        Ok(q) => Ok(q),
+        Err(e) => {
+            eprintln!(
+                "ee-proxy: configfs-tsm unavailable ({e}); using placeholder quote. \
+                 Clients will fail ITA verification — this is expected off-enclave."
+            );
+            Ok(b"ee-proxy-placeholder-quote".to_vec())
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn try_configfs_tsm_quote(pubkey: &[u8; 32]) -> anyhow::Result<Vec<u8>> {
     use std::fs;
     use std::io::Write;
+
+    // Probe the tsm report mount before touching anything; on non-TDX
+    // hosts (CI runners, laptops) this path doesn't exist and we
+    // short-circuit to the placeholder.
+    let base = std::path::Path::new("/sys/kernel/config/tsm/report");
+    if !base.exists() {
+        anyhow::bail!("{} not present", base.display());
+    }
 
     let mut report_data = [0u8; 64];
     report_data[..32].copy_from_slice(pubkey);
 
-    let dir = "/sys/kernel/config/tsm/report/ee-proxy";
-    fs::create_dir_all(dir)?;
+    let dir = base.join("ee-proxy");
+    fs::create_dir_all(&dir)?;
     {
-        let mut inblob = fs::OpenOptions::new()
-            .write(true)
-            .open(format!("{dir}/inblob"))?;
+        let mut inblob = fs::OpenOptions::new().write(true).open(dir.join("inblob"))?;
         inblob.write_all(&report_data)?;
     }
-    let outblob = fs::read(format!("{dir}/outblob"))?;
-    fs::remove_dir(dir).ok();
+    let outblob = fs::read(dir.join("outblob"))?;
+    fs::remove_dir(&dir).ok();
     Ok(outblob)
 }
 
 #[cfg(not(target_os = "linux"))]
-fn tdx_quote(_pubkey: &[u8; 32]) -> anyhow::Result<Vec<u8>> {
-    // Non-Linux build — used for `cargo check` on dev machines.
-    // Return a placeholder so constructors still succeed; the binary
-    // only actually runs inside a TDX VM.
-    Ok(b"non-linux-placeholder-quote".to_vec())
+fn try_configfs_tsm_quote(_pubkey: &[u8; 32]) -> anyhow::Result<Vec<u8>> {
+    anyhow::bail!("configfs-tsm is Linux-only")
 }
 
 #[cfg(test)]
