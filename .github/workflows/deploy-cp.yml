@@ -255,16 +255,21 @@ jobs:
           # real 200 on /health (not a CF Access 302 false-positive).
           # Serial console lives at /var/log/ee-local-${env}-cp.log
           # on the tdx2 host if you need to tail it manually.
-          for i in $(seq 1 60); do
+          #
+          # Budget: 15 minutes. On this baremetal host fresh-PR tunnel
+          # registration + CF edge propagation can land anywhere in
+          # the 2-12 minute range; 5 minutes was too tight and lost
+          # otherwise-healthy deploys to the race.
+          for i in $(seq 1 180); do
             CODE=$(curl -s -o /dev/null -w '%{http_code}' "${AGENT_URL}/health" || echo "000")
             if [ "$CODE" = "200" ]; then
               echo "CP healthy at ${AGENT_URL} (HTTP 200)"
               exit 0
             fi
-            echo "  waiting for tunnel (got HTTP ${CODE})... (${i}/60)"
+            echo "  waiting for tunnel (got HTTP ${CODE})... (${i}/180)"
             sleep 5
           done
-          echo "::error::CP not healthy within 5 minutes (SSH target)"
+          echo "::error::CP not healthy within 15 minutes (SSH target)"
           exit 1
 
       - name: Verify NEW VM via TDX attestation

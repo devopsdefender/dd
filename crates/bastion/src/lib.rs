@@ -48,6 +48,12 @@ pub mod capture;
 pub mod ee;
 pub mod ee_sync;
 
+/// Re-export so `bastion::noise::NoiseStatic` + `bastion::noise_tunnel::*`
+/// continue to work after the primitives moved into `dd-common` (shared
+/// with the CP / agent m2m path).
+pub use dd_common::noise_static as noise;
+pub use dd_common::noise_tunnel;
+
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, State};
 use axum::response::{Html, IntoResponse};
@@ -220,6 +226,19 @@ pub struct Manager {
     /// in the fleet. Absent → single-node fallback.
     cp_url: Option<Arc<str>>,
     http: reqwest::Client,
+    /// Long-term Noise static keypair. Clients fetch the pubkey
+    /// via `GET /attest` and pin it; Phase 2b runs a Noise_KK
+    /// handshake keyed by this + a client static key. Absent in
+    /// standalone dev / local-embedder mode — `/attest` then
+    /// responds 404.
+    noise: Option<Arc<noise::NoiseStatic>>,
+    /// Path to easyenclave's unix socket. When set, `/attest`
+    /// fetches a fresh TDX quote with `REPORT_DATA = sha256(noise_pubkey)`
+    /// and includes it in the response so clients can verify the
+    /// pubkey came from a genuine enclave (Phase 2d). Absent →
+    /// `/attest` still returns the pubkey, just without an
+    /// attached quote.
+    ee_socket: Option<Arc<str>>,
 }
 
 impl Default for Manager {
@@ -234,6 +253,8 @@ impl Manager {
             inner: Arc::new(RwLock::new(Default::default())),
             cp_url: None,
             http: reqwest::Client::new(),
+            noise: None,
+            ee_socket: None,
         }
     }
 
@@ -246,6 +267,27 @@ impl Manager {
         let url = url.into();
         if !url.is_empty() {
             self.cp_url = Some(Arc::from(url));
+        }
+        self
+    }
+
+    /// Attach the persistent Noise static keypair. When set, `GET
+    /// /attest` returns `{noise_pubkey_hex}` so clients can pin it
+    /// before Phase 2b's Noise_KK handshake. Absent → `/attest`
+    /// returns 404.
+    pub fn with_noise_key(mut self, key: noise::NoiseStatic) -> Self {
+        self.noise = Some(Arc::new(key));
+        self
+    }
+
+    /// Point at easyenclave's unix socket so `/attest` can return a
+    /// TDX quote with `REPORT_DATA = sha256(noise_pubkey)`. Clients
+    /// / auditors use this to verify the advertised pubkey came from
+    /// a genuine enclave rather than a MITM serving its own key.
+    pub fn with_ee_socket(mut self, path: impl Into<String>) -> Self {
+        let p = path.into();
+        if !p.is_empty() {
+            self.ee_socket = Some(Arc::from(p));
         }
         self
     }
@@ -760,11 +802,94 @@ pub fn router(manager: Manager) -> Router {
 
     Router::new()
         .route("/", get(page))
+        .route("/attest", get(attest))
         .route("/api/sessions", get(list_sessions).post(create_session))
         .route("/api/sessions/{id}", delete(kill_session))
         .route("/ws/{id}", get(ws_upgrade))
+        .route("/noise/ws", get(noise_ws_upgrade))
+        .route("/noise/shell/{id}", get(noise_shell_upgrade))
         .layer(cors)
         .with_state(manager)
+}
+
+/// GET /attest — returns this bastion's long-term Noise static
+/// pubkey. Clients pin the returned `noise_pubkey_hex` and use it
+/// as the responder key for the Noise_IK handshake.
+///
+/// When an easyenclave socket is configured (`with_ee_socket`), the
+/// response also carries a TDX attestation quote whose REPORT_DATA
+/// is `sha256(noise_pubkey)`. Clients / auditors submit the quote
+/// to Intel Trust Authority; a successful verify proves the advertised
+/// pubkey came from a genuinely-measured enclave rather than a MITM
+/// serving its own key. Quote mint failures don't fail the endpoint
+/// — the pubkey is still useful for transport encryption even without
+/// the attestation, and callers can retry.
+///
+/// 404 when no Noise keypair is configured (standalone dev,
+/// embedders that didn't call `Manager::with_noise_key`).
+async fn attest(State(m): State<Manager>) -> impl IntoResponse {
+    let Some(key) = m.noise.as_ref() else {
+        return (
+            axum::http::StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "noise key not configured"
+            })),
+        )
+            .into_response();
+    };
+
+    // Bind sha256(pubkey) into the TDX quote's REPORT_DATA. SHA-256
+    // is 32 bytes; EE pads to 64 internally. Client verifies by
+    // re-hashing the cached pubkey and comparing against the quote's
+    // REPORT_DATA field after ITA verification.
+    let quote = attach_noise_quote(&m, key.public().as_bytes()).await;
+
+    let mut body = serde_json::json!({
+        "noise_pubkey_hex": key.public_hex(),
+        "source": format!("{:?}", key.source()).to_lowercase(),
+    });
+    if let Some((quote_b64, report_data_b64)) = quote {
+        body["tdx_quote_b64"] = serde_json::Value::String(quote_b64);
+        body["report_data_b64"] = serde_json::Value::String(report_data_b64);
+    }
+    Json(body).into_response()
+}
+
+/// Mint a TDX quote binding `sha256(noise_pubkey)` into REPORT_DATA.
+/// Returns `(quote_b64, report_data_b64)` on success, or `None` if no
+/// EE socket is configured or the socket call failed — the caller
+/// downgrades gracefully by omitting the fields from the response.
+async fn attach_noise_quote(m: &Manager, pubkey_bytes: &[u8]) -> Option<(String, String)> {
+    let ee_path = m.ee_socket.as_ref()?;
+    // SHA-256 over the raw 32-byte pubkey. Domain separation isn't
+    // needed: REPORT_DATA is scoped to this bastion's quote and the
+    // client verifies both halves against the same pubkey.
+    let digest = {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(pubkey_bytes);
+        let d = h.finalize();
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&d);
+        out
+    };
+    use base64::Engine as _;
+    let report_data_b64 = base64::engine::general_purpose::STANDARD.encode(digest);
+    let ee = crate::ee::EeClient::new(ee_path.as_ref());
+    match ee.attest_with_report_data(&report_data_b64).await {
+        Ok(v) if v.get("ok").and_then(|b| b.as_bool()) == Some(true) => {
+            let q = v.get("quote_b64")?.as_str()?.to_string();
+            Some((q, report_data_b64))
+        }
+        Ok(v) => {
+            eprintln!("bastion: /attest EE said {v}");
+            None
+        }
+        Err(e) => {
+            eprintln!("bastion: /attest EE error: {e}");
+            None
+        }
+    }
 }
 
 async fn page(State(m): State<Manager>) -> impl IntoResponse {
@@ -1024,6 +1149,493 @@ async fn ws_loop(mut socket: WebSocket, id: String, m: Manager) {
         _ = inbound => {},
         _ = outbound => {},
     }
+}
+
+// ---------------------------------------------------------------------
+// /noise/shell/{id} — Noise_IK-tunneled PTY streaming
+//
+// Mirrors `/ws/{id}` but every frame rides inside a Noise_IK
+// transport. Inside the encrypted tunnel we use a 1-byte type tag so
+// we don't pay base64 overhead on the high-volume stdout stream:
+//   0x01 <bytes>      — raw PTY data (stdin client→server or
+//                       stdout server→client)
+//   0x02 <json-bytes> — control frame (resize/hello/block/exit/...)
+// ---------------------------------------------------------------------
+
+const NOISE_FRAME_RAW: u8 = 0x01;
+const NOISE_FRAME_CTRL: u8 = 0x02;
+
+async fn noise_shell_upgrade(
+    ws: WebSocketUpgrade,
+    Path(id): Path<String>,
+    State(m): State<Manager>,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| noise_shell_loop(socket, id, m))
+}
+
+async fn noise_shell_loop(mut socket: WebSocket, id: String, m: Manager) {
+    use futures_util::StreamExt;
+
+    let Some(noise_key) = m.noise.clone() else {
+        let _ = socket
+            .send(Message::Text(
+                r#"{"error":"noise_not_configured"}"#.to_string().into(),
+            ))
+            .await;
+        return;
+    };
+
+    // Drive the IK handshake first. Same dance as /noise/ws.
+    let mut responder = match noise_tunnel::Responder::new(noise_key.secret_bytes()) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("bastion/noise-shell: responder init: {e}");
+            return;
+        }
+    };
+    let msg1 = match socket.recv().await {
+        Some(Ok(Message::Binary(b))) => b,
+        other => {
+            eprintln!("bastion/noise-shell: expected binary msg1, got {other:?}");
+            return;
+        }
+    };
+    if let Err(e) = responder.read_msg1(&msg1) {
+        eprintln!("bastion/noise-shell: msg1 read: {e}");
+        return;
+    }
+    let peer_pub = responder
+        .peer_pubkey()
+        .map(|p| format!("{}…", &crate::noise::hex_encode(&p)[..16]))
+        .unwrap_or_else(|| "?".into());
+    let msg2 = match responder.write_msg2(&[]) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("bastion/noise-shell: msg2 write: {e}");
+            return;
+        }
+    };
+    if socket.send(Message::Binary(msg2.into())).await.is_err() {
+        return;
+    }
+    let transport = match responder.into_transport() {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("bastion/noise-shell: transport xition: {e}");
+            return;
+        }
+    };
+    eprintln!("bastion/noise-shell: tunnel up for session {id} (peer={peer_pub})");
+
+    // Wrap the transport + split socket eagerly so the not-found and
+    // replay paths use the same Arc<Mutex> dispatch as the hot loops.
+    let transport = Arc::new(Mutex::new(transport));
+    let (sink, mut stream) = socket.split();
+    let sink = Arc::new(Mutex::new(sink));
+
+    let Some(session) = m.get(&id).await else {
+        noise_send_ctrl(
+            &sink,
+            &transport,
+            &serde_json::json!({"type":"error","code":"not_found"}),
+        )
+        .await;
+        return;
+    };
+
+    // Replay: current ring + blocks + ready, same as ws_loop but
+    // through the encrypted channel.
+    {
+        let ring_bytes: Vec<u8> = session.ring.lock().await.iter().copied().collect();
+        if !ring_bytes.is_empty() {
+            noise_send_raw(&sink, &transport, &ring_bytes).await;
+        }
+        let blocks = session.blocks.read().await;
+        for b in blocks.iter() {
+            noise_send_ctrl(
+                &sink,
+                &transport,
+                &serde_json::json!({
+                    "type": "block",
+                    "session_id": b.session_id,
+                    "kind": b.kind,
+                    "seq": b.seq,
+                    "started_at_ms": b.started_at_ms,
+                    "ended_at_ms": b.ended_at_ms,
+                    "command": b.command,
+                    "output_b64": b.output_b64,
+                    "exit_code": b.exit_code,
+                }),
+            )
+            .await;
+        }
+        let seq = *session.next_seq.lock().await;
+        noise_send_ctrl(
+            &sink,
+            &transport,
+            &serde_json::json!({"type":"ready","seq":seq}),
+        )
+        .await;
+    }
+
+    let mut rx = session.tx.subscribe();
+    let writer = session.writer.clone();
+    let master = session.master.clone();
+    let transport_in = transport.clone();
+
+    let inbound = async move {
+        while let Some(Ok(msg)) = stream.next().await {
+            let Message::Binary(cipher) = msg else {
+                if matches!(msg, Message::Close(_)) {
+                    break;
+                }
+                // Plaintext text frames are invalid once the tunnel
+                // is up; drop them.
+                continue;
+            };
+            let plain = {
+                let mut t = transport_in.lock().await;
+                match t.recv(&cipher) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("bastion/noise-shell: decrypt: {e}");
+                        break;
+                    }
+                }
+            };
+            if plain.is_empty() {
+                continue;
+            }
+            match plain[0] {
+                NOISE_FRAME_RAW => {
+                    let Some(w) = writer.clone() else { continue };
+                    let bytes = plain[1..].to_vec();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        let mut g = w.blocking_lock();
+                        let _ = g.write_all(&bytes);
+                    })
+                    .await;
+                }
+                NOISE_FRAME_CTRL => {
+                    let Ok(msg) = serde_json::from_slice::<ClientMsg>(&plain[1..]) else {
+                        continue;
+                    };
+                    match msg {
+                        ClientMsg::Resize(r) => {
+                            let Some(m) = master.as_ref() else { continue };
+                            let g = m.lock().await;
+                            let _ = g.resize(PtySize {
+                                rows: r.rows.max(4),
+                                cols: r.cols.max(8),
+                                pixel_width: 0,
+                                pixel_height: 0,
+                            });
+                        }
+                        ClientMsg::Hello(_) => {}
+                    }
+                }
+                _ => {} // Unknown frame type — ignore.
+            }
+        }
+    };
+
+    let sink_out = sink.clone();
+    let transport_out = transport.clone();
+    let outbound = async move {
+        loop {
+            let ev = match rx.recv().await {
+                Ok(e) => e,
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(_) => break,
+            };
+            let ok = match ev {
+                Event::Raw(bytes) => noise_send_raw(&sink_out, &transport_out, &bytes).await,
+                Event::Block(b) => {
+                    noise_send_ctrl(
+                        &sink_out,
+                        &transport_out,
+                        &serde_json::json!({
+                            "type": "block",
+                            "session_id": b.session_id,
+                            "kind": b.kind,
+                            "seq": b.seq,
+                            "started_at_ms": b.started_at_ms,
+                            "ended_at_ms": b.ended_at_ms,
+                            "command": b.command,
+                            "output_b64": b.output_b64,
+                            "exit_code": b.exit_code,
+                        }),
+                    )
+                    .await
+                }
+                Event::Exit(code) => {
+                    noise_send_ctrl(
+                        &sink_out,
+                        &transport_out,
+                        &serde_json::json!({"type":"exit","code":code}),
+                    )
+                    .await;
+                    false
+                }
+            };
+            if !ok {
+                break;
+            }
+        }
+    };
+
+    tokio::select! {
+        _ = inbound => {},
+        _ = outbound => {},
+    }
+}
+
+/// Encrypt + send a raw-bytes frame (PTY stdout). Returns `false` if
+/// the sink has died so the caller can break its loop.
+async fn noise_send_raw(
+    sink: &Arc<Mutex<futures_util::stream::SplitSink<WebSocket, Message>>>,
+    transport: &Arc<Mutex<noise_tunnel::Transport>>,
+    bytes: &[u8],
+) -> bool {
+    let mut framed = Vec::with_capacity(bytes.len() + 1);
+    framed.push(NOISE_FRAME_RAW);
+    framed.extend_from_slice(bytes);
+    let cipher = {
+        let mut t = transport.lock().await;
+        match t.send(&framed) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("bastion/noise-shell: encrypt raw: {e}");
+                return false;
+            }
+        }
+    };
+    use futures_util::SinkExt;
+    let mut s = sink.lock().await;
+    s.send(Message::Binary(cipher.into())).await.is_ok()
+}
+
+/// Encrypt + send a JSON control frame (block, exit, ready, ...).
+async fn noise_send_ctrl(
+    sink: &Arc<Mutex<futures_util::stream::SplitSink<WebSocket, Message>>>,
+    transport: &Arc<Mutex<noise_tunnel::Transport>>,
+    payload: &serde_json::Value,
+) -> bool {
+    let Ok(json) = serde_json::to_vec(payload) else {
+        return false;
+    };
+    let mut framed = Vec::with_capacity(json.len() + 1);
+    framed.push(NOISE_FRAME_CTRL);
+    framed.extend_from_slice(&json);
+    let cipher = {
+        let mut t = transport.lock().await;
+        match t.send(&framed) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("bastion/noise-shell: encrypt ctrl: {e}");
+                return false;
+            }
+        }
+    };
+    use futures_util::SinkExt;
+    let mut s = sink.lock().await;
+    s.send(Message::Binary(cipher.into())).await.is_ok()
+}
+
+// ---------------------------------------------------------------------
+// /noise/ws — Noise_IK-tunneled JSON RPC
+// ---------------------------------------------------------------------
+
+/// JSON-over-Noise request/response envelope. Every request carries an
+/// `id` so the client can correlate responses on a single multiplexed
+/// tunnel. `op` discriminates the call; payload fields are flattened.
+///
+/// Phase 2b scope: `sessions.list` / `sessions.create` / `sessions.delete`
+/// only. Phase 2c will add `shell.open` / `shell.input` / `shell.resize`
+/// for tunneling the terminal WS body.
+#[derive(Debug, Deserialize)]
+struct NoiseReq {
+    id: u64,
+    #[serde(flatten)]
+    body: NoiseReqBody,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+enum NoiseReqBody {
+    SessionsList,
+    SessionsCreate {
+        title: Option<String>,
+    },
+    SessionsDelete {
+        session_id: String,
+    },
+    /// Heartbeat — response echoes the current server time. Lets the
+    /// client tell "tunnel alive" from "app hung."
+    Ping,
+}
+
+#[derive(Debug, Serialize)]
+struct NoiseResp {
+    id: u64,
+    #[serde(flatten)]
+    body: NoiseRespBody,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum NoiseRespBody {
+    /// Named `sessions` field so serde's `#[serde(tag)]` internal-
+    /// tagging works (it can't internally-tag a bare `Vec`).
+    Sessions {
+        sessions: Vec<SessionInfo>,
+    },
+    Session {
+        session: SessionInfo,
+    },
+    Ok,
+    Err {
+        msg: String,
+    },
+    Pong {
+        server_time_ms: u64,
+    },
+}
+
+async fn noise_ws_upgrade(ws: WebSocketUpgrade, State(m): State<Manager>) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| noise_ws_loop(socket, m))
+}
+
+async fn noise_ws_loop(mut socket: WebSocket, m: Manager) {
+    let Some(noise_key) = m.noise.clone() else {
+        // No server key configured. Close with an unencrypted text
+        // frame so the client can log a sensible error rather than
+        // staring at a silent drop.
+        let _ = socket
+            .send(Message::Text(
+                r#"{"error":"noise_not_configured"}"#.to_string().into(),
+            ))
+            .await;
+        return;
+    };
+
+    // Drive the IK handshake first. Client sends msg1, server
+    // responds with msg2, both enter transport mode.
+    let mut responder = match noise_tunnel::Responder::new(noise_key.secret_bytes()) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("bastion/noise: responder init: {e}");
+            return;
+        }
+    };
+
+    let msg1 = match socket.recv().await {
+        Some(Ok(Message::Binary(b))) => b,
+        other => {
+            eprintln!("bastion/noise: expected binary msg1, got {other:?}");
+            return;
+        }
+    };
+    if let Err(e) = responder.read_msg1(&msg1) {
+        eprintln!("bastion/noise: msg1 read: {e}");
+        return;
+    }
+    let peer_pub = responder
+        .peer_pubkey()
+        .map(|p| format!("{}…", &crate::noise::hex_encode(&p)[..16]))
+        .unwrap_or_else(|| "?".into());
+    let msg2 = match responder.write_msg2(&[]) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("bastion/noise: msg2 write: {e}");
+            return;
+        }
+    };
+    if socket.send(Message::Binary(msg2.into())).await.is_err() {
+        return;
+    }
+    let mut transport = match responder.into_transport() {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("bastion/noise: transport xition: {e}");
+            return;
+        }
+    };
+    eprintln!("bastion/noise: tunnel up (peer={peer_pub})");
+
+    // Serve requests on the encrypted stream. Each inbound binary
+    // frame is one decrypted JSON `NoiseReq`; response is one frame.
+    while let Some(frame) = socket.recv().await {
+        let Ok(Message::Binary(cipher)) = frame else {
+            continue;
+        };
+        let plain = match transport.recv(&cipher) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("bastion/noise: decrypt: {e}");
+                break;
+            }
+        };
+        let resp = dispatch_noise_req(&m, &plain).await;
+        let resp_bytes = match serde_json::to_vec(&resp) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("bastion/noise: encode resp: {e}");
+                break;
+            }
+        };
+        let ct = match transport.send(&resp_bytes) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("bastion/noise: encrypt: {e}");
+                break;
+            }
+        };
+        if socket.send(Message::Binary(ct.into())).await.is_err() {
+            break;
+        }
+    }
+}
+
+async fn dispatch_noise_req(m: &Manager, plain: &[u8]) -> NoiseResp {
+    let req: NoiseReq = match serde_json::from_slice(plain) {
+        Ok(r) => r,
+        Err(e) => {
+            return NoiseResp {
+                id: 0,
+                body: NoiseRespBody::Err {
+                    msg: format!("bad request: {e}"),
+                },
+            };
+        }
+    };
+    let body = match req.body {
+        NoiseReqBody::SessionsList => NoiseRespBody::Sessions {
+            sessions: m.list().await,
+        },
+        NoiseReqBody::SessionsCreate { title } => {
+            let t = title.unwrap_or_else(|| "shell".to_string());
+            match m.create(t).await {
+                Ok(s) => NoiseRespBody::Session { session: s.info() },
+                Err(e) => NoiseRespBody::Err {
+                    msg: format!("create: {e}"),
+                },
+            }
+        }
+        NoiseReqBody::SessionsDelete { session_id } => {
+            if m.remove(&session_id).await {
+                NoiseRespBody::Ok
+            } else {
+                NoiseRespBody::Err {
+                    msg: "not_found".to_string(),
+                }
+            }
+        }
+        NoiseReqBody::Ping => NoiseRespBody::Pong {
+            server_time_ms: now_ms(),
+        },
+    };
+    NoiseResp { id: req.id, body }
 }
 
 // ---------------------------------------------------------------------

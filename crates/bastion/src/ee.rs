@@ -97,4 +97,19 @@ impl EeClient {
             })
             .unwrap_or_default())
     }
+
+    /// `{"method":"attest","report_data_b64":"..."}` — TDX quote with
+    /// caller-supplied REPORT_DATA. Used by `/attest` to bind the
+    /// Noise static pubkey into the quote (Phase 2d). `data_b64` must
+    /// base64-decode to ≤64 bytes; EE rejects longer.
+    pub async fn attest_with_report_data(
+        &self,
+        data_b64: &str,
+    ) -> std::io::Result<serde_json::Value> {
+        self.call(serde_json::json!({
+            "method": "attest",
+            "report_data_b64": data_b64,
+        }))
+        .await
+    }
 }

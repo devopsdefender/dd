@@ -498,6 +498,31 @@ fn is_admin_label(label: &str) -> bool {
     ADMIN_LABELS.contains(&label)
 }
 
+/// For bastion's `block` label, the hostname itself stays gated by a
+/// human CF Access policy (so `https://block.{env}` still opens the
+/// SSO-protected Svelte SPA). The two Noise-client-only paths —
+/// `/attest` and everything under `/noise/` — need path-scoped
+/// bypasses so the native desktop client can hit them without
+/// following a login redirect. Noise handshakes are self-authenticating
+/// (TDX quote on /attest, Noise_IK mutual auth on /noise/*), so public
+/// reachability is safe. Best-effort: on CF rejection we log and
+/// continue rather than blocking the whole CP startup, matching the
+/// treatment of other bypass paths in this file.
+async fn ensure_block_noise_bypasses(
+    http: &Client,
+    cf: &CfCreds,
+    name_prefix: &str,
+    block_domain: &str,
+) {
+    for (suffix, app_suffix) in [("/attest", "-attest"), ("/noise/", "-noise")] {
+        let domain = format!("{block_domain}{suffix}");
+        let name = format!("{name_prefix}{app_suffix}");
+        if let Err(e) = ensure_bypass_app(http, cf, &name, &domain).await {
+            eprintln!("cf: bypass for {domain} failed (non-fatal): {e}");
+        }
+    }
+}
+
 /// Provision the CP's Access apps at startup.
 ///
 /// Apps created:
@@ -539,14 +564,18 @@ pub async fn provision_cp_access(
     for label in workload_labels {
         let domain = label_hostname(hostname, label);
         if is_admin_label(label) {
+            let app_name = format!("dd-{env}-cp-{label}");
             ensure_app(
                 http,
                 cf,
-                &format!("dd-{env}-cp-{label}"),
+                &app_name,
                 &domain,
                 vec![human_policy(owner, admin_email, &idp)],
             )
             .await?;
+            if label == "block" {
+                ensure_block_noise_bypasses(http, cf, &app_name, &domain).await;
+            }
         } else {
             ensure_bypass_app(http, cf, &format!("dd-{env}-cp-{label}"), &domain).await?;
         }
@@ -667,14 +696,18 @@ pub async fn provision_agent_access(
     for label in workload_labels {
         let domain = label_hostname(agent_hostname, label);
         if is_admin_label(label) {
+            let app_name = format!("dd-{env}-workload-{domain}");
             ensure_app(
                 http,
                 cf,
-                &format!("dd-{env}-workload-{domain}"),
+                &app_name,
                 &domain,
                 vec![human_policy(owner, admin_email, &idp)],
             )
             .await?;
+            if label == "block" {
+                ensure_block_noise_bypasses(http, cf, &app_name, &domain).await;
+            }
         } else {
             ensure_bypass_app(http, cf, &format!("dd-{env}-workload-{domain}"), &domain).await?;
         }
