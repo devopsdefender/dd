@@ -487,10 +487,8 @@ async fn ensure_bypass_app(http: &Client, cf: &CfCreds, name: &str, domain: &str
 /// app, not a public bypass — otherwise exposing ttyd on a public
 /// subdomain would be a free shell for the internet.
 ///
-/// - `term` — ttyd workload (DD's built-in).
-/// - `block` — [bastion](https://github.com/devopsdefender/bastion)
-///   workload when deployed onto an agent via dd-deploy. Bastion is a
-///   block-aware web terminal; exposing it without auth is the same
+/// - `term` — legacy ttyd subdomain (kept admin-gated for older deploys).
+/// - `block` — ttyd workload; exposing it without auth is the same
 ///   "free shell for the internet" risk.
 const ADMIN_LABELS: &[&str] = &["term", "block"];
 
@@ -530,7 +528,7 @@ pub async fn provision_cp_access(
     .await?;
 
     // One CF Access app per CP-exposed workload label. Admin labels
-    // (from `ADMIN_LABELS` — e.g. the bastion terminal at `block`) get
+    // (from `ADMIN_LABELS` — e.g. the ttyd terminal at `block`) get
     // the human policy; anything else gets a public bypass.
     let desired: std::collections::HashSet<String> = workload_labels
         .iter()

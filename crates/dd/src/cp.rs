@@ -18,8 +18,6 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use tokio::sync::{Mutex, RwLock};
 
-use bastion;
-
 use crate::cf;
 use crate::collector::{self, Store};
 use crate::config::Cp as Cfg;
@@ -57,12 +55,13 @@ pub async fn run() -> Result<()> {
     eprintln!("cp: self-provisioning tunnel for {}", cfg.hostname);
     let http = reqwest::Client::new();
     let self_name = cf::cp_tunnel_name(&cfg.common.env_label);
-    // `block.<hostname>` routes to the bastion workload on port 7681.
-    // The CP boot set always includes bastion, so the CNAME + ingress
-    // rule always resolve. CF Access gates this subdomain with the
-    // same human policy as the CP dashboard (see `ADMIN_LABELS` in
-    // cf.rs for the gating decision).
-    let cp_extras: Vec<(String, u16)> = vec![("block".into(), 7681)];
+    // `block.<hostname>` routes to the ttyd workload on port 7681;
+    // `ee.<hostname>` routes to the ee-proxy workload on port 7682.
+    // Both are in the CP boot set, so the CNAME + ingress always
+    // resolve. `block` is admin-gated (human CF Access); `ee` is
+    // bypassed at the edge because Noise+TDX-attest authenticates
+    // the session cryptographically — see ADMIN_LABELS in cf.rs.
+    let cp_extras: Vec<(String, u16)> = vec![("block".into(), 7681), ("ee".into(), 7682)];
     let tunnel = match cf::create(&http, &cfg.cf, &self_name, &cfg.hostname, &cp_extras).await {
         Ok(t) => t,
         Err(e) => {
@@ -246,7 +245,6 @@ pub async fn run() -> Result<()> {
 
     let app = Router::new()
         .route("/", get(fleet))
-        .route("/bastion", get(bastion_aggregator))
         .route("/health", get(health))
         .route("/register", post(register))
         .route("/ingress/replace", post(ingress_replace))
@@ -263,7 +261,7 @@ pub async fn run() -> Result<()> {
     // `into_make_service_with_connect_info` so handlers can see the
     // peer socket address via the `ConnectInfo` extractor. Used by
     // `api_agents` to grant auth-free access to same-VM loopback
-    // callers (bastion + dd-management proxy paths).
+    // callers (same-VM workloads + dd-management proxy paths).
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
@@ -589,7 +587,7 @@ async fn fleet(State(s): State<St>) -> Response {
 
     Html(shell(
         "DD Fleet",
-        &html::nav(&[("Fleet", "/", true), ("Bastion", "/bastion", false)]),
+        &html::nav(&[("Fleet", "/", true)]),
         &format!(
             r#"<h1>Fleet</h1><div class="sub">{host} · env {env} · {n} agent(s)</div>{table}"#,
             host = html::escape(&s.cfg.hostname),
@@ -600,44 +598,14 @@ async fn fleet(State(s): State<St>) -> Response {
     .into_response()
 }
 
-/// GET /bastion — fleet-wide bastion SPA. Builds the list of
-/// `(vm_name, block-origin)` pairs from the agent catalog (plus the
-/// CP itself), and returns bastion's Svelte SPA with
-/// `window.__DD_AGENTS__` preloaded so it fans out cross-origin to
-/// every node and renders one unified sidebar. CF Access's shared
-/// session-domain cookie on `.devopsdefender.com` makes the browser
-/// send credentials on every `fetch`/`wss` across subdomains.
-async fn bastion_aggregator(State(s): State<St>) -> Response {
-    let mut agents: Vec<(String, String)> = Vec::new();
-
-    // CP itself — has a bastion workload at `block.<cp-hostname>`.
-    let cp_block = cf::label_hostname(&s.cfg.hostname, "block");
-    agents.push((
-        format!("cp ({})", s.cfg.common.env_label),
-        format!("https://{cp_block}"),
-    ));
-
-    // Every registered agent, sorted for stable ordering.
-    let store = s.store.lock().await;
-    let mut by_vm: Vec<_> = store.values().cloned().collect();
-    drop(store);
-    by_vm.sort_by(|a, b| a.vm_name.cmp(&b.vm_name));
-    for a in &by_vm {
-        let block = cf::label_hostname(&a.hostname, "block");
-        agents.push((a.vm_name.clone(), format!("https://{block}")));
-    }
-
-    Html(bastion::aggregator_body(&agents)).into_response()
-}
-
 /// GET /api/agents — JSON list of
 /// `{agent_id, vm_name, hostname, status, last_seen}`.
 ///
 /// Gated three ways, any of which succeeds:
-/// 1. **Loopback** (`127.0.0.1`, `::1`) — same-VM callers (bastion
-///    workload, dd-agent's own proxy). Trust is anchored by EE's
-///    Tier-1 seal: a process on the VM at all is already a workload
-///    EE spawned and gave the shared `EE_TOKEN` env to.
+/// 1. **Loopback** (`127.0.0.1`, `::1`) — same-VM callers (any
+///    workload on the CP VM, dd-agent's own proxy). Trust is anchored
+///    by EE's Tier-1 seal: a process on the VM at all is already a
+///    workload EE spawned and gave the shared `EE_TOKEN` env to.
 /// 2. **GH OIDC** — CI action (`dd-deploy`, etc.) presents a GitHub
 ///    Actions OIDC JWT as `Authorization: Bearer <jwt>`; we verify
 ///    against GitHub's JWKS and require `repository_owner ==
@@ -674,7 +642,7 @@ async fn api_agents(
 }
 
 /// Accept the request if the caller is on the loopback interface
-/// (same-VM trust — bastion / dd-agent-proxy) or presents a valid
+/// (same-VM trust — any CP-VM workload / dd-agent-proxy) or presents a valid
 /// bearer that verifies as either a GitHub Actions OIDC token for
 /// this owner, or a fresh Intel-signed ITA token for this CP. See
 /// [`api_agents`] for the full policy.
@@ -778,11 +746,10 @@ async fn agent_detail(State(s): State<St>, Path(id): Path<String>) -> Response {
         )
     };
 
-    // `{hostname-base}-block.{tld}` is the bastion subdomain (CP's own
+    // `{hostname-base}-block.{tld}` is the ttyd subdomain (CP's own
     // tunnel publishes it; agents publish it via their register-time
     // `extra_ingress`). Flat shape so Universal SSL covers the cert.
-    // Human-gated by CF Access; the block-aware terminal lives there,
-    // persistent per-session with OSC 133 command history.
+    // Human-gated by CF Access.
     let term_host = html::escape(&cf::label_hostname(&a.hostname, "block"));
     let extra = if is_cp {
         format!(
@@ -832,7 +799,7 @@ async fn agent_detail(State(s): State<St>, Path(id): Path<String>) -> Response {
 
     Html(shell(
         &format!("DD — {}", a.vm_name),
-        &html::nav(&[("Fleet", "/", false), ("Bastion", "/bastion", false)]),
+        &html::nav(&[("Fleet", "/", false)]),
         &format!(
             r#"<div class="back"><a href="/">← fleet</a></div>
 <h1>{vm}</h1><div class="sub">{id} · {host}</div>
@@ -895,7 +862,7 @@ async fn agent_logs(State(s): State<St>, Path((id, app)): Path<(String, String)>
         .unwrap_or_default();
     Html(shell(
         &format!("{app} logs"),
-        &html::nav(&[("Fleet", "/", false), ("Bastion", "/bastion", false)]),
+        &html::nav(&[("Fleet", "/", false)]),
         &format!(
             r#"<div class="back"><a href="/agent/control-plane">← control-plane</a></div>
 <h1>{app}</h1><div class="sub">auto-refresh 2s</div>

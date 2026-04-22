@@ -167,15 +167,15 @@ jobs:
           EE_BOOT_WORKLOADS=$({
             bake apps/cloudflared/workload.json
             bake apps/dd-management/workload.json.tmpl
-            # Bastion hits localhost:8080 for the agent catalog (CP
-            # itself on this VM), so DD_CP_URL isn't needed in its env.
-            bake apps/bastion/workload.json.tmpl
+            bake apps/ttyd/workload.json
+            bake apps/ee-proxy/workload.json.tmpl
           } | jq -cs '.')
 
           # EE_CAPTURE_SOCKET tells EE (post-capture-socket patch) to tee
-          # every spawned workload's stdio to this unix socket. Bastion
-          # binds and reads it. Unpatched EE images ignore the variable,
-          # so landing this is safe before the EE image catches up.
+          # every spawned workload's stdio to this unix socket. Kept for
+          # forward compatibility — a future workload can bind + read it.
+          # Unpatched EE images ignore the variable; patched EE falls back
+          # to running without capture when nothing is listening.
           jq -c -n \
             --arg workloads "$EE_BOOT_WORKLOADS" \
             '{ "EE_BOOT_WORKLOADS": $workloads, "EE_OWNER": "devopsdefender", "EE_CAPTURE_SOCKET": "/run/ee/capture.sock" }' \

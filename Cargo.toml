@@ -2,8 +2,7 @@
 resolver = "2"
 members = [
     "crates/dd",
-    "crates/bastion",
-    "crates/dd-common",
+    "crates/ee-proxy",
 ]
 
 [workspace.package]
