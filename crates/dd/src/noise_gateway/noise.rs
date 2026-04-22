@@ -3,21 +3,14 @@
 //! Wire:
 //!   1. Client opens `GET /noise/ws` and upgrades to WebSocket.
 //!   2. Client sends the first Noise_IK message (binary WS frame).
-//!      After reading it, we can inspect the initiator's static key
-//!      via `get_remote_static()`. If it isn't in the trust store we
-//!      close the connection.
+//!      After reading it we inspect the initiator's static key via
+//!      `get_remote_static()`. If it isn't in the shared trust set
+//!      we close the connection.
 //!   3. We respond with the second handshake message.
-//!   4. Once both messages exchanged, both sides move into transport
-//!      mode; each subsequent WS binary frame is one Noise transport
-//!      message carrying a JSON request envelope. The proxy forwards
-//!      the envelope to EE's agent socket, encrypts the response, and
-//!      sends it back.
-//!
-//! Post-handshake flow:
-//!   - decrypt → [`crate::allowlist::classify`] → EE upstream call →
-//!     encrypt response → WS binary frame back.
-//!   - any error at any step closes the connection with a short JSON
-//!     error frame (encrypted) before the close.
+//!   4. Both sides move into transport mode; each subsequent WS
+//!      binary frame is one Noise transport message carrying a JSON
+//!      request envelope, gated by [`super::allowlist::classify`]
+//!      and forwarded to the EE agent socket.
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
@@ -27,7 +20,7 @@ use axum::Router;
 use futures_util::StreamExt;
 use snow::{Builder, HandshakeState, TransportState};
 
-use crate::{allowlist, State as AppState};
+use super::{allowlist, State as AppState};
 
 const NOISE_PATTERN: &str = "Noise_IK_25519_ChaChaPoly_BLAKE2s";
 const MAX_NOISE_MSG: usize = 65535;
@@ -39,15 +32,12 @@ pub(crate) fn routes() -> Router<AppState> {
 async fn upgrade(ws: WebSocketUpgrade, State(state): State<AppState>) -> Response {
     ws.on_upgrade(move |socket| async move {
         if let Err(e) = handle(socket, state).await {
-            eprintln!("ee-proxy: noise session ended: {e:#}");
+            eprintln!("noise-gw: session ended: {e:#}");
         }
     })
 }
 
 async fn handle(mut socket: WebSocket, state: AppState) -> anyhow::Result<()> {
-    // Build the responder with our static private key. `snow`'s
-    // X25519 representation is the same 32-byte little-endian scalar
-    // that `x25519-dalek::StaticSecret::to_bytes()` emits.
     let static_private = state.attest.secret().to_bytes();
 
     let mut hs: HandshakeState = Builder::new(NOISE_PATTERN.parse()?)
@@ -70,9 +60,8 @@ async fn handle(mut socket: WebSocket, state: AppState) -> anyhow::Result<()> {
     let mut remote = [0u8; 32];
     remote.copy_from_slice(remote_static);
 
-    if !state.trust.contains(&remote).await {
-        // Send nothing — drop the connection. Prevents an oracle on
-        // trust-list membership beyond the `Close` frame itself.
+    let trusted = state.trust.read().await.contains(&remote);
+    if !trusted {
         let _ = socket
             .send(Message::Close(Some(axum::extract::ws::CloseFrame {
                 code: axum::extract::ws::close_code::POLICY,
@@ -123,9 +112,6 @@ async fn handle(mut socket: WebSocket, state: AppState) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Pull the next WS binary frame. Returns `Ok(None)` on normal close
-/// (including `Close` and stream exhaustion); text frames and pings
-/// are ignored (pong handled by axum automatically).
 async fn next_binary(socket: &mut WebSocket) -> anyhow::Result<Option<Vec<u8>>> {
     while let Some(msg) = socket.next().await {
         match msg? {

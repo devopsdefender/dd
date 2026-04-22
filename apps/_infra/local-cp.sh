@@ -96,8 +96,6 @@ build_config_iso() {
       DD_ITA_ISSUER="$DD_ITA_ISSUER" \
       bake "$REPO_ROOT/apps/dd-management/workload.json.tmpl"
     bake "$REPO_ROOT/apps/ttyd/workload.json"
-    DD_RELEASE_TAG="$DD_RELEASE_TAG" \
-      bake "$REPO_ROOT/apps/ee-proxy/workload.json.tmpl"
   } | jq -cs '.')
 
   {

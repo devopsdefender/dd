@@ -1,12 +1,11 @@
 //! TDX attestation + Noise static keypair.
 //!
 //! On boot we either load an existing 32-byte X25519 private key from
-//! disk (tmpfs — `/run/ee-proxy/noise.key`) or mint a fresh one. The
-//! corresponding public key is embedded in a TDX quote's
-//! `report_data` field (low 32 bytes; high 32 bytes zero).
-//!
-//! Clients fetch `GET /attest` over plain HTTPS, verify the quote via
-//! ITA, extract the Noise static pubkey from `report_data`, and trust
+//! disk (tmpfs — `/run/devopsdefender/noise.key`) or mint a fresh one.
+//! The corresponding public key is embedded in a TDX quote's
+//! `report_data` field (low 32 bytes; high 32 bytes zero). Clients
+//! fetch `GET /attest` over plain HTTPS, verify the quote via ITA,
+//! extract the Noise static pubkey from `report_data`, and trust
 //! that key for the handshake. No X.509 certs in the loop.
 
 use std::path::{Path, PathBuf};
@@ -29,8 +28,12 @@ pub struct Attestor {
 
 impl Attestor {
     /// Load `key_file` if it exists and is 32 bytes, otherwise mint a
-    /// fresh keypair and persist it with 0600 perms. Then generate a
-    /// fresh TDX quote binding the public key into `report_data`.
+    /// fresh keypair and best-effort-persist it with 0600 perms.
+    /// Persistence is non-fatal: every deploy already rotates the
+    /// enclave Noise key (fresh VM / fresh boot), so losing the write
+    /// just means this same VM won't reuse the key across an
+    /// in-enclave process restart. Then generate a fresh TDX quote
+    /// binding the public key into `report_data`.
     pub async fn load_or_mint(key_file: &Path) -> anyhow::Result<Self> {
         let secret = match tokio::fs::read(key_file).await {
             Ok(bytes) if bytes.len() == 32 => {
@@ -40,7 +43,12 @@ impl Attestor {
             }
             _ => {
                 let fresh = StaticSecret::random_from_rng(OsRng);
-                persist_key(key_file, fresh.as_bytes()).await?;
+                if let Err(e) = persist_key(key_file, fresh.as_bytes()).await {
+                    eprintln!(
+                        "noise-gw: persist {} failed ({e}); continuing with in-memory key",
+                        key_file.display()
+                    );
+                }
                 fresh
             }
         };
@@ -68,7 +76,7 @@ impl Attestor {
     }
 }
 
-pub(crate) fn routes() -> Router<crate::State> {
+pub(crate) fn routes() -> Router<super::State> {
     Router::new().route("/attest", get(attest))
 }
 
@@ -78,7 +86,7 @@ struct AttestResponse {
     pubkey_hex: String,
 }
 
-async fn attest(State(s): State<crate::State>) -> Json<AttestResponse> {
+async fn attest(State(s): State<super::State>) -> Json<AttestResponse> {
     Json(AttestResponse {
         quote_b64: B64.encode(s.attest.quote()),
         pubkey_hex: hex::encode(s.attest.public_key()),
@@ -112,10 +120,10 @@ fn tdx_quote(pubkey: &[u8; 32]) -> anyhow::Result<Vec<u8>> {
         Ok(q) => Ok(q),
         Err(e) => {
             eprintln!(
-                "ee-proxy: configfs-tsm unavailable ({e}); using placeholder quote. \
+                "noise-gw: configfs-tsm unavailable ({e}); using placeholder quote. \
                  Clients will fail ITA verification — this is expected off-enclave."
             );
-            Ok(b"ee-proxy-placeholder-quote".to_vec())
+            Ok(b"noise-gw-placeholder-quote".to_vec())
         }
     }
 }
@@ -125,9 +133,6 @@ fn try_configfs_tsm_quote(pubkey: &[u8; 32]) -> anyhow::Result<Vec<u8>> {
     use std::fs;
     use std::io::Write;
 
-    // Probe the tsm report mount before touching anything; on non-TDX
-    // hosts (CI runners, laptops) this path doesn't exist and we
-    // short-circuit to the placeholder.
     let base = std::path::Path::new("/sys/kernel/config/tsm/report");
     if !base.exists() {
         anyhow::bail!("{} not present", base.display());
@@ -136,7 +141,7 @@ fn try_configfs_tsm_quote(pubkey: &[u8; 32]) -> anyhow::Result<Vec<u8>> {
     let mut report_data = [0u8; 64];
     report_data[..32].copy_from_slice(pubkey);
 
-    let dir = base.join("ee-proxy");
+    let dir = base.join("devopsdefender");
     fs::create_dir_all(&dir)?;
     {
         let mut inblob = fs::OpenOptions::new()
@@ -164,7 +169,6 @@ mod tests {
         let kf = dir.path().join("noise.key");
         let a = Attestor::load_or_mint(&kf).await.unwrap();
         let pk = *a.public_key();
-        // Second load should yield the same pubkey.
         let b = Attestor::load_or_mint(&kf).await.unwrap();
         assert_eq!(&pk, b.public_key());
     }

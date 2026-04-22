@@ -82,19 +82,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # GCP auth configured on every deploy. target=gcp creates a GCE
-      # instance; target=ssh still needs to be able to reap any GCE
-      # instance left behind by a prior gcp-target deploy (see the
-      # STONITH step below) — so the gate lives in the step that uses
-      # the auth, not the auth setup itself. Callers are expected to
-      # always pass `workload_identity_provider` + `service_account`;
-      # release.yml does this unconditionally for both staging and
-      # production environments.
+      # GCP auth only on target=gcp. We used to configure it
+      # unconditionally so ssh-target deploys could reap GCE orphans
+      # from a prior gcp-target deploy, but the resulting ~20s
+      # overhead per deploy outweighed the benefit — the orphan path
+      # is only reachable during a one-time target=gcp→ssh
+      # transition, and `.github/workflows/force-cleanup-tunnels.yml`
+      # (and GCP's own console) are better homes for that cleanup.
       - uses: google-github-actions/auth@v2
+        if: inputs.target == 'gcp'
         with:
           workload_identity_provider: ${{ inputs.workload_identity_provider }}
           service_account: ${{ inputs.service_account }}
       - uses: google-github-actions/setup-gcloud@v2
+        if: inputs.target == 'gcp'
 
       - name: Relaunch SSH CP VM (target=ssh)
         if: inputs.target == 'ssh'
@@ -271,15 +272,15 @@ jobs:
         env:
           AGENT_URL: https://${{ inputs.hostname }}
         run: |
-          # /cp/attest is CF-Access-bypassed: the response is an
-          # Intel-signed TDX quote, so the content is self-authenticating
-          # and needs no transport auth. MRTD = 48 bytes at offset 184
-          # in TDX quote v4; non-zero means attestation worked.
-          NONCE=$(openssl rand -base64 16)
+          # /attest is CF-Access-bypassed and served by the in-process
+          # Noise gateway. The response is `{ quote_b64, pubkey_hex }`
+          # where `quote_b64` is an Intel-signed TDX quote whose
+          # `report_data` (first 32 bytes) equals the raw Noise static
+          # pubkey. MRTD = 48 bytes at offset 184 in TDX quote v4;
+          # non-zero means attestation worked.
           for attempt in $(seq 1 60); do
-            BODY=$(curl -sG -w '\n%{http_code}' \
-              --data-urlencode "nonce=${NONCE}" \
-              "${AGENT_URL}/cp/attest" || echo $'\n000')
+            BODY=$(curl -s -w '\n%{http_code}' \
+              "${AGENT_URL}/attest" || echo $'\n000')
             CODE=$(echo "$BODY" | tail -n1)
             JSON=$(echo "$BODY" | sed '$d')
             if [ "$CODE" = "200" ]; then
@@ -288,19 +289,20 @@ jobs:
                 MRTD=$(echo "$QUOTE_B64" | base64 -d \
                   | dd bs=1 skip=184 count=48 status=none | xxd -p -c 48)
                 if [ -n "$MRTD" ] && [ "$MRTD" != "$(printf '00%.0s' {1..48})" ]; then
-                  echo "NEW VM verified — MRTD: $MRTD"
+                  PUBKEY=$(echo "$JSON" | jq -r '.pubkey_hex // empty')
+                  echo "NEW VM verified — MRTD: $MRTD, noise_pubkey: $PUBKEY"
                   exit 0
                 fi
-                echo "  /cp/attest 200 but MRTD empty/zero, retrying... (${attempt}/60)"
+                echo "  /attest 200 but MRTD empty/zero, retrying... (${attempt}/60)"
               else
-                echo "  /cp/attest 200 but no quote_b64, retrying... (${attempt}/60)"
+                echo "  /attest 200 but no quote_b64, retrying... (${attempt}/60)"
               fi
             else
-              echo "  /cp/attest returned HTTP ${CODE}, retrying... (${attempt}/60)"
+              echo "  /attest returned HTTP ${CODE}, retrying... (${attempt}/60)"
             fi
             sleep 10
           done
-          echo "::error::/cp/attest never returned a valid quote — stale tunnel or new VM never came up"
+          echo "::error::/attest never returned a valid quote — stale tunnel or new VM never came up"
           exit 1
 
       - name: Verify dashboard is fronted by CF Access
@@ -442,64 +444,43 @@ jobs:
       # keeps the slowest + flakiest verify (24×5s loop + fallback
       # force-delete) behind the user-facing outputs (PR comment,
       # relaunched local agent).
+      #
+      # target=ssh skips this step entirely — the CP runs on tdx2
+      # libvirt, there's no GCE instance to verify. Orphans from a
+      # historical gcp-target deploy are cleaned up via the separate
+      # `force-cleanup-tunnels.yml` workflow.
       - name: Verify STONITH halted prior VM(s) in this env
+        if: inputs.target == 'gcp'
         env:
           GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
         run: |
-          if [ "${{ inputs.target }}" = "gcp" ]; then
-            # dd-register STONITHs the old VM on startup by deleting its
-            # CF tunnel → old cloudflared exits → old dd-register poweroffs.
-            # Scoped to this env — per-PR previews are hostname-isolated,
-            # so this only reaps prior deploys of the same env.
-            NEW_VM=$(gcloud compute instances list \
+          # dd-register STONITHs the old VM on startup by deleting its
+          # CF tunnel → old cloudflared exits → old dd-register poweroffs.
+          # Scoped to this env — per-PR previews are hostname-isolated,
+          # so this only reaps prior deploys of the same env.
+          NEW_VM=$(gcloud compute instances list \
+            --project="$GCP_PROJECT_ID" \
+            --filter="labels.devopsdefender=managed AND labels.dd_env=${DD_ENV}" \
+            --format="value(name)" --sort-by=~creationTimestamp | head -1)
+          echo "new VM: $NEW_VM"
+          SURVIVORS=""
+          for i in $(seq 1 24); do
+            SURVIVORS=$(gcloud compute instances list \
               --project="$GCP_PROJECT_ID" \
-              --filter="labels.devopsdefender=managed AND labels.dd_env=${DD_ENV}" \
-              --format="value(name)" --sort-by=~creationTimestamp | head -1)
-            echo "new VM: $NEW_VM"
-            SURVIVORS=""
-            for i in $(seq 1 24); do
-              SURVIVORS=$(gcloud compute instances list \
-                --project="$GCP_PROJECT_ID" \
-                --filter="labels.devopsdefender=managed AND labels.dd_env=${DD_ENV} AND status=RUNNING" \
-                --format="value(name)" \
-                | grep -vx "$NEW_VM" || true)
-              if [ -z "$SURVIVORS" ]; then
-                echo "STONITH verified — only $NEW_VM running in ${DD_ENV}"
-                exit 0
-              fi
-              echo "  still running besides $NEW_VM: $(echo "$SURVIVORS" | tr '\n' ' ')"
-              echo "  waiting for STONITH poweroff... (${i}/24)"
-              sleep 5
-            done
-            echo "::warning::STONITH-by-tunnel-delete timed out; force-deleting zombies:"
-            echo "$SURVIVORS"
-            # shellcheck disable=SC2086
-            gcloud compute instances delete $SURVIVORS \
-              --project="$GCP_PROJECT_ID" --zone="$GCP_ZONE" --quiet || true
-            echo "zombies reaped; $NEW_VM is the only ${DD_ENV} VM"
-          else
-            # target=ssh: the CP runs on tdx2 baremetal (libvirt), so no
-            # GCE instance should exist under these labels. Anything we
-            # find is an orphan from a prior gcp-target deploy — reap it.
-            # Includes TERMINATED instances: the attached disk still bills.
-            # Global list (no --zone filter) so orphans in unexpected
-            # zones are caught; per-instance delete uses the listed zone.
-            ORPHANS=$(gcloud compute instances list \
-              --project="$GCP_PROJECT_ID" \
-              --filter="labels.devopsdefender=managed AND labels.dd_env=${DD_ENV}" \
-              --format="value(name,zone)")
-            if [ -z "$ORPHANS" ]; then
-              echo "no GCE instances to reap for ${DD_ENV} (target=ssh)"
+              --filter="labels.devopsdefender=managed AND labels.dd_env=${DD_ENV} AND status=RUNNING" \
+              --format="value(name)" \
+              | grep -vx "$NEW_VM" || true)
+            if [ -z "$SURVIVORS" ]; then
+              echo "STONITH verified — only $NEW_VM running in ${DD_ENV}"
               exit 0
             fi
-            echo "::warning::target=ssh but GCE orphans remain from a prior gcp deploy; reaping:"
-            echo "$ORPHANS"
-            echo "$ORPHANS" | while read -r name zone; do
-              [ -n "$name" ] || continue
-              # zone column is a full URL; strip to the basename.
-              zone="${zone##*/}"
-              gcloud compute instances delete "$name" \
-                --project="$GCP_PROJECT_ID" --zone="$zone" --quiet || true
-            done
-            echo "orphan reap complete for ${DD_ENV}"
-          fi
+            echo "  still running besides $NEW_VM: $(echo "$SURVIVORS" | tr '\n' ' ')"
+            echo "  waiting for STONITH poweroff... (${i}/24)"
+            sleep 5
+          done
+          echo "::warning::STONITH-by-tunnel-delete timed out; force-deleting zombies:"
+          echo "$SURVIVORS"
+          # shellcheck disable=SC2086
+          gcloud compute instances delete $SURVIVORS \
+            --project="$GCP_PROJECT_ID" --zone="$GCP_ZONE" --quiet || true
+          echo "zombies reaped; $NEW_VM is the only ${DD_ENV} VM"

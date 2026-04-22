@@ -130,11 +130,9 @@ pub struct Cp {
     /// Source-of-truth file for the device registry (JSON). Survives
     /// CP restart; mutations fsync through to disk.
     pub devices_path: std::path::PathBuf,
-    /// Runtime view written on every mutation so the locally-running
-    /// ee-proxy workload can consume it without an HTTP hop. Fixed to
-    /// ee-proxy's default (`/run/ee-proxy/trusted-devices.json`) but
-    /// overridable for tests.
-    pub runtime_trust_path: std::path::PathBuf,
+    /// Where the Noise gateway persists its X25519 static private key
+    /// (tmpfs). Fresh per-boot when missing.
+    pub noise_key_path: std::path::PathBuf,
 }
 
 impl Cp {
@@ -151,8 +149,8 @@ impl Cp {
         let devices_path = std::env::var("DD_CP_DEVICES_PATH")
             .unwrap_or_else(|_| "/var/lib/devopsdefender/devices.json".into())
             .into();
-        let runtime_trust_path = std::env::var("DD_CP_RUNTIME_TRUST_PATH")
-            .unwrap_or_else(|_| crate::devices::RUNTIME_TRUST_PATH.into())
+        let noise_key_path = std::env::var("DD_NOISE_KEY_PATH")
+            .unwrap_or_else(|_| "/run/devopsdefender/noise.key".into())
             .into();
         Ok(Self {
             common,
@@ -162,7 +160,7 @@ impl Cp {
             scrape_interval_secs,
             ita: Ita::from_env()?,
             devices_path,
-            runtime_trust_path,
+            noise_key_path,
         })
     }
 }

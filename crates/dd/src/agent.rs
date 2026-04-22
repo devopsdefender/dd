@@ -36,6 +36,7 @@ use crate::gh_oidc;
 use crate::html::{self, shell};
 use crate::ita;
 use crate::metrics;
+use crate::noise_gateway;
 
 /// Re-mint interval. Intel ITA tokens typically expire in a few
 /// minutes; refresh well before so `/health` always serves a live
@@ -114,24 +115,50 @@ pub async fn run() -> Result<()> {
         });
     }
 
-    // Background poll for the device trust list. Writes
-    // `/run/ee-proxy/trusted-devices.json` on every refresh so the
-    // locally-running ee-proxy can consume the current set without an
-    // HTTP hop. Revocations propagate within ~DEVICES_POLL.
+    // Noise gateway runs in-process too: this agent serves `/attest`
+    // + `/noise/ws` on the same port 8080 as everything else, so
+    // bastion-app CLIs can attach directly to the agent's EE
+    // instance without going through the CP.
+    let trust = noise_gateway::new_trust_handle();
+
+    // Background poll for the device trust list. Mutates `trust`
+    // in place so the local Noise responder picks up revocations
+    // within ~DEVICES_POLL.
     {
         let cp_url = cfg.cp_url.clone();
         let token = ita_token.clone();
+        let trust = trust.clone();
         tokio::spawn(async move {
             let http = reqwest::Client::new();
-            let out_path: std::path::PathBuf = crate::devices::RUNTIME_TRUST_PATH.into();
             loop {
-                if let Err(e) = sync_trusted_devices(&http, &cp_url, &token, &out_path).await {
+                if let Err(e) = sync_trusted_devices(&http, &cp_url, &token, &trust).await {
                     eprintln!("agent: device sync failed: {e}");
                 }
                 tokio::time::sleep(DEVICES_POLL).await;
             }
         });
     }
+
+    // Attestation keypair + upstream EE client for the Noise gateway.
+    let noise_key_path: std::path::PathBuf = std::env::var("DD_NOISE_KEY_PATH")
+        .unwrap_or_else(|_| "/run/devopsdefender/noise.key".into())
+        .into();
+    let attestor = Arc::new(
+        noise_gateway::attest::Attestor::load_or_mint(&noise_key_path)
+            .await
+            .map_err(|e| Error::Internal(format!("noise keypair: {e}")))?,
+    );
+    eprintln!("agent: noise_pubkey={}", hex::encode(attestor.public_key()));
+    let ee_token = std::env::var("EE_TOKEN").ok();
+    let upstream = Arc::new(noise_gateway::upstream::EeAgent::new(
+        std::path::PathBuf::from(noise_gateway::upstream::DEFAULT_EE_AGENT_SOCK),
+        ee_token,
+    ));
+    let ng_state = noise_gateway::State {
+        attest: attestor,
+        trust,
+        upstream,
+    };
 
     let gh = gh_oidc::Verifier::new(cfg.common.owner.clone(), "dd-agent".into());
 
@@ -153,9 +180,9 @@ pub async fn run() -> Result<()> {
         .route("/deploy", post(deploy))
         .route("/exec", post(exec))
         .route("/logs/{app}", get(logs))
-        .route("/api/agents", get(api_agents_proxy))
         .fallback(log_unmatched)
-        .with_state(state);
+        .with_state(state)
+        .merge(noise_gateway::router(ng_state));
 
     let addr = format!("0.0.0.0:{}", cfg.common.port);
     eprintln!("agent: listening on {addr}");
@@ -168,21 +195,20 @@ pub async fn run() -> Result<()> {
     .map_err(|e| Error::Internal(e.to_string()))
 }
 
-/// Pull the CP's device registry and write a minimal
-/// `{"pubkeys": [...]}` view — only non-revoked pubkeys — to
-/// `out_path` atomically. `ee-proxy` re-reads this file every
-/// ~10s so revocations take effect without restart.
+/// Pull the CP's device registry (`{"pubkeys": ["<hex>", ...]}`) and
+/// atomically replace the local `TrustHandle`. The local Noise
+/// responder reads this set directly; revocations propagate within
+/// one `DEVICES_POLL` tick.
 async fn sync_trusted_devices(
     http: &reqwest::Client,
     cp_url: &str,
     ita_token: &Arc<RwLock<String>>,
-    out_path: &std::path::Path,
+    trust: &noise_gateway::TrustHandle,
 ) -> Result<()> {
     // `/api/v1/devices/trusted` is CF-Access-bypassed (see
     // `cf::provision_cp_access`) so cross-VM agents can reach it over
     // the public tunnel. Auth is in-code: loopback / GH-OIDC / ITA,
-    // same three-way policy as `/api/agents`. The agent presents its
-    // fresh ITA token as a Bearer.
+    // same three-way policy as `/api/agents`.
     let url = format!("{}/api/v1/devices/trusted", cp_url.trim_end_matches('/'));
     let token = ita_token.read().await.clone();
     let resp = http
@@ -197,16 +223,21 @@ async fn sync_trusted_devices(
             resp.status()
         )));
     }
-    // The response shape already matches what ee-proxy's `--trust-file`
-    // parses — `{ "pubkeys": ["<hex>", ...] }`. Re-serialize compact.
     let body: serde_json::Value = resp.json().await?;
-    let bytes = serde_json::to_vec(&body)?;
-    if let Some(parent) = out_path.parent() {
-        tokio::fs::create_dir_all(parent).await.ok();
+    let mut fresh: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
+    if let Some(arr) = body["pubkeys"].as_array() {
+        for v in arr {
+            let Some(s) = v.as_str() else { continue };
+            let Ok(bytes) = hex::decode(s) else { continue };
+            if bytes.len() != 32 {
+                continue;
+            }
+            let mut k = [0u8; 32];
+            k.copy_from_slice(&bytes);
+            fresh.insert(k);
+        }
     }
-    let tmp = out_path.with_extension("json.tmp");
-    tokio::fs::write(&tmp, &bytes).await?;
-    tokio::fs::rename(&tmp, out_path).await?;
+    *trust.write().await = fresh;
     Ok(())
 }
 
@@ -215,12 +246,13 @@ struct Bootstrap {
     tunnel_token: String,
     hostname: String,
     agent_id: String,
-    #[allow(dead_code)]
-    cp_hostname: String,
 }
 
 async fn register(cfg: &Cfg, ita_token: &str) -> Result<Bootstrap> {
-    let http = reqwest::Client::new();
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(60))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
     let url = format!("{}/register", cfg.cp_url.trim_end_matches('/'));
     let extra_ingress: Vec<serde_json::Value> = cfg
         .extra_ingress
@@ -229,24 +261,47 @@ async fn register(cfg: &Cfg, ita_token: &str) -> Result<Bootstrap> {
         .collect();
     let body = serde_json::json!({
         "vm_name": cfg.common.vm_name,
-        "env_label": cfg.common.env_label,
-        "owner": cfg.common.owner,
         "ita_token": ita_token,
         "extra_ingress": extra_ingress,
     });
+
     // /register is CF-Access-bypassed; ITA attestation is the gate.
-    let resp = http
-        .post(&url)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| Error::Upstream(format!("register {url}: {e}")))?;
-    if !resp.status().is_success() {
-        let s = resp.status();
-        let b = resp.text().await.unwrap_or_default();
-        return Err(Error::Upstream(format!("register {url} → {s}: {b}")));
+    // The transport layer is retried — the agent VM often boots
+    // faster than CF edge propagation for a just-flipped CP CNAME
+    // or a just-reconnected cloudflared tunnel, and the first POST
+    // tends to fail with "error sending request" / 502 / 530.
+    // Exponential-ish backoff, ~90s total.
+    let mut last_err: Option<Error> = None;
+    for attempt in 1..=6u32 {
+        match http.post(&url).json(&body).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                return Ok(resp.json().await?);
+            }
+            Ok(resp) => {
+                let s = resp.status();
+                // 4xx from the CP is almost always a real config
+                // error (ITA invalid, etc.) — no point retrying.
+                if s.is_client_error() && s != reqwest::StatusCode::TOO_MANY_REQUESTS {
+                    let b = resp.text().await.unwrap_or_default();
+                    return Err(Error::Upstream(format!("register {url} → {s}: {b}")));
+                }
+                let b = resp.text().await.unwrap_or_default();
+                last_err = Some(Error::Upstream(format!("register {url} → {s}: {b}")));
+            }
+            Err(e) => {
+                // Print `{:?}` so the reqwest error chain (TLS,
+                // DNS, connect details) lands in the agent log
+                // instead of just the wrapper message.
+                last_err = Some(Error::Upstream(format!("register {url}: {e:?}")));
+            }
+        }
+        eprintln!(
+            "agent: register attempt {attempt}/6 failed ({}) — backing off",
+            last_err.as_ref().map(|e| e.to_string()).unwrap_or_default()
+        );
+        tokio::time::sleep(Duration::from_secs(5 * attempt as u64)).await;
     }
-    Ok(resp.json().await?)
+    Err(last_err.unwrap_or_else(|| Error::Upstream("register: exhausted retries".into())))
 }
 
 /// Mint an Intel-signed TDX attestation JWT. Fatal on any failure —
@@ -647,38 +702,6 @@ async fn logs(
         .map(String::from)
         .ok_or(Error::NotFound)?;
     Ok(Json(s.ee.logs(&id).await?))
-}
-
-/// GET /api/agents — loopback-only proxy to the CP's same-named
-/// endpoint. Uses this agent's own ITA token as the Bearer, so the
-/// CP's ITA verifier accepts the call without needing a GH OIDC
-/// JWT or service token. Bastion on this VM calls
-/// `http://localhost:8080/api/agents` to get the fleet catalog
-/// without having to cross-origin to the CP's public hostname.
-async fn api_agents_proxy(
-    State(s): State<St>,
-    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
-) -> Result<Json<serde_json::Value>> {
-    if !peer.ip().is_loopback() {
-        return Err(Error::Unauthorized);
-    }
-    let token = s.ita_token.read().await.clone();
-    let url = format!("{}/api/agents", s.cfg.cp_url.trim_end_matches('/'));
-    let resp = reqwest::Client::new()
-        .get(&url)
-        .bearer_auth(&token)
-        .timeout(std::time::Duration::from_secs(3))
-        .send()
-        .await
-        .map_err(|e| Error::Upstream(format!("cp /api/agents: {e}")))?;
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        return Err(Error::Upstream(format!(
-            "cp /api/agents → {status}: {body}"
-        )));
-    }
-    Ok(Json(resp.json().await?))
 }
 
 async fn exec(

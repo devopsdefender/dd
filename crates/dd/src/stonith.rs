@@ -64,8 +64,20 @@ pub async fn kill_old_tunnels(http: &Client, cf: &CfCreds, self_tunnel_id: &str,
     }
 }
 
-/// Background watchdog — runs until the VM powers off.
-pub async fn self_watchdog(cf: CfCreds, self_tunnel_id: String) -> ! {
+/// How long we give in-flight requests to finish after the tunnel is
+/// confirmed deleted before forcing a poweroff. Buys time for streaming
+/// Noise sessions + long polls on the old CP to drain cleanly.
+const GRACEFUL_DRAIN: Duration = Duration::from_secs(30);
+
+/// Background watchdog — runs until the VM powers off. When the
+/// tunnel goes away (new CP took over), fires `shutdown` to let axum
+/// drain in-flight requests, waits up to `GRACEFUL_DRAIN`, then
+/// powers off.
+pub async fn self_watchdog(
+    cf: CfCreds,
+    self_tunnel_id: String,
+    shutdown: tokio::sync::broadcast::Sender<()>,
+) -> ! {
     let http = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()
@@ -87,7 +99,17 @@ pub async fn self_watchdog(cf: CfCreds, self_tunnel_id: String) -> ! {
                 gone += 1;
                 eprintln!("stonith: watchdog: tunnel gone ({gone}/{CONSECUTIVE_GONE})");
                 if gone >= CONSECUTIVE_GONE {
-                    eprintln!("stonith: poweroff — tunnel {self_tunnel_id} confirmed deleted");
+                    eprintln!(
+                        "stonith: tunnel {self_tunnel_id} confirmed deleted — draining ({}s) before poweroff",
+                        GRACEFUL_DRAIN.as_secs()
+                    );
+                    // Signal axum::serve(..).with_graceful_shutdown(..)
+                    // to stop accepting new connections and let the
+                    // live ones finish. `send` can only fail if every
+                    // subscriber has been dropped, which is fine
+                    // (nothing to drain anyway).
+                    let _ = shutdown.send(());
+                    tokio::time::sleep(GRACEFUL_DRAIN).await;
                     poweroff();
                 }
             }

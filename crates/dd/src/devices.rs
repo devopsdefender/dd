@@ -2,10 +2,10 @@
 //!
 //! Holds the X25519 pubkeys of paired client devices. Source of truth
 //! lives on the CP's disk at [`Store::path`] (JSON, pretty-printed for
-//! human editability in a pinch). A runtime view at
-//! [`RUNTIME_TRUST_PATH`] (tmpfs) is re-written on every mutation so
-//! the locally-running `ee-proxy` workload picks up the current
-//! allowlist without an HTTP round-trip.
+//! human editability in a pinch). The live set of *non-revoked*
+//! pubkeys is also mirrored into a [`noise_gateway::TrustHandle`] so
+//! the locally-running Noise gateway can read it directly from shared
+//! memory — no on-disk runtime view, no cross-process file contract.
 //!
 //! Wire format on disk:
 //! ```json
@@ -16,22 +16,15 @@
 //!   ]
 //! }
 //! ```
-//!
-//! Runtime (ee-proxy) view — only non-revoked pubkeys:
-//! ```json
-//! { "pubkeys": ["<64-hex>", "<64-hex>"] }
-//! ```
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
-/// Where the local `ee-proxy` workload expects to read its trust
-/// list. Must match `ee-proxy`'s `--trust-file` default.
-pub const RUNTIME_TRUST_PATH: &str = "/run/ee-proxy/trusted-devices.json";
+use crate::noise_gateway::TrustHandle;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Device {
@@ -48,22 +41,17 @@ struct OnDisk {
     devices: Vec<Device>,
 }
 
-#[derive(Serialize)]
-struct RuntimeView<'a> {
-    pubkeys: Vec<&'a str>,
-}
-
 pub struct Store {
     path: PathBuf,
-    runtime_path: PathBuf,
     inner: RwLock<BTreeMap<String, Device>>,
+    trust: TrustHandle,
 }
 
 impl Store {
     /// Load the source-of-truth file (missing is fine — starts empty)
-    /// and emit the runtime view so the local ee-proxy sees the
-    /// current set immediately after CP boot.
-    pub async fn load(path: PathBuf, runtime_path: PathBuf) -> anyhow::Result<Arc<Self>> {
+    /// and seed the shared `TrustHandle` with the current non-revoked
+    /// set. Every mutation after this recomputes the handle in place.
+    pub async fn load(path: PathBuf, trust: TrustHandle) -> anyhow::Result<Arc<Self>> {
         let devices = match tokio::fs::read(&path).await {
             Ok(bytes) => {
                 let parsed: OnDisk = serde_json::from_slice(&bytes)?;
@@ -75,10 +63,10 @@ impl Store {
         let map: BTreeMap<_, _> = devices.into_iter().map(|d| (d.pubkey.clone(), d)).collect();
         let store = Arc::new(Self {
             path,
-            runtime_path,
             inner: RwLock::new(map),
+            trust,
         });
-        store.flush_runtime().await?;
+        store.sync_trust_handle().await;
         Ok(store)
     }
 
@@ -92,7 +80,7 @@ impl Store {
             w.insert(device.pubkey.clone(), device);
         }
         self.flush_source().await?;
-        self.flush_runtime().await?;
+        self.sync_trust_handle().await;
         Ok(())
     }
 
@@ -111,9 +99,32 @@ impl Store {
         };
         if ok {
             self.flush_source().await?;
-            self.flush_runtime().await?;
+            self.sync_trust_handle().await;
         }
         Ok(ok)
+    }
+
+    /// Full snapshot — including revoked records — for `/api/v1/admin/export`.
+    pub async fn export_full(&self) -> Vec<Device> {
+        self.list().await
+    }
+
+    /// Merge a batch of device records into the store. Each pubkey
+    /// overwrites any existing record (later `revoked_at_ms` wins via
+    /// plain overwrite since callers always hand us the latest).
+    /// Persists to disk + refreshes the trust handle.
+    pub async fn import_merge(&self, devices: Vec<Device>) -> anyhow::Result<usize> {
+        let mut n = 0;
+        {
+            let mut w = self.inner.write().await;
+            for d in devices {
+                w.insert(d.pubkey.clone(), d);
+                n += 1;
+            }
+        }
+        self.flush_source().await?;
+        self.sync_trust_handle().await;
+        Ok(n)
     }
 
     async fn flush_source(&self) -> anyhow::Result<()> {
@@ -123,16 +134,22 @@ impl Store {
         atomic_write(&self.path, &bytes).await
     }
 
-    async fn flush_runtime(&self) -> anyhow::Result<()> {
+    async fn sync_trust_handle(&self) {
         let guard = self.inner.read().await;
-        let pubkeys: Vec<&str> = guard
-            .values()
-            .filter(|d| d.revoked_at_ms.is_none())
-            .map(|d| d.pubkey.as_str())
-            .collect();
-        let view = RuntimeView { pubkeys };
-        let bytes = serde_json::to_vec(&view)?;
-        atomic_write(&self.runtime_path, &bytes).await
+        let mut fresh: HashSet<[u8; 32]> = HashSet::with_capacity(guard.len());
+        for d in guard.values() {
+            if d.revoked_at_ms.is_some() {
+                continue;
+            }
+            if let Ok(bytes) = hex::decode(&d.pubkey) {
+                if bytes.len() == 32 {
+                    let mut k = [0u8; 32];
+                    k.copy_from_slice(&bytes);
+                    fresh.insert(k);
+                }
+            }
+        }
+        *self.trust.write().await = fresh;
     }
 }
 
@@ -162,6 +179,7 @@ pub fn validate_hex_pubkey(s: &str) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::noise_gateway;
 
     fn mk_dev(pk: &str, label: &str) -> Device {
         Device {
@@ -172,78 +190,101 @@ mod tests {
         }
     }
 
+    fn pk_bytes(hex_str: &str) -> [u8; 32] {
+        let v = hex::decode(hex_str).unwrap();
+        let mut k = [0u8; 32];
+        k.copy_from_slice(&v);
+        k
+    }
+
     #[tokio::test]
-    async fn upsert_persists_and_exports_runtime() {
+    async fn upsert_persists_and_mirrors_trust_handle() {
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("devices.json");
-        let run = dir.path().join("runtime/trusted.json");
-        let store = Store::load(src.clone(), run.clone()).await.unwrap();
+        let trust = noise_gateway::new_trust_handle();
+        let store = Store::load(src.clone(), trust.clone()).await.unwrap();
 
         let pk1 = "a".repeat(64);
         let pk2 = "b".repeat(64);
         store.upsert(mk_dev(&pk1, "laptop")).await.unwrap();
         store.upsert(mk_dev(&pk2, "phone")).await.unwrap();
 
-        // Source of truth has both.
-        let src_bytes = tokio::fs::read(&src).await.unwrap();
-        let src_val: serde_json::Value = serde_json::from_slice(&src_bytes).unwrap();
+        // Source has both records.
+        let src_val: serde_json::Value =
+            serde_json::from_slice(&tokio::fs::read(&src).await.unwrap()).unwrap();
         assert_eq!(src_val["devices"].as_array().unwrap().len(), 2);
 
-        // Runtime view has both pubkeys, no metadata.
-        let run_bytes = tokio::fs::read(&run).await.unwrap();
-        let run_val: serde_json::Value = serde_json::from_slice(&run_bytes).unwrap();
-        let runtime_keys: Vec<_> = run_val["pubkeys"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|v| v.as_str().unwrap().to_string())
-            .collect();
-        assert!(runtime_keys.contains(&pk1));
-        assert!(runtime_keys.contains(&pk2));
+        // Trust handle reflects both pubkeys.
+        let live = trust.read().await;
+        assert!(live.contains(&pk_bytes(&pk1)));
+        assert!(live.contains(&pk_bytes(&pk2)));
+        assert_eq!(live.len(), 2);
     }
 
     #[tokio::test]
-    async fn revoke_drops_from_runtime_but_keeps_source() {
+    async fn revoke_drops_from_trust_handle_but_keeps_source() {
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("devices.json");
-        let run = dir.path().join("trusted.json");
-        let store = Store::load(src.clone(), run.clone()).await.unwrap();
+        let trust = noise_gateway::new_trust_handle();
+        let store = Store::load(src.clone(), trust.clone()).await.unwrap();
 
         let pk = "c".repeat(64);
         store.upsert(mk_dev(&pk, "laptop")).await.unwrap();
-        let ok = store.revoke(&pk, 99).await.unwrap();
-        assert!(ok);
-
-        // Revoking again is a no-op.
+        assert!(store.revoke(&pk, 99).await.unwrap());
         assert!(!store.revoke(&pk, 100).await.unwrap());
 
-        // Source file still has the record with a revoked_at_ms stamp.
-        let src_bytes = tokio::fs::read(&src).await.unwrap();
-        let src_val: serde_json::Value = serde_json::from_slice(&src_bytes).unwrap();
-        let d = &src_val["devices"][0];
-        assert_eq!(d["pubkey"].as_str().unwrap(), pk);
-        assert_eq!(d["revoked_at_ms"].as_i64(), Some(99));
+        let src_val: serde_json::Value =
+            serde_json::from_slice(&tokio::fs::read(&src).await.unwrap()).unwrap();
+        assert_eq!(src_val["devices"][0]["revoked_at_ms"].as_i64(), Some(99));
 
-        // Runtime view no longer lists it.
-        let run_bytes = tokio::fs::read(&run).await.unwrap();
-        let run_val: serde_json::Value = serde_json::from_slice(&run_bytes).unwrap();
-        assert!(run_val["pubkeys"].as_array().unwrap().is_empty());
+        assert!(trust.read().await.is_empty());
     }
 
     #[tokio::test]
     async fn load_persists_across_instances() {
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("devices.json");
-        let run = dir.path().join("trusted.json");
         let pk = "e".repeat(64);
         {
-            let s = Store::load(src.clone(), run.clone()).await.unwrap();
+            let trust = noise_gateway::new_trust_handle();
+            let s = Store::load(src.clone(), trust).await.unwrap();
             s.upsert(mk_dev(&pk, "desktop")).await.unwrap();
         }
-        let s2 = Store::load(src.clone(), run.clone()).await.unwrap();
+        let trust2 = noise_gateway::new_trust_handle();
+        let s2 = Store::load(src.clone(), trust2.clone()).await.unwrap();
         let list = s2.list().await;
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].pubkey, pk);
+        assert!(trust2.read().await.contains(&pk_bytes(&pk)));
+    }
+
+    #[tokio::test]
+    async fn import_merge_roundtrips_with_export() {
+        let dir = tempfile::tempdir().unwrap();
+        let src_a = dir.path().join("a.json");
+        let src_b = dir.path().join("b.json");
+        let trust_a = noise_gateway::new_trust_handle();
+        let trust_b = noise_gateway::new_trust_handle();
+        let a = Store::load(src_a, trust_a).await.unwrap();
+        let b = Store::load(src_b, trust_b.clone()).await.unwrap();
+
+        let pk_live = "1".repeat(64);
+        let pk_revoked = "2".repeat(64);
+        a.upsert(mk_dev(&pk_live, "live")).await.unwrap();
+        a.upsert(mk_dev(&pk_revoked, "gone")).await.unwrap();
+        a.revoke(&pk_revoked, 42).await.unwrap();
+
+        let exported = a.export_full().await;
+        let merged = b.import_merge(exported).await.unwrap();
+        assert_eq!(merged, 2);
+
+        let list_b = b.list().await;
+        assert_eq!(list_b.len(), 2);
+        // Only the non-revoked pubkey is in B's trust handle.
+        let trust = trust_b.read().await;
+        assert_eq!(trust.len(), 1);
+        assert!(trust.contains(&pk_bytes(&pk_live)));
+        assert!(!trust.contains(&pk_bytes(&pk_revoked)));
     }
 
     #[test]

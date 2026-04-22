@@ -140,8 +140,6 @@ build_config_iso() {
     bake "$REPO_ROOT/apps/podman-bootstrap/workload.json"
     bake "$REPO_ROOT/apps/cloudflared/workload.json"
     bake "$REPO_ROOT/apps/ttyd/workload.json"
-    DD_RELEASE_TAG="$DD_RELEASE_TAG" \
-      bake "$REPO_ROOT/apps/ee-proxy/workload.json.tmpl"
   })
 
   local extra_ingress

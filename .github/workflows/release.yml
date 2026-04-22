@@ -79,11 +79,6 @@ jobs:
       - name: Build static binaries
         run: |
           cargo build --release -p devopsdefender --target x86_64-unknown-linux-musl
-          cargo build --release -p ee-proxy --bin ee-proxy --target x86_64-unknown-linux-musl
-          # Rename ee-proxy → ee-proxy.x86_64 so the release asset name
-          # matches `apps/ee-proxy/workload.json.tmpl`'s `github_release.asset`.
-          cp target/x86_64-unknown-linux-musl/release/ee-proxy \
-             target/x86_64-unknown-linux-musl/release/ee-proxy.x86_64
 
       - name: Resolve release tag
         id: meta
@@ -116,13 +111,6 @@ jobs:
           subject-path: target/x86_64-unknown-linux-musl/release/devopsdefender
           subject-name: devopsdefender
 
-      - name: Attest ee-proxy binary
-        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-        uses: actions/attest-build-provenance@v2
-        with:
-          subject-path: target/x86_64-unknown-linux-musl/release/ee-proxy.x86_64
-          subject-name: ee-proxy.x86_64
-
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -130,7 +118,6 @@ jobs:
           PRERELEASE: ${{ steps.meta.outputs.prerelease }}
         run: |
           DD_BINARY=target/x86_64-unknown-linux-musl/release/devopsdefender
-          EE_PROXY_BINARY=target/x86_64-unknown-linux-musl/release/ee-proxy.x86_64
           # Rolling tags (latest, pr-*) get recreated each run. Versioned
           # v* tags are immutable.
           if [[ "$TAG" == "latest" || "$TAG" == pr-* ]]; then
@@ -139,7 +126,7 @@ jobs:
           gh release create "$TAG" $PRERELEASE \
             --title "$TAG" \
             --notes "Built from ${GITHUB_SHA}" \
-            "$DD_BINARY" "$EE_PROXY_BINARY"
+            "$DD_BINARY"
 
       - name: Rotate old PR pre-releases
         if: github.event_name == 'pull_request'
