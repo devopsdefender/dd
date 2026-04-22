@@ -82,19 +82,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # GCP auth configured on every deploy. target=gcp creates a GCE
-      # instance; target=ssh still needs to be able to reap any GCE
-      # instance left behind by a prior gcp-target deploy (see the
-      # STONITH step below) — so the gate lives in the step that uses
-      # the auth, not the auth setup itself. Callers are expected to
-      # always pass `workload_identity_provider` + `service_account`;
-      # release.yml does this unconditionally for both staging and
-      # production environments.
+      # GCP auth only on target=gcp. We used to configure it
+      # unconditionally so ssh-target deploys could reap GCE orphans
+      # from a prior gcp-target deploy, but the resulting ~20s
+      # overhead per deploy outweighed the benefit — the orphan path
+      # is only reachable during a one-time target=gcp→ssh
+      # transition, and `.github/workflows/force-cleanup-tunnels.yml`
+      # (and GCP's own console) are better homes for that cleanup.
       - uses: google-github-actions/auth@v2
+        if: inputs.target == 'gcp'
         with:
           workload_identity_provider: ${{ inputs.workload_identity_provider }}
           service_account: ${{ inputs.service_account }}
       - uses: google-github-actions/setup-gcloud@v2
+        if: inputs.target == 'gcp'
 
       - name: Relaunch SSH CP VM (target=ssh)
         if: inputs.target == 'ssh'
@@ -443,64 +444,43 @@ jobs:
       # keeps the slowest + flakiest verify (24×5s loop + fallback
       # force-delete) behind the user-facing outputs (PR comment,
       # relaunched local agent).
+      #
+      # target=ssh skips this step entirely — the CP runs on tdx2
+      # libvirt, there's no GCE instance to verify. Orphans from a
+      # historical gcp-target deploy are cleaned up via the separate
+      # `force-cleanup-tunnels.yml` workflow.
       - name: Verify STONITH halted prior VM(s) in this env
+        if: inputs.target == 'gcp'
         env:
           GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
         run: |
-          if [ "${{ inputs.target }}" = "gcp" ]; then
-            # dd-register STONITHs the old VM on startup by deleting its
-            # CF tunnel → old cloudflared exits → old dd-register poweroffs.
-            # Scoped to this env — per-PR previews are hostname-isolated,
-            # so this only reaps prior deploys of the same env.
-            NEW_VM=$(gcloud compute instances list \
+          # dd-register STONITHs the old VM on startup by deleting its
+          # CF tunnel → old cloudflared exits → old dd-register poweroffs.
+          # Scoped to this env — per-PR previews are hostname-isolated,
+          # so this only reaps prior deploys of the same env.
+          NEW_VM=$(gcloud compute instances list \
+            --project="$GCP_PROJECT_ID" \
+            --filter="labels.devopsdefender=managed AND labels.dd_env=${DD_ENV}" \
+            --format="value(name)" --sort-by=~creationTimestamp | head -1)
+          echo "new VM: $NEW_VM"
+          SURVIVORS=""
+          for i in $(seq 1 24); do
+            SURVIVORS=$(gcloud compute instances list \
               --project="$GCP_PROJECT_ID" \
-              --filter="labels.devopsdefender=managed AND labels.dd_env=${DD_ENV}" \
-              --format="value(name)" --sort-by=~creationTimestamp | head -1)
-            echo "new VM: $NEW_VM"
-            SURVIVORS=""
-            for i in $(seq 1 24); do
-              SURVIVORS=$(gcloud compute instances list \
-                --project="$GCP_PROJECT_ID" \
-                --filter="labels.devopsdefender=managed AND labels.dd_env=${DD_ENV} AND status=RUNNING" \
-                --format="value(name)" \
-                | grep -vx "$NEW_VM" || true)
-              if [ -z "$SURVIVORS" ]; then
-                echo "STONITH verified — only $NEW_VM running in ${DD_ENV}"
-                exit 0
-              fi
-              echo "  still running besides $NEW_VM: $(echo "$SURVIVORS" | tr '\n' ' ')"
-              echo "  waiting for STONITH poweroff... (${i}/24)"
-              sleep 5
-            done
-            echo "::warning::STONITH-by-tunnel-delete timed out; force-deleting zombies:"
-            echo "$SURVIVORS"
-            # shellcheck disable=SC2086
-            gcloud compute instances delete $SURVIVORS \
-              --project="$GCP_PROJECT_ID" --zone="$GCP_ZONE" --quiet || true
-            echo "zombies reaped; $NEW_VM is the only ${DD_ENV} VM"
-          else
-            # target=ssh: the CP runs on tdx2 baremetal (libvirt), so no
-            # GCE instance should exist under these labels. Anything we
-            # find is an orphan from a prior gcp-target deploy — reap it.
-            # Includes TERMINATED instances: the attached disk still bills.
-            # Global list (no --zone filter) so orphans in unexpected
-            # zones are caught; per-instance delete uses the listed zone.
-            ORPHANS=$(gcloud compute instances list \
-              --project="$GCP_PROJECT_ID" \
-              --filter="labels.devopsdefender=managed AND labels.dd_env=${DD_ENV}" \
-              --format="value(name,zone)")
-            if [ -z "$ORPHANS" ]; then
-              echo "no GCE instances to reap for ${DD_ENV} (target=ssh)"
+              --filter="labels.devopsdefender=managed AND labels.dd_env=${DD_ENV} AND status=RUNNING" \
+              --format="value(name)" \
+              | grep -vx "$NEW_VM" || true)
+            if [ -z "$SURVIVORS" ]; then
+              echo "STONITH verified — only $NEW_VM running in ${DD_ENV}"
               exit 0
             fi
-            echo "::warning::target=ssh but GCE orphans remain from a prior gcp deploy; reaping:"
-            echo "$ORPHANS"
-            echo "$ORPHANS" | while read -r name zone; do
-              [ -n "$name" ] || continue
-              # zone column is a full URL; strip to the basename.
-              zone="${zone##*/}"
-              gcloud compute instances delete "$name" \
-                --project="$GCP_PROJECT_ID" --zone="$zone" --quiet || true
-            done
-            echo "orphan reap complete for ${DD_ENV}"
-          fi
+            echo "  still running besides $NEW_VM: $(echo "$SURVIVORS" | tr '\n' ' ')"
+            echo "  waiting for STONITH poweroff... (${i}/24)"
+            sleep 5
+          done
+          echo "::warning::STONITH-by-tunnel-delete timed out; force-deleting zombies:"
+          echo "$SURVIVORS"
+          # shellcheck disable=SC2086
+          gcloud compute instances delete $SURVIVORS \
+            --project="$GCP_PROJECT_ID" --zone="$GCP_ZONE" --quiet || true
+          echo "zombies reaped; $NEW_VM is the only ${DD_ENV} VM"
