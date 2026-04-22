@@ -96,9 +96,7 @@ jobs:
           workload: apps/myapp/workload.json
 ```
 
-The agent verifies the OIDC token against GitHub's JWKS, checks `repository_owner == DD_OWNER`, and launches the workload. Full inputs/outputs in [`.github/actions/dd-deploy/README.md`](.github/actions/dd-deploy/README.md).
-
-The companion [`dd-logs`](.github/actions/dd-logs/README.md) action pulls any workload's captured stdout from the same agent (`GET /logs/{app}`) using the same OIDC auth. `dd-deploy` also uses it internally to dump `dd-agent`'s own log when a deploy times out, so CI logs show agent-side ground truth without an SSH hop.
+The agent verifies the OIDC token against GitHub's JWKS, checks `repository_owner == DD_OWNER`, and launches the workload. Full inputs/outputs in [`.github/actions/dd-deploy/README.md`](.github/actions/dd-deploy/README.md). On deploy timeout, `dd-deploy` fetches `/logs/dd-agent` over the same OIDC auth so CI logs show agent-side ground truth without an SSH hop.
 
 ## Terminal access
 

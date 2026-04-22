@@ -294,6 +294,7 @@ pub async fn run() -> Result<()> {
             axum::routing::delete(revoke_device),
         )
         .route("/api/v1/admin/export", get(export_state))
+        .route("/admin/enroll", get(enroll_page))
         .with_state(state)
         .merge(noise_gateway::router(ng_state));
 
@@ -827,6 +828,98 @@ async fn revoke_device(
         "revoked": pubkey,
         "at_ms": now,
     })))
+}
+
+/// GET /admin/enroll?pubkey=…&label=… — human-facing confirmation
+/// page that a `bastion-app` (CLI or desktop) bounces the operator
+/// to. Behind the CP's human CF Access app: by the time this
+/// handler renders, the browser has a valid CF Access session
+/// cookie. The rendered page POSTs to `/api/v1/devices` with the
+/// same cookie via `credentials: "same-origin"`, completing the
+/// enrollment that headless clients can't do themselves.
+///
+/// Intent-over-GET: we deliberately don't enroll on page load —
+/// the user clicks Confirm so a copy-pasted link can't silently
+/// add a pubkey.
+async fn enroll_page(Query(q): Query<HashMap<String, String>>) -> Response {
+    let pubkey = q.get("pubkey").cloned().unwrap_or_default();
+    let label = q.get("label").cloned().unwrap_or_default();
+
+    if let Err(e) = crate::devices::validate_hex_pubkey(&pubkey) {
+        return Html(shell(
+            "Enroll device",
+            "",
+            &format!(
+                r#"<div class="card"><h1>Invalid pubkey</h1><p class="dim">{}</p></div>"#,
+                html::escape(&e.to_string())
+            ),
+        ))
+        .into_response();
+    }
+    if label.trim().is_empty() || label.len() > 128 {
+        return Html(shell(
+            "Enroll device",
+            "",
+            r#"<div class="card"><h1>Invalid label</h1><p class="dim">label must be 1..=128 chars</p></div>"#,
+        ))
+        .into_response();
+    }
+
+    let short = &pubkey[..16];
+    let body = format!(
+        r#"<div class="card">
+  <h1>Enroll this device?</h1>
+  <div class="row"><span>Label</span><span>{label}</span></div>
+  <div class="row"><span>Pubkey</span><code>{short}…</code></div>
+  <p class="dim">
+    Confirming adds this X25519 public key to the trust list. Every
+    DD agent mirrors that list within 30&nbsp;s; thereafter, a client
+    holding the matching private key can open Noise_IK sessions to
+    any enclave in the fleet. Revoke any time with
+    <code>DELETE /api/v1/devices/&lt;pubkey&gt;</code>.
+  </p>
+  <p id="status"></p>
+  <div style="display:flex;gap:8px">
+    <button id="confirm" class="ok">Confirm</button>
+    <a href="/" class="btn">Cancel</a>
+  </div>
+</div>
+<script>
+  const pubkey = {pubkey_js};
+  const label  = {label_js};
+  const status = document.getElementById("status");
+  document.getElementById("confirm").addEventListener("click", async (ev) => {{
+    ev.target.disabled = true;
+    status.textContent = "Enrolling…";
+    try {{
+      const resp = await fetch("/api/v1/devices", {{
+        method: "POST",
+        credentials: "same-origin",
+        headers: {{ "Content-Type": "application/json" }},
+        body: JSON.stringify({{ pubkey, label }}),
+      }});
+      if (!resp.ok) {{
+        const text = await resp.text();
+        status.innerHTML = "<span class='err'>Enrollment failed: " +
+          resp.status + " " + text.slice(0, 400).replace(/</g, "&lt;") +
+          "</span>";
+        ev.target.disabled = false;
+        return;
+      }}
+      status.innerHTML = "<span class='ok'>Enrolled ✓ — you can close this tab</span>";
+    }} catch (e) {{
+      status.innerHTML = "<span class='err'>Network error: " + String(e) + "</span>";
+      ev.target.disabled = false;
+    }}
+  }});
+</script>"#,
+        label = html::escape(&label),
+        short = html::escape(short),
+        pubkey_js = serde_json::to_string(&pubkey).unwrap_or_else(|_| "\"\"".into()),
+        label_js = serde_json::to_string(&label).unwrap_or_else(|_| "\"\"".into()),
+    );
+
+    Html(shell("Enroll device", "", &body)).into_response()
 }
 
 /// GET /api/agents — JSON list of

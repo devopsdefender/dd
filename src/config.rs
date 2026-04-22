@@ -146,8 +146,16 @@ impl Cp {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(30);
+        // `/tmp/` (tmpfs) is the only universally-writable path in the
+        // EE workload sandbox — the root FS is RO, and `/var/lib/` +
+        // `/data/` are both unavailable on the CP VM (no mount-data
+        // in the CP boot set; root FS read-only for workloads).
+        // Ephemeral across CP restarts is OK: the zero-downtime
+        // boot hydrates devices from the predecessor CP via
+        // `/api/v1/admin/export` before flipping DNS, so the on-disk
+        // copy is a cache, not source of truth.
         let devices_path = std::env::var("DD_CP_DEVICES_PATH")
-            .unwrap_or_else(|_| "/var/lib/devopsdefender/devices.json".into())
+            .unwrap_or_else(|_| "/tmp/devopsdefender/devices.json".into())
             .into();
         let noise_key_path = std::env::var("DD_NOISE_KEY_PATH")
             .unwrap_or_else(|_| "/run/devopsdefender/noise.key".into())
