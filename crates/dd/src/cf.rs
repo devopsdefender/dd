@@ -594,6 +594,7 @@ pub async fn provision_cp_access(
         ("/health", "health"),
         ("/cp/attest", "attest"),
         ("/api/agents", "api-agents"),
+        ("/api/v1/devices/trusted", "api-devices-trusted"),
         ("/register", "register"),
         ("/ingress/replace", "ingress"),
     ] {

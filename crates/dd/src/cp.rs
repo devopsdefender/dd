@@ -266,6 +266,7 @@ pub async fn run() -> Result<()> {
         .route("/agent/{id}/logs/{app}", get(agent_logs))
         .route("/api/agents", get(api_agents))
         .route("/api/v1/devices", get(list_devices).post(create_device))
+        .route("/api/v1/devices/trusted", get(list_trusted_devices))
         .route(
             "/api/v1/devices/{pubkey}",
             axum::routing::delete(revoke_device),
@@ -625,10 +626,33 @@ async fn fleet(State(s): State<St>) -> Response {
 // session cookie at the edge.
 
 /// GET /api/v1/devices — list all devices (including revoked ones, so
-/// operators can audit).
+/// operators can audit). Behind CF Access (human admin).
 async fn list_devices(State(s): State<St>) -> Json<serde_json::Value> {
     let devices = s.devices.list().await;
     Json(serde_json::json!({ "devices": devices }))
+}
+
+/// GET /api/v1/devices/trusted — minimal, machine-readable view:
+/// `{ "pubkeys": ["<hex>", ...] }` with only currently-trusted keys.
+/// CF-Access-bypassed at the edge so cross-VM dd-agent callers can
+/// reach it; gated in-code by the same three-way policy as
+/// `/api/agents`. This is the agent's poll target for syncing its
+/// local `trusted-devices.json`.
+async fn list_trusted_devices(
+    State(s): State<St>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    headers: axum::http::HeaderMap,
+) -> Result<Json<serde_json::Value>> {
+    if !agents_auth_ok(&s, peer, &headers).await {
+        return Err(Error::Unauthorized);
+    }
+    let devices = s.devices.list().await;
+    let pubkeys: Vec<String> = devices
+        .into_iter()
+        .filter(|d| d.revoked_at_ms.is_none())
+        .map(|d| d.pubkey)
+        .collect();
+    Ok(Json(serde_json::json!({ "pubkeys": pubkeys })))
 }
 
 #[derive(Debug, Deserialize)]

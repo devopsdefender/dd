@@ -178,16 +178,13 @@ async fn sync_trusted_devices(
     ita_token: &Arc<RwLock<String>>,
     out_path: &std::path::Path,
 ) -> Result<()> {
-    let url = format!("{}/api/v1/devices", cp_url.trim_end_matches('/'));
+    // `/api/v1/devices/trusted` is CF-Access-bypassed (see
+    // `cf::provision_cp_access`) so cross-VM agents can reach it over
+    // the public tunnel. Auth is in-code: loopback / GH-OIDC / ITA,
+    // same three-way policy as `/api/agents`. The agent presents its
+    // fresh ITA token as a Bearer.
+    let url = format!("{}/api/v1/devices/trusted", cp_url.trim_end_matches('/'));
     let token = ita_token.read().await.clone();
-    // The /api/v1/devices route is behind CF Access — a loopback
-    // caller from a CP-VM workload is fine, but a cross-VM agent is
-    // not on loopback. Use the agent's ITA token: the CP has GH OIDC
-    // + ITA fallbacks on /api/agents; /api/v1/devices will gain the
-    // same shape in follow-up. Today CF Access fronts it; in staging
-    // we get around that with a service-token bypass app. The raw
-    // 401 is logged rather than fatal so a mid-deploy revoke doesn't
-    // take down the agent.
     let resp = http
         .get(&url)
         .bearer_auth(token)
@@ -200,19 +197,10 @@ async fn sync_trusted_devices(
             resp.status()
         )));
     }
+    // The response shape already matches what ee-proxy's `--trust-file`
+    // parses — `{ "pubkeys": ["<hex>", ...] }`. Re-serialize compact.
     let body: serde_json::Value = resp.json().await?;
-    let pubkeys: Vec<&str> = body["devices"]
-        .as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter(|d| d.get("revoked_at_ms").and_then(|v| v.as_i64()).is_none())
-                .filter_map(|d| d.get("pubkey").and_then(|v| v.as_str()))
-                .collect()
-        })
-        .unwrap_or_default();
-
-    let view = serde_json::json!({ "pubkeys": pubkeys });
-    let bytes = serde_json::to_vec(&view)?;
+    let bytes = serde_json::to_vec(&body)?;
     if let Some(parent) = out_path.parent() {
         tokio::fs::create_dir_all(parent).await.ok();
     }

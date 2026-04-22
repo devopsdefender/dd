@@ -32,14 +32,20 @@ impl TrustStore {
             inner: RwLock::new(initial),
         });
 
-        // Background poller.
+        // Background poller. Treats "file absent" as "empty" — on a
+        // fresh enclave the trust file only materializes once the
+        // dd-agent's first /api/v1/devices/trusted poll round-trips.
+        // Log only on real changes or real errors, not on each
+        // absent-file tick.
         {
             let store = store.clone();
             tokio::spawn(async move {
+                let mut last_absent = false;
                 loop {
                     tokio::time::sleep(WATCH_INTERVAL).await;
                     match read_file(&store.path).await {
                         Ok(fresh) => {
+                            last_absent = false;
                             let mut w = store.inner.write().await;
                             if *w != fresh {
                                 eprintln!(
@@ -51,7 +57,25 @@ impl TrustStore {
                             }
                         }
                         Err(e) => {
-                            eprintln!("ee-proxy: trust file re-read failed: {e}");
+                            let is_missing = e
+                                .downcast_ref::<std::io::Error>()
+                                .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound);
+                            if is_missing {
+                                // Absent = empty. Log once on transition so
+                                // it's obvious from the logs, then stay quiet.
+                                if !last_absent {
+                                    eprintln!(
+                                        "ee-proxy: trust file absent; waiting for dd-agent to populate it"
+                                    );
+                                    last_absent = true;
+                                }
+                                let mut w = store.inner.write().await;
+                                if !w.is_empty() {
+                                    w.clear();
+                                }
+                            } else {
+                                eprintln!("ee-proxy: trust file re-read failed: {e}");
+                            }
                         }
                     }
                 }
