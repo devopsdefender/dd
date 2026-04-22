@@ -28,8 +28,12 @@ pub struct Attestor {
 
 impl Attestor {
     /// Load `key_file` if it exists and is 32 bytes, otherwise mint a
-    /// fresh keypair and persist it with 0600 perms. Then generate a
-    /// fresh TDX quote binding the public key into `report_data`.
+    /// fresh keypair and best-effort-persist it with 0600 perms.
+    /// Persistence is non-fatal: every deploy already rotates the
+    /// enclave Noise key (fresh VM / fresh boot), so losing the write
+    /// just means this same VM won't reuse the key across an
+    /// in-enclave process restart. Then generate a fresh TDX quote
+    /// binding the public key into `report_data`.
     pub async fn load_or_mint(key_file: &Path) -> anyhow::Result<Self> {
         let secret = match tokio::fs::read(key_file).await {
             Ok(bytes) if bytes.len() == 32 => {
@@ -39,7 +43,12 @@ impl Attestor {
             }
             _ => {
                 let fresh = StaticSecret::random_from_rng(OsRng);
-                persist_key(key_file, fresh.as_bytes()).await?;
+                if let Err(e) = persist_key(key_file, fresh.as_bytes()).await {
+                    eprintln!(
+                        "noise-gw: persist {} failed ({e}); continuing with in-memory key",
+                        key_file.display()
+                    );
+                }
                 fresh
             }
         };
