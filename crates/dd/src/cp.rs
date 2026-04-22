@@ -46,6 +46,9 @@ struct St {
     /// GH OIDC verifier for `/api/agents` callers (CI, humans). Same
     /// audience as dd-agent, shared owner claim.
     gh: Arc<crate::gh_oidc::Verifier>,
+    /// Paired device pubkeys. Mutations persist to disk and emit a
+    /// runtime view for the local ee-proxy workload.
+    devices: Arc<crate::devices::Store>,
 }
 
 pub async fn run() -> Result<()> {
@@ -233,6 +236,16 @@ pub async fn run() -> Result<()> {
 
     let gh = crate::gh_oidc::Verifier::new(cfg.common.owner.clone(), "dd-agent".into());
 
+    let devices =
+        crate::devices::Store::load(cfg.devices_path.clone(), cfg.runtime_trust_path.clone())
+            .await
+            .map_err(|e| Error::Internal(format!("devices store load: {e}")))?;
+    eprintln!(
+        "cp: loaded {} device(s) from {}",
+        devices.list().await.len(),
+        cfg.devices_path.display()
+    );
+
     let state = St {
         cfg: cfg.clone(),
         ee,
@@ -241,6 +254,7 @@ pub async fn run() -> Result<()> {
         verifier,
         cp_ita_token,
         gh,
+        devices,
     };
 
     let app = Router::new()
@@ -251,6 +265,11 @@ pub async fn run() -> Result<()> {
         .route("/agent/{id}", get(agent_detail))
         .route("/agent/{id}/logs/{app}", get(agent_logs))
         .route("/api/agents", get(api_agents))
+        .route("/api/v1/devices", get(list_devices).post(create_device))
+        .route(
+            "/api/v1/devices/{pubkey}",
+            axum::routing::delete(revoke_device),
+        )
         .route("/cp/attest", get(cp_attest))
         .route("/cp/ita", get(cp_ita))
         .with_state(state);
@@ -596,6 +615,73 @@ async fn fleet(State(s): State<St>) -> Response {
         ),
     ))
     .into_response()
+}
+
+// ── Devices API ─────────────────────────────────────────────────────────
+//
+// Paired client-device X25519 pubkeys that the ee-proxy workload is
+// allowed to let through the Noise_IK handshake. Behind the CP's human
+// CF Access app (same policy as `/`) — no in-code auth, CF checks the
+// session cookie at the edge.
+
+/// GET /api/v1/devices — list all devices (including revoked ones, so
+/// operators can audit).
+async fn list_devices(State(s): State<St>) -> Json<serde_json::Value> {
+    let devices = s.devices.list().await;
+    Json(serde_json::json!({ "devices": devices }))
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateDeviceReq {
+    pubkey: String,
+    label: String,
+}
+
+/// POST /api/v1/devices — enroll a device pubkey. Idempotent on
+/// pubkey: re-posting with a new label replaces the record in place.
+async fn create_device(
+    State(s): State<St>,
+    Json(req): Json<CreateDeviceReq>,
+) -> Result<(axum::http::StatusCode, Json<crate::devices::Device>)> {
+    let pubkey = req.pubkey.to_lowercase();
+    crate::devices::validate_hex_pubkey(&pubkey).map_err(|e| Error::BadRequest(e.to_string()))?;
+    let label = req.label.trim().to_string();
+    if label.is_empty() || label.len() > 128 {
+        return Err(Error::BadRequest("label must be 1..=128 chars".into()));
+    }
+    let device = crate::devices::Device {
+        pubkey,
+        label,
+        created_at_ms: chrono::Utc::now().timestamp_millis(),
+        revoked_at_ms: None,
+    };
+    s.devices
+        .upsert(device.clone())
+        .await
+        .map_err(|e| Error::Internal(format!("devices upsert: {e}")))?;
+    Ok((axum::http::StatusCode::CREATED, Json(device)))
+}
+
+/// DELETE /api/v1/devices/{pubkey} — revoke. Returns 404 if the
+/// pubkey isn't known or was already revoked.
+async fn revoke_device(
+    State(s): State<St>,
+    Path(pubkey): Path<String>,
+) -> Result<Json<serde_json::Value>> {
+    let pubkey = pubkey.to_lowercase();
+    let now = chrono::Utc::now().timestamp_millis();
+    let ok = s
+        .devices
+        .revoke(&pubkey, now)
+        .await
+        .map_err(|e| Error::Internal(format!("devices revoke: {e}")))?;
+    if !ok {
+        return Err(Error::NotFound);
+    }
+    Ok(Json(serde_json::json!({
+        "revoked": pubkey,
+        "at_ms": now,
+    })))
 }
 
 /// GET /api/agents — JSON list of

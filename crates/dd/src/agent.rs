@@ -42,6 +42,10 @@ use crate::metrics;
 /// token to the CP's collector.
 const ITA_REFRESH: Duration = Duration::from_secs(180);
 
+/// Poll interval for syncing the device trust list from the CP.
+/// Tuned so a revoke propagates within ~30s.
+const DEVICES_POLL: Duration = Duration::from_secs(30);
+
 #[derive(Clone)]
 struct St {
     cfg: Arc<Cfg>,
@@ -110,6 +114,25 @@ pub async fn run() -> Result<()> {
         });
     }
 
+    // Background poll for the device trust list. Writes
+    // `/run/ee-proxy/trusted-devices.json` on every refresh so the
+    // locally-running ee-proxy can consume the current set without an
+    // HTTP hop. Revocations propagate within ~DEVICES_POLL.
+    {
+        let cp_url = cfg.cp_url.clone();
+        let token = ita_token.clone();
+        tokio::spawn(async move {
+            let http = reqwest::Client::new();
+            let out_path: std::path::PathBuf = crate::devices::RUNTIME_TRUST_PATH.into();
+            loop {
+                if let Err(e) = sync_trusted_devices(&http, &cp_url, &token, &out_path).await {
+                    eprintln!("agent: device sync failed: {e}");
+                }
+                tokio::time::sleep(DEVICES_POLL).await;
+            }
+        });
+    }
+
     let gh = gh_oidc::Verifier::new(cfg.common.owner.clone(), "dd-agent".into());
 
     let state = St {
@@ -143,6 +166,60 @@ pub async fn run() -> Result<()> {
     )
     .await
     .map_err(|e| Error::Internal(e.to_string()))
+}
+
+/// Pull the CP's device registry and write a minimal
+/// `{"pubkeys": [...]}` view — only non-revoked pubkeys — to
+/// `out_path` atomically. `ee-proxy` re-reads this file every
+/// ~10s so revocations take effect without restart.
+async fn sync_trusted_devices(
+    http: &reqwest::Client,
+    cp_url: &str,
+    ita_token: &Arc<RwLock<String>>,
+    out_path: &std::path::Path,
+) -> Result<()> {
+    let url = format!("{}/api/v1/devices", cp_url.trim_end_matches('/'));
+    let token = ita_token.read().await.clone();
+    // The /api/v1/devices route is behind CF Access — a loopback
+    // caller from a CP-VM workload is fine, but a cross-VM agent is
+    // not on loopback. Use the agent's ITA token: the CP has GH OIDC
+    // + ITA fallbacks on /api/agents; /api/v1/devices will gain the
+    // same shape in follow-up. Today CF Access fronts it; in staging
+    // we get around that with a service-token bypass app. The raw
+    // 401 is logged rather than fatal so a mid-deploy revoke doesn't
+    // take down the agent.
+    let resp = http
+        .get(&url)
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(|e| Error::Upstream(format!("devices GET {url}: {e}")))?;
+    if !resp.status().is_success() {
+        return Err(Error::Upstream(format!(
+            "devices GET {url} → {}",
+            resp.status()
+        )));
+    }
+    let body: serde_json::Value = resp.json().await?;
+    let pubkeys: Vec<&str> = body["devices"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter(|d| d.get("revoked_at_ms").and_then(|v| v.as_i64()).is_none())
+                .filter_map(|d| d.get("pubkey").and_then(|v| v.as_str()))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let view = serde_json::json!({ "pubkeys": pubkeys });
+    let bytes = serde_json::to_vec(&view)?;
+    if let Some(parent) = out_path.parent() {
+        tokio::fs::create_dir_all(parent).await.ok();
+    }
+    let tmp = out_path.with_extension("json.tmp");
+    tokio::fs::write(&tmp, &bytes).await?;
+    tokio::fs::rename(&tmp, out_path).await?;
+    Ok(())
 }
 
 #[derive(Debug, serde::Deserialize)]

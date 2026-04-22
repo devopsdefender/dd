@@ -23,12 +23,21 @@ const INITIAL_MAX_SECS: u64 = 25;
 const CONSECUTIVE_GONE: u32 = 3;
 
 /// Poweroff via reboot(2). Bypasses busybox's PID-1-is-systemd
-/// assumption. Requires CAP_SYS_BOOT (we're root).
+/// assumption. Requires CAP_SYS_BOOT (we're root). Linux-only; on
+/// other targets (developer workstations running `cargo test`) we
+/// just abort, since there's no enclave to tear down.
+#[cfg(target_os = "linux")]
 pub fn poweroff() -> ! {
     unsafe {
         libc::sync();
         libc::reboot(libc::LINUX_REBOOT_CMD_POWER_OFF);
     }
+    std::process::abort();
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn poweroff() -> ! {
+    eprintln!("stonith: poweroff called on non-linux target — aborting process");
     std::process::abort();
 }
 

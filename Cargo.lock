@@ -324,10 +324,12 @@ dependencies = [
 name = "devopsdefender"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "axum",
  "base64",
  "chrono",
  "futures-util",
+ "hex",
  "jsonwebtoken",
  "libc",
  "rand 0.8.5",
@@ -335,6 +337,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sysinfo",
+ "tempfile",
  "thiserror",
  "tokio",
  "urlencoding",
