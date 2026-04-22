@@ -249,7 +249,10 @@ struct Bootstrap {
 }
 
 async fn register(cfg: &Cfg, ita_token: &str) -> Result<Bootstrap> {
-    let http = reqwest::Client::new();
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(60))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
     let url = format!("{}/register", cfg.cp_url.trim_end_matches('/'));
     let extra_ingress: Vec<serde_json::Value> = cfg
         .extra_ingress
@@ -261,19 +264,44 @@ async fn register(cfg: &Cfg, ita_token: &str) -> Result<Bootstrap> {
         "ita_token": ita_token,
         "extra_ingress": extra_ingress,
     });
+
     // /register is CF-Access-bypassed; ITA attestation is the gate.
-    let resp = http
-        .post(&url)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| Error::Upstream(format!("register {url}: {e}")))?;
-    if !resp.status().is_success() {
-        let s = resp.status();
-        let b = resp.text().await.unwrap_or_default();
-        return Err(Error::Upstream(format!("register {url} → {s}: {b}")));
+    // The transport layer is retried — the agent VM often boots
+    // faster than CF edge propagation for a just-flipped CP CNAME
+    // or a just-reconnected cloudflared tunnel, and the first POST
+    // tends to fail with "error sending request" / 502 / 530.
+    // Exponential-ish backoff, ~90s total.
+    let mut last_err: Option<Error> = None;
+    for attempt in 1..=6u32 {
+        match http.post(&url).json(&body).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                return Ok(resp.json().await?);
+            }
+            Ok(resp) => {
+                let s = resp.status();
+                // 4xx from the CP is almost always a real config
+                // error (ITA invalid, etc.) — no point retrying.
+                if s.is_client_error() && s != reqwest::StatusCode::TOO_MANY_REQUESTS {
+                    let b = resp.text().await.unwrap_or_default();
+                    return Err(Error::Upstream(format!("register {url} → {s}: {b}")));
+                }
+                let b = resp.text().await.unwrap_or_default();
+                last_err = Some(Error::Upstream(format!("register {url} → {s}: {b}")));
+            }
+            Err(e) => {
+                // Print `{:?}` so the reqwest error chain (TLS,
+                // DNS, connect details) lands in the agent log
+                // instead of just the wrapper message.
+                last_err = Some(Error::Upstream(format!("register {url}: {e:?}")));
+            }
+        }
+        eprintln!(
+            "agent: register attempt {attempt}/6 failed ({}) — backing off",
+            last_err.as_ref().map(|e| e.to_string()).unwrap_or_default()
+        );
+        tokio::time::sleep(Duration::from_secs(5 * attempt as u64)).await;
     }
-    Ok(resp.json().await?)
+    Err(last_err.unwrap_or_else(|| Error::Upstream("register: exhausted retries".into())))
 }
 
 /// Mint an Intel-signed TDX attestation JWT. Fatal on any failure —
