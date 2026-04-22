@@ -81,12 +81,6 @@ build_config_iso() {
 
   local workloads
   workloads=$({
-    # mount-data must run before bastion so `/data` is a writable ext4
-    # mount by the time bastion tries to mint its noise key there
-    # (`--noise-key /data/bastion-noise.key`). Without it, the bastion
-    # workload sees /data on the rootfs overlay, which is RO inside
-    # EE's workload namespace, and fails with `Read-only file system`.
-    bake "$REPO_ROOT/apps/mount-data/workload.json"
     bake "$REPO_ROOT/apps/cloudflared/workload.json"
     DD_RELEASE_TAG="$DD_RELEASE_TAG" \
       CLOUDFLARE_API_TOKEN="$CLOUDFLARE_API_TOKEN" \
@@ -130,39 +124,6 @@ build_overlay() {
   echo "  wrote $overlay (160G, backing $BASE)"
 }
 
-build_workload_disk() {
-  # Persistent ext4 mounted at /data inside the VM via EE's mount-data
-  # workload. CP only needs this for small stable state (today: the
-  # bastion Noise static key, ~32 bytes). 10G is massively oversized
-  # but qcow2 is sparse — actual disk use is ≈1 MB until something
-  # writes. Mirrors local-agents.sh's build_workload_disk, just
-  # smaller.
-  local disk="$IMG_DIR/$VM-workload.qcow2"
-  if [ -f "$disk" ]; then
-    echo "  workload disk $disk already exists (reusing)"
-    return
-  fi
-  qemu-img create -q -f qcow2 "$disk" 10G
-  sudo modprobe nbd max_part=8 2>/dev/null || true
-  local nbd
-  for n in /dev/nbd*; do
-    [ -b "$n" ] || continue
-    [ -s "/sys/block/$(basename "$n")/pid" ] && continue
-    nbd="$n"
-    break
-  done
-  [ -n "$nbd" ] || { echo "no free /dev/nbd*"; exit 1; }
-  sudo qemu-nbd --connect="$nbd" "$disk"
-  for _ in 1 2 3 4 5; do
-    if sudo mkfs.ext4 -q -L workload "$nbd" 2>/dev/null; then
-      break
-    fi
-    sleep 1
-  done
-  sudo qemu-nbd --disconnect "$nbd" >/dev/null
-  echo "  wrote $disk (10G ext4, label=workload)"
-}
-
 render_domain_xml() {
   local out="/tmp/$VM.xml"
   virsh dumpxml "$BASE_DOMAIN" > "$out"
@@ -173,24 +134,6 @@ render_domain_xml() {
   sed -i "s|$IMG_DIR/$BASE_DOMAIN.qcow2|$IMG_DIR/$VM.qcow2|g" "$out"
   sed -i "s|$IMG_DIR/$BASE_DOMAIN-config.iso|$IMG_DIR/$VM-config.iso|g" "$out"
   sed -i "s|/var/log/ee-local\\.log|/var/log/ee-local-$NAME.log|g" "$out"
-
-  # Inject the workload disk as /dev/vdc — EE's mount-data workload
-  # picks it up by LABEL=workload and mounts at /data. Bastion's
-  # --noise-key lives there so the pubkey persists across CP reboots.
-  python3 - "$out" "$IMG_DIR/$VM-workload.qcow2" <<'PY'
-import re, sys
-xml_path, disk_path = sys.argv[1], sys.argv[2]
-with open(xml_path) as f: x = f.read()
-new_disk = (
-    f"    <disk type='file' device='disk'>\n"
-    f"      <driver name='qemu' type='qcow2'/>\n"
-    f"      <source file='{disk_path}'/>\n"
-    f"      <target dev='vdc' bus='virtio'/>\n"
-    f"    </disk>\n"
-)
-x = re.sub(r"(</disk>\n)(?=(?:(?!</disk>).)*?</devices>)", r"\1" + new_disk, x, count=1, flags=re.DOTALL)
-with open(xml_path, "w") as f: f.write(x)
-PY
 
   # CP sizing (general shape — no GPU).
   local mem_kib=16777216   # 16 GiB
@@ -233,7 +176,6 @@ PY
 
 echo "== $VM → https://$HOSTNAME (env=$ENV_LABEL) =="
 build_overlay
-build_workload_disk
 build_config_iso
 xml=$(render_domain_xml)
 # Destroy any previous instance. rm on /var/log needs sudo (root-owned
