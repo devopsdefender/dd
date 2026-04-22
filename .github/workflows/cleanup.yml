@@ -148,12 +148,15 @@ jobs:
             --project="$GCP_PROJECT_ID" \
             --filter='labels.devopsdefender=managed AND labels.dd_env~"^pr-" AND status=RUNNING' \
             --format='value(labels.dd_env)' | sort -u)
+          # `grep -oE` returns 1 on no matches, which trips pipefail
+          # the moment the CF account genuinely has no pr-* envs left
+          # (the happy steady state). Swallow that specific case.
           envs=$( {
             echo "$apps"    | jq -r '.result[].name // empty'
             echo "$tunnels" | jq -r '.result[].name // empty'
             echo "$dns"     | jq -r '.result[].name // empty'
             echo "$vm_envs"
-          } | grep -oE 'pr-[0-9]+' | sort -u )
+          } | grep -oE 'pr-[0-9]+' | sort -u || true )
 
           total_apps=0 total_tun=0 total_dns=0 total_vms=0 total_envs=0
 
