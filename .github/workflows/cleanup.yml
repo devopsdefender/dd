@@ -128,9 +128,48 @@ jobs:
           CF_ZONE_ID:     ${{ secrets.DD_CP_CF_ZONE_ID }}
           DD_DOMAIN:      ${{ vars.DD_CF_DOMAIN || 'devopsdefender.com' }}
           GH_TOKEN:       ${{ github.token }}
+          # SSH into the tdx2 host so we can `virsh destroy/undefine`
+          # `dd-local-pr-N-cp` libvirt domains that `gcloud compute
+          # instances delete` can no longer reach now that PR CPs are
+          # target=ssh (b87b36c). Left alone, they accumulate forever.
+          DD_LOCAL_HOST:    ${{ secrets.DD_LOCAL_HOST }}
+          DD_LOCAL_SSH_KEY: ${{ secrets.DD_LOCAL_SSH_KEY }}
         run: |
           set -euo pipefail
           AUTH=(-H "Authorization: Bearer $CF_API_TOKEN")
+
+          # SSH key for the per-env libvirt teardown below. One key,
+          # reused across all closed envs; trap cleans it up on exit.
+          ssh_key=$(mktemp)
+          trap 'rm -f "$ssh_key"' EXIT
+          printf '%s\n' "$DD_LOCAL_SSH_KEY" > "$ssh_key"
+          chmod 600 "$ssh_key"
+          # `|| true` — if the tdx2 host is unreachable this sweep run,
+          # fall through and still do the CF/GCE cleanup. Next run
+          # catches whatever was missed.
+          teardown_libvirt_cp() {
+            ssh -i "$ssh_key" -T \
+                -o StrictHostKeyChecking=accept-new \
+                -o ServerAliveInterval=30 \
+                -o ConnectTimeout=15 \
+                tdx2@"$DD_LOCAL_HOST" bash -s -- "$1" <<'EOSSH' || true
+          set -euo pipefail
+          env="$1"
+          vm="dd-local-$env-cp"
+          # Only announce if the domain actually existed — silent
+          # no-op if the sweep had already picked this env up.
+          if virsh dominfo "$vm" >/dev/null 2>&1; then
+            virsh destroy "$vm" 2>/dev/null || true
+            virsh undefine "$vm" --managed-save --snapshots-metadata 2>/dev/null || true
+            echo "  - libvirt $vm"
+          fi
+          sudo rm -f \
+            "/var/lib/libvirt/images/$vm.qcow2" \
+            "/var/lib/libvirt/images/$vm-config.iso" \
+            "/var/log/ee-local-$env-cp.log" \
+            2>/dev/null || true
+          EOSSH
+          }
 
           echo "Fetching Access apps, tunnels, DNS CNAMEs..."
           apps=$(curl -fsS "${AUTH[@]}" \
@@ -205,13 +244,19 @@ jobs:
             total_dns=$((total_dns + d))
             total_vms=$((total_vms + v))
 
-            # VMs
+            # VMs — GCE side (legacy; pre-b87b36c previews live here).
             if [ -n "$env_vms" ]; then
               echo "  deleting VMs: $(echo "$env_vms" | tr '\n' ' ')"
               # shellcheck disable=SC2086
               gcloud compute instances delete $env_vms \
                 --project="$GCP_PROJECT_ID" --zone="$GCP_ZONE" --quiet || true
             fi
+
+            # VMs — libvirt side on tdx2. Current ssh-target previews
+            # live here (`dd-local-pr-N-cp`) and aren't counted in `v`
+            # above because that number comes from gcloud. No-op if
+            # the domain isn't defined (already torn down earlier).
+            teardown_libvirt_cp "$env"
 
             # Apps / tunnels / DNS — best-effort each; one failure
             # shouldn't abort the sweep.
