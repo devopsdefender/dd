@@ -113,12 +113,18 @@ runs:
           trap 'rm -f "$key"' EXIT
           printf '%s\n' "$SSH_KEY" > "$key"
           chmod 600 "$key"
+          # `stdbuf -oL` on both ends: force tail and sed to line-buffer
+          # so each VM boot line streams into this job's log as it's
+          # written, rather than block-buffering until the pipe closes.
+          # Dropping `2>/dev/null` on tail so "cannot open" / "retrying"
+          # diagnostics surface — if the serial log file never appears,
+          # we want the reason on-screen, not a silent wait.
           ssh -i "$key" -T \
               -o StrictHostKeyChecking=accept-new \
               -o ServerAliveInterval=30 \
               tdx2@"$HOST" \
-              "sudo tail -n +1 -F /var/log/ee-local-$KIND.log 2>/dev/null || true" \
-            2>&1 | sed -u "s/^/  [$vm console] /" &
+              "sudo stdbuf -oL tail -n +1 -F /var/log/ee-local-$KIND.log || true" \
+            2>&1 | stdbuf -oL sed -u "s/^/  [$vm console] /" &
           tail_pid=$!
           # Give the tail a moment to attach so its first lines land
           # before the register wait's first status message.
