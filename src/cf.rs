@@ -631,6 +631,10 @@ pub async fn provision_cp_access(
 ///   - Bypass: `{agent}.{domain}/deploy` — GH-OIDC-gated in code
 ///   - Bypass: `{agent}.{domain}/exec` — GH-OIDC-gated in code
 ///   - Bypass: `{agent}.{domain}/logs/*` — GH-OIDC-gated in code
+///   - Bypass: `{agent}.{domain}/attest` — self-authenticating
+///     (Intel-signed TDX quote over the Noise static pubkey)
+///   - Bypass: `{agent}.{domain}/noise/ws` — Noise_IK-gated in code
+///     against the paired device pubkey set
 ///   - Bypass: `{label}.{agent}.{domain}` for other labels — workload
 ///     URLs are public by default (this is the nvidia-smi exemption).
 ///   - Any existing `*.{agent}.{domain}` app whose label is no longer
@@ -660,6 +664,19 @@ pub async fn provision_agent_access(
         ("/deploy", "deploy"),
         ("/exec", "exec"),
         ("/logs", "logs"),
+        // The in-process Noise gateway (merged into the agent's
+        // router in agent.rs) lives on the same port and hostname
+        // as /deploy + /exec, so direct client attach to an agent
+        // needs the same bypass treatment the CP hostname already
+        // gets (cp.rs's provision_cp_access). Without these, the
+        // pre-handshake `GET /attest` quote fetch and the
+        // `WS /noise/ws` upgrade both 302 to CF Access login and
+        // the handshake can't even start. In-code trust is the
+        // gate: /attest is self-authenticating (Intel-signed quote
+        // over the Noise static pubkey), /noise/ws is Noise_IK
+        // against the paired device pubkey the CP trusts.
+        ("/attest", "noise-attest"),
+        ("/noise/ws", "noise-ws"),
     ] {
         ensure_bypass_app(
             http,
