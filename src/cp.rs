@@ -89,12 +89,49 @@ pub async fn run() -> Result<()> {
     // still points at the old CP's tunnel, so this GET lands on the
     // old CP. Tolerant of failure (first boot, old CP already dead,
     // stale code without `/api/v1/admin/export`).
+    //
+    // Gated on "does a predecessor CP tunnel exist for this env?"
+    // because on a *fresh* env (first PR deploy, or after cleanup
+    // reaped the old tunnel) the hostname has no CNAME, `getaddrinfo`
+    // returns NXDOMAIN, and the host's libvirt dnsmasq at
+    // 192.168.122.1 negative-caches that — with a default neg-TTL of
+    // minutes. Stage 3 below then creates the CNAME, but every VM on
+    // the default network (including the dd-local-preview agent that
+    // `release.yml` spins up right after) keeps seeing the cached
+    // NXDOMAIN until the TTL expires, blowing past the agent's
+    // register-retry budget and dying fatal. We diagnosed this by
+    // (a) the agent's `Name does not resolve` spam in its serial log
+    // while (b) the same hostname resolving from the CI runner, then
+    // (c) confirming via `dig @192.168.122.1`. The `cf::list` probe
+    // is against `api.cloudflare.com` (always resolves), so it's
+    // safe to run unconditionally — it doesn't touch the poisonable
+    // hostname at all.
     let store: Store = Arc::new(Mutex::new(HashMap::new()));
     let trust = noise_gateway::new_trust_handle();
     let devices = crate::devices::Store::load(cfg.devices_path.clone(), trust.clone())
         .await
         .map_err(|e| Error::Internal(format!("devices store load: {e}")))?;
-    hydrate_from_peer(&http, &cfg.hostname, &initial_token, &devices, &store).await;
+    let predecessor_prefix = cf::cp_prefix(&cfg.common.env_label);
+    let has_predecessor = match cf::list(&http, &cfg.cf).await {
+        Ok(tunnels) => tunnels.iter().any(|t| {
+            t["name"]
+                .as_str()
+                .is_some_and(|n| n.starts_with(&predecessor_prefix))
+        }),
+        Err(e) => {
+            // Ambiguous — CF API unreachable. Skip hydrate rather than
+            // probe-and-poison; the CP's own tunnel Stage 3 creates
+            // below doesn't depend on this branch, and a missed
+            // hydrate is strictly less bad than a poisoned dnsmasq.
+            eprintln!("cp: predecessor probe failed ({e}); skipping hydrate");
+            false
+        }
+    };
+    if has_predecessor {
+        hydrate_from_peer(&http, &cfg.hostname, &initial_token, &devices, &store).await;
+    } else {
+        eprintln!("cp: no predecessor {predecessor_prefix}* tunnel — skipping hydrate (fresh env)");
+    }
 
     // Stage 3: create our own tunnel. `cf::create` upserts the CNAME
     // for `cfg.hostname` → our tunnel id; traffic moves to us the
