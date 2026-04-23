@@ -182,7 +182,15 @@ pub async fn run() -> Result<()> {
         .route("/logs/{app}", get(logs))
         .fallback(log_unmatched)
         .with_state(state)
-        .merge(noise_gateway::router(ng_state));
+        .merge(noise_gateway::router(ng_state))
+        // Wire-level request log. Fires for every HTTP request the
+        // listener accepts — strictly before any extractor runs and
+        // strictly after any handler returns, so it draws a line
+        // between "request reached axum" and "request died in
+        // CF/cloudflared before us" (the `/deploy` 2xx-empty-body
+        // bug from GH Actions runners). One line in, one line out,
+        // per request — cheap enough to keep on in prod.
+        .layer(axum::middleware::from_fn(log_http));
 
     let addr = format!("0.0.0.0:{}", cfg.common.port);
     eprintln!("agent: listening on {addr}");
@@ -193,6 +201,54 @@ pub async fn run() -> Result<()> {
     )
     .await
     .map_err(|e| Error::Internal(e.to_string()))
+}
+
+/// Logs one line per inbound HTTP request before any extractor runs,
+/// and one line for the final response status. Primary motivation:
+/// the `/deploy` handler's "entered" eprintln never fires for the
+/// empty-2xx failures from GH runners, leaving ambiguous whether
+/// the request ever crossed the CF+cloudflared boundary. This pins
+/// down that boundary.
+///
+/// Headers logged (presence or value) — chosen because each one
+/// distinguishes a plausible failure mode:
+///   - Content-Type + Content-Length: whether the body extractor
+///     (`Json`) would accept/reject on arrival.
+///   - Authorization (presence only, never the token): auth vs.
+///     no-auth path.
+///   - User-Agent: GH runners' curl leaves a distinct UA; a rewrite
+///     upstream would show here.
+///   - CF-Ray + CF-Connecting-IP: cross-reference with CF edge logs
+///     — ground truth for "did CF see this and from where?"
+async fn log_http(
+    req: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> Response {
+    let method = req.method().clone();
+    let path = req.uri().path().to_string();
+    let h = req.headers();
+    let get = |k: &str| {
+        h.get(k)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("-")
+            .to_string()
+    };
+    let auth = if h.contains_key(axum::http::header::AUTHORIZATION) {
+        "yes"
+    } else {
+        "no"
+    };
+    eprintln!(
+        "agent: IN {method} {path} auth={auth} ct={} cl={} ua={} cf-ray={} cf-ip={}",
+        get("content-type"),
+        get("content-length"),
+        get("user-agent"),
+        get("cf-ray"),
+        get("cf-connecting-ip"),
+    );
+    let res = next.run(req).await;
+    eprintln!("agent: OUT {method} {path} -> {}", res.status().as_u16());
+    res
 }
 
 /// Pull the CP's device registry (`{"pubkeys": ["<hex>", ...]}`) and
