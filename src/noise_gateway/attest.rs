@@ -3,21 +3,22 @@
 //! On boot we either load an existing 32-byte X25519 private key from
 //! disk (tmpfs — `/run/devopsdefender/noise.key`) or mint a fresh one.
 //! The corresponding public key is embedded in a TDX quote's
-//! `report_data` field (low 32 bytes; high 32 bytes zero). Clients
-//! fetch `GET /attest` over plain HTTPS, verify the quote via ITA,
-//! extract the Noise static pubkey from `report_data`, and trust
-//! that key for the handshake. No X.509 certs in the loop.
+//! `report_data` field (low 32 bytes; high 32 bytes zero). The quote +
+//! pubkey bundle is surfaced by the containing service's `/health`
+//! endpoint (see `agent::health` and `cp::health`); clients verify
+//! the quote via ITA, extract the Noise static pubkey from
+//! `report_data`, and trust that key for the handshake. No X.509
+//! certs in the loop.
+//!
+//! There used to be a dedicated `GET /attest` route here. It was
+//! collapsed into `/health` so a bastion-app bootstrap does one
+//! request instead of two, and so the CF Access bypass list shrinks
+//! by one app per env × per service. The Noise quote is stable per
+//! boot — just an `Arc<Attestor>` clone on each `/health` hit.
 
 use std::path::{Path, PathBuf};
 
-use axum::extract::State;
-use axum::response::Json;
-use axum::routing::get;
-use axum::Router;
-use base64::engine::general_purpose::STANDARD as B64;
-use base64::Engine as _;
 use rand::rngs::OsRng;
-use serde::Serialize;
 use x25519_dalek::{PublicKey, StaticSecret};
 
 pub struct Attestor {
@@ -74,23 +75,6 @@ impl Attestor {
     pub fn quote(&self) -> &[u8] {
         &self.quote
     }
-}
-
-pub(crate) fn routes() -> Router<super::State> {
-    Router::new().route("/attest", get(attest))
-}
-
-#[derive(Serialize)]
-struct AttestResponse {
-    quote_b64: String,
-    pubkey_hex: String,
-}
-
-async fn attest(State(s): State<super::State>) -> Json<AttestResponse> {
-    Json(AttestResponse {
-        quote_b64: B64.encode(s.attest.quote()),
-        pubkey_hex: hex::encode(s.attest.public_key()),
-    })
 }
 
 async fn persist_key(key_file: &Path, bytes: &[u8; 32]) -> anyhow::Result<()> {

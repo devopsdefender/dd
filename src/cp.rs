@@ -50,6 +50,13 @@ struct St {
     /// Paired device pubkeys. Mutations persist to disk and emit a
     /// runtime view for the local ee-proxy workload.
     devices: Arc<crate::devices::Store>,
+    /// TDX-quote + Noise-static-pubkey bundle. Surfaced by `/health`
+    /// as `{ noise: { quote_b64, pubkey_hex } }` so a bastion-app
+    /// bootstraps in one fetch (the former standalone `/attest`
+    /// endpoint was folded in). Shared `Arc` with the Noise gateway
+    /// module's handshake responder — one keypair / one quote per
+    /// boot.
+    attest: Arc<noise_gateway::attest::Attestor>,
 }
 
 pub async fn run() -> Result<()> {
@@ -174,8 +181,10 @@ pub async fn run() -> Result<()> {
     // Stage 4: provision CF Access apps for our own tunnel. Workload
     // labels (e.g. `block` for ttyd) get the human policy; the
     // paths in the bypass list (`/register`, `/api/agents`,
-    // `/api/v1/devices/trusted`, `/api/v1/admin/export`, `/attest`,
-    // `/noise/ws`, …) are CF-bypassed with in-code gating.
+    // `/api/v1/devices/trusted`, `/api/v1/admin/export`, `/noise/ws`,
+    // `/health`, …) are CF-bypassed with in-code gating. `/health`
+    // also carries the Noise pre-handshake quote + pubkey (the former
+    // `/attest` — now inlined to save a bootstrap round-trip).
     let cp_labels: Vec<String> = cp_extras.iter().map(|(l, _)| l.clone()).collect();
     if let Err(e) = cf::provision_cp_access(
         &http,
@@ -300,7 +309,7 @@ pub async fn run() -> Result<()> {
         ee_token,
     ));
     let ng_state = noise_gateway::State {
-        attest: attestor,
+        attest: attestor.clone(),
         trust: trust.clone(),
         upstream,
     };
@@ -314,6 +323,7 @@ pub async fn run() -> Result<()> {
         cp_ita_token,
         gh,
         devices,
+        attest: attestor,
     };
 
     let app = Router::new()
@@ -460,6 +470,7 @@ async fn health(
     State(s): State<St>,
     Query(q): Query<HashMap<String, String>>,
 ) -> Json<serde_json::Value> {
+    use base64::Engine as _;
     let agents = s.store.lock().await;
     let mut body = serde_json::json!({
         "ok": true,
@@ -469,11 +480,21 @@ async fn health(
         "uptime_secs": s.started.elapsed().as_secs(),
         "agent_count": agents.len(),
         "healthy_count": agents.values().filter(|a| a.status == "healthy").count(),
+        // Pre-Noise-handshake bundle — the former `GET /attest`
+        // endpoint folded in here so bastion-app bootstraps in one
+        // fetch and we drop a CF Access bypass-app per env × per
+        // service. Stable per boot; `Arc` clones are effectively free
+        // per request. `quote_b64` binds the raw Noise pubkey into
+        // TDX `report_data`, self-authenticating via ITA.
+        "noise": {
+            "quote_b64": base64::engine::general_purpose::STANDARD.encode(s.attest.quote()),
+            "pubkey_hex": hex::encode(s.attest.public_key()),
+        },
     });
     // `?verbose=1` folds in the CP's current ITA token so operators
     // can inspect the CP VM's TDX measurement without a second route
     // (the old `/cp/ita` + `/cp/attest` paths were removed; the
-    // Noise gateway's `/attest` is the public quote surface).
+    // TDX quote for the Noise pubkey is also above, unconditionally).
     if q.get("verbose").map(|v| v.as_str()) == Some("1") {
         if let Some(obj) = body.as_object_mut() {
             obj.insert(
@@ -1114,7 +1135,7 @@ async fn agent_detail(State(s): State<St>, Path(id): Path<String>) -> Response {
     let term_host = html::escape(&cf::label_hostname(&a.hostname, "block"));
     let extra = if is_cp {
         format!(
-            r#"<p><a href="https://{term_host}/" target="_blank">Terminal ↗</a> · <a href="/attest">attest</a> · <a href="/health?verbose=1">ita</a></p>"#
+            r#"<p><a href="https://{term_host}/" target="_blank">Terminal ↗</a> · <a href="/health">health (incl. noise quote)</a> · <a href="/health?verbose=1">health?verbose=1 (incl. ita)</a></p>"#
         )
     } else {
         format!(
