@@ -37,6 +37,18 @@ git fetch --quiet origin "$REF"
 git checkout --quiet "origin/$REF" -- apps/
 echo "dd-relaunch-cp: refreshed apps/ from origin/$REF"
 
+# Sync the libvirt base qcow2 from the easyenclave release channel
+# for this env. `production` tracks `stable` (v*); anything else
+# (pr-N, dev) tracks `staging`. `DD_EE_TAG` overrides the channel
+# default for pre-flight-testing a candidate release.
+# shellcheck source=./ee-sync.sh
+. ./apps/_infra/ee-sync.sh
+case "$ENV_LABEL" in
+  production) export DD_EE_CHANNEL="${DD_EE_CHANNEL:-stable}"  ;;
+  *)          export DD_EE_CHANNEL="${DD_EE_CHANNEL:-staging}" ;;
+esac
+sync_base /var/lib/libvirt/images/easyenclave-local.qcow2
+
 VM="dd-local-$ENV_LABEL-cp"
 
 ./apps/_infra/local-cp.sh "$ENV_LABEL" "$HOSTNAME"

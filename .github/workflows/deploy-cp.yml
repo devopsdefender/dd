@@ -62,6 +62,11 @@ on:
         required: false
         type: string
         default: ssh
+      ee_tag:
+        description: 'Explicit easyenclave release tag to pin this deploy to (pre-flight-test a candidate before promoting staging→stable). Empty = default to channel resolved from env.'
+        required: false
+        type: string
+        default: ''
 
 # Serialize PR-preview deploys on the `preview` bucket: all pr-*
 # runs share one libvirt domain (`dd-local-preview`) on tdx2, so
@@ -89,6 +94,26 @@ jobs:
       GCP_ZONE: us-central1-c
     steps:
       - uses: actions/checkout@v4
+
+      # Map dd env → easyenclave channel. Prod (CP and local) tracks
+      # `stable` (EE v* tags); everything else (pr-N previews) tracks
+      # `staging` (EE prereleases from main). Keeps dd prod off
+      # in-flight-main EE builds while preview deploys catch EE
+      # regressions early. Applies to both target=gcp (image family
+      # lookup) and target=ssh (release-asset sync on tdx2).
+      - name: Resolve easyenclave channel
+        id: ee
+        env:
+          ENV: ${{ inputs.env }}
+        run: |
+          case "$ENV" in
+            production) channel=stable;  family=easyenclave-stable  ;;
+            *)          channel=staging; family=easyenclave-staging ;;
+          esac
+          {
+            echo "channel=$channel"
+            echo "family=$family"
+          } >> "$GITHUB_OUTPUT"
 
       # GCP auth only on target=gcp. We used to configure it
       # unconditionally so ssh-target deploys could reap GCE orphans
@@ -120,6 +145,8 @@ jobs:
           admin-email:   ${{ vars.DD_ACCESS_ADMIN_EMAIL || secrets.DD_ACCESS_ADMIN_EMAIL }}
           ita-api-key:   ${{ secrets.DD_ITA_API_KEY }}
           release-tag:   ${{ inputs.release_tag }}
+          ee-channel:    ${{ steps.ee.outputs.channel }}
+          ee-tag:        ${{ inputs.ee_tag }}
 
       - name: Create TDX VM (boots from easyenclave, fetches dd from GitHub releases)
         if: inputs.target == 'gcp'
@@ -132,7 +159,7 @@ jobs:
           DD_ACCESS_ADMIN_EMAIL: ${{ vars.DD_ACCESS_ADMIN_EMAIL || secrets.DD_ACCESS_ADMIN_EMAIL }}
           DD_ITA_API_KEY: ${{ secrets.DD_ITA_API_KEY }}
           DD_RELEASE_TAG: ${{ inputs.release_tag }}
-          EE_IMAGE_FAMILY: easyenclave-staging
+          EE_IMAGE_FAMILY: ${{ steps.ee.outputs.family }}
           EE_IMAGE_PROJECT: easyenclave
           VM_MACHINE_TYPE: c3-standard-4
           VM_DISK_SIZE: 10GB
@@ -456,6 +483,8 @@ jobs:
           host: ${{ secrets.DD_LOCAL_HOST }}
           ita-api-key: ${{ secrets.DD_ITA_API_KEY }}
           release-tag: ${{ inputs.release_tag }}
+          ee-channel: ${{ steps.ee.outputs.channel }}
+          ee-tag: ${{ inputs.ee_tag }}
 
       # Preview only: deploy hello-world as the end-to-end canary.
       # Exercises the full GH-OIDC auth path (mint → agent verify
