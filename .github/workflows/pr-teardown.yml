@@ -140,3 +140,43 @@ jobs:
               "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records/${record_id}" \
               >/dev/null
           fi
+
+      # Since the CP target default flipped to `ssh` (b87b36c), PR CPs
+      # are libvirt domains on the tdx2 host (`dd-local-pr-N-cp`), not
+      # GCE VMs. The GCE delete step above finds nothing; left alone,
+      # the domain + its 160 GB sparse qcow2 overlay + config.iso +
+      # serial log accumulate forever — `dd-relaunch-cp.sh`'s
+      # destroy-then-redefine only fires on the NEXT push to the same
+      # PR, which never comes for a merged/closed PR.
+      - name: Destroy PR preview CP libvirt domain on tdx2
+        if: steps.pr.outputs.skip != 'true'
+        env:
+          DD_ENV: ${{ steps.pr.outputs.dd_env }}
+          HOST:    ${{ secrets.DD_LOCAL_HOST }}
+          SSH_KEY: ${{ secrets.DD_LOCAL_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          key=$(mktemp)
+          trap 'rm -f "$key"' EXIT
+          printf '%s\n' "$SSH_KEY" > "$key"
+          chmod 600 "$key"
+          # `bash -s -- "$DD_ENV"` so the env name is passed as $1 into
+          # the quoted heredoc instead of expanding locally (avoids
+          # double-quote interpolation bugs for hypothetical shell-meta
+          # characters in env labels).
+          ssh -i "$key" -T \
+              -o StrictHostKeyChecking=accept-new \
+              -o ServerAliveInterval=30 \
+              tdx2@"$HOST" bash -s -- "$DD_ENV" <<'EOSSH'
+          set -euo pipefail
+          env="$1"
+          vm="dd-local-$env-cp"
+          virsh destroy "$vm" 2>/dev/null || true
+          virsh undefine "$vm" --managed-save --snapshots-metadata 2>/dev/null || true
+          sudo rm -f \
+            "/var/lib/libvirt/images/$vm.qcow2" \
+            "/var/lib/libvirt/images/$vm-config.iso" \
+            "/var/log/ee-local-$env-cp.log" \
+            2>/dev/null || true
+          echo "teardown-pr-cp: $vm torn down"
+          EOSSH
