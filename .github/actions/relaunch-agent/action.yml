@@ -27,6 +27,14 @@ inputs:
   release-tag:
     description: 'devopsdefender release tag the local agent should download (e.g. pr-abc123, latest)'
     required: true
+  ee-channel:
+    description: 'easyenclave release channel to sync the libvirt base qcow2 from (stable | staging)'
+    required: false
+    default: 'staging'
+  ee-tag:
+    description: 'Explicit easyenclave release tag override for pre-flight testing a candidate (e.g. image-abc123456). Wins over `ee-channel`.'
+    required: false
+    default: ''
   stream-console:
     description: 'Tail /var/log/ee-local-<kind>.log from tdx2 into the CI log for the duration of the register-wait. Surfaces what the agent VM is actually doing when it fails to register.'
     required: false
@@ -59,11 +67,13 @@ runs:
         REF: ${{ inputs.ref }}
         RELEASE_TAG: ${{ inputs.release-tag }}
         DD_ITA_API_KEY: ${{ inputs.ita-api-key }}
+        DD_EE_CHANNEL: ${{ inputs.ee-channel }}
+        DD_EE_TAG: ${{ inputs.ee-tag }}
       with:
         host: ${{ inputs.host }}
         username: tdx2
         key: ${{ inputs.ssh-key }}
-        envs: KIND,URL,REF,RELEASE_TAG,DD_ITA_API_KEY
+        envs: KIND,URL,REF,RELEASE_TAG,DD_ITA_API_KEY,DD_EE_CHANNEL,DD_EE_TAG
         script: |
           /home/tdx2/src/dd/apps/_infra/dd-relaunch.sh "$KIND" "$URL" "$REF" "$RELEASE_TAG"
 

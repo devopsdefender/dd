@@ -29,6 +29,10 @@ on:
         description: 'Release tag to deploy to production (rollback tool; default: latest)'
         required: false
         default: 'latest'
+      ee_tag:
+        description: 'Pin the libvirt base qcow2 to a specific easyenclave release (e.g. image-abc123456) for pre-flight testing a candidate EE. Empty = track the env''s channel default (stable for prod, staging otherwise).'
+        required: false
+        default: ''
 
 concurrency:
   group: dd-release-${{ github.ref }}
@@ -159,6 +163,7 @@ jobs:
       release_tag: ${{ needs.build.outputs.tag }}
       comment_on_pr: true
       ref: ${{ github.event.pull_request.head.ref }}
+      ee_tag: ${{ inputs.ee_tag || '' }}
     secrets: inherit
 
   # Production deploy at app.{domain}. Fires on push-to-main OR on a
@@ -186,4 +191,5 @@ jobs:
       release_tag: ${{ inputs.release_tag || 'latest' }}
       comment_on_pr: false
       ref: main
+      ee_tag: ${{ inputs.ee_tag || '' }}
     secrets: inherit
