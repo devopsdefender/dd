@@ -108,9 +108,20 @@ runs:
         # Output is prefixed so console lines are distinguishable
         # from the wait loop's own status prints.
         tail_pid=""
+        # Mirror of the tailed console, grepped by the register-wait
+        # loop below for `devopsdefender: fatal:` — the single
+        # `eprintln!` src/main.rs emits on unrecoverable error.
+        # If the agent's register retries all fail (e.g. dnsmasq
+        # negative-cached NXDOMAIN from the CP's hydrate probe), the
+        # agent exits and will never appear in `/api/agents`; without
+        # this mirror the CI loop would poll a corpse for its full
+        # 10-min budget. Always produced even when streaming is off,
+        # since the grep is what saves the budget.
+        mirror=$(mktemp)
+        trap 'rm -f "$mirror"' EXIT
         if [ "$STREAM_CONSOLE" = "true" ]; then
           key=$(mktemp)
-          trap 'rm -f "$key"' EXIT
+          trap 'rm -f "$key" "$mirror"' EXIT
           printf '%s\n' "$SSH_KEY" > "$key"
           chmod 600 "$key"
           # `stdbuf -oL` on both ends: force tail and sed to line-buffer
@@ -124,17 +135,24 @@ runs:
               -o ServerAliveInterval=30 \
               tdx2@"$HOST" \
               "sudo stdbuf -oL tail -n +1 -F /var/log/ee-local-$KIND.log || true" \
-            2>&1 | stdbuf -oL sed -u "s/^/  [$vm console] /" &
+            2>&1 | stdbuf -oL sed -u "s/^/  [$vm console] /" \
+                 | stdbuf -oL tee -a "$mirror" &
           tail_pid=$!
           # Give the tail a moment to attach so its first lines land
           # before the register wait's first status message.
           sleep 1
         fi
         cleanup_tail() {
-          if [ -n "$tail_pid" ]; then
-            kill "$tail_pid" 2>/dev/null || true
-            wait "$tail_pid" 2>/dev/null || true
-          fi
+          # Kill every child process — the `ssh | sed | tee` pipeline
+          # plus any stragglers. `kill "$tail_pid"` alone drops tee but
+          # leaves ssh holding its remote `tail -F`, which can prevent
+          # the Actions runner from closing the step out (stdout stream
+          # still has live writers). `pkill -P $$` nukes the whole
+          # tree; a short SIGKILL chaser covers processes that ignored
+          # SIGTERM.
+          pkill -TERM -P $$ 2>/dev/null || true
+          sleep 0.3
+          pkill -KILL -P $$ 2>/dev/null || true
         }
 
         # Mint a GH OIDC token for the /api/agents bearer auth. The
@@ -162,6 +180,19 @@ runs:
             echo "$vm registered at https://$host_found"
             cleanup_tail
             exit 0
+          fi
+          # Fail fast if the agent already exited with a fatal error.
+          # The console mirror is the streaming tee of the serial log;
+          # `devopsdefender: fatal:` is main.rs's terminal eprintln
+          # and EE doesn't restart boot workloads, so once it lands in
+          # the mirror there's nothing left to wait for.
+          if [ -s "$mirror" ] && grep -q 'devopsdefender: fatal:' "$mirror"; then
+            cleanup_tail
+            echo "::group::Fatal line from $vm console"
+            grep -m1 'devopsdefender: fatal:' "$mirror" || true
+            echo "::endgroup::"
+            echo "::error::$vm agent exited fatal; not polling /api/agents further"
+            exit 1
           fi
           echo "  waiting for $vm to register with $URL... (${i}/60)"
           sleep 10

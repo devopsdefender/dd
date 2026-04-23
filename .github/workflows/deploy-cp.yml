@@ -264,7 +264,19 @@ jobs:
           # timeout into a traceable failure.
           tail_pid=""
           key=$(mktemp)
-          trap 'rm -f "$key"; [ -n "$tail_pid" ] && kill "$tail_pid" 2>/dev/null; exit' EXIT
+          mirror=$(mktemp)
+          # `rc=$?` FIRST: capture the script's actual exit status so
+          # the `exit $rc` at the end doesn't inherit `pkill`'s exit 1
+          # (which fires whenever it has no matches — i.e. a clean
+          # state). Without that, every successful run would be
+          # reported as failed.
+          #
+          # `pkill -P $$` kills the ENTIRE tail pipeline (ssh, sed,
+          # tee) — not just `$tail_pid`, which is tee (the last
+          # command). Without this the ssh hangs on the remote
+          # `tail -F`, stdout stays open on the runner, and the step
+          # can stall long past the script's `exit` call.
+          trap 'rc=$?; rm -f "$key" "$mirror"; pkill -TERM -P $$ 2>/dev/null || true; sleep 0.3; pkill -KILL -P $$ 2>/dev/null || true; exit $rc' EXIT
           printf '%s\n' "$SSH_KEY" > "$key"
           chmod 600 "$key"
           # `stdbuf -oL` on both ends: force tail and sed to line-buffer
@@ -274,12 +286,19 @@ jobs:
           # tail so "cannot open log" / "retrying" diagnostics surface
           # — if the log file never appears, we want to see why rather
           # than stare at an apparently-silent boot.
+          #
+          # `tee -a "$mirror"` so the health-poll loop can fail fast
+          # when the CP's main.rs emits its terminal
+          # `devopsdefender: fatal:` eprintln. Without this the loop
+          # would burn its full 5-min budget polling /health on a
+          # tunnel that never came up.
           ssh -i "$key" -T \
               -o StrictHostKeyChecking=accept-new \
               -o ServerAliveInterval=30 \
               tdx2@"$HOST" \
               "sudo stdbuf -oL tail -n +1 -F /var/log/ee-local-${ENV_LABEL}-cp.log || true" \
-            2>&1 | stdbuf -oL sed -u "s/^/  [dd-local-${ENV_LABEL}-cp console] /" &
+            2>&1 | stdbuf -oL sed -u "s/^/  [dd-local-${ENV_LABEL}-cp console] /" \
+                 | stdbuf -oL tee -a "$mirror" &
           tail_pid=$!
           sleep 1
           for i in $(seq 1 60); do
@@ -287,6 +306,13 @@ jobs:
             if [ "$CODE" = "200" ]; then
               echo "CP healthy at ${AGENT_URL} (HTTP 200)"
               exit 0
+            fi
+            if [ -s "$mirror" ] && grep -q 'devopsdefender: fatal:' "$mirror"; then
+              echo "::group::Fatal line from CP console"
+              grep -m1 'devopsdefender: fatal:' "$mirror" || true
+              echo "::endgroup::"
+              echo "::error::CP exited fatal; not polling /health further"
+              exit 1
             fi
             echo "  waiting for tunnel (got HTTP ${CODE})... (${i}/60)"
             sleep 5
