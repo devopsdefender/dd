@@ -27,6 +27,10 @@ inputs:
   release-tag:
     description: 'devopsdefender release tag the local agent should download (e.g. pr-abc123, latest)'
     required: true
+  stream-console:
+    description: 'Tail /var/log/ee-local-<kind>.log from tdx2 into the CI log for the duration of the register-wait. Surfaces what the agent VM is actually doing when it fails to register.'
+    required: false
+    default: 'true'
 
 runs:
   using: composite
@@ -65,40 +69,100 @@ runs:
 
     # Block until the freshly-booted agent VM registers with the CP.
     # This is the "I can see the local agent deployment worked"
-    # signal that gates the whole release. 30 attempts × 10s = 5 min
-    # covers a cold VM boot (~60s) + cloudflared tunnel (~30s) +
-    # agent startup + register. This is a JSON-body predicate poll —
-    # no off-the-shelf action, so it's kept as a tight loop.
+    # signal that gates the whole release.
+    #
+    # Budget: cold VM boot ~60s + EE pre-fetch of the dd binary
+    # from GitHub releases (can be 60s+ on a cold cache) +
+    # cloudflared tunnel ~30s + agent ITA mint (one round-trip to
+    # Intel) + register with the CP's 6-retry backoff path
+    # (~105s cumulative if CF edge is still propagating). Worst
+    # case is ~7 min end-to-end, so 5 min was too tight — preview
+    # deploys were flaking here even when the agent eventually
+    # came up. 60 × 10s = 10 min covers it with headroom.
+    #
+    # Simultaneously we tail the VM's serial console log from
+    # /var/log/ee-local-<kind>.log on tdx2 so every `eprintln!`
+    # the agent prints (mint failures, register errors, EE boot
+    # issues) lands in the CI log in real time. Previously the
+    # only visibility was "never registered" — now the cause is
+    # in the same job log as the wait.
+    #
+    # On failure we also dump the last /api/agents payload so
+    # the CP-side view is captured alongside the VM-side view.
     - name: Verify agent registered with CP
       shell: bash
       env:
-        URL: ${{ inputs.url }}
-        KIND: ${{ inputs.kind }}
+        URL:             ${{ inputs.url }}
+        KIND:            ${{ inputs.kind }}
+        HOST:            ${{ inputs.host }}
+        SSH_KEY:         ${{ inputs.ssh-key }}
+        STREAM_CONSOLE:  ${{ inputs.stream-console }}
       run: |
+        set -uo pipefail
         vm="dd-local-$KIND"
         since=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+        # Start the serial-console tail first so the boot messages
+        # that arrive during the register wait all show up in-line.
+        # `tail -F` follows rotation; `ssh -T` suppresses the pty.
+        # Output is prefixed so console lines are distinguishable
+        # from the wait loop's own status prints.
+        tail_pid=""
+        if [ "$STREAM_CONSOLE" = "true" ]; then
+          key=$(mktemp)
+          trap 'rm -f "$key"' EXIT
+          printf '%s\n' "$SSH_KEY" > "$key"
+          chmod 600 "$key"
+          ssh -i "$key" -T \
+              -o StrictHostKeyChecking=accept-new \
+              -o ServerAliveInterval=30 \
+              tdx2@"$HOST" \
+              "sudo tail -n +1 -F /var/log/ee-local-$KIND.log 2>/dev/null || true" \
+            2>&1 | sed -u "s/^/  [$vm console] /" &
+          tail_pid=$!
+          # Give the tail a moment to attach so its first lines land
+          # before the register wait's first status message.
+          sleep 1
+        fi
+        cleanup_tail() {
+          if [ -n "$tail_pid" ]; then
+            kill "$tail_pid" 2>/dev/null || true
+            wait "$tail_pid" 2>/dev/null || true
+          fi
+        }
+
         # Mint a GH OIDC token for the /api/agents bearer auth. The
         # calling job must grant `id-token: write` in its
         # permissions block.
         if [ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
+          cleanup_tail
           echo "::error::id-token not available — caller needs 'permissions: id-token: write'"
           exit 1
         fi
         oidc=$(curl -fsSL \
           -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
           "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=dd-agent" | jq -r .value)
-        for i in $(seq 1 30); do
-          host=$(curl -fsS --max-time 10 -H "Authorization: Bearer ${oidc}" \
-            "$URL/api/agents" 2>/dev/null \
-            | jq -r --arg since "$since" --arg vm "$vm" '
+        last_payload=""
+        for i in $(seq 1 60); do
+          payload=$(curl -fsS --max-time 10 -H "Authorization: Bearer ${oidc}" \
+            "$URL/api/agents" 2>/dev/null || true)
+          if [ -n "$payload" ]; then
+            last_payload="$payload"
+          fi
+          host_found=$(echo "$payload" | jq -r --arg since "$since" --arg vm "$vm" '
                 [.[] | select(.vm_name==$vm and .status=="healthy" and .last_seen > $since)]
-                | sort_by(.last_seen) | reverse | .[0].hostname // empty' || true)
-          if [ -n "$host" ]; then
-            echo "$vm registered at https://$host"
+                | sort_by(.last_seen) | reverse | .[0].hostname // empty' 2>/dev/null || true)
+          if [ -n "$host_found" ]; then
+            echo "$vm registered at https://$host_found"
+            cleanup_tail
             exit 0
           fi
-          echo "  waiting for $vm to register with $URL... (${i}/30)"
+          echo "  waiting for $vm to register with $URL... (${i}/60)"
           sleep 10
         done
-        echo "::error::$vm never registered with $URL within 5 min"
+        cleanup_tail
+        echo "::group::Last /api/agents payload"
+        echo "$last_payload" | jq . 2>/dev/null || echo "$last_payload"
+        echo "::endgroup::"
+        echo "::error::$vm never registered with $URL within 10 min (since=$since)"
         exit 1
