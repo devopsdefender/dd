@@ -600,6 +600,25 @@ pub async fn provision_cp_access(
             }
         }
     }
+    // One-shot reap: any prior deploy left behind a
+    // `dd-{env}-cp-noise-attest` bypass app fronting `{hostname}/attest`.
+    // The attest route is gone, so the bypass has no job. The workload
+    // sweep above is subdomain-scoped and won't catch path-bypass apps,
+    // so delete it explicitly here. Lookup-by-domain is idempotent;
+    // no-op once the app is gone.
+    if let Ok(Some(stale)) = find_app_by_domain(http, cf, &format!("{hostname}/attest")).await {
+        if let Some(id) = stale["id"].as_str() {
+            let _ = call(
+                http,
+                cf,
+                Method::DELETE,
+                &format!("/accounts/{}/access/apps/{id}", cf.account_id),
+                None,
+            )
+            .await;
+        }
+    }
+
     for (path_suffix, label) in [
         ("/health", "health"),
         ("/api/agents", "api-agents"),
