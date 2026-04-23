@@ -43,10 +43,16 @@ sync_base() {
                  --json tagName -q '.[0].tagName' 2>/dev/null)
         ;;
       staging)
-        # Staging = newest release, prerelease or not. `gh release list`
-        # with no filter sorts newest-first.
-        target=$(gh release list --repo "$EE_REPO" \
-                 --limit 1 --json tagName -q '.[0].tagName' 2>/dev/null)
+        # Staging = newest prerelease. NOT `--limit 1` unfiltered: the
+        # day easyenclave cuts a `v*` stable tag, that release gets a
+        # later `createdAt` than every existing prerelease, and an
+        # unfiltered newest-first query would collapse staging onto
+        # stable — defeating the whole channel-split. Explicitly keep
+        # only `isPrerelease: true` entries. The first `image-*` tag
+        # cut on main before the v* release always wins.
+        target=$(gh release list --repo "$EE_REPO" --limit 20 \
+                 --json tagName,isPrerelease \
+                 -q '[.[] | select(.isPrerelease)][0].tagName' 2>/dev/null)
         ;;
       *)
         echo "ee-sync: unknown DD_EE_CHANNEL=$channel (want stable|staging)" >&2
