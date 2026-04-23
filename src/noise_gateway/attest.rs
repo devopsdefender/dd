@@ -7,8 +7,17 @@
 //! fetch `GET /attest` over plain HTTPS, verify the quote via ITA,
 //! extract the Noise static pubkey from `report_data`, and trust
 //! that key for the handshake. No X.509 certs in the loop.
+//!
+//! When `DD_ITA_*` is configured, we also mint an ITA-signed JWT
+//! over the same quote at boot and refresh it in the background.
+//! The JWT rides in `/attest` as `ita_token`; a client that checks
+//! it escapes TOFU-pin semantics entirely. Mint failures are
+//! non-fatal — the field is simply omitted and clients fall back
+//! to TOFU.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
 
 use axum::extract::State;
 use axum::response::Json;
@@ -18,12 +27,26 @@ use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
 use rand::rngs::OsRng;
 use serde::Serialize;
+use tokio::sync::RwLock;
 use x25519_dalek::{PublicKey, StaticSecret};
+
+use crate::config::Ita;
+
+/// How often we re-mint the `/attest` ITA token. The token itself
+/// is valid for ~24h from Intel, but the Noise quote is immutable
+/// for the life of the process, so re-minting is cheap insurance
+/// against JWKS-rotation edge cases.
+const ITA_REFRESH: Duration = Duration::from_secs(3600);
 
 pub struct Attestor {
     secret: StaticSecret,
     public: [u8; 32],
     quote: Vec<u8>,
+    /// ITA-minted JWT over `quote`. `None` until `start_ita_refresh`
+    /// successfully mints once (and cleared on repeated failure is
+    /// avoided — we keep the last good token so a brief Intel outage
+    /// doesn't drop clients into TOFU).
+    ita_token: Arc<RwLock<Option<String>>>,
 }
 
 impl Attestor {
@@ -60,6 +83,7 @@ impl Attestor {
             secret,
             public,
             quote,
+            ita_token: Arc::new(RwLock::new(None)),
         })
     }
 
@@ -74,6 +98,47 @@ impl Attestor {
     pub fn quote(&self) -> &[u8] {
         &self.quote
     }
+
+    /// Mint an initial ITA token and spawn a background task that
+    /// re-mints every [`ITA_REFRESH`]. Non-fatal on failure: the
+    /// token field stays `None` and `/attest` omits it, which puts
+    /// the client back on TOFU semantics rather than refusing the
+    /// handshake.
+    ///
+    /// Off-enclave (placeholder quote), the mint will 4xx — we log
+    /// and move on. In prod the quote is real and the mint should
+    /// succeed on every refresh.
+    pub fn start_ita_refresh(self: &Arc<Self>, ita: Ita) {
+        let me = self.clone();
+        tokio::spawn(async move {
+            match me.mint_once(&ita).await {
+                Ok(tok) => {
+                    eprintln!(
+                        "noise-gw: minted initial /attest ITA token ({} bytes)",
+                        tok.len()
+                    );
+                    *me.ita_token.write().await = Some(tok);
+                }
+                Err(e) => eprintln!("noise-gw: initial /attest ITA mint failed: {e}"),
+            }
+            loop {
+                tokio::time::sleep(ITA_REFRESH).await;
+                match me.mint_once(&ita).await {
+                    Ok(tok) => *me.ita_token.write().await = Some(tok),
+                    Err(e) => eprintln!("noise-gw: /attest ITA refresh failed: {e}"),
+                }
+            }
+        });
+    }
+
+    async fn mint_once(&self, ita: &Ita) -> crate::error::Result<String> {
+        let quote_b64 = B64.encode(&self.quote);
+        crate::ita::mint(&ita.base_url, &ita.api_key, &quote_b64).await
+    }
+
+    pub async fn ita_token(&self) -> Option<String> {
+        self.ita_token.read().await.clone()
+    }
 }
 
 pub(crate) fn routes() -> Router<super::State> {
@@ -84,12 +149,15 @@ pub(crate) fn routes() -> Router<super::State> {
 struct AttestResponse {
     quote_b64: String,
     pubkey_hex: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ita_token: Option<String>,
 }
 
 async fn attest(State(s): State<super::State>) -> Json<AttestResponse> {
     Json(AttestResponse {
         quote_b64: B64.encode(s.attest.quote()),
         pubkey_hex: hex::encode(s.attest.public_key()),
+        ita_token: s.attest.ita_token().await,
     })
 }
 
@@ -171,5 +239,15 @@ mod tests {
         let pk = *a.public_key();
         let b = Attestor::load_or_mint(&kf).await.unwrap();
         assert_eq!(&pk, b.public_key());
+    }
+
+    #[tokio::test]
+    async fn ita_token_default_none_and_updatable() {
+        let dir = tempfile::tempdir().unwrap();
+        let kf = dir.path().join("noise.key");
+        let a = Arc::new(Attestor::load_or_mint(&kf).await.unwrap());
+        assert!(a.ita_token().await.is_none());
+        *a.ita_token.write().await = Some("stub.jwt".into());
+        assert_eq!(a.ita_token().await.as_deref(), Some("stub.jwt"));
     }
 }

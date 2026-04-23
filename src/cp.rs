@@ -257,6 +257,7 @@ pub async fn run() -> Result<()> {
             .map_err(|e| Error::Internal(format!("noise keypair: {e}")))?,
     );
     eprintln!("cp: noise_pubkey={}", hex::encode(attestor.public_key()));
+    attestor.start_ita_refresh(cfg.ita.clone());
     let ee_token = std::env::var("EE_TOKEN").ok();
     let upstream = Arc::new(noise_gateway::upstream::EeAgent::new(
         std::path::PathBuf::from(noise_gateway::upstream::DEFAULT_EE_AGENT_SOCK),
