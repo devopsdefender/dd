@@ -265,12 +265,18 @@ jobs:
           tail_pid=""
           key=$(mktemp)
           mirror=$(mktemp)
-          # pkill -P $$ on exit: kill the ENTIRE tail pipeline (ssh,
-          # sed, tee) — not just `$tail_pid` (which is tee, the last
+          # `rc=$?` FIRST: capture the script's actual exit status so
+          # the `exit $rc` at the end doesn't inherit `pkill`'s exit 1
+          # (which fires whenever it has no matches — i.e. a clean
+          # state). Without that, every successful run would be
+          # reported as failed.
+          #
+          # `pkill -P $$` kills the ENTIRE tail pipeline (ssh, sed,
+          # tee) — not just `$tail_pid`, which is tee (the last
           # command). Without this the ssh hangs on the remote
           # `tail -F`, stdout stays open on the runner, and the step
           # can stall long past the script's `exit` call.
-          trap 'rm -f "$key" "$mirror"; pkill -TERM -P $$ 2>/dev/null; sleep 0.3; pkill -KILL -P $$ 2>/dev/null; exit' EXIT
+          trap 'rc=$?; rm -f "$key" "$mirror"; pkill -TERM -P $$ 2>/dev/null || true; sleep 0.3; pkill -KILL -P $$ 2>/dev/null || true; exit $rc' EXIT
           printf '%s\n' "$SSH_KEY" > "$key"
           chmod 600 "$key"
           # `stdbuf -oL` on both ends: force tail and sed to line-buffer
