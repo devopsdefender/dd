@@ -276,19 +276,29 @@ jobs:
             od=$(printf '%s\n' "$orphan_dns"  | grep -c . || true)
             echo "Orphan-agent: apps=$oa dns=$od"
 
-            [ -n "$orphan_apps" ] && echo "$orphan_apps" | while read -r id name; do
-              [ -z "$id" ] && continue
-              curl -fsS -X DELETE "${AUTH[@]}" \
-                "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/access/apps/$id" \
-                >/dev/null 2>&1 && echo "  - app $name" || echo "  ! app $name FAILED"
-            done
-            [ -n "$orphan_dns" ] && echo "$orphan_dns" | while read -r id name; do
-              [ -z "$id" ] && continue
-              curl -fsS -X DELETE "${AUTH[@]}" \
-                "https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/dns_records/$id" \
-                >/dev/null 2>&1 && echo "  - dns $name" || echo "  ! dns $name FAILED"
-            done
+            if [ -n "$orphan_apps" ]; then
+              echo "$orphan_apps" | while read -r id name; do
+                [ -z "$id" ] && continue
+                curl -fsS -X DELETE "${AUTH[@]}" \
+                  "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/access/apps/$id" \
+                  >/dev/null 2>&1 && echo "  - app $name" || echo "  ! app $name FAILED"
+              done
+            fi
+            if [ -n "$orphan_dns" ]; then
+              echo "$orphan_dns" | while read -r id name; do
+                [ -z "$id" ] && continue
+                curl -fsS -X DELETE "${AUTH[@]}" \
+                  "https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/dns_records/$id" \
+                  >/dev/null 2>&1 && echo "  - dns $name" || echo "  ! dns $name FAILED"
+              done
+            fi
           fi
+
+          # Explicit success — prior `[ -n "$x" ] && cmd` short-circuit
+          # would leave `$?=1` when both orphan lists were empty (the
+          # happy state), and `set -e` turned that into a script failure
+          # with no visible error. Trailing no-op restores exit 0.
+          echo "cleanup done."
 
   # TERMINATED GCE VMs accumulate for *open* envs (STONITH moves a
   # prior VM to TERMINATED; deploy-cp.yml's verify step force-deletes
