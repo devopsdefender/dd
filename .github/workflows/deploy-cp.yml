@@ -246,16 +246,35 @@ jobs:
           tail -80 /tmp/serial.log | sed 's/^/[serial] /'
           exit 1
 
-      - name: Wait for CP health (SSH CP — no serial stream, just poll)
+      - name: Wait for CP health (SSH CP — streams serial console)
         if: inputs.target == 'ssh'
         env:
           AGENT_URL: https://${{ inputs.hostname }}
+          ENV_LABEL: ${{ inputs.env }}
+          HOST:      ${{ secrets.DD_LOCAL_HOST }}
+          SSH_KEY:   ${{ secrets.DD_LOCAL_SSH_KEY }}
         run: |
+          set -uo pipefail
           # SSH CP boot fires asynchronously via `virsh start` on the
-          # tdx2 host. We only own the outside view here — poll for a
-          # real 200 on /health (not a CF Access 302 false-positive).
-          # Serial console lives at /var/log/ee-local-${env}-cp.log
-          # on the tdx2 host if you need to tail it manually.
+          # tdx2 host. We own the outside view (poll /health for a
+          # real 200) and tail the inside view — the serial console
+          # at /var/log/ee-local-${env}-cp.log — so every boot-time
+          # eprintln! lands in this job's log in real time. Both views
+          # together turn "CP not healthy within 5 min" from an opaque
+          # timeout into a traceable failure.
+          tail_pid=""
+          key=$(mktemp)
+          trap 'rm -f "$key"; [ -n "$tail_pid" ] && kill "$tail_pid" 2>/dev/null; exit' EXIT
+          printf '%s\n' "$SSH_KEY" > "$key"
+          chmod 600 "$key"
+          ssh -i "$key" -T \
+              -o StrictHostKeyChecking=accept-new \
+              -o ServerAliveInterval=30 \
+              tdx2@"$HOST" \
+              "sudo tail -n +1 -F /var/log/ee-local-${ENV_LABEL}-cp.log 2>/dev/null || true" \
+            2>&1 | sed -u "s/^/  [dd-local-${ENV_LABEL}-cp console] /" &
+          tail_pid=$!
+          sleep 1
           for i in $(seq 1 60); do
             CODE=$(curl -s -o /dev/null -w '%{http_code}' "${AGENT_URL}/health" || echo "000")
             if [ "$CODE" = "200" ]; then
