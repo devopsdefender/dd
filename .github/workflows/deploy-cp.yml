@@ -63,8 +63,16 @@ on:
         type: string
         default: ssh
 
+# Serialize PR-preview deploys on the `preview` bucket: all pr-*
+# runs share one libvirt domain (`dd-local-preview`) on tdx2, so
+# two concurrent deploys race — the second PR's dd-relaunch.sh
+# destroys and rebuilds the VM mid-way through the first PR's
+# register-wait, so the first PR's agent ends up registering
+# against the WRONG cp (whichever env won the rebuild) and the
+# wait times out. Keeping production in its own group so a
+# prod deploy isn't blocked by a preview queue.
 concurrency:
-  group: deploy-cp-${{ inputs.env }}
+  group: deploy-cp-${{ inputs.env == 'production' && 'production' || 'preview' }}
   cancel-in-progress: false
 
 jobs:
