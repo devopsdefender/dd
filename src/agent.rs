@@ -26,6 +26,7 @@ use axum::http::HeaderMap;
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use base64::Engine as _;
 use serde::Deserialize;
 use tokio::sync::RwLock;
 
@@ -70,6 +71,13 @@ struct St {
     /// without any shared secret; anyone else is denied at claim
     /// check.
     gh: Arc<gh_oidc::Verifier>,
+    /// TDX-quote + Noise-static-pubkey bundle. Served as
+    /// `{ noise: { quote_b64, pubkey_hex } }` off `/health` so a
+    /// bastion-app can bootstrap a Noise session in one fetch (used
+    /// to be a separate `/attest` endpoint — folded in here). Shared
+    /// `Arc` with the Noise gateway module's handshake responder;
+    /// one keypair / one quote per boot.
+    attest: Arc<noise_gateway::attest::Attestor>,
 }
 
 pub async fn run() -> Result<()> {
@@ -115,10 +123,12 @@ pub async fn run() -> Result<()> {
         });
     }
 
-    // Noise gateway runs in-process too: this agent serves `/attest`
-    // + `/noise/ws` on the same port 8080 as everything else, so
-    // bastion-app CLIs can attach directly to the agent's EE
-    // instance without going through the CP.
+    // Noise gateway runs in-process too: this agent serves the
+    // pre-handshake bundle inline on /health (`.noise.quote_b64` +
+    // `.noise.pubkey_hex`) and the Noise_IK responder on /noise/ws,
+    // both on the same port 8080 as everything else, so bastion-app
+    // CLIs can attach directly to the agent's EE instance without
+    // going through the CP.
     let trust = noise_gateway::new_trust_handle();
 
     // Background poll for the device trust list. Mutates `trust`
@@ -155,7 +165,7 @@ pub async fn run() -> Result<()> {
         ee_token,
     ));
     let ng_state = noise_gateway::State {
-        attest: attestor,
+        attest: attestor.clone(),
         trust,
         upstream,
     };
@@ -171,6 +181,7 @@ pub async fn run() -> Result<()> {
         ita_token,
         extras: Arc::new(RwLock::new(cfg.extra_ingress.clone())),
         gh,
+        attest: attestor,
     };
 
     let app = Router::new()
@@ -463,6 +474,17 @@ async fn health(State(s): State<St>) -> Json<serde_json::Value> {
         "system_uptime_secs": m.uptime_secs,
         "ita_token": ita_token,
         "extra_ingress": extra_ingress,
+        // Pre-Noise-handshake bundle — stable per boot. Used to be a
+        // standalone `GET /attest` endpoint. Keeping it here lets a
+        // bastion-app bootstrap with one fetch and drops a CF Access
+        // bypass-app per env × per service. `quote_b64` binds the
+        // raw Noise pubkey into its TDX `report_data`; clients verify
+        // the Intel signature and pin the pubkey from the quote — no
+        // TOFU needed.
+        "noise": {
+            "quote_b64": base64::engine::general_purpose::STANDARD.encode(s.attest.quote()),
+            "pubkey_hex": hex::encode(s.attest.public_key()),
+        },
     }))
 }
 

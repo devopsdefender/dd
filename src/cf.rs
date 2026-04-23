@@ -510,9 +510,10 @@ fn is_admin_label(label: &str) -> bool {
 /// Apps created:
 ///   - Human: `{hostname}` — GitHub org or admin email (dashboard, /agent/*, /cp/*)
 ///   - Human: `term.{hostname}` — ttyd shell, org members only
-///   - Bypass: `{hostname}/health` — public (read-only fleet health)
-///   - Bypass: `{hostname}/cp/attest` — TDX quote is self-authenticating
+///   - Bypass: `{hostname}/health` — public (read-only fleet health;
+///     also carries the Noise pre-handshake `{quote_b64, pubkey_hex}`)
 ///   - Bypass: `{hostname}/api/agents` — read-only agent list
+///   - Bypass: `{hostname}/noise/ws` — Noise_IK-gated in code
 ///   - Bypass: `{hostname}/register` — ITA-gated in code
 ///   - Bypass: `{hostname}/ingress/replace` — ITA-gated in code
 pub async fn provision_cp_access(
@@ -599,12 +600,33 @@ pub async fn provision_cp_access(
             }
         }
     }
+    // One-shot reap: any prior deploy left behind a
+    // `dd-{env}-cp-noise-attest` bypass app fronting `{hostname}/attest`.
+    // The attest route is gone, so the bypass has no job. The workload
+    // sweep above is subdomain-scoped and won't catch path-bypass apps,
+    // so delete it explicitly here. Lookup-by-domain is idempotent;
+    // no-op once the app is gone.
+    if let Ok(Some(stale)) = find_app_by_domain(http, cf, &format!("{hostname}/attest")).await {
+        if let Some(id) = stale["id"].as_str() {
+            let _ = call(
+                http,
+                cf,
+                Method::DELETE,
+                &format!("/accounts/{}/access/apps/{id}", cf.account_id),
+                None,
+            )
+            .await;
+        }
+    }
+
     for (path_suffix, label) in [
         ("/health", "health"),
         ("/api/agents", "api-agents"),
         ("/api/v1/devices/trusted", "api-devices-trusted"),
         ("/api/v1/admin/export", "api-admin-export"),
-        ("/attest", "noise-attest"),
+        // The Noise pre-handshake bundle (`quote_b64` + `pubkey_hex`)
+        // now rides on `/health` — `/attest` was deleted. Only the
+        // handshake itself still needs its own bypass.
         ("/noise/ws", "noise-ws"),
         ("/register", "register"),
         ("/ingress/replace", "ingress"),
@@ -627,10 +649,13 @@ pub async fn provision_cp_access(
 ///   - Human: `{agent}.{domain}` — browser dashboard only
 ///   - Human: `<admin-label>.{agent}.{domain}` for labels in
 ///     `ADMIN_LABELS` (ttyd et al) — org members only
-///   - Bypass: `{agent}.{domain}/health` — public
+///   - Bypass: `{agent}.{domain}/health` — public; carries the Noise
+///     pre-handshake `{quote_b64, pubkey_hex}` in its response
 ///   - Bypass: `{agent}.{domain}/deploy` — GH-OIDC-gated in code
 ///   - Bypass: `{agent}.{domain}/exec` — GH-OIDC-gated in code
 ///   - Bypass: `{agent}.{domain}/logs/*` — GH-OIDC-gated in code
+///   - Bypass: `{agent}.{domain}/noise/ws` — Noise_IK-gated in code
+///     against the CP-trusted paired device pubkey set
 ///   - Bypass: `{label}.{agent}.{domain}` for other labels — workload
 ///     URLs are public by default (this is the nvidia-smi exemption).
 ///   - Any existing `*.{agent}.{domain}` app whose label is no longer
@@ -660,6 +685,15 @@ pub async fn provision_agent_access(
         ("/deploy", "deploy"),
         ("/exec", "exec"),
         ("/logs", "logs"),
+        // The in-process Noise gateway (merged into the agent's
+        // router in agent.rs) lives on the same port + hostname as
+        // /deploy + /exec, so a direct bastion-app attach needs the
+        // same bypass treatment the CP hostname already gets. The
+        // pre-handshake quote bundle is served by /health above
+        // (collapsed from the old /attest), so only the handshake
+        // WebSocket needs its own entry here. Noise_IK against the
+        // paired device pubkey set is the gate.
+        ("/noise/ws", "noise-ws"),
     ] {
         ensure_bypass_app(
             http,
