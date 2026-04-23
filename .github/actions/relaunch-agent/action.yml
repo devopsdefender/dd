@@ -65,10 +65,21 @@ runs:
 
     # Block until the freshly-booted agent VM registers with the CP.
     # This is the "I can see the local agent deployment worked"
-    # signal that gates the whole release. 30 attempts × 10s = 5 min
-    # covers a cold VM boot (~60s) + cloudflared tunnel (~30s) +
-    # agent startup + register. This is a JSON-body predicate poll —
-    # no off-the-shelf action, so it's kept as a tight loop.
+    # signal that gates the whole release.
+    #
+    # Budget: cold VM boot ~60s + EE pre-fetch of the dd binary
+    # from GitHub releases (can be 60s+ on a cold cache) +
+    # cloudflared tunnel ~30s + agent ITA mint (one round-trip to
+    # Intel) + register with the CP's 6-retry backoff path
+    # (~105s cumulative if CF edge is still propagating). Worst
+    # case is ~7 min end-to-end, so 5 min was too tight — preview
+    # deploys were flaking here even when the agent eventually
+    # came up. 60 × 10s = 10 min covers it with headroom.
+    #
+    # On failure we dump the last /api/agents payload so the CI
+    # log shows what the CP actually saw (stale registration
+    # without a fresh last_seen, wrong vm_name, empty array…)
+    # instead of the previous opaque "never registered" message.
     - name: Verify agent registered with CP
       shell: bash
       env:
@@ -87,18 +98,25 @@ runs:
         oidc=$(curl -fsSL \
           -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
           "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=dd-agent" | jq -r .value)
-        for i in $(seq 1 30); do
-          host=$(curl -fsS --max-time 10 -H "Authorization: Bearer ${oidc}" \
-            "$URL/api/agents" 2>/dev/null \
-            | jq -r --arg since "$since" --arg vm "$vm" '
+        last_payload=""
+        for i in $(seq 1 60); do
+          payload=$(curl -fsS --max-time 10 -H "Authorization: Bearer ${oidc}" \
+            "$URL/api/agents" 2>/dev/null || true)
+          if [ -n "$payload" ]; then
+            last_payload="$payload"
+          fi
+          host=$(echo "$payload" | jq -r --arg since "$since" --arg vm "$vm" '
                 [.[] | select(.vm_name==$vm and .status=="healthy" and .last_seen > $since)]
-                | sort_by(.last_seen) | reverse | .[0].hostname // empty' || true)
+                | sort_by(.last_seen) | reverse | .[0].hostname // empty' 2>/dev/null || true)
           if [ -n "$host" ]; then
             echo "$vm registered at https://$host"
             exit 0
           fi
-          echo "  waiting for $vm to register with $URL... (${i}/30)"
+          echo "  waiting for $vm to register with $URL... (${i}/60)"
           sleep 10
         done
-        echo "::error::$vm never registered with $URL within 5 min"
+        echo "::group::Last /api/agents payload"
+        echo "$last_payload" | jq . 2>/dev/null || echo "$last_payload"
+        echo "::endgroup::"
+        echo "::error::$vm never registered with $URL within 10 min (since=$since)"
         exit 1
