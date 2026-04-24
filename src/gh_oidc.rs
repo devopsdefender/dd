@@ -72,9 +72,37 @@ impl Verifier {
         })
     }
 
-    /// Verify a JWT, check the signature, issuer, audience, and
-    /// `repository_owner` claim. Returns decoded claims on success.
+    /// Verify a JWT and require `repository_owner == DD_OWNER` (the
+    /// fleet owner). Use this for endpoints only the fleet should
+    /// reach — e.g. `/owner`, which re-assigns an agent to a tenant.
     pub async fn verify(&self, token: &str) -> Result<Claims> {
+        self.verify_allowing(token, None).await
+    }
+
+    /// Verify a JWT and accept the caller if `repository_owner`
+    /// matches EITHER the fleet owner (`DD_OWNER`) OR the passed
+    /// `extra_owner` (typically the agent's runtime `agent_owner`,
+    /// set by the Sats-for-Compute bot via `POST /owner` when a
+    /// claim activates). Use this for workload-control endpoints
+    /// (`/deploy`, `/exec`, `/logs`) that should accept either ops
+    /// or the active tenant.
+    pub async fn verify_allowing(&self, token: &str, extra_owner: Option<&str>) -> Result<Claims> {
+        let claims = self.decode_and_validate(token).await?;
+        let ok = claims.repository_owner == self.owner
+            || extra_owner
+                .filter(|o| !o.is_empty())
+                .is_some_and(|o| o == claims.repository_owner);
+        if !ok {
+            return Err(Error::Unauthorized);
+        }
+        Ok(claims)
+    }
+
+    /// JWT decode + signature/issuer/audience validation, without
+    /// any owner check. Extracted so `verify` and `verify_allowing`
+    /// share identical crypto/claim-parsing behaviour and only
+    /// differ in the final authorization gate.
+    async fn decode_and_validate(&self, token: &str) -> Result<Claims> {
         let header = jsonwebtoken::decode_header(token)
             .map_err(|e| Error::BadRequest(format!("gh oidc header: {e}")))?;
         if !ALLOWED_ALGS.contains(&header.alg) {
@@ -107,7 +135,7 @@ impl Verifier {
             .map_err(|e| Error::BadRequest(format!("gh oidc verify: {e}")))?;
 
         let raw = data.claims;
-        let claims = Claims {
+        Ok(Claims {
             exp: raw.get("exp").and_then(|x| x.as_i64()).unwrap_or(0),
             iat: raw.get("iat").and_then(|x| x.as_i64()).unwrap_or(0),
             iss: raw.get("iss").and_then(|x| x.as_str()).unwrap_or("").into(),
@@ -128,12 +156,7 @@ impl Verifier {
                 .and_then(|x| x.as_str())
                 .unwrap_or("")
                 .into(),
-        };
-
-        if claims.repository_owner != self.owner {
-            return Err(Error::Unauthorized);
-        }
-        Ok(claims)
+        })
     }
 
     async fn lookup(&self, kid: &str) -> Option<DecodingKey> {
@@ -190,5 +213,16 @@ mod tests {
             Error::BadRequest(m) => assert!(m.contains("alg")),
             e => panic!("expected BadRequest, got {e:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn verify_allowing_rejects_bad_alg() {
+        // verify_allowing shares the decode_and_validate path with verify,
+        // so the alg-rejection behaviour should hold regardless of the
+        // extra_owner argument.
+        let token = "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.e30.";
+        let v = Verifier::new("fleet".into(), "dd-agent".into());
+        let err = v.verify_allowing(token, Some("tenant")).await.unwrap_err();
+        assert!(matches!(err, Error::BadRequest(_)));
     }
 }
