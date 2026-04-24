@@ -30,7 +30,7 @@ on:
         required: false
         default: 'latest'
       ee_tag:
-        description: 'Pin the libvirt base qcow2 to a specific easyenclave release (e.g. v0.3.0 or image-abc123456) for pre-flight testing a candidate EE. Empty = workflow default (production pinned in deploy-production block below; preview tracks the staging channel).'
+        description: 'Pin the libvirt base qcow2 to a specific easyenclave release (e.g. v0.3.1 or image-abc123456) for pre-flight testing a candidate EE. Empty = workflow default (prod + preview both pinned to the same v-tag in their with: blocks below).'
         required: false
         default: ''
 
@@ -163,7 +163,13 @@ jobs:
       release_tag: ${{ needs.build.outputs.tag }}
       comment_on_pr: true
       ref: ${{ github.event.pull_request.head.ref }}
-      ee_tag: ${{ inputs.ee_tag || '' }}
+      # Preview used to track the `staging` channel (newest image-*
+      # prerelease on EE main) for early regression signal, but an
+      # unreleasable EE main snapshot blocked every dd PR's CI until
+      # EE shipped a fix. Pin preview to the same tag as prod — one
+      # bump, one PR — so dd development isn't coupled to EE main's
+      # release health. Bump in lockstep with the prod pin below.
+      ee_tag: ${{ inputs.ee_tag || 'v0.3.1' }}
     secrets: inherit
 
   # Production deploy at app.{domain}. Fires on push-to-main OR on a
@@ -196,5 +202,5 @@ jobs:
       # pinning is the whole point — prod should never silently pick
       # up whatever EE shipped most recently. Preview still tracks
       # the staging channel (see deploy-preview block above).
-      ee_tag: ${{ inputs.ee_tag || 'v0.3.0' }}
+      ee_tag: ${{ inputs.ee_tag || 'v0.3.1' }}
     secrets: inherit

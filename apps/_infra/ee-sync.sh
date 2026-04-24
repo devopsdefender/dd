@@ -8,12 +8,13 @@
 #   2. Compares against the sidecar `.tag` file next to the qcow2.
 #   3. Downloads + atomic-renames into place if different.
 #
-# Channel mapping lives in the callers. Preview (pr-*) envs track EE
-# `staging` (newest image-* prerelease on main) so PRs catch EE
-# regressions early. Production passes an explicit `DD_EE_TAG` pin
-# (set in release.yml's deploy-production block) — it does NOT track
-# a channel, so production's base image only moves when the pin is
-# bumped in a PR. `DD_EE_TAG` always wins over `DD_EE_CHANNEL` below.
+# Both prod and preview pass an explicit `DD_EE_TAG` pin from
+# release.yml's deploy-production / deploy-preview `with:` blocks.
+# Neither env tracks a channel dynamically — the pin only moves when
+# release.yml is updated in a PR. `DD_EE_TAG` always wins over
+# `DD_EE_CHANNEL` below; the channel-resolver fallback is kept only
+# for the workflow_dispatch-with-blank-ee_tag rollback escape-hatch
+# and for the (currently unused) GCP image-family path.
 #
 # The sidecar tag file (`<base>.tag`) is the only persistent state
 # besides the qcow2 itself. If it drifts (operator manually SCP'd a
