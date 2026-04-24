@@ -29,6 +29,12 @@ Source layout (all under `src/`, flat module tree):
 
 The sealed enclave runtime is [EasyEnclave](https://github.com/easyenclave/easyenclave) — a separate project.
 
+## Public website
+
+[**devopsdefender.com**](https://devopsdefender.com) is a static site served from this repo's [`gh-pages` branch](https://github.com/devopsdefender/dd/tree/gh-pages) (CNAME pinned there). It's the **only** place public-facing marketing copy lives — the CP binary serves operator dashboards behind CF Access and is never the right home for public prose.
+
+To change the website: PR against `gh-pages` (not `main`). The branch's own `.github/workflows/website-preview.yml` auto-deploys each PR to `devopsdefender.com/pr-preview/<N>/` via [`rossjrw/pr-preview-action`](https://github.com/rossjrw/pr-preview-action); merging to `gh-pages` publishes to root.
+
 ## Deployment
 
 Every fleet VM boots from a sealed easyenclave image published by [easyenclave/easyenclave](https://github.com/easyenclave/easyenclave/releases). No cloud-init, no stock Ubuntu, no runtime `apt-get install`. The TDX VM's rootfs is the latest image in the `easyenclave-staging` (or `-stable`) family, attestable against a single UKI SHA256.
