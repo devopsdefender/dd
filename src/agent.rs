@@ -38,6 +38,7 @@ use crate::html::{self, shell};
 use crate::ita;
 use crate::metrics;
 use crate::noise_gateway;
+use crate::taint::{TaintReason, TaintSet};
 
 /// Re-mint interval. Intel ITA tokens typically expire in a few
 /// minutes; refresh well before so `/health` always serves a live
@@ -86,6 +87,11 @@ struct St {
     /// `Arc` with the Noise gateway module's handshake responder;
     /// one keypair / one quote per boot.
     attest: Arc<noise_gateway::attest::Attestor>,
+    /// Integrity taint-reason set. Seeded at boot (ArbitraryExecEnabled
+    /// when mutation routes are registered) and appended at runtime
+    /// as events happen (`/owner` → CustomerOwnerEnabled, `/deploy`
+    /// ok → CustomerWorkloadDeployed). Mirrored in `/health`.
+    taint: TaintSet,
 }
 
 pub async fn run() -> Result<()> {
@@ -180,6 +186,15 @@ pub async fn run() -> Result<()> {
 
     let gh = gh_oidc::Verifier::new(cfg.common.owner.clone(), "dd-agent".into());
 
+    // Seed taint set. Boot-time facts go in now; runtime events
+    // (CustomerOwnerEnabled, CustomerWorkloadDeployed) are appended
+    // by their respective handlers as they happen.
+    let mut boot_taint: Vec<TaintReason> = Vec::new();
+    if !cfg.confidential {
+        boot_taint.push(TaintReason::ArbitraryExecEnabled);
+    }
+    let taint = TaintSet::with_initial(boot_taint);
+
     let state = St {
         cfg: cfg.clone(),
         ee,
@@ -191,16 +206,28 @@ pub async fn run() -> Result<()> {
         gh,
         attest: attestor,
         agent_owner: Arc::new(RwLock::new(None)),
+        taint,
     };
 
-    let app = Router::new()
+    // Confidential mode: `/deploy`, `/exec`, and `/owner` are not
+    // registered at all — they 404 rather than 401. Attestation +
+    // the taint-reason set (see /health) prove to third parties
+    // that these mutation channels are absent, without requiring
+    // trust in the agent's HTTP response ("disabled? really?").
+    // `/logs` stays available so observers can still stream output
+    // from the sealed workload.
+    let mut app = Router::new()
         .route("/", get(dashboard))
         .route("/health", get(health))
         .route("/workload/{id}", get(workload_page))
-        .route("/deploy", post(deploy))
-        .route("/exec", post(exec))
-        .route("/logs/{app}", get(logs))
-        .route("/owner", post(set_owner))
+        .route("/logs/{app}", get(logs));
+    if !cfg.confidential {
+        app = app
+            .route("/deploy", post(deploy))
+            .route("/exec", post(exec))
+            .route("/owner", post(set_owner));
+    }
+    let app = app
         .fallback(log_unmatched)
         .with_state(state)
         .merge(noise_gateway::router(ng_state))
@@ -452,6 +479,8 @@ async fn health(State(s): State<St>) -> Json<serde_json::Value> {
         .unwrap_or_default();
     let m = metrics::collect().await;
     let ita_token = s.ita_token.read().await.clone();
+    let agent_owner = s.agent_owner.read().await.clone();
+    let taint_reasons = s.taint.snapshot().await;
     let extra_ingress: Vec<serde_json::Value> = s
         .extras
         .read()
@@ -466,7 +495,23 @@ async fn health(State(s): State<St>) -> Json<serde_json::Value> {
         "agent_id": s.agent_id,
         "vm_name": s.cfg.common.vm_name,
         "hostname": s.hostname,
+        // `owner` is the fleet owner (`DD_OWNER`) — retained for
+        // existing /health consumers that already key off it. The
+        // runtime tenant-owner set via POST /owner (if any) is in
+        // `agent_owner`; `/deploy`, `/exec`, `/logs` accept GH OIDC
+        // from either.
         "owner": s.cfg.common.owner,
+        "fleet_owner": s.cfg.common.owner,
+        "agent_owner": agent_owner,
+        // Integrity surface (SATS_FOR_COMPUTE_SPEC Integrity States).
+        // `confidential_mode`: boot-time flag; true → /deploy + /exec
+        // + /owner were NOT registered on this agent. Set from
+        // `DD_CONFIDENTIAL`.
+        // `taint_reasons`: current set, sorted for diff-friendliness.
+        // Empty set = pristine. v0: informational — DD doesn't block
+        // actions based on the set.
+        "confidential_mode": s.cfg.confidential,
+        "taint_reasons": taint_reasons,
         "attestation_type": ee_health["attestation_type"].as_str().unwrap_or("unknown"),
         "deployments": deployments,
         "deployment_count": list["deployments"].as_array().map(|a| a.len()).unwrap_or(0),
@@ -703,6 +748,11 @@ async fn deploy(
 
     let response = s.ee.deploy(spec).await?;
 
+    // Once a runtime deploy has succeeded, the node is not pristine
+    // anymore. Set idempotently — only the first successful /deploy
+    // per boot actually inserts.
+    s.taint.insert(TaintReason::CustomerWorkloadDeployed).await;
+
     if let Some((label, port)) = expose {
         if let Err(e) = push_extra_ingress(&s, label.clone(), port).await {
             // Soft-fail: the workload is deployed, the owner just can't
@@ -854,6 +904,14 @@ async fn set_owner(
         *guard = new_owner.clone();
         prev
     };
+    // Taint only when transitioning to a NON-fleet owner. Clearing
+    // (new_owner == None) leaves the existing flag set — we don't
+    // untaint a node that was ever customer-owned, since a past
+    // tenant could have exfiltrated via /exec while their window
+    // was active. Setting to a new tenant is idempotent via HashSet.
+    if new_owner.is_some() {
+        s.taint.insert(TaintReason::CustomerOwnerEnabled).await;
+    }
     eprintln!(
         "agent: /owner {} -> {} (by sub={}, claim_id={})",
         previous.as_deref().unwrap_or("<none>"),
