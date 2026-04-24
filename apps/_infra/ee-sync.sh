@@ -8,11 +8,12 @@
 #   2. Compares against the sidecar `.tag` file next to the qcow2.
 #   3. Downloads + atomic-renames into place if different.
 #
-# Channel mapping lives in the callers: dd `production` / `dd-local-prod`
-# track EE `stable` (v*); everything else tracks EE `staging` (image-*
-# prereleases on main). An explicit `DD_EE_TAG` overrides the channel
-# default for pre-flight-testing a candidate EE against dd before
-# promoting the prerelease.
+# Channel mapping lives in the callers. Preview (pr-*) envs track EE
+# `staging` (newest image-* prerelease on main) so PRs catch EE
+# regressions early. Production passes an explicit `DD_EE_TAG` pin
+# (set in release.yml's deploy-production block) — it does NOT track
+# a channel, so production's base image only moves when the pin is
+# bumped in a PR. `DD_EE_TAG` always wins over `DD_EE_CHANNEL` below.
 #
 # The sidecar tag file (`<base>.tag`) is the only persistent state
 # besides the qcow2 itself. If it drifts (operator manually SCP'd a
