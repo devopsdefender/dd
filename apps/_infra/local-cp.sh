@@ -153,21 +153,16 @@ with open(p, "w") as f: f.write(x)
 PY
 
   # Wire QEMU's tdx-guest to host's QGS unix socket — same treatment
-  # local-agents.sh does so ITA quotes work inside the CP VM.
+  # local-agents.sh does so ITA quotes work inside the CP VM. Must use
+  # libvirt's schema-valid form: `<quoteGenerationService path='...'/>`
+  # (camelCase, path attribute). The earlier
+  # `<Quote-Generation-Service>vsock:2:4050</Quote-Generation-Service>`
+  # form is not in libvirt's RNG — `virsh define` accepts it but
+  # canonicalizes it away, leaving `<launchSecurity type='tdx'/>` with
+  # no QGS wired → guest can't produce a quote → dd-management's ITA
+  # mint fails with "Quote cannot be empty" → CP poweroffs.
   if grep -q "<launchSecurity type='tdx'/>" "$out"; then
-    # Replace the empty launchSecurity with the full form + object.
-    python3 - "$out" <<'PY'
-import sys
-p = sys.argv[1]
-with open(p) as f: x = f.read()
-x = x.replace(
-    "<launchSecurity type='tdx'/>",
-    """<launchSecurity type='tdx'>
-    <Quote-Generation-Service>vsock:2:4050</Quote-Generation-Service>
-  </launchSecurity>""",
-)
-with open(p, "w") as f: f.write(x)
-PY
+    sed -i "s|<launchSecurity type='tdx'/>|<launchSecurity type='tdx'><quoteGenerationService path='/var/run/tdx-qgs/qgs.socket'/></launchSecurity>|" "$out"
   fi
 
   cat "$out"
