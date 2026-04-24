@@ -83,6 +83,48 @@ section .subtitle { color: var(--text-dim); font-size: 16px; margin-bottom: 40px
 .callout h3 { font-size: 20px; margin-bottom: 12px; }
 .callout p { color: var(--text-dim); font-size: 15px; margin-bottom: 20px; }
 
+/* Two-mode comparison */
+.modes { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-top: 32px; }
+.mode { background: var(--bg-alt); border: 1px solid var(--surface); border-radius: 10px; padding: 24px; }
+.mode h3 { margin: 12px 0 12px; font-size: 18px; }
+.mode p { color: var(--text); font-size: 14px; margin-bottom: 12px; line-height: 1.6; }
+.mode p.dim { color: var(--text-dim); font-style: italic; font-size: 13px; }
+.mode-tag {
+  display: inline-block; padding: 3px 10px; border-radius: 4px;
+  font-size: 11px; font-weight: 600; letter-spacing: 0.05em; text-transform: uppercase;
+  font-family: var(--mono);
+}
+.mode-customer h3 { color: var(--mauve); }
+.mode-customer .mode-tag { background: rgba(203, 166, 247, 0.15); color: var(--mauve); }
+.mode-confidential h3 { color: #fab387; }
+.mode-confidential .mode-tag { background: rgba(250, 179, 135, 0.15); color: #fab387; }
+
+/* Trust model table */
+.trust-table { border-collapse: collapse; width: 100%; margin: 24px 0 16px; }
+.trust-table td {
+  vertical-align: top; padding: 14px 12px;
+  border-bottom: 1px solid var(--surface);
+  font-size: 14px; color: var(--text);
+  line-height: 1.6;
+}
+.trust-table td:first-child { width: 140px; white-space: nowrap; }
+.state-pill {
+  display: inline-block; padding: 3px 10px; border-radius: 4px;
+  font-size: 12px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase;
+  font-family: var(--mono);
+}
+.state-pristine { background: rgba(166, 227, 161, 0.18); color: var(--green); }
+.state-tainted  { background: rgba(250, 179, 135, 0.18); color: #fab387; }
+.state-safe     { background: rgba(137, 180, 250, 0.18); color: var(--blue); }
+.reasons { list-style: none; padding-left: 0; }
+.reasons li { padding: 4px 0; font-size: 13px; color: var(--text-dim); }
+.reasons li code { color: var(--text); }
+.trust-cta {
+  margin-top: 16px; padding: 14px 16px;
+  background: rgba(250, 179, 135, 0.08); border-left: 3px solid #fab387; border-radius: 0 6px 6px 0;
+  font-size: 14px; color: var(--text); line-height: 1.6;
+}
+
 /* CTA */
 .cta { text-align: center; padding: 80px 24px; }
 .cta h2 { font-size: 28px; margin-bottom: 12px; }
@@ -99,4 +141,6 @@ footer a:hover { color: var(--text); }
   .hero { padding: 80px 16px 48px; }
   .stats { gap: 24px; }
   .grid-3 { grid-template-columns: 1fr; }
+  .modes { grid-template-columns: 1fr; }
+  .trust-table td:first-child { width: auto; }
 }

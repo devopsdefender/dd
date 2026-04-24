@@ -13,6 +13,8 @@
     <a href="/" class="logo">DevOps Defender</a>
     <div class="links">
       <a href="#how">How It Works</a>
+      <a href="#models">Models</a>
+      <a href="#trust">Trust</a>
       <a href="#features">Features</a>
       <a href="#arch">Architecture</a>
       <a href="https://github.com/devopsdefender/dd">GitHub</a>
@@ -20,8 +22,8 @@
   </nav>
 
   <div class="hero">
-    <h1>Provably secure <span class="accent">AI compute</span></h1>
-    <p>Run OpenClaw, Ollama, and any AI workload on hardware-sealed Intel TDX VMs. Cryptographic attestation proves your code runs unmodified. Nobody can read your data &mdash; not us, not the cloud provider, not anyone.</p>
+    <h1>Attested compute, <span class="accent">two ways to use it</span></h1>
+    <p>Hardware-sealed Intel TDX VMs with cryptographic attestation. Bring your own workload &mdash; full <code>/deploy</code> authority, browser shell, the works. Or pay for a sealed oracle nobody (not even the operator) can change post-boot. Verify either via the TDX quote on <code>/health</code>.</p>
     <div class="buttons">
       <a href="https://app.devopsdefender.com" class="btn btn-primary">Fleet Dashboard</a>
       <a href="https://github.com/devopsdefender/dd" class="btn btn-outline">View Source</a>
@@ -85,8 +87,8 @@
         </div>
         <div class="card">
           <div class="icon">&#x20bf;</div>
-          <h3>BTC Payments</h3>
-          <p>Pay for compute with Bitcoin via satsforcompute. No credit cards, no KYC, no middlemen. Lightning for instant settlement.</p>
+          <h3>Sats for Compute</h3>
+          <p>The canonical example operator: pay BTC, get a fresh attested node bound to your GitHub identity &mdash; or a sealed oracle from your public workload repo. State lives in GitHub issues; <code>workflow_dispatch</code> is the actuator. <a href="https://github.com/satsforcompute/satsforcompute" target="_blank">Forkable</a>.</p>
         </div>
         <div class="card">
           <div class="icon">&#x1f6e1;</div>
@@ -104,6 +106,60 @@
           <p>Every <code>devopsdefender</code> binary CI publishes carries a Sigstore-backed GitHub build attestation. <code>gh attestation verify</code> proves a binary came from this repo's release workflow &mdash; provable provenance, not trust us.</p>
         </div>
       </div>
+    </div>
+  </section>
+
+  <section id="models" class="section-center">
+    <div class="container">
+      <h2>Two deployment models</h2>
+      <p class="subtitle">Same substrate, two product shapes &mdash; chosen at boot, provable from the TDX quote.</p>
+      <div class="modes">
+        <div class="mode mode-customer">
+          <span class="mode-tag">customer deploy</span>
+          <h3>Bring your own workload</h3>
+          <p>The customer's GitHub OIDC identity is bound to a fresh agent via <code>POST /owner</code>. They get full <code>/deploy</code>, <code>/exec</code>, <code>/logs</code>, and browser-shell (<code>ttyd</code>) authority &mdash; the same surface DD ops uses, scoped to their org for the duration of the claim.</p>
+          <p class="dim">For: general-purpose compute, dev shells, GPU jobs.</p>
+        </div>
+        <div class="mode mode-confidential">
+          <span class="mode-tag">confidential</span>
+          <h3>Sealed oracle</h3>
+          <p>The bot deploys a workload from the customer's public GitHub repo (<code>workload.json</code> at root). The agent boots with <code>DD_CONFIDENTIAL=true</code> &mdash; <code>/deploy</code>, <code>/exec</code>, and <code>/owner</code> are <em>not registered</em> on this node. Logs and attestation stay open. The TDX quote measures the boot config, so a third party can verify the workload is sealed without trusting the operator.</p>
+          <p class="dim">For: oracles, bot-oracles, anything where "this is the code, it hasn't changed" is the product.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section id="trust" class="section-center">
+    <div class="container">
+      <h2>Trust model</h2>
+      <p class="subtitle">Taint is a <em>set</em> of reasons, not a boolean. Read <code>/health.taint_reasons</code> + the TDX quote and reconstruct the trust profile in one fetch.</p>
+      <table class="trust-table">
+        <tr>
+          <td><span class="state-pill state-pristine">pristine</span></td>
+          <td>Booted from a known image. No customer has had deploy / exec / shell authority. <code>taint_reasons</code> set is empty.</td>
+        </tr>
+        <tr>
+          <td><span class="state-pill state-tainted">tainted</span></td>
+          <td>Customer-influenced via at least one channel. Reasons surface which:</td>
+        </tr>
+        <tr>
+          <td></td>
+          <td>
+            <ul class="reasons">
+              <li><code>customer_workload_deployed</code> &mdash; a <code>/deploy</code> succeeded since boot</li>
+              <li><code>customer_owner_enabled</code> &mdash; <code>/owner</code> set a non-fleet tenant</li>
+              <li><code>arbitrary_exec_enabled</code> &mdash; node booted with <code>/deploy</code> + <code>/exec</code> registered (i.e. not confidential mode)</li>
+              <li><code>interactive_shell_enabled</code> &mdash; ttyd or equivalent in the running workload</li>
+            </ul>
+          </td>
+        </tr>
+        <tr>
+          <td><span class="state-pill state-safe">safe_mode</span></td>
+          <td>On reboot, the agent's runtime owner clears and the node returns to bot/DD control. It may still be tainted; safe_mode is not the same as pristine. A tainted node is rebuilt before reassignment.</td>
+        </tr>
+      </table>
+      <p class="trust-cta">Confidential-mode nodes ship with <code>taint_reasons = [customer_workload_deployed]</code> only &mdash; the absence of <code>arbitrary_exec_enabled</code> + <code>interactive_shell_enabled</code> is the cryptographic signal that the operator can't tamper with the running code.</p>
     </div>
   </section>
 
