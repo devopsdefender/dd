@@ -71,6 +71,14 @@ struct St {
     /// without any shared secret; anyone else is denied at claim
     /// check.
     gh: Arc<gh_oidc::Verifier>,
+    /// Runtime tenant-owner set via `POST /owner`. When `Some(org)`,
+    /// `/deploy` / `/exec` / `/logs` accept GitHub OIDC from EITHER
+    /// `DD_OWNER` (fleet ops) OR this tenant org — shared admin. The
+    /// `/owner` endpoint itself is gated on fleet-only auth. Reset
+    /// to `None` on every agent boot (no persistence); the s12e bot
+    /// reapplies via `/owner` if the claim is still active after a
+    /// restart.
+    agent_owner: Arc<RwLock<Option<String>>>,
     /// TDX-quote + Noise-static-pubkey bundle. Served as
     /// `{ noise: { quote_b64, pubkey_hex } }` off `/health` so a
     /// bastion-app can bootstrap a Noise session in one fetch (used
@@ -182,6 +190,7 @@ pub async fn run() -> Result<()> {
         extras: Arc::new(RwLock::new(cfg.extra_ingress.clone())),
         gh,
         attest: attestor,
+        agent_owner: Arc::new(RwLock::new(None)),
     };
 
     let app = Router::new()
@@ -191,6 +200,7 @@ pub async fn run() -> Result<()> {
         .route("/deploy", post(deploy))
         .route("/exec", post(exec))
         .route("/logs/{app}", get(logs))
+        .route("/owner", post(set_owner))
         .fallback(log_unmatched)
         .with_state(state)
         .merge(noise_gateway::router(ng_state))
@@ -635,19 +645,36 @@ async fn workload_page(State(s): State<St>, Path(id): Path<String>) -> Result<Re
     .into_response())
 }
 
-/// Extract + verify a GitHub Actions OIDC bearer token. The /deploy
-/// and /exec endpoints are CF-Access-bypassed; this is the real gate.
-async fn require_gh_oidc(s: &St, headers: &HeaderMap) -> Result<gh_oidc::Claims> {
+/// Extract the `Authorization: Bearer <jwt>` header and return the
+/// trimmed token body. Shared by fleet-only and fleet-or-agent auth
+/// paths so the Bearer-parsing shape stays consistent.
+fn bearer_token(headers: &HeaderMap) -> Result<&str> {
     let auth = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .ok_or(Error::Unauthorized)?;
-    let token = auth
-        .strip_prefix("Bearer ")
+    auth.strip_prefix("Bearer ")
         .or_else(|| auth.strip_prefix("bearer "))
         .map(str::trim)
         .filter(|t| !t.is_empty())
-        .ok_or(Error::Unauthorized)?;
+        .ok_or(Error::Unauthorized)
+}
+
+/// Workload-control auth (`/deploy`, `/exec`, `/logs`): accept a
+/// GitHub Actions OIDC token whose `repository_owner` matches
+/// EITHER the fleet owner (`DD_OWNER`) OR the agent's runtime
+/// `agent_owner`. Shared admin — ops and the active tenant both
+/// have deploy/exec/logs authority.
+async fn require_gh_oidc(s: &St, headers: &HeaderMap) -> Result<gh_oidc::Claims> {
+    let token = bearer_token(headers)?;
+    let agent_owner = s.agent_owner.read().await.clone();
+    s.gh.verify_allowing(token, agent_owner.as_deref()).await
+}
+
+/// Fleet-only auth. Used by `/owner`, which re-assigns the tenant:
+/// only ops (`DD_OWNER`) may call it, never the tenant themselves.
+async fn require_fleet_oidc(s: &St, headers: &HeaderMap) -> Result<gh_oidc::Claims> {
+    let token = bearer_token(headers)?;
     s.gh.verify(token).await
 }
 
@@ -789,4 +816,59 @@ async fn exec(
 ) -> Result<Json<serde_json::Value>> {
     let _ = require_gh_oidc(&s, &headers).await?;
     Ok(Json(s.ee.exec(&req.cmd, req.timeout_secs).await?))
+}
+
+#[derive(Debug, Deserialize)]
+struct OwnerReq {
+    /// New tenant org (GitHub user or org login). Empty string clears
+    /// the runtime owner — after which `/deploy`/`/exec`/`/logs`
+    /// accept only the fleet owner again.
+    agent_owner: String,
+    /// Opaque ID from the caller's claim system (e.g. the s12e bot's
+    /// claim issue). Logged for audit; the agent doesn't interpret it.
+    #[serde(default)]
+    claim_id: String,
+}
+
+/// POST /owner — set (or clear) the agent's runtime tenant owner.
+/// Fleet-gated: only `DD_OWNER` can reassign a node. Runtime-only
+/// state: resets to `None` on reboot, so a crash/restart is self-
+/// healing (the bot re-applies if the claim is still active).
+async fn set_owner(
+    State(s): State<St>,
+    headers: HeaderMap,
+    Json(req): Json<OwnerReq>,
+) -> Result<Json<serde_json::Value>> {
+    let claims = require_fleet_oidc(&s, &headers).await?;
+    let new_owner = {
+        let trimmed = req.agent_owner.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    };
+    let previous = {
+        let mut guard = s.agent_owner.write().await;
+        let prev = guard.clone();
+        *guard = new_owner.clone();
+        prev
+    };
+    eprintln!(
+        "agent: /owner {} -> {} (by sub={}, claim_id={})",
+        previous.as_deref().unwrap_or("<none>"),
+        new_owner.as_deref().unwrap_or("<none>"),
+        claims.sub,
+        if req.claim_id.is_empty() {
+            "<none>"
+        } else {
+            req.claim_id.as_str()
+        },
+    );
+    Ok(Json(serde_json::json!({
+        "agent_id": s.agent_id,
+        "agent_owner": new_owner,
+        "previous_owner": previous,
+        "claim_id": req.claim_id,
+    })))
 }
