@@ -621,6 +621,10 @@ pub async fn provision_cp_access(
 
     for (path_suffix, label) in [
         ("/health", "health"),
+        // `/about` is the public marketing landing — no login required
+        // so anyone clicking the link from external docs sees the
+        // page without bouncing through CF Access first.
+        ("/about", "about"),
         ("/api/agents", "api-agents"),
         ("/api/v1/devices/trusted", "api-devices-trusted"),
         ("/api/v1/admin/export", "api-admin-export"),

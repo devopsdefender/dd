@@ -328,6 +328,7 @@ pub async fn run() -> Result<()> {
 
     let app = Router::new()
         .route("/", get(fleet))
+        .route("/about", get(about))
         .route("/health", get(health))
         .route("/register", post(register))
         .route("/ingress/replace", post(ingress_replace))
@@ -726,6 +727,17 @@ async fn mint_cp_ita(cfg: &Cfg, ee: &Ee) -> Result<String> {
         .ok_or_else(|| Error::Upstream("EE attest returned no quote_b64".into()))?
         .to_string();
     ita::mint(&cfg.ita.base_url, &cfg.ita.api_key, &quote_b64).await
+}
+
+// ── Public landing (CF-Access-bypassed) ───────────────────────────────────
+
+/// `GET /about` — public marketing page describing the deployment
+/// model. CF-Access-bypassed (see `cf::reconcile_cp_apps`). Static
+/// content, no state — the page lives here in the CP because the CP
+/// is the only HTTP frontend with a public hostname today; if/when
+/// an apex landing at devopsdefender.com is set up, this can move.
+async fn about() -> Response {
+    Html(html::about_page()).into_response()
 }
 
 // ── Fleet dashboard ──────────────────────────────────────────────────────
