@@ -188,6 +188,15 @@ pub struct Agent {
     /// `expose` hints on individual workload specs. Empty is fine —
     /// the agent just gets the default dashboard rule.
     pub extra_ingress: Vec<(String, u16)>,
+    /// Confidential-mode flag from `DD_CONFIDENTIAL`. When true, the
+    /// agent omits `/deploy`, `/exec`, and `/owner` from its router —
+    /// no one (not tenant, not ops) can mutate the running workload
+    /// post-boot. `/logs` + `/health` + attestation stay open. Used by
+    /// Sats for Compute's "confidential mode" product variant for
+    /// oracle / bot-oracle workloads where the operator proves to
+    /// third parties that the code is sealed. Backward-compatible:
+    /// unset = default (mutation endpoints enabled).
+    pub confidential: bool,
 }
 
 impl Agent {
@@ -199,14 +208,30 @@ impl Agent {
         let ee_socket = std::env::var("EE_SOCKET_PATH")
             .unwrap_or_else(|_| "/var/lib/easyenclave/agent.sock".into());
         let extra_ingress = parse_extra_ingress()?;
+        let confidential = parse_truthy("DD_CONFIDENTIAL");
         Ok(Self {
             common,
             cp_url,
             ee_socket,
             ita: Ita::from_env()?,
             extra_ingress,
+            confidential,
         })
     }
+}
+
+/// Best-effort bool parser for env flags. Treats any of
+/// `1 / true / yes / on` (case-insensitive) as true; everything else
+/// (including empty and absent) as false.
+fn parse_truthy(key: &str) -> bool {
+    std::env::var(key)
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
 }
 
 /// Parse `DD_EXTRA_INGRESS` as a comma-separated list of `label:port`

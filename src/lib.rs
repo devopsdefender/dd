@@ -12,3 +12,4 @@ pub mod ita;
 pub mod metrics;
 pub mod noise_gateway;
 pub mod stonith;
+pub mod taint;
