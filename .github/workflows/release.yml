@@ -30,7 +30,7 @@ on:
         required: false
         default: 'latest'
       ee_tag:
-        description: 'Pin the libvirt base qcow2 to a specific easyenclave release (e.g. image-abc123456) for pre-flight testing a candidate EE. Empty = track the env''s channel default (stable for prod, staging otherwise).'
+        description: 'Pin the libvirt base qcow2 to a specific easyenclave release (e.g. v0.3.0 or image-abc123456) for pre-flight testing a candidate EE. Empty = workflow default (production pinned in deploy-production block below; preview tracks the staging channel).'
         required: false
         default: ''
 
@@ -191,5 +191,10 @@ jobs:
       release_tag: ${{ inputs.release_tag || 'latest' }}
       comment_on_pr: false
       ref: main
-      ee_tag: ${{ inputs.ee_tag || '' }}
+      # Production EE base image pin. Bump this (single-line PR) when
+      # we want prod to move to a newer easyenclave release. Static
+      # pinning is the whole point — prod should never silently pick
+      # up whatever EE shipped most recently. Preview still tracks
+      # the staging channel (see deploy-preview block above).
+      ee_tag: ${{ inputs.ee_tag || 'v0.3.0' }}
     secrets: inherit
