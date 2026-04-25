@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# local-agents.sh — define two local TDX agent VMs on this host:
+# local-agents.sh — define local TDX agent VMs on this host:
 #
 #   dd-local-preview : no GPU, registers with the PR-preview CP. Bare
 #                      agent + podman — no demo workload — so the release
@@ -10,31 +10,42 @@
 #                      deployed post-registration by a Release workflow
 #                      step using GitHub Actions OIDC against the agent's
 #                      /deploy endpoint. Boot stays fast and minimal.
+#   dd-local-bot     : no GPU, registers with production. Dedicated host
+#                      for the Sats for Compute bot (or any always-on
+#                      operator workload). Started/stopped manually —
+#                      CI doesn't reprovision; deploy-bot.yml in the
+#                      satsforcompute repo just dd-deploys the bot
+#                      workload onto this agent's /deploy. Same boot
+#                      chain as preview (cloudflared + dd-agent + ttyd
+#                      + podman). Modest sizing.
 #
-# Both reuse the existing easyenclave base qcow2 via copy-on-write
+# All three reuse the existing easyenclave base qcow2 via copy-on-write
 # overlays; each gets its own config.iso baking in DD_CP_URL +
 # DD_ITA_API_KEY for that target. No GitHub PAT — the agent
 # authenticates to the CP via ITA attestation at /register and picks
 # up a CF Access service token from the register response for all
 # subsequent machine-to-machine calls. Libvirt XML is rendered from
-# the existing `easyenclave-local` domain (strip hostdev for preview).
+# the existing `easyenclave-local` domain (strip hostdev for preview/bot).
 #
 # Usage:
 #   export DD_ITA_API_KEY="$(cat ~/.secrets/ita_api_key)"
-#   ./apps/_infra/local-agents.sh https://pr-106.devopsdefender.com https://app.devopsdefender.com
+#   ./apps/_infra/local-agents.sh <preview> <prod> <bot>
 #
-# Pass "" for either URL to skip defining that VM:
-#   ./apps/_infra/local-agents.sh "" https://app.devopsdefender.com   # prod only
-#   ./apps/_infra/local-agents.sh https://pr-N.devopsdefender.com ""  # preview only
+# Each URL arg is independent — pass "" to skip provisioning that VM:
+#   ./apps/_infra/local-agents.sh "" https://app.devopsdefender.com ""                          # prod only
+#   ./apps/_infra/local-agents.sh https://pr-N.devopsdefender.com "" ""                         # preview only
+#   ./apps/_infra/local-agents.sh "" "" https://app.devopsdefender.com                          # bot only
+#   ./apps/_infra/local-agents.sh "" https://app.devopsdefender.com https://app.devopsdefender.com  # prod + bot
 #
-# After: virsh start dd-local-preview && virsh start dd-local-prod
+# After: virsh start dd-local-preview && virsh start dd-local-prod && virsh start dd-local-bot
 
 set -euo pipefail
 
 PREVIEW_CP="${1-}"
 PROD_CP="${2-}"
-if [ -z "$PREVIEW_CP" ] && [ -z "$PROD_CP" ]; then
-  echo "usage: $0 <preview-cp-url|\"\"> <prod-cp-url|\"\">" >&2
+BOT_CP="${3-}"
+if [ -z "$PREVIEW_CP" ] && [ -z "$PROD_CP" ] && [ -z "$BOT_CP" ]; then
+  echo "usage: $0 <preview-cp-url|\"\"> <prod-cp-url|\"\"> <bot-cp-url|\"\">" >&2
   exit 1
 fi
 : "${DD_ITA_API_KEY?set DD_ITA_API_KEY}"
@@ -345,17 +356,20 @@ define_agent() {
 
 [ -n "$PREVIEW_CP" ] && define_agent preview "$PREVIEW_CP" no
 [ -n "$PROD_CP"    ] && define_agent prod    "$PROD_CP"    yes
+[ -n "$BOT_CP"     ] && define_agent bot     "$BOT_CP"     no
 
 echo
 echo "done. start with:"
 [ -n "$PREVIEW_CP" ] && echo "  virsh start dd-local-preview"
 [ -n "$PROD_CP"    ] && echo "  virsh start dd-local-prod"
+[ -n "$BOT_CP"     ] && echo "  virsh start dd-local-bot"
 echo
 echo "watch registration (Ctrl-] to exit):"
 [ -n "$PREVIEW_CP" ] && echo "  virsh console dd-local-preview"
 [ -n "$PROD_CP"    ] && echo "  virsh console dd-local-prod"
+[ -n "$BOT_CP"     ] && echo "  virsh console dd-local-bot"
 
-# Explicit 0 — the tail `[ -n "$PROD_CP" ] && …` returns 1 when
-# PROD_CP="" (preview-only), bubbling up as the script exit status
-# and tripping set -e in dd-relaunch.sh. Force success.
+# Explicit 0 — the tail `[ -n "$BOT_CP" ] && …` returns 1 when
+# BOT_CP="" (preview/prod-only), bubbling up as the script exit
+# status and tripping set -e in dd-relaunch.sh. Force success.
 exit 0
