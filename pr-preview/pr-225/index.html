@@ -1,0 +1,252 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>DevOpsDefender &mdash; sealed compute, verifiable from outside</title>
+  <meta name="description" content="Run an oracle whose code can't be changed by the operator. TDX-attested workloads with a public, cryptographic seal you verify yourself.">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<div class="hex-band" aria-hidden="true">
+  <span>49 6e 74 65 6c 20 54 44 58 20 51 75 6f 74 65 20 76 34 20 4d 52 54 44 20 30 78 7b 7d 7d 20 76 65 72 69 66 69 65 64 20 62 79 20 49 6e 74 65 6c 2d 73 69 67 6e 65 64 20 4a 57 54 20 6f 6e 20 2f 68 65 61 6c 74 68</span>
+</div>
+
+<header>
+  <a href="/" class="brand">
+    <span class="dot">&bull;</span> devopsdefender
+  </a>
+  <nav>
+    <a href="#seal">the&nbsp;seal</a>
+    <a href="#how">how</a>
+    <a href="#verify">verify</a>
+    <a href="#trust">trust</a>
+    <a href="#operators">operators</a>
+    <a href="https://github.com/devopsdefender/dd" target="_blank">github</a>
+  </nav>
+</header>
+
+<section class="hero">
+  <h1>
+    Code nobody&nbsp;can&nbsp;change.<br>
+    <span class="accent">Verifiable from outside.</span>
+  </h1>
+  <p class="lede">
+    Sealed oracle workloads on Intel TDX hardware. The seal is provable
+    from outside &mdash; you don&apos;t trust the operator, you verify
+    the quote.
+  </p>
+  <div class="cta">
+    <a href="#how" class="btn primary">Ship a verifiable oracle &nbsp;&rarr;</a>
+    <a href="https://github.com/satsforcompute/satsforcompute" class="btn ghost" target="_blank">Pay BTC &amp; go</a>
+  </div>
+  <p class="proof">
+    <span class="muted">last verified attestation:</span>
+    <code>MRTD 0x4a86&hellip;c91d</code> &middot;
+    <span class="ok">Intel-signed</span> &middot;
+    <span class="muted">via</span> <code>/health</code>
+  </p>
+</section>
+
+<section id="seal">
+  <h2>What &ldquo;sealed&rdquo; means.</h2>
+  <p>
+    Intel TDX seals the guest&rsquo;s memory against the host. That part
+    is table stakes: every confidential-compute platform claims it.
+  </p>
+  <p>
+    DD adds a stronger property on top: <strong>sealed against the
+    operator&nbsp;too</strong>. A confidential-mode agent boots with
+    <code>DD_CONFIDENTIAL=true</code>, which means
+    <code>/deploy</code>, <code>/exec</code>, and <code>/owner</code>
+    are not registered as routes. Nobody &mdash; not the customer, not
+    DD ops, not the bot &mdash; has a channel to mutate the running
+    workload post-boot. Logs and attestation stay open. The TDX quote
+    measures the boot config, so the absence of mutation channels is
+    visible from outside.
+  </p>
+
+  <div class="compare">
+    <div class="col bad">
+      <h4>Without confidential mode</h4>
+      <ul>
+        <li><code>POST /deploy</code> &middot; live workload swap</li>
+        <li><code>POST /exec</code> &middot; arbitrary command run</li>
+        <li><code>ttyd</code> shell &middot; interactive access</li>
+        <li><code>POST /owner</code> &middot; reassign tenant</li>
+      </ul>
+      <p class="note">All four channels exist. Trust = trust the operator&rsquo;s policy not to push them.</p>
+    </div>
+    <div class="col good">
+      <h4>Confidential mode</h4>
+      <ul>
+        <li><code class="strike">POST /deploy</code> &middot; <span class="ok">404</span></li>
+        <li><code class="strike">POST /exec</code> &middot; <span class="ok">404</span></li>
+        <li><code class="strike">ttyd</code> &middot; <span class="ok">not in workload</span></li>
+        <li><code class="strike">POST /owner</code> &middot; <span class="ok">404</span></li>
+      </ul>
+      <p class="note">Zero channels. Trust = verify the TDX quote covers a config disk that omits them.</p>
+    </div>
+  </div>
+</section>
+
+<section id="how">
+  <h2>Three steps to a sealed oracle.</h2>
+  <ol class="steps">
+    <li>
+      <span class="num">01</span>
+      <div>
+        <h3>Publish a <code>workload.json</code></h3>
+        <p>
+          Public GitHub repo, file at root. The bot will fetch it at a
+          specified commit and deploy as-is. No build step inside the
+          enclave; binaries come from your own GitHub release assets
+          via <code>github_release</code> entries. Same shape DD&rsquo;s
+          existing apps already use.
+        </p>
+        <pre class="code">{
+  "app_name": "my-oracle",
+  "github_release": { "repo": "alice/my-oracle", "asset": "my-oracle" },
+  "cmd": ["/var/lib/easyenclave/bin/my-oracle"],
+  "expose": { "hostname_label": "oracle", "port": 8080 }
+}</pre>
+      </div>
+    </li>
+    <li>
+      <span class="num">02</span>
+      <div>
+        <h3>Pay or run your own operator</h3>
+        <p>
+          Pay BTC at the canonical operator
+          (<a href="https://github.com/satsforcompute/satsforcompute" target="_blank">satsforcompute</a>),
+          or fork the example operator and run your own bot against your
+          own DD fleet. Either way, the bot creates a GitHub-issue
+          claim, watches mempool.space for payment, then deploys the
+          workload onto a fresh agent in confidential mode.
+        </p>
+      </div>
+    </li>
+    <li>
+      <span class="num">03</span>
+      <div>
+        <h3>Verify the seal yourself</h3>
+        <p>
+          Pull the agent&rsquo;s <code>/health</code> JSON. Check the
+          TDX quote was Intel-signed. Confirm
+          <code>taint_reasons</code> contains exactly
+          <code>["customer_workload_deployed"]</code> &mdash; no exec,
+          no shell, no owner-set. The absence of those channels is the
+          proof, and it&rsquo;s cryptographic.
+        </p>
+      </div>
+    </li>
+  </ol>
+</section>
+
+<section id="verify">
+  <h2>Verifying the seal.</h2>
+  <p>
+    There&rsquo;s no &ldquo;DD trust me&rdquo; step. Three commands
+    against any agent&rsquo;s public hostname:
+  </p>
+  <pre class="code"><span class="comment"># 1. Fetch the TDX quote (Noise pre-handshake bundle on /health).</span>
+curl -fsSL https://&lt;agent&gt;.devopsdefender.com/health \
+  | jq <span class="str">'.noise.quote_b64, .noise.pubkey_hex'</span>
+
+<span class="comment"># 2. Verify the quote with Intel Trust Authority (or any TDX verifier).</span>
+<span class="comment">#    The quote's report_data binds the agent's Noise pubkey,</span>
+<span class="comment">#    and the MRTD is the measured boot.</span>
+
+<span class="comment"># 3. Confirm the running workload is sealed.</span>
+curl -fsSL https://&lt;agent&gt;.devopsdefender.com/health \
+  | jq <span class="str">'{ confidential_mode, taint_reasons }'</span>
+
+<span class="comment"># Expected for a sealed oracle:</span>
+<span class="comment">#   { "confidential_mode": true,</span>
+<span class="comment">#     "taint_reasons": ["customer_workload_deployed"] }</span></pre>
+  <p class="footnote">
+    The <code>/health</code> endpoint is CF-Access-bypassed and
+    public. Anyone can verify any agent at any time without operator
+    cooperation.
+  </p>
+</section>
+
+<section id="trust">
+  <h2>Trust state machine.</h2>
+  <p>
+    Taint is a <em>set</em> of reasons, not a boolean. Each reason
+    points to a concrete mechanism that gave somebody influence over
+    the node. A sealed oracle&rsquo;s set is small and known.
+  </p>
+  <table class="trust">
+    <tr>
+      <td><span class="state pristine">pristine</span></td>
+      <td>Booted from a known image. <code>taint_reasons = []</code>. No customer has had any authority since boot.</td>
+    </tr>
+    <tr>
+      <td><span class="state tainted">tainted</span></td>
+      <td>One or more reasons in the set:</td>
+    </tr>
+    <tr><td></td><td><code>customer_workload_deployed</code> &middot; a <code>/deploy</code> succeeded since boot</td></tr>
+    <tr><td></td><td><code>customer_owner_enabled</code> &middot; <code>/owner</code> set a non-fleet tenant</td></tr>
+    <tr><td></td><td><code>arbitrary_exec_enabled</code> &middot; node booted with <code>/deploy</code> + <code>/exec</code> registered</td></tr>
+    <tr><td></td><td><code>interactive_shell_enabled</code> &middot; <code>ttyd</code> or equivalent in the running workload</td></tr>
+    <tr>
+      <td><span class="state safe">safe_mode</span></td>
+      <td>On reboot, the runtime owner clears and the node returns to bot/DD control. May still be tainted &mdash; tainted nodes are rebuilt before reassignment.</td>
+    </tr>
+  </table>
+  <p class="callout">
+    A sealed oracle ships with exactly <code>{customer_workload_deployed}</code>
+    in the set. The absence of <code>arbitrary_exec_enabled</code>
+    and <code>interactive_shell_enabled</code> is the cryptographic
+    signal that the operator has no tamper channel.
+  </p>
+</section>
+
+<section id="operators">
+  <h2>Two paths to attested compute.</h2>
+  <div class="paths">
+    <div class="path">
+      <span class="path-label">path 1</span>
+      <h3>Sats for Compute</h3>
+      <p>The canonical operator. Pay BTC, get a fresh attested node bound to your GitHub identity &mdash; or a sealed oracle from your public workload repo. State lives in GitHub issues. Forkable.</p>
+      <a href="https://github.com/satsforcompute/satsforcompute" target="_blank">github &rarr;</a>
+    </div>
+    <div class="path">
+      <span class="path-label">path 2</span>
+      <h3>Run your own</h3>
+      <p>Stand up a DD fleet. Pick your own <code>DD_OWNER</code> trust ring. Run a Sats-for-Compute-style bot &mdash; or your own &mdash; that calls <code>POST /owner</code> via <em>your</em> operator-ops repo&rsquo;s GitHub Actions OIDC. MIT.</p>
+      <a href="https://github.com/devopsdefender/dd" target="_blank">github &rarr;</a>
+    </div>
+  </div>
+</section>
+
+<section class="cta-section">
+  <h2>Ship a verifiable oracle.</h2>
+  <p>The substrate is open source. The seal is cryptographic. The proof is one <code>curl</code> away.</p>
+  <div class="cta">
+    <a href="https://github.com/satsforcompute/satsforcompute" class="btn primary" target="_blank">Pay BTC &amp; go &nbsp;&rarr;</a>
+    <a href="https://github.com/devopsdefender/dd/blob/main/SATS_FOR_COMPUTE_SPEC.md" class="btn ghost" target="_blank">Read the spec</a>
+  </div>
+</section>
+
+<footer>
+  <div class="hex-band footer-band" aria-hidden="true">
+    <span>74 64 78 2d 71 75 6f 74 65 2d 76 65 72 69 66 69 65 64 20 7c 20 6d 72 74 64 2d 6d 65 61 73 75 72 65 64 20 7c 20 73 65 61 6c 65 64 2d 61 67 61 69 6e 73 74 2d 6f 70 65 72 61 74 6f 72</span>
+  </div>
+  <div class="foot-row">
+    <span class="brand"><span class="dot">&bull;</span> devopsdefender</span>
+    <span class="links">
+      <a href="https://github.com/devopsdefender/dd" target="_blank">dd</a>
+      <a href="https://github.com/easyenclave/easyenclave" target="_blank">easyenclave</a>
+      <a href="https://github.com/satsforcompute/satsforcompute" target="_blank">satsforcompute</a>
+      <a href="https://app.devopsdefender.com" target="_blank">dashboard</a>
+    </span>
+    <span class="muted">MIT &middot; built on Intel TDX</span>
+  </div>
+</footer>
+
+</body>
+</html>
