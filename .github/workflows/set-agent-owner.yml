@@ -1,0 +1,78 @@
+name: Set agent owner
+
+# One-shot operator tool: POST /owner on a DD agent to set its
+# `agent_owner` to a chosen GitHub user/org. The /owner endpoint is
+# fleet-gated — only an OIDC token with repository_owner = DD_OWNER
+# (devopsdefender) is accepted. So this workflow lives in the dd repo,
+# not on the tenant's repo.
+#
+# Use cases:
+#   - Pinning dd-local-bot to `satsforcompute` so satsforcompute's CI
+#     can /deploy the bot binary.
+#   - Re-applying after a node reboot (agent_owner is runtime-only).
+#   - Clearing (set agent-owner to empty string).
+
+on:
+  workflow_dispatch:
+    inputs:
+      cp-url:
+        description: 'Control-plane URL (e.g. https://app.devopsdefender.com)'
+        required: true
+        default: https://app.devopsdefender.com
+      vm-name:
+        description: 'Target agent vm_name (e.g. dd-local-bot)'
+        required: true
+      agent-owner:
+        description: 'GitHub user/org to set as agent_owner. Empty string to clear.'
+        required: true
+      claim-id:
+        description: 'Optional claim_id for the audit log (free-form).'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+  id-token: write   # required to mint the fleet OIDC token
+
+jobs:
+  set-owner:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve agent host + POST /owner
+        env:
+          CP_URL: ${{ inputs.cp-url }}
+          VM_NAME: ${{ inputs.vm-name }}
+          AGENT_OWNER: ${{ inputs.agent-owner }}
+          CLAIM_ID: ${{ inputs.claim-id }}
+          AUDIENCE: dd-agent
+        run: |
+          set -euo pipefail
+          # Mint an OIDC token whose repository_owner = devopsdefender;
+          # the agent's `require_fleet_oidc` accepts only this issuer.
+          TOKEN=$(curl -fsSL \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${AUDIENCE}" \
+            -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            | jq -r .value)
+
+          AGENT_HOST=$(curl -fsSL \
+            -H "Authorization: Bearer ${TOKEN}" \
+            "${CP_URL}/api/agents" \
+            | jq -r --arg vm "$VM_NAME" \
+              '[.[] | select(.vm_name==$vm and .status=="healthy")][0].hostname')
+          if [ -z "$AGENT_HOST" ] || [ "$AGENT_HOST" = "null" ]; then
+            echo "::error::no healthy agent with vm_name=$VM_NAME"
+            exit 1
+          fi
+
+          echo "POST https://${AGENT_HOST}/owner agent_owner=${AGENT_OWNER:-<clear>}"
+          BODY=$(jq -n \
+            --arg owner "$AGENT_OWNER" \
+            --arg claim "$CLAIM_ID" \
+            '{agent_owner: $owner, claim_id: $claim}')
+
+          RESP=$(curl -fsSL \
+            -X POST "https://${AGENT_HOST}/owner" \
+            -H "Authorization: Bearer ${TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "$BODY")
+          echo "agent: $RESP"
