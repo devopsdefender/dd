@@ -653,6 +653,7 @@ pub async fn provision_cp_access(
 ///     pre-handshake `{quote_b64, pubkey_hex}` in its response
 ///   - Bypass: `{agent}.{domain}/deploy` — GH-OIDC-gated in code
 ///   - Bypass: `{agent}.{domain}/exec` — GH-OIDC-gated in code
+///   - Bypass: `{agent}.{domain}/owner` — fleet-GH-OIDC-gated in code
 ///   - Bypass: `{agent}.{domain}/logs/*` — GH-OIDC-gated in code
 ///   - Bypass: `{agent}.{domain}/noise/ws` — Noise_IK-gated in code
 ///     against the CP-trusted paired device pubkey set
@@ -684,6 +685,7 @@ pub async fn provision_agent_access(
         ("/health", "health"),
         ("/deploy", "deploy"),
         ("/exec", "exec"),
+        ("/owner", "owner"),
         ("/logs", "logs"),
         // The in-process Noise gateway (merged into the agent's
         // router in agent.rs) lives on the same port + hostname as
