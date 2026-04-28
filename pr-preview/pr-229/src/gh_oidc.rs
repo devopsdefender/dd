@@ -183,11 +183,7 @@ impl Verifier {
     /// `POST /owner` when a claim activates). Use this for
     /// workload-control endpoints (`/deploy`, `/exec`, `/logs`) that
     /// should accept either ops or the active tenant.
-    pub async fn verify_allowing(
-        &self,
-        token: &str,
-        extra: Option<&Principal>,
-    ) -> Result<Claims> {
+    pub async fn verify_allowing(&self, token: &str, extra: Option<&Principal>) -> Result<Claims> {
         let claims = self.decode_and_validate(token).await?;
         let ok = self.owner.matches(&claims) || extra.is_some_and(|p| p.matches(&claims));
         if !ok {
@@ -243,7 +239,10 @@ impl Verifier {
                 .and_then(|x| x.as_str())
                 .unwrap_or("")
                 .into(),
-            repository_id: raw.get("repository_id").and_then(|x| x.as_u64()).unwrap_or(0),
+            repository_id: raw
+                .get("repository_id")
+                .and_then(|x| x.as_u64())
+                .unwrap_or(0),
             repository_owner: raw
                 .get("repository_owner")
                 .and_then(|x| x.as_str())
@@ -600,10 +599,7 @@ FwIDAQAB
             "repository_owner_id": 99999999u64,
         }));
         let v = verifier(org());
-        let err = v
-            .verify_allowing(&token, Some(&user()))
-            .await
-            .unwrap_err();
+        let err = v.verify_allowing(&token, Some(&user())).await.unwrap_err();
         assert!(matches!(err, Error::Unauthorized));
     }
 }
