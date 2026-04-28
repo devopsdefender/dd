@@ -990,9 +990,10 @@ async fn enroll_page(Query(q): Query<HashMap<String, String>>) -> Response {
 ///    workload EE spawned and gave the shared `EE_TOKEN` env to.
 /// 2. **GH OIDC** — CI action (`dd-deploy`, etc.) presents a GitHub
 ///    Actions OIDC JWT as `Authorization: Bearer <jwt>`; we verify
-///    against GitHub's JWKS and require `repository_owner ==
-///    DD_OWNER`. Matches the pattern dd-agent uses for `/deploy` +
-///    `/exec`.
+///    against GitHub's JWKS and require the principal carried by
+///    `DD_OWNER`/`DD_OWNER_ID`/`DD_OWNER_KIND` (see
+///    [`gh_oidc::Principal::matches`]). Matches the pattern dd-agent
+///    uses for `/deploy` + `/exec`.
 /// 3. **ITA** — dd-agent's `/api/agents` proxy forwards its own
 ///    Intel-attested ITA token so cross-VM calls from any attested
 ///    DD agent in the fleet succeed.
@@ -1048,10 +1049,10 @@ async fn agents_auth_ok(
     let Some(token) = bearer else {
         return false;
     };
-    if let Ok(claims) = s.gh.verify(token).await {
-        if claims.repository_owner == s.cfg.common.owner {
-            return true;
-        }
+    // `gh.verify` already enforces the principal match — a successful
+    // result is itself the authorization.
+    if s.gh.verify(token).await.is_ok() {
+        return true;
     }
     if s.verifier.verify(token).await.is_ok() {
         return true;

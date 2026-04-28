@@ -417,16 +417,42 @@ async fn find_app_by_domain(
     }))
 }
 
-/// Build the two-include GitHub-org-OR-admin-email policy used for
-/// every human-facing app (CP root + per-agent dashboard).
-fn human_policy(owner: &str, admin_email: &str, gh_idp_uuid: &str) -> serde_json::Value {
+/// Build the human-facing CF Access policy used for the CP root and
+/// each per-agent dashboard. `admin_email` is always included as the
+/// operator escape hatch. The GitHub-side rule depends on the
+/// principal's kind, because Cloudflare Access has no include rule
+/// for "specific GitHub user login" or "specific repository":
+///
+///   kind=org  → adds a `github-organization` include — anyone in
+///                that org login is admitted.
+///   kind=user → admin_email-only. CF Access can't gate on a
+///                specific GitHub user login by name; the operator
+///                gets in by email.
+///   kind=repo → admin_email-only, same reason.
+///
+/// The two non-org kinds losing GitHub-side dashboard access is not
+/// a regression: the prior behavior — a `github-organization` rule
+/// configured with a user login — silently matched nobody.
+fn human_policy(
+    owner: &crate::gh_oidc::Principal,
+    admin_email: &str,
+    gh_idp_uuid: &str,
+) -> serde_json::Value {
+    let mut includes = vec![serde_json::json!({
+        "email": { "email": admin_email }
+    })];
+    if let crate::gh_oidc::PrincipalKind::Org = owner.kind {
+        includes.push(serde_json::json!({
+            "github-organization": {
+                "name": owner.name,
+                "identity_provider_id": gh_idp_uuid,
+            }
+        }));
+    }
     serde_json::json!({
         "name": "dd-human",
         "decision": "allow",
-        "include": [
-            { "github-organization": { "name": owner, "identity_provider_id": gh_idp_uuid } },
-            { "email": { "email": admin_email } }
-        ],
+        "include": includes,
     })
 }
 
@@ -521,7 +547,7 @@ pub async fn provision_cp_access(
     cf: &CfCreds,
     env: &str,
     hostname: &str,
-    owner: &str,
+    owner: &crate::gh_oidc::Principal,
     admin_email: &str,
     workload_labels: &[String],
 ) -> Result<()> {
@@ -666,7 +692,7 @@ pub async fn provision_agent_access(
     cf: &CfCreds,
     env: &str,
     agent_hostname: &str,
-    owner: &str,
+    owner: &crate::gh_oidc::Principal,
     admin_email: &str,
     workload_labels: &[String],
 ) -> Result<()> {

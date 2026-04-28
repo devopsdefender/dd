@@ -39,6 +39,9 @@ inputs:
     description: 'Tail /var/log/ee-local-<kind>.log from tdx2 into the CI log for the duration of the register-wait. Surfaces what the agent VM is actually doing when it fails to register.'
     required: false
     default: 'true'
+  owner:
+    description: 'Fleet principal — GitHub login or owner/repo path. Forwarded as EE_OWNER to local-agents.sh on the tdx2 host, which resolves it to id+kind via gh api and bakes all three into agent.env.'
+    required: true
 
 runs:
   using: composite
@@ -69,11 +72,12 @@ runs:
         DD_ITA_API_KEY: ${{ inputs.ita-api-key }}
         DD_EE_CHANNEL: ${{ inputs.ee-channel }}
         DD_EE_TAG: ${{ inputs.ee-tag }}
+        EE_OWNER: ${{ inputs.owner }}
       with:
         host: ${{ inputs.host }}
         username: tdx2
         key: ${{ inputs.ssh-key }}
-        envs: KIND,URL,REF,RELEASE_TAG,DD_ITA_API_KEY,DD_EE_CHANNEL,DD_EE_TAG
+        envs: KIND,URL,REF,RELEASE_TAG,DD_ITA_API_KEY,DD_EE_CHANNEL,DD_EE_TAG,EE_OWNER
         script: |
           /home/tdx2/src/dd/apps/_infra/dd-relaunch.sh "$KIND" "$URL" "$REF" "$RELEASE_TAG"
 

@@ -170,6 +170,7 @@ jobs:
       # bump, one PR — so dd development isn't coupled to EE main's
       # release health. Bump in lockstep with the prod pin below.
       ee_tag: ${{ inputs.ee_tag || 'v0.3.1' }}
+      owner: devopsdefender
     secrets: inherit
 
   # Production deploy at app.{domain}. Fires on push-to-main OR on a
@@ -203,4 +204,5 @@ jobs:
       # up whatever EE shipped most recently. Preview still tracks
       # the staging channel (see deploy-preview block above).
       ee_tag: ${{ inputs.ee_tag || 'v0.3.1' }}
+      owner: devopsdefender
     secrets: inherit

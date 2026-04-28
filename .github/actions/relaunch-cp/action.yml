@@ -47,6 +47,9 @@ inputs:
     description: 'Explicit easyenclave release tag override for pre-flight testing a candidate (e.g. image-abc123456). Wins over `ee-channel`.'
     required: false
     default: ''
+  owner:
+    description: 'Fleet principal — GitHub login or owner/repo path. Forwarded as EE_OWNER to local-cp.sh on the tdx2 host, which resolves it to id+kind via gh api and bakes all three into agent.env.'
+    required: true
 
 runs:
   using: composite
@@ -65,11 +68,12 @@ runs:
         DD_ITA_API_KEY:         ${{ inputs.ita-api-key }}
         DD_EE_CHANNEL:          ${{ inputs.ee-channel }}
         DD_EE_TAG:              ${{ inputs.ee-tag }}
+        EE_OWNER:               ${{ inputs.owner }}
       with:
         host: ${{ inputs.host }}
         username: tdx2
         key: ${{ inputs.ssh-key }}
-        envs: ENV_LABEL,CP_HOSTNAME,REF,RELEASE_TAG,CLOUDFLARE_API_TOKEN,CLOUDFLARE_ACCOUNT_ID,CLOUDFLARE_ZONE_ID,DD_ACCESS_ADMIN_EMAIL,DD_ITA_API_KEY,DD_EE_CHANNEL,DD_EE_TAG
+        envs: ENV_LABEL,CP_HOSTNAME,REF,RELEASE_TAG,CLOUDFLARE_API_TOKEN,CLOUDFLARE_ACCOUNT_ID,CLOUDFLARE_ZONE_ID,DD_ACCESS_ADMIN_EMAIL,DD_ITA_API_KEY,DD_EE_CHANNEL,DD_EE_TAG,EE_OWNER
         script: |
           /home/tdx2/src/dd/apps/_infra/dd-relaunch-cp.sh \
             "$ENV_LABEL" "$CP_HOSTNAME" "$REF" "$RELEASE_TAG"

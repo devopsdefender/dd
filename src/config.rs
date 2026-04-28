@@ -1,6 +1,7 @@
 //! Environment-derived configuration for both modes.
 
 use crate::error::{Error, Result};
+use crate::gh_oidc::{Principal, PrincipalKind};
 
 #[derive(Clone)]
 pub struct CfCreds {
@@ -26,7 +27,7 @@ impl CfCreds {
 pub struct Common {
     pub env_label: String,
     pub port: u16,
-    pub owner: String,
+    pub owner: Principal,
     pub vm_name: String,
 }
 
@@ -39,12 +40,40 @@ impl Common {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(8080);
-        // DD_OWNER must be a GitHub **organization** login — the CF
-        // Access policy uses the `github-organization` include rule,
-        // which is member-of-org only. A personal-user login here
-        // would produce a policy that silently matches nobody.
-        let owner = std::env::var("DD_OWNER")
-            .map_err(|_| Error::Internal("DD_OWNER required (GitHub organization login)".into()))?;
+        // DD_OWNER + DD_OWNER_ID + DD_OWNER_KIND together describe the
+        // principal authorized to deploy to this agent.
+        //
+        //   kind=user|org → DD_OWNER is a GitHub login (no '/'). The
+        //                   verifier matches tokens whose
+        //                   repository_owner == DD_OWNER and
+        //                   repository_owner_id == DD_OWNER_ID. The
+        //                   two kinds differ only at CF Access:
+        //                   kind=org maps to a github-organization
+        //                   include rule; kind=user falls back to
+        //                   admin_email-only for the dashboard.
+        //   kind=repo     → DD_OWNER is "<owner>/<repo>" (one '/'),
+        //                   verifier matches repository == DD_OWNER
+        //                   and repository_id == DD_OWNER_ID.
+        //                   Dashboard CF Access falls back to
+        //                   admin_email-only.
+        //
+        // DD_OWNER_ID defeats login-squat — a deleted/transferred
+        // account whose login is later re-registered will produce
+        // tokens with a different numeric id and be rejected.
+        //
+        // All three are required at boot. Existing agents from before
+        // this change must be re-provisioned.
+        let owner_name =
+            std::env::var("DD_OWNER").map_err(|_| Error::Internal("DD_OWNER required".into()))?;
+        let owner_id: u64 = std::env::var("DD_OWNER_ID")
+            .map_err(|_| Error::Internal("DD_OWNER_ID required (numeric GitHub id)".into()))?
+            .parse()
+            .map_err(|e| Error::Internal(format!("DD_OWNER_ID parse: {e}")))?;
+        let owner_kind = PrincipalKind::parse(
+            &std::env::var("DD_OWNER_KIND")
+                .map_err(|_| Error::Internal("DD_OWNER_KIND required (user|org|repo)".into()))?,
+        )?;
+        let owner = Principal::from_parts(owner_name, owner_id, owner_kind)?;
         let vm_name = std::env::var("DD_VM_NAME").unwrap_or_else(|_| {
             std::fs::read_to_string("/etc/hostname")
                 .ok()
