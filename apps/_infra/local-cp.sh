@@ -16,6 +16,9 @@
 # Required env (all from the calling workflow's secrets):
 #   CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID, CLOUDFLARE_ZONE_ID
 #   DD_ACCESS_ADMIN_EMAIL, DD_ITA_API_KEY
+#   EE_OWNER         GitHub login or owner/repo path (no default).
+#                    Resolved at runtime via `gh api` to (id, kind);
+#                    DD_OWNER_ID + DD_OWNER_KIND are derived from it.
 #   DD_RELEASE_TAG  (defaults to "latest")
 #
 # Sizing: 16 GiB RAM / 4 vCPU / 160 GB qcow2 overlay — general shape
@@ -31,7 +34,31 @@ HOSTNAME="${2?hostname required}"
 : "${CLOUDFLARE_ZONE_ID?}"
 : "${DD_ACCESS_ADMIN_EMAIL?}"
 : "${DD_ITA_API_KEY?}"
+: "${EE_OWNER?set EE_OWNER (GitHub login or owner/repo path; no default)}"
 DD_RELEASE_TAG="${DD_RELEASE_TAG:-latest}"
+
+# Resolve EE_OWNER to (id, kind) via gh api — same idiom as
+# local-agents.sh.
+command -v gh >/dev/null || { echo "gh CLI required to resolve EE_OWNER" >&2; exit 1; }
+if [[ "$EE_OWNER" == */* ]]; then
+  EE_OWNER_ID=$(gh api "repos/$EE_OWNER" -q .id) || {
+    echo "EE_OWNER='$EE_OWNER' did not resolve via gh api repos/" >&2
+    exit 1
+  }
+  EE_OWNER_KIND=repo
+else
+  read -r EE_OWNER_ID _gh_type < <(gh api "users/$EE_OWNER" -q '"\(.id) \(.type)"') || {
+    echo "EE_OWNER='$EE_OWNER' did not resolve via gh api users/" >&2
+    exit 1
+  }
+  case "$_gh_type" in
+    User)         EE_OWNER_KIND=user ;;
+    Organization) EE_OWNER_KIND=org ;;
+    *) echo "unexpected gh api type: $_gh_type" >&2; exit 1 ;;
+  esac
+fi
+unset _gh_type
+echo "  EE_OWNER=$EE_OWNER (kind=$EE_OWNER_KIND, id=$EE_OWNER_ID)"
 DD_DOMAIN="${DD_DOMAIN:-devopsdefender.com}"
 DD_ITA_BASE_URL="${DD_ITA_BASE_URL:-https://api.trustauthority.intel.com}"
 DD_ITA_JWKS_URL="${DD_ITA_JWKS_URL:-https://portal.trustauthority.intel.com/certs}"
@@ -94,12 +121,17 @@ build_config_iso() {
       DD_ITA_BASE_URL="$DD_ITA_BASE_URL" \
       DD_ITA_JWKS_URL="$DD_ITA_JWKS_URL" \
       DD_ITA_ISSUER="$DD_ITA_ISSUER" \
+      DD_OWNER="$EE_OWNER" \
+      DD_OWNER_ID="$EE_OWNER_ID" \
+      DD_OWNER_KIND="$EE_OWNER_KIND" \
       bake "$REPO_ROOT/apps/dd-management/workload.json.tmpl"
     bake "$REPO_ROOT/apps/ttyd/workload.json"
   } | jq -cs '.')
 
   {
-    echo "EE_OWNER=devopsdefender"
+    echo "EE_OWNER=$EE_OWNER"
+    echo "EE_OWNER_ID=$EE_OWNER_ID"
+    echo "EE_OWNER_KIND=$EE_OWNER_KIND"
     echo "EE_BOOT_WORKLOADS=$workloads"
     echo "EE_CAPTURE_SOCKET=/run/ee/capture.sock"
   } > "$tmp/agent.env"

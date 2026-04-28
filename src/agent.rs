@@ -12,9 +12,10 @@
 //!     `block.<hostname>` — a plain web shell, not tied to any
 //!     deployment.
 //!   - `/deploy` and `/exec` are CF-Access-bypassed and gated in-code
-//!     by a GitHub Actions OIDC token — any CI workflow in the
-//!     `DD_OWNER` org can call them by presenting its per-job OIDC
-//!     JWT as `Authorization: Bearer …`.
+//!     by a GitHub Actions OIDC token — any CI workflow whose
+//!     principal matches `DD_OWNER`/`DD_OWNER_ID`/`DD_OWNER_KIND`
+//!     (see [`gh_oidc::Principal::matches`]) can call them by
+//!     presenting its per-job OIDC JWT as `Authorization: Bearer …`.
 //!   - Agent → CP `/ingress/replace` calls include the agent's fresh
 //!     ITA token in the body; the CP verifies it against Intel.
 
@@ -68,18 +69,18 @@ struct St {
     /// so the CP's PUT is a straight replacement.
     extras: Arc<RwLock<Vec<(String, u16)>>>,
     /// Verifier for GitHub Actions OIDC JWTs — the auth on /deploy
-    /// and /exec. CI workflows in the DD_OWNER org can call them
+    /// and /exec. CI workflows whose principal matches
+    /// `DD_OWNER`/`DD_OWNER_ID`/`DD_OWNER_KIND` can call them
     /// without any shared secret; anyone else is denied at claim
     /// check.
     gh: Arc<gh_oidc::Verifier>,
-    /// Runtime tenant-owner set via `POST /owner`. When `Some(org)`,
+    /// Runtime tenant-owner set via `POST /owner`. When `Some(p)`,
     /// `/deploy` / `/exec` / `/logs` accept GitHub OIDC from EITHER
-    /// `DD_OWNER` (fleet ops) OR this tenant org — shared admin. The
-    /// `/owner` endpoint itself is gated on fleet-only auth. Reset
-    /// to `None` on every agent boot (no persistence); the s12e bot
-    /// reapplies via `/owner` if the claim is still active after a
-    /// restart.
-    agent_owner: Arc<RwLock<Option<String>>>,
+    /// the fleet principal OR `p` — shared admin. The `/owner`
+    /// endpoint itself is gated on fleet-only auth. Reset to `None`
+    /// on every agent boot (no persistence); the s12e bot reapplies
+    /// via `/owner` if the claim is still active after a restart.
+    agent_owner: Arc<RwLock<Option<gh_oidc::Principal>>>,
     /// TDX-quote + Noise-static-pubkey bundle. Served as
     /// `{ noise: { quote_b64, pubkey_hex } }` off `/health` so a
     /// bastion-app can bootstrap a Noise session in one fetch (used
@@ -489,20 +490,28 @@ async fn health(State(s): State<St>) -> Json<serde_json::Value> {
         .map(|(label, port)| serde_json::json!({"hostname_label": label, "port": port}))
         .collect();
 
+    // Back-compat surface: pre-Principal /health consumers
+    // (satsforcompute's bot, owner-update.yml, anything else keying
+    // off the /health JSON) read `agent_owner` and `owner` as plain
+    // strings. Keep them strings (the principal `name`) and expose
+    // the structured form alongside as `*_principal` for new callers.
+    let fleet_owner_name = s.cfg.common.owner.name.clone();
+    let agent_owner_name = agent_owner.as_ref().map(|p| p.name.clone());
+
     Json(serde_json::json!({
         "ok": true,
         "service": "agent",
         "agent_id": s.agent_id,
         "vm_name": s.cfg.common.vm_name,
         "hostname": s.hostname,
-        // `owner` is the fleet owner (`DD_OWNER`) — retained for
-        // existing /health consumers that already key off it. The
-        // runtime tenant-owner set via POST /owner (if any) is in
-        // `agent_owner`; `/deploy`, `/exec`, `/logs` accept GH OIDC
-        // from either.
-        "owner": s.cfg.common.owner,
-        "fleet_owner": s.cfg.common.owner,
-        "agent_owner": agent_owner,
+        // `owner` / `agent_owner`: strings, principal name only —
+        // back-compat for pre-Principal consumers. Structured form
+        // (with id and kind) is on the `*_principal` keys below.
+        "owner": fleet_owner_name,
+        "fleet_owner": fleet_owner_name,
+        "agent_owner": agent_owner_name,
+        "fleet_owner_principal": s.cfg.common.owner,
+        "agent_owner_principal": agent_owner,
         // Integrity surface (SATS_FOR_COMPUTE_SPEC Integrity States).
         // `confidential_mode`: boot-time flag; true → /deploy + /exec
         // + /owner were NOT registered on this agent. Set from
@@ -706,18 +715,20 @@ fn bearer_token(headers: &HeaderMap) -> Result<&str> {
 }
 
 /// Workload-control auth (`/deploy`, `/exec`, `/logs`): accept a
-/// GitHub Actions OIDC token whose `repository_owner` matches
-/// EITHER the fleet owner (`DD_OWNER`) OR the agent's runtime
+/// GitHub Actions OIDC token whose principal (per
+/// [`gh_oidc::Principal::matches`]) is EITHER the fleet owner
+/// (`DD_OWNER`/`DD_OWNER_ID`/`DD_OWNER_KIND`) OR the agent's runtime
 /// `agent_owner`. Shared admin — ops and the active tenant both
 /// have deploy/exec/logs authority.
 async fn require_gh_oidc(s: &St, headers: &HeaderMap) -> Result<gh_oidc::Claims> {
     let token = bearer_token(headers)?;
     let agent_owner = s.agent_owner.read().await.clone();
-    s.gh.verify_allowing(token, agent_owner.as_deref()).await
+    s.gh.verify_allowing(token, agent_owner.as_ref()).await
 }
 
 /// Fleet-only auth. Used by `/owner`, which re-assigns the tenant:
-/// only ops (`DD_OWNER`) may call it, never the tenant themselves.
+/// only ops (the fleet principal) may call it, never the tenant
+/// themselves.
 async fn require_fleet_oidc(s: &St, headers: &HeaderMap) -> Result<gh_oidc::Claims> {
     let token = bearer_token(headers)?;
     s.gh.verify(token).await
@@ -870,10 +881,20 @@ async fn exec(
 
 #[derive(Debug, Deserialize)]
 struct OwnerReq {
-    /// New tenant org (GitHub user or org login). Empty string clears
-    /// the runtime owner — after which `/deploy`/`/exec`/`/logs`
-    /// accept only the fleet owner again.
+    /// New tenant principal name. Empty string clears the runtime
+    /// owner — after which `/deploy`/`/exec`/`/logs` accept only
+    /// the fleet owner again. When non-empty, `agent_owner_id` and
+    /// `agent_owner_kind` are required and validated for shape
+    /// consistency (see [`gh_oidc::Principal::from_parts`]).
     agent_owner: String,
+    /// Numeric GitHub id of the principal. Required when
+    /// `agent_owner` is non-empty; ignored when clearing.
+    #[serde(default)]
+    agent_owner_id: u64,
+    /// `"user" | "org" | "repo"`. Required when `agent_owner` is
+    /// non-empty.
+    #[serde(default)]
+    agent_owner_kind: String,
     /// Opaque ID from the caller's claim system (e.g. the s12e bot's
     /// claim issue). Logged for audit; the agent doesn't interpret it.
     #[serde(default)]
@@ -881,27 +902,32 @@ struct OwnerReq {
 }
 
 /// POST /owner — set (or clear) the agent's runtime tenant owner.
-/// Fleet-gated: only `DD_OWNER` can reassign a node. Runtime-only
-/// state: resets to `None` on reboot, so a crash/restart is self-
-/// healing (the bot re-applies if the claim is still active).
+/// Fleet-gated: only the fleet principal can reassign a node.
+/// Runtime-only state: resets to `None` on reboot, so a crash/restart
+/// is self-healing (the bot re-applies if the claim is still active).
 async fn set_owner(
     State(s): State<St>,
     headers: HeaderMap,
     Json(req): Json<OwnerReq>,
 ) -> Result<Json<serde_json::Value>> {
     let claims = require_fleet_oidc(&s, &headers).await?;
-    let new_owner = {
+    let new_owner: Option<gh_oidc::Principal> = {
         let trimmed = req.agent_owner.trim();
         if trimmed.is_empty() {
             None
         } else {
-            Some(trimmed.to_string())
+            let kind = gh_oidc::PrincipalKind::parse(&req.agent_owner_kind)?;
+            Some(gh_oidc::Principal::from_parts(
+                trimmed.to_string(),
+                req.agent_owner_id,
+                kind,
+            )?)
         }
     };
     let previous = {
         let mut guard = s.agent_owner.write().await;
         let prev = guard.clone();
-        *guard = new_owner.clone();
+        guard.clone_from(&new_owner);
         prev
     };
     // Taint only when transitioning to a NON-fleet owner. Clearing
@@ -912,10 +938,15 @@ async fn set_owner(
     if new_owner.is_some() {
         s.taint.insert(TaintReason::CustomerOwnerEnabled).await;
     }
+    let display = |o: &Option<gh_oidc::Principal>| -> String {
+        o.as_ref()
+            .map(|p| format!("{}({}/{})", p.name, p.kind.as_str(), p.id))
+            .unwrap_or_else(|| "<none>".into())
+    };
     eprintln!(
         "agent: /owner {} -> {} (by sub={}, claim_id={})",
-        previous.as_deref().unwrap_or("<none>"),
-        new_owner.as_deref().unwrap_or("<none>"),
+        display(&previous),
+        display(&new_owner),
         claims.sub,
         if req.claim_id.is_empty() {
             "<none>"
@@ -923,10 +954,16 @@ async fn set_owner(
             req.claim_id.as_str()
         },
     );
+    // Same back-compat as /health: existing callers (s12e bot,
+    // owner-update.yml) parse `agent_owner` / `previous_owner` as
+    // strings. Keep them strings here too; surface the structured
+    // form on `*_principal`.
     Ok(Json(serde_json::json!({
         "agent_id": s.agent_id,
-        "agent_owner": new_owner,
-        "previous_owner": previous,
+        "agent_owner": new_owner.as_ref().map(|p| p.name.clone()),
+        "agent_owner_principal": new_owner,
+        "previous_owner": previous.as_ref().map(|p| p.name.clone()),
+        "previous_owner_principal": previous,
         "claim_id": req.claim_id,
     })))
 }

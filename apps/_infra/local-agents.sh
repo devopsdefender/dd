@@ -27,8 +27,22 @@
 # subsequent machine-to-machine calls. Libvirt XML is rendered from
 # the existing `easyenclave-local` domain (strip hostdev for preview/bot).
 #
+# `EE_OWNER` (required) is the principal authorized to deploy to the
+# baked agents — one of:
+#   <login>        a GitHub user OR org login (no '/'). Resolved via
+#                  `gh api users/<login>` to a numeric id and a
+#                  user-vs-org kind.
+#   <owner>/<repo> a specific repository. Resolved via
+#                  `gh api repos/<owner>/<repo>` to a numeric id.
+#                  Strictly tighter than the bare-login form.
+# Both DD_OWNER_ID and DD_OWNER_KIND are derived from the resolved
+# answer and baked alongside DD_OWNER. There is no default — pick a
+# principal explicitly. CF Access dashboard membership only works
+# for kind=org; user/repo fall back to admin-email-only.
+#
 # Usage:
 #   export DD_ITA_API_KEY="$(cat ~/.secrets/ita_api_key)"
+#   export EE_OWNER="devopsdefender"   # or "alice", "alice/dd-foo", etc.
 #   ./apps/_infra/local-agents.sh <preview> <prod> <bot>
 #
 # Each URL arg is independent — pass "" to skip provisioning that VM:
@@ -49,10 +63,37 @@ if [ -z "$PREVIEW_CP" ] && [ -z "$PROD_CP" ] && [ -z "$BOT_CP" ]; then
   exit 1
 fi
 : "${DD_ITA_API_KEY?set DD_ITA_API_KEY}"
+: "${EE_OWNER?set EE_OWNER (GitHub login or owner/repo path; no default)}"
 # DD_RELEASE_TAG pins which devopsdefender binary the agent downloads.
 # Defaults to "latest" for ad-hoc runs; the relaunch-agent action sets
 # it to the PR's release tag so preview deploys test the PR binary.
 DD_RELEASE_TAG="${DD_RELEASE_TAG:-latest}"
+
+# Resolve EE_OWNER to (id, kind) once via `gh api`. Hard-fails if the
+# login or repo doesn't exist — better than baking a typo into a
+# config.iso whose agent then 401s every deploy with no signal.
+# Run once at script load so all three VMs (preview/prod/bot) share
+# the same owner principal.
+command -v gh >/dev/null || { echo "gh CLI required to resolve EE_OWNER" >&2; exit 1; }
+if [[ "$EE_OWNER" == */* ]]; then
+  EE_OWNER_ID=$(gh api "repos/$EE_OWNER" -q .id) || {
+    echo "EE_OWNER='$EE_OWNER' (looks like a repo, contains '/') did not resolve via gh api" >&2
+    exit 1
+  }
+  EE_OWNER_KIND=repo
+else
+  read -r EE_OWNER_ID _gh_type < <(gh api "users/$EE_OWNER" -q '"\(.id) \(.type)"') || {
+    echo "EE_OWNER='$EE_OWNER' did not resolve via gh api users/" >&2
+    exit 1
+  }
+  case "$_gh_type" in
+    User)         EE_OWNER_KIND=user ;;
+    Organization) EE_OWNER_KIND=org ;;
+    *) echo "unexpected gh api type: $_gh_type" >&2; exit 1 ;;
+  esac
+fi
+unset _gh_type
+echo "  EE_OWNER=$EE_OWNER (kind=$EE_OWNER_KIND, id=$EE_OWNER_ID)"
 
 # Resolve repo root regardless of invoking CWD — the workload specs
 # under apps/<name>/ need absolute paths so bake() can find them.
@@ -165,11 +206,16 @@ build_config_iso() {
       DD_VM_NAME="dd-local-$name" \
       DD_EXTRA_INGRESS="$extra_ingress" \
       DD_RELEASE_TAG="$DD_RELEASE_TAG" \
+      DD_OWNER="$EE_OWNER" \
+      DD_OWNER_ID="$EE_OWNER_ID" \
+      DD_OWNER_KIND="$EE_OWNER_KIND" \
       bake "$REPO_ROOT/apps/dd-agent/workload.json.tmpl"
   } | jq -cs '.')
 
   {
-    echo "EE_OWNER=devopsdefender"
+    echo "EE_OWNER=$EE_OWNER"
+    echo "EE_OWNER_ID=$EE_OWNER_ID"
+    echo "EE_OWNER_KIND=$EE_OWNER_KIND"
     echo "EE_BOOT_WORKLOADS=$workloads"
     # EE capture-socket tee target. Kept for forward compatibility: a
     # future workload (e.g. an attested proxy) can bind + listen on it.

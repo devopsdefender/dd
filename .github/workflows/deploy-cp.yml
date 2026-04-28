@@ -67,6 +67,10 @@ on:
         required: false
         type: string
         default: ''
+      owner:
+        description: 'Fleet principal — GitHub login or owner/repo path. Baked into the agent.env as EE_OWNER and resolved to id+kind via gh api. No default; the caller (release.yml) sets it explicitly.'
+        required: true
+        type: string
 
 # Serialize PR-preview deploys on the `preview` bucket: all pr-*
 # runs share one libvirt domain (`dd-local-preview`) on tdx2, so
@@ -159,6 +163,8 @@ jobs:
           DD_ACCESS_ADMIN_EMAIL: ${{ vars.DD_ACCESS_ADMIN_EMAIL || secrets.DD_ACCESS_ADMIN_EMAIL }}
           DD_ITA_API_KEY: ${{ secrets.DD_ITA_API_KEY }}
           DD_RELEASE_TAG: ${{ inputs.release_tag }}
+          EE_OWNER: ${{ inputs.owner }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           EE_IMAGE_FAMILY: ${{ steps.ee.outputs.family }}
           EE_IMAGE_PROJECT: easyenclave
           VM_MACHINE_TYPE: c3-standard-4
@@ -172,6 +178,26 @@ jobs:
           VM_NAME="dd-${DD_ENV}-$(date +%s)"
           : "${DD_ITA_API_KEY:?set DD_ITA_API_KEY via secrets.DD_ITA_API_KEY}"
           : "${DD_ACCESS_ADMIN_EMAIL:?set DD_ACCESS_ADMIN_EMAIL via vars or secrets.DD_ACCESS_ADMIN_EMAIL}"
+          : "${EE_OWNER:?set inputs.owner from the calling workflow}"
+
+          # Resolve EE_OWNER → numeric id + kind via gh api. Same idiom
+          # as apps/_infra/local-{agents,cp}.sh. Hard-fails on lookup
+          # miss so a typo doesn't bake a bricked principal into the VM.
+          if [[ "$EE_OWNER" == */* ]]; then
+            EE_OWNER_ID=$(gh api "repos/$EE_OWNER" -q .id)
+            EE_OWNER_KIND=repo
+          else
+            read -r EE_OWNER_ID GH_TYPE < <(gh api "users/$EE_OWNER" -q '"\(.id) \(.type)"')
+            case "$GH_TYPE" in
+              User)         EE_OWNER_KIND=user ;;
+              Organization) EE_OWNER_KIND=org ;;
+              *) echo "::error::unexpected gh api type: $GH_TYPE"; exit 1 ;;
+            esac
+          fi
+          export DD_OWNER="$EE_OWNER" DD_OWNER_ID DD_OWNER_KIND
+          DD_OWNER_ID="$EE_OWNER_ID"
+          DD_OWNER_KIND="$EE_OWNER_KIND"
+          echo "  EE_OWNER=$EE_OWNER (kind=$EE_OWNER_KIND, id=$EE_OWNER_ID)"
 
           # Bake a workload template: substitute ${VAR} placeholders
           # and strip "KEY=" env entries that ended up with empty values
@@ -214,7 +240,16 @@ jobs:
           # to running without capture when nothing is listening.
           jq -c -n \
             --arg workloads "$EE_BOOT_WORKLOADS" \
-            '{ "EE_BOOT_WORKLOADS": $workloads, "EE_OWNER": "devopsdefender", "EE_CAPTURE_SOCKET": "/run/ee/capture.sock" }' \
+            --arg owner "$EE_OWNER" \
+            --argjson owner_id "$EE_OWNER_ID" \
+            --arg owner_kind "$EE_OWNER_KIND" \
+            '{
+               "EE_BOOT_WORKLOADS": $workloads,
+               "EE_OWNER": $owner,
+               "EE_OWNER_ID": ($owner_id | tostring),
+               "EE_OWNER_KIND": $owner_kind,
+               "EE_CAPTURE_SOCKET": "/run/ee/capture.sock"
+             }' \
             > /tmp/ee-config.json
 
           gcloud compute instances create "$VM_NAME" \
