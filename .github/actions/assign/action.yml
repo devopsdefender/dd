@@ -1,0 +1,67 @@
+name: Assign DD v2 agent owner
+description: >-
+  Mint a GitHub Actions OIDC token for the assignment authority and
+  idempotently assign a DD v2 agent to a GitHub principal.
+
+inputs:
+  agent-url:
+    description: 'Agent base URL, e.g. https://agent.example.com'
+    required: true
+  owner-kind:
+    description: 'Principal kind: user, org, or repo'
+    required: true
+  owner-name:
+    description: 'GitHub login or owner/repo path'
+    required: true
+  owner-id:
+    description: 'Numeric GitHub user/org/repo id'
+    required: true
+  claim-id:
+    description: 'External lease/claim id; safe to reuse for idempotent reconciliation'
+    required: false
+    default: ''
+  audience:
+    description: 'OIDC audience expected by the agent'
+    required: false
+    default: dd-agent
+
+outputs:
+  changed:
+    description: 'Whether the assignment changed runtime state'
+    value: ${{ steps.assign.outputs.changed }}
+
+runs:
+  using: composite
+  steps:
+    - name: Assign owner
+      id: assign
+      shell: bash
+      env:
+        AGENT_URL: ${{ inputs.agent-url }}
+        OWNER_KIND: ${{ inputs.owner-kind }}
+        OWNER_NAME: ${{ inputs.owner-name }}
+        OWNER_ID: ${{ inputs.owner-id }}
+        CLAIM_ID: ${{ inputs.claim-id }}
+        AUDIENCE: ${{ inputs.audience }}
+      run: |
+        set -euo pipefail
+        if [ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
+          echo "::error::id-token unavailable; set 'permissions: id-token: write'"
+          exit 1
+        fi
+        oidc=$(curl -fsSL \
+          -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+          "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${AUDIENCE}" | jq -r .value)
+        body=$(jq -n \
+          --arg kind "$OWNER_KIND" \
+          --arg name "$OWNER_NAME" \
+          --argjson id "$OWNER_ID" \
+          --arg claim "$CLAIM_ID" \
+          '{owner:{kind:$kind,name:$name,id:$id},claim_id:$claim}')
+        resp=$(curl -fsSL \
+          -X POST "${AGENT_URL%/}/owner" \
+          -H "Authorization: Bearer ${oidc}" \
+          -H "Content-Type: application/json" \
+          -d "$body")
+        echo "$resp" | jq .
+        echo "changed=$(echo "$resp" | jq -r .changed)" >> "$GITHUB_OUTPUT"

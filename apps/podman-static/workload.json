@@ -1,7 +1,0 @@
-{
-  "app_name": "podman-static",
-  "github_release": {
-    "repo": "mgoltzsche/podman-static",
-    "asset": "podman-linux-amd64.tar.gz"
-  }
-}

@@ -1,0 +1,69 @@
+name: Verify DD v2 agent proof
+description: Fetch and check a DD v2 agent proof document.
+
+inputs:
+  agent-url:
+    description: 'Agent base URL, e.g. https://agent.example.com'
+    required: true
+  owner-kind:
+    description: 'Expected owner kind. Empty skips owner check.'
+    required: false
+    default: ''
+  owner-name:
+    description: 'Expected owner name. Empty skips owner check.'
+    required: false
+    default: ''
+  owner-id:
+    description: 'Expected numeric owner id. Empty skips owner check.'
+    required: false
+    default: ''
+  require-no-exec:
+    description: 'Fail if capabilities.exec is true'
+    required: false
+    default: 'false'
+  require-no-shell:
+    description: 'Fail if capabilities.interactive_shell is true'
+    required: false
+    default: 'false'
+
+outputs:
+  agent-id:
+    description: 'Agent id from proof'
+    value: ${{ steps.verify.outputs.agent-id }}
+
+runs:
+  using: composite
+  steps:
+    - name: Verify proof
+      id: verify
+      shell: bash
+      env:
+        AGENT_URL: ${{ inputs.agent-url }}
+        OWNER_KIND: ${{ inputs.owner-kind }}
+        OWNER_NAME: ${{ inputs.owner-name }}
+        OWNER_ID: ${{ inputs.owner-id }}
+        REQUIRE_NO_EXEC: ${{ inputs.require-no-exec }}
+        REQUIRE_NO_SHELL: ${{ inputs.require-no-shell }}
+      run: |
+        set -euo pipefail
+        proof=$(curl -fsSL "${AGENT_URL%/}/health")
+        echo "$proof" | jq .
+        echo "agent-id=$(echo "$proof" | jq -r .agent_id)" >> "$GITHUB_OUTPUT"
+
+        if [ -n "$OWNER_KIND" ] || [ -n "$OWNER_NAME" ] || [ -n "$OWNER_ID" ]; then
+          if [ -z "$OWNER_KIND" ] || [ -z "$OWNER_NAME" ] || [ -z "$OWNER_ID" ]; then
+            echo "::error::owner-kind, owner-name, and owner-id must be set together"
+            exit 1
+          fi
+          echo "$proof" | jq -e \
+            --arg kind "$OWNER_KIND" \
+            --arg name "$OWNER_NAME" \
+            --argjson id "$OWNER_ID" \
+            '.owner.kind == $kind and .owner.name == $name and .owner.id == $id' >/dev/null
+        fi
+        if [ "$REQUIRE_NO_EXEC" = "true" ]; then
+          echo "$proof" | jq -e '.capabilities.exec == false' >/dev/null
+        fi
+        if [ "$REQUIRE_NO_SHELL" = "true" ]; then
+          echo "$proof" | jq -e '.capabilities.interactive_shell == false' >/dev/null
+        fi

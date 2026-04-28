@@ -1,0 +1,75 @@
+name: Deploy to DD v2 agent
+description: >-
+  Deploy a workload JSON to a DD v2 agent using the calling repository's
+  GitHub Actions OIDC identity. The agent accepts only its current owner.
+
+inputs:
+  agent-url:
+    description: 'Agent base URL, e.g. https://agent.example.com'
+    required: true
+  workload:
+    description: 'Path to workload JSON'
+    required: true
+  audience:
+    description: 'OIDC audience expected by the agent'
+    required: false
+    default: dd-agent
+  wait-seconds:
+    description: 'Seconds to wait for workload to appear in /health; 0 disables wait'
+    required: false
+    default: '120'
+
+outputs:
+  app-name:
+    description: 'Deployed app_name'
+    value: ${{ steps.deploy.outputs.app-name }}
+
+runs:
+  using: composite
+  steps:
+    - name: Deploy workload
+      id: deploy
+      shell: bash
+      env:
+        AGENT_URL: ${{ inputs.agent-url }}
+        WORKLOAD: ${{ inputs.workload }}
+        AUDIENCE: ${{ inputs.audience }}
+        WAIT_SECONDS: ${{ inputs.wait-seconds }}
+      run: |
+        set -euo pipefail
+        if [ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
+          echo "::error::id-token unavailable; set 'permissions: id-token: write'"
+          exit 1
+        fi
+        app=$(jq -r '.app_name // empty' "$WORKLOAD")
+        if [ -z "$app" ]; then
+          echo "::error::$WORKLOAD missing .app_name"
+          exit 1
+        fi
+        echo "app-name=$app" >> "$GITHUB_OUTPUT"
+
+        echo "Preflight proof:"
+        curl -fsSL "${AGENT_URL%/}/health" | jq '{agent_id, owner, capabilities}'
+
+        oidc=$(curl -fsSL \
+          -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+          "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${AUDIENCE}" | jq -r .value)
+        curl -fsSL \
+          -X POST "${AGENT_URL%/}/deploy" \
+          -H "Authorization: Bearer ${oidc}" \
+          -H "Content-Type: application/json" \
+          -d @"$WORKLOAD" | jq .
+
+        if [ "$WAIT_SECONDS" -gt 0 ]; then
+          deadline=$(( $(date +%s) + WAIT_SECONDS ))
+          while [ "$(date +%s)" -lt "$deadline" ]; do
+            proof=$(curl -fsSL "${AGENT_URL%/}/health")
+            if echo "$proof" | jq -e --arg app "$app" '.workloads[]? | select(.app_name == $app)' >/dev/null; then
+              echo "$app visible in proof"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::$app did not appear in /health within ${WAIT_SECONDS}s"
+          exit 1
+        fi
