@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>DevOps Defender - Confidential MCP Servers and Oracles</title>
+  <meta name="description" content="Run attestable MCP servers, crypto oracles, and private AI bots on hardware-sealed Intel TDX VMs. Powered by EasyEnclave &mdash; the Linux distribution replacement for confidential VMs. No Go, no systemd.">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+  <nav>
+    <a href="/" class="logo">DevOps Defender</a>
+    <div class="links">
+      <a href="#how">How It Works</a>
+      <a href="#models">Models</a>
+      <a href="#trust">Trust</a>
+      <a href="#features">Use Cases</a>
+      <a href="#arch">Architecture</a>
+      <a href="https://app.devopsdefender.com">Dashboard</a>
+      <a href="https://github.com/devopsdefender/dd">GitHub</a>
+    </div>
+  </nav>
+
+  <div class="hero">
+    <h1>Confidential apps, <span class="accent">attestable by design</span></h1>
+    <p>Enclave computing is hard. <strong>EasyEnclave makes it easy.</strong> It's a drop-in replacement for a Linux distribution inside Intel TDX VMs &mdash; no Go, no systemd, no package manager. From this pristine confidential base, install an open-source MCP server or crypto oracle whose code can be attested, or install a Noise + LLM confidential endpoint for a private bot with durable history. Verify either path via the TDX quote on <code>/health</code>.</p>
+    <div class="buttons">
+      <a href="https://app.devopsdefender.com" class="btn btn-primary">Fleet Dashboard</a>
+      <a href="https://github.com/devopsdefender/dd" class="btn btn-outline">View Source</a>
+    </div>
+    <div class="stats">
+      <div class="stat"><span class="value">EE Pristine</span><span class="label">Confidential base image</span></div>
+      <div class="stat"><span class="value">MCP Ready</span><span class="label">Attestable tool servers</span></div>
+      <div class="stat"><span class="value">Noise + LLM</span><span class="label">Private bot endpoints</span></div>
+    </div>
+  </div>
+
+  <section id="how" class="section-center">
+    <div class="container">
+      <h2>How It Works</h2>
+      <p class="subtitle">Three steps from code to a private, remotely verifiable app.</p>
+      <div class="steps">
+        <div class="step">
+          <div class="step-num">1</div>
+          <div class="step-content">
+            <h3>Start pristine</h3>
+            <p>Boot a TDX VM where EasyEnclave <em>replaces the Linux distribution</em>: a single Rust PID 1, no systemd, no Go runtime, no apt or yum. Sealed memory, no tenant deploy authority, an empty taint profile &mdash; the smallest measurable surface that still runs your apps.</p>
+          </div>
+        </div>
+        <div class="step">
+          <div class="step-num">2</div>
+          <div class="step-content">
+            <h3>Install one shape</h3>
+            <p>Choose an attestable open-source workload, such as an MCP server or crypto oracle, or choose a sealed Noise + LLM endpoint for an always-on private bot. Both are ordinary <code>workload.json</code> apps; the difference is who has runtime authority after boot.</p>
+          </div>
+        </div>
+        <div class="step">
+          <div class="step-num">3</div>
+          <div class="step-content">
+            <h3>Attest &amp; use</h3>
+            <p>Intel TDX seals guest memory; the agent mints a quote and the CP verifies it via Intel Trust Authority at <code>/register</code>. Clients can check the quote, taint reasons, and workload identity before sending secrets, prompts, keys, or trading logic.</p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section id="features">
+    <div class="container section-center">
+      <h2>Use Cases</h2>
+      <p class="subtitle">Confidential apps where the code, history, and operator boundary matter.</p>
+      <div class="grid-3">
+        <div class="card">
+          <div class="icon">&#x1f9f0;</div>
+          <h3>Attestable MCP Servers</h3>
+          <p>Run a Model Context Protocol server from open-source code in a measured VM. A client can verify the server binary, boot config, and taint profile before granting tools, files, or credentials.</p>
+        </div>
+        <div class="card">
+          <div class="icon">&#x20bf;</div>
+          <h3>Crypto Oracles</h3>
+          <p>Publish oracle logic as a public repo and run it sealed. Users verify that the exact oracle code is live before relying on signed market data, settlement decisions, or automated treasury actions.</p>
+        </div>
+        <div class="card">
+          <div class="icon">&#x1f512;</div>
+          <h3>Confidential Bots</h3>
+          <p>Install a Noise + LLM endpoint that keeps conversation history inside the enclave. The bot can remember useful context while the operator still cannot read the history or swap the runtime after boot.</p>
+        </div>
+        <div class="card">
+          <div class="icon">&#x1f4ca;</div>
+          <h3>Fleet Metrics</h3>
+          <p>CP dashboard scrapes <code>/health</code> on every agent: CPU, memory, per-disk capacity, per-NIC rx/tx, ITA attestation status, workload identity, and taint reasons.</p>
+        </div>
+        <div class="card">
+          <div class="icon">&#x1f680;</div>
+          <h3>Workloads as JSON</h3>
+          <p>Every app &mdash; cloudflared, dd-agent, MCP servers, oracles, LLM endpoints, yours &mdash; is one file at <code>apps/&lt;name&gt;/workload.json</code>. Boot workloads and runtime deploys share the same schema.</p>
+        </div>
+        <div class="card">
+          <div class="icon">&#x1f6e1;</div>
+          <h3>EasyEnclave Runtime</h3>
+          <p>EasyEnclave replaces your Linux distribution inside the sealed VM &mdash; an open-source Rust PID 1 with a Unix socket API. No systemd, no Go, no networking in the runtime. Enclave computing was hard; this is the boring base layer that makes it easy.</p>
+        </div>
+        <div class="card">
+          <div class="icon">&#x20bf;</div>
+          <h3>Sats for Compute</h3>
+          <p>The canonical example operator: pay BTC, get a fresh attested node bound to your GitHub identity, or a sealed oracle from your public workload repo. State lives in GitHub issues; <code>workflow_dispatch</code> is the actuator. <a href="https://satsforcompute.com" target="_blank">satsforcompute.com</a>.</p>
+        </div>
+        <div class="card">
+          <div class="icon">&#x1f310;</div>
+          <h3>Cloudflare Tunnels</h3>
+          <p>Every agent gets a tunnel hostname. No public IPs, no firewall rules, no port forwarding. The CP provisions tunnels automatically on registration.</p>
+        </div>
+        <div class="card">
+          <div class="icon">&#x1f4dc;</div>
+          <h3>Signed Releases</h3>
+          <p>Every <code>devopsdefender</code> binary CI publishes carries a Sigstore-backed GitHub build attestation. <code>gh attestation verify</code> proves a binary came from this repo's release workflow &mdash; provable provenance, not trust us.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section id="models" class="section-center">
+    <div class="container">
+      <h2>Two install paths</h2>
+      <p class="subtitle">Same pristine EasyEnclave substrate, two product shapes &mdash; chosen at boot, provable from the TDX quote.</p>
+      <div class="modes">
+        <div class="mode mode-customer">
+          <span class="mode-tag">attestable open source</span>
+          <h3>MCP servers and oracles</h3>
+          <p>Install a workload from open-source code whose repo, release, and boot config are part of the evidence. Clients verify the TDX quote and <code>/health</code> before they trust the MCP tools, oracle outputs, private keys, API credentials, or trading logic.</p>
+          <p class="dim">For: MCP tool servers, crypto price oracles, settlement bots, verifiable automation.</p>
+        </div>
+        <div class="mode mode-confidential">
+          <span class="mode-tag">confidential endpoint</span>
+          <h3>Noise + LLM private bot</h3>
+          <p>Install a sealed endpoint that speaks Noise to the client and keeps prompts, memory, and chat history inside the enclave. The agent boots with <code>DD_CONFIDENTIAL=true</code> &mdash; <code>/deploy</code>, <code>/exec</code>, and <code>/owner</code> are <em>not registered</em> on this node. Logs and attestation stay open; operator mutation paths stay closed.</p>
+          <p class="dim">For: private assistants, trading bots, support agents, and long-lived agents that need history without exposing it to the host.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section id="trust" class="section-center">
+    <div class="container">
+      <h2>Trust model</h2>
+      <p class="subtitle">EasyEnclave is the pristine confidential root. Taint is a <em>set</em> of reasons, not a boolean. Read <code>/health.taint_reasons</code> + the TDX quote and reconstruct the trust profile in one fetch.</p>
+      <table class="trust-table">
+        <tr>
+          <td><span class="state-pill state-pristine">pristine</span></td>
+          <td>Booted from a known EasyEnclave image. No customer has had deploy / exec / shell authority. <code>taint_reasons</code> set is empty.</td>
+        </tr>
+        <tr>
+          <td><span class="state-pill state-tainted">tainted</span></td>
+          <td>Customer-influenced via at least one channel. Reasons surface which:</td>
+        </tr>
+        <tr>
+          <td></td>
+          <td>
+            <ul class="reasons">
+              <li><code>customer_workload_deployed</code> &mdash; a <code>/deploy</code> succeeded since boot</li>
+              <li><code>customer_owner_enabled</code> &mdash; <code>/owner</code> set a non-fleet tenant</li>
+              <li><code>arbitrary_exec_enabled</code> &mdash; node booted with <code>/deploy</code> + <code>/exec</code> registered (i.e. not confidential mode)</li>
+              <li><code>interactive_shell_enabled</code> &mdash; ttyd or equivalent in the running workload</li>
+            </ul>
+          </td>
+        </tr>
+        <tr>
+          <td><span class="state-pill state-safe">safe_mode</span></td>
+          <td>On reboot, the agent's runtime owner clears and the node returns to bot/DD control. It may still be tainted; safe_mode is not the same as pristine. A tainted node is rebuilt before reassignment.</td>
+        </tr>
+      </table>
+      <p class="trust-cta">Confidential-mode nodes ship with the workload measured at boot and no runtime mutation endpoints. The absence of <code>arbitrary_exec_enabled</code> + <code>interactive_shell_enabled</code> is the cryptographic signal that the operator cannot tamper with the running MCP server, oracle, or private bot.</p>
+    </div>
+  </section>
+
+  <section id="arch" class="section-center">
+    <div class="container">
+      <h2>Architecture</h2>
+      <p class="subtitle">1 binary, 2 install paths, workloads as code.</p>
+      <div class="arch">
+<pre>
+<span class="hl">Customer</span> (browser)
+  |
+  v
+<span class="hl">Cloudflare Edge</span> ──── tunnel ────> <span class="gr">TDX VM</span>
+                                    |
+                            <span class="gr">easyenclave</span> (PID 1)
+                            |
+                            └── spawns confidential apps from <span class="hl">apps/*/workload.json</span>
+                                ├── <span class="hl">cloudflared</span>           (fetch-only, gives us a tunnel)
+                                ├── <span class="hl">devopsdefender agent</span>  (/health, /deploy, /exec)
+                                ├── <span class="hl">podman</span>                (static, rootful, daemon-less)
+                                ├── <span class="hl">mcp server</span>             (attestable open-source tools)
+                                ├── <span class="hl">crypto oracle</span>          (sealed decision logic)
+                                └── <span class="hl">Noise + LLM endpoint</span>   (private bot + history)
+
+<span class="hl">devopsdefender cp</span> (fleet dashboard + management)
+  ├── discovers agents via CF tunnels
+  ├── scrapes /health (per-disk + per-NIC metrics)
+  ├── verifies each agent's ITA quote at /register
+  └── web UI: fleet table, per-agent detail, in-browser shell
+</pre>
+      </div>
+    </div>
+  </section>
+
+  <section class="section-center">
+    <div class="container">
+      <h2>Deploy with GitHub Actions</h2>
+      <p class="subtitle">Per-job OIDC token, no stored credentials. Any workflow in the DD GitHub org deploys &mdash; nothing else does.</p>
+      <div class="code-block">
+        <div class="code-header">.github/workflows/deploy.yml</div>
+<pre><span class="k">jobs:</span>
+  <span class="k">deploy:</span>
+    <span class="k">runs-on:</span> <span class="s">ubuntu-latest</span>
+    <span class="k">permissions:</span>
+      <span class="k">id-token:</span> <span class="s">write</span>   <span class="c"># mints the OIDC token</span>
+      <span class="k">contents:</span> <span class="s">read</span>
+    <span class="k">steps:</span>
+      <span class="k">- uses:</span> <span class="s">actions/checkout@v4</span>
+      <span class="k">- uses:</span> <span class="s">devopsdefender/dd/.github/actions/dd-deploy@main</span>
+        <span class="k">with:</span>
+          <span class="k">cp-url:</span> <span class="s">https://app.devopsdefender.com</span>
+          <span class="k">vm-name:</span> <span class="s">dd-local-prod</span>
+          <span class="k">workload:</span> <span class="s">apps/myapp/workload.json</span></pre>
+      </div>
+      <p style="margin-top:16px;color:var(--text-dim);font-size:14px;">The agent verifies the GitHub Actions OIDC JWT in-code against GitHub's JWKS, checks <code>repository_owner == DD_OWNER</code>, and launches the workload. No service tokens, no PATs, no secrets stored anywhere.</p>
+    </div>
+  </section>
+
+  <section>
+    <div class="container">
+      <div class="callout">
+        <h3>Powered by <a href="https://easyenclave.com">EasyEnclave</a></h3>
+        <p>A Linux distribution replacement for confidential VMs. Enclave computing is hard; EasyEnclave makes it easy. One Rust binary as PID 1 inside Intel TDX &mdash; no systemd, no Go, no package manager, no shell to attack. Unix socket API. No networking in the runtime. DevOps Defender layers attestable app installation, fleet health, and confidential endpoint patterns on top.</p>
+        <a href="https://easyenclave.com" class="btn btn-outline">Learn More</a>
+      </div>
+    </div>
+  </section>
+
+  <section class="cta">
+    <h2>Run private tools people can verify.</h2>
+    <p>Attestable MCP servers, sealed crypto oracles, and confidential bots with memory.</p>
+    <div class="buttons">
+      <a href="https://app.devopsdefender.com" class="btn btn-primary">Get Started</a>
+      <a href="https://github.com/devopsdefender/dd" class="btn btn-outline">View on GitHub</a>
+    </div>
+  </section>
+
+  <footer>
+    <p>
+      <a href="https://github.com/devopsdefender/dd">GitHub</a>
+      <a href="https://easyenclave.com">EasyEnclave</a>
+      <a href="https://app.devopsdefender.com">Dashboard</a>
+    </p>
+    <p style="margin-top:8px">DevOps Defender &mdash; MIT License</p>
+  </footer>
+
+</body>
+</html>

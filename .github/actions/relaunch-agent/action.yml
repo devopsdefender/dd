@@ -1,0 +1,219 @@
+name: Relaunch local TDX agent
+description: >-
+  SSH into the tdx2 host, recreate the matching dd-local-{kind} libvirt
+  domain against the given CP url (pulling apps/ from the given git ref),
+  then block until the agent re-registers with the CP. A release is "done"
+  only when this action succeeds end-to-end.
+
+inputs:
+  kind:
+    description: 'prod | preview — which libvirt domain to relaunch'
+    required: true
+  url:
+    description: 'CP URL the agent should register against (e.g. https://app.devopsdefender.com)'
+    required: true
+  ref:
+    description: 'git ref whose scripts/apps tree dd-relaunch.sh should check out on the host'
+    required: true
+  ssh-key:
+    description: 'Private SSH key for tdx2@host'
+    required: true
+  host:
+    description: 'Public host address of the tdx2 node'
+    required: true
+  ita-api-key:
+    description: 'Intel Trust Authority API key for attestation'
+    required: true
+  release-tag:
+    description: 'devopsdefender release tag the local agent should download (e.g. pr-abc123, latest)'
+    required: true
+  ee-channel:
+    description: 'easyenclave release channel to sync the libvirt base qcow2 from (stable | staging)'
+    required: false
+    default: 'staging'
+  ee-tag:
+    description: 'Explicit easyenclave release tag override for pre-flight testing a candidate (e.g. image-abc123456). Wins over `ee-channel`.'
+    required: false
+    default: ''
+  stream-console:
+    description: 'Tail /var/log/ee-local-<kind>.log from tdx2 into the CI log for the duration of the register-wait. Surfaces what the agent VM is actually doing when it fails to register.'
+    required: false
+    default: 'true'
+  owner:
+    description: 'Fleet principal — GitHub login or owner/repo path. Forwarded as EE_OWNER to local-agents.sh on the tdx2 host, which resolves it to id+kind via gh api and bakes all three into agent.env.'
+    required: true
+
+runs:
+  using: composite
+  steps:
+    # curl's native --retry handles the CP-healthy wait. On PR pushes
+    # we race with Release's deploy-preview standing up the pr-N CP;
+    # /health is CF-bypassed. 60 attempts × 10s = 10 min budget.
+    - name: Wait for CP to be healthy
+      shell: bash
+      env:
+        URL: ${{ inputs.url }}
+      run: |
+        curl -fsS --retry 60 --retry-delay 10 --retry-all-errors \
+          --max-time 5 "$URL/health" >/dev/null
+        echo "CP $URL healthy"
+
+    # appleboy/ssh-action owns key + known_hosts setup; we just hand
+    # it the script to run on the tdx2 host. dd-relaunch.sh finishes
+    # in ~10s — the baked config.iso's EE_BOOT_WORKLOADS drives the
+    # rest of the boot asynchronously.
+    - name: ssh + relaunch VM
+      uses: appleboy/ssh-action@v1.2.0
+      env:
+        KIND: ${{ inputs.kind }}
+        URL: ${{ inputs.url }}
+        REF: ${{ inputs.ref }}
+        RELEASE_TAG: ${{ inputs.release-tag }}
+        DD_ITA_API_KEY: ${{ inputs.ita-api-key }}
+        DD_EE_CHANNEL: ${{ inputs.ee-channel }}
+        DD_EE_TAG: ${{ inputs.ee-tag }}
+        EE_OWNER: ${{ inputs.owner }}
+      with:
+        host: ${{ inputs.host }}
+        username: tdx2
+        key: ${{ inputs.ssh-key }}
+        envs: KIND,URL,REF,RELEASE_TAG,DD_ITA_API_KEY,DD_EE_CHANNEL,DD_EE_TAG,EE_OWNER
+        script: |
+          /home/tdx2/src/dd/apps/_infra/dd-relaunch.sh "$KIND" "$URL" "$REF" "$RELEASE_TAG"
+
+    # Block until the freshly-booted agent VM registers with the CP.
+    # This is the "I can see the local agent deployment worked"
+    # signal that gates the whole release.
+    #
+    # Budget: cold VM boot ~60s + EE pre-fetch of the dd binary
+    # from GitHub releases (can be 60s+ on a cold cache) +
+    # cloudflared tunnel ~30s + agent ITA mint (one round-trip to
+    # Intel) + register with the CP's 6-retry backoff path
+    # (~105s cumulative if CF edge is still propagating). Worst
+    # case is ~7 min end-to-end, so 5 min was too tight — preview
+    # deploys were flaking here even when the agent eventually
+    # came up. 60 × 10s = 10 min covers it with headroom.
+    #
+    # Simultaneously we tail the VM's serial console log from
+    # /var/log/ee-local-<kind>.log on tdx2 so every `eprintln!`
+    # the agent prints (mint failures, register errors, EE boot
+    # issues) lands in the CI log in real time. Previously the
+    # only visibility was "never registered" — now the cause is
+    # in the same job log as the wait.
+    #
+    # On failure we also dump the last /api/agents payload so
+    # the CP-side view is captured alongside the VM-side view.
+    - name: Verify agent registered with CP
+      shell: bash
+      env:
+        URL:             ${{ inputs.url }}
+        KIND:            ${{ inputs.kind }}
+        HOST:            ${{ inputs.host }}
+        SSH_KEY:         ${{ inputs.ssh-key }}
+        STREAM_CONSOLE:  ${{ inputs.stream-console }}
+      run: |
+        set -uo pipefail
+        vm="dd-local-$KIND"
+        since=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+        # Start the serial-console tail first so the boot messages
+        # that arrive during the register wait all show up in-line.
+        # `tail -F` follows rotation; `ssh -T` suppresses the pty.
+        # Output is prefixed so console lines are distinguishable
+        # from the wait loop's own status prints.
+        tail_pid=""
+        # Mirror of the tailed console, grepped by the register-wait
+        # loop below for `devopsdefender: fatal:` — the single
+        # `eprintln!` src/main.rs emits on unrecoverable error.
+        # If the agent's register retries all fail (e.g. dnsmasq
+        # negative-cached NXDOMAIN from the CP's hydrate probe), the
+        # agent exits and will never appear in `/api/agents`; without
+        # this mirror the CI loop would poll a corpse for its full
+        # 10-min budget. Always produced even when streaming is off,
+        # since the grep is what saves the budget.
+        mirror=$(mktemp)
+        trap 'rm -f "$mirror"' EXIT
+        if [ "$STREAM_CONSOLE" = "true" ]; then
+          key=$(mktemp)
+          trap 'rm -f "$key" "$mirror"' EXIT
+          printf '%s\n' "$SSH_KEY" > "$key"
+          chmod 600 "$key"
+          # `stdbuf -oL` on both ends: force tail and sed to line-buffer
+          # so each VM boot line streams into this job's log as it's
+          # written, rather than block-buffering until the pipe closes.
+          # Dropping `2>/dev/null` on tail so "cannot open" / "retrying"
+          # diagnostics surface — if the serial log file never appears,
+          # we want the reason on-screen, not a silent wait.
+          ssh -i "$key" -T \
+              -o StrictHostKeyChecking=accept-new \
+              -o ServerAliveInterval=30 \
+              tdx2@"$HOST" \
+              "sudo stdbuf -oL tail -n +1 -F /var/log/ee-local-$KIND.log || true" \
+            2>&1 | stdbuf -oL sed -u "s/^/  [$vm console] /" \
+                 | stdbuf -oL tee -a "$mirror" &
+          tail_pid=$!
+          # Give the tail a moment to attach so its first lines land
+          # before the register wait's first status message.
+          sleep 1
+        fi
+        cleanup_tail() {
+          # Kill every child process — the `ssh | sed | tee` pipeline
+          # plus any stragglers. `kill "$tail_pid"` alone drops tee but
+          # leaves ssh holding its remote `tail -F`, which can prevent
+          # the Actions runner from closing the step out (stdout stream
+          # still has live writers). `pkill -P $$` nukes the whole
+          # tree; a short SIGKILL chaser covers processes that ignored
+          # SIGTERM.
+          pkill -TERM -P $$ 2>/dev/null || true
+          sleep 0.3
+          pkill -KILL -P $$ 2>/dev/null || true
+        }
+
+        # Mint a GH OIDC token for the /api/agents bearer auth. The
+        # calling job must grant `id-token: write` in its
+        # permissions block.
+        if [ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
+          cleanup_tail
+          echo "::error::id-token not available — caller needs 'permissions: id-token: write'"
+          exit 1
+        fi
+        oidc=$(curl -fsSL \
+          -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+          "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=dd-agent" | jq -r .value)
+        last_payload=""
+        for i in $(seq 1 60); do
+          payload=$(curl -fsS --max-time 10 -H "Authorization: Bearer ${oidc}" \
+            "$URL/api/agents" 2>/dev/null || true)
+          if [ -n "$payload" ]; then
+            last_payload="$payload"
+          fi
+          host_found=$(echo "$payload" | jq -r --arg since "$since" --arg vm "$vm" '
+                [.[] | select(.vm_name==$vm and .status=="healthy" and .last_seen > $since)]
+                | sort_by(.last_seen) | reverse | .[0].hostname // empty' 2>/dev/null || true)
+          if [ -n "$host_found" ]; then
+            echo "$vm registered at https://$host_found"
+            cleanup_tail
+            exit 0
+          fi
+          # Fail fast if the agent already exited with a fatal error.
+          # The console mirror is the streaming tee of the serial log;
+          # `devopsdefender: fatal:` is main.rs's terminal eprintln
+          # and EE doesn't restart boot workloads, so once it lands in
+          # the mirror there's nothing left to wait for.
+          if [ -s "$mirror" ] && grep -q 'devopsdefender: fatal:' "$mirror"; then
+            cleanup_tail
+            echo "::group::Fatal line from $vm console"
+            grep -m1 'devopsdefender: fatal:' "$mirror" || true
+            echo "::endgroup::"
+            echo "::error::$vm agent exited fatal; not polling /api/agents further"
+            exit 1
+          fi
+          echo "  waiting for $vm to register with $URL... (${i}/60)"
+          sleep 10
+        done
+        cleanup_tail
+        echo "::group::Last /api/agents payload"
+        echo "$last_payload" | jq . 2>/dev/null || echo "$last_payload"
+        echo "::endgroup::"
+        echo "::error::$vm never registered with $URL within 10 min (since=$since)"
+        exit 1

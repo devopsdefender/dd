@@ -1,0 +1,353 @@
+name: Cleanup
+
+# Unified teardown for per-PR preview envs, plus orphan CF state.
+#
+# One `teardown_env` routine, used by both trigger classes:
+#
+#   - `on: delete` (branch-delete) → tear down exactly that PR's env.
+#     Replaces the old dedicated `pr-teardown.yml`; fast path.
+#
+#   - `schedule` + `workflow_dispatch` + `workflow_run: Release` →
+#     sweep every closed/merged PR env that still has lingering CF
+#     state or VMs, then run an orphan-agent hostname pass. Slow
+#     path; safety net for anything the fast path missed (branch
+#     kept open post-close, CF/libvirt/GCE error during teardown,
+#     agent-tunnel UUIDs the per-env prefix doesn't catch).
+#
+# Per-env teardown covers, in order:
+#   1. `dd-local-{env}-cp` libvirt domain + qcow2 + config iso
+#      + serial log on tdx2 (via SSH — target=ssh CPs).
+#   2. CF Access apps named `dd-{env}-…`.
+#   3. CF tunnels named `dd-{env}-…` (connections drained first —
+#      delete is 400 otherwise).
+#   4. CF DNS CNAMEs matching `{env}.`, `{env}-`, or `dd-{env}-`.
+#   5. GCE instances labeled `dd_env={env}` (legacy target=gcp;
+#      ssh-target deploys don't produce these).
+#
+# A separate `reap-terminated-gce` job still exists to sweep
+# TERMINATED GCE VMs for *open* envs (production; historic staging
+# TERMINATED state). That's orthogonal to per-env teardown and
+# keyed on status rather than PR lifecycle.
+
+on:
+  delete:
+  workflow_dispatch:
+  workflow_run:
+    workflows: ["Release"]
+    types: [completed]
+  schedule:
+    - cron: '0 */6 * * *'
+
+concurrency:
+  group: dd-cleanup
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  GCP_ZONE: us-central1-c
+
+jobs:
+  teardown-pr-envs:
+    # Ignore tag-deletes; they never have an associated env.
+    if: github.event_name != 'delete' || github.event.ref_type == 'branch'
+    runs-on: ubuntu-latest
+    environment: staging
+    permissions:
+      contents: read
+      id-token: write
+      pull-requests: read
+    env:
+      GCP_PROJECT_ID:    ${{ secrets.GCP_PROJECT_ID }}
+      CF_API_TOKEN:      ${{ secrets.DD_CP_CF_API_TOKEN }}
+      CF_ACCOUNT_ID:     ${{ secrets.DD_CP_CF_ACCOUNT_ID }}
+      CF_ZONE_ID:        ${{ secrets.DD_CP_CF_ZONE_ID }}
+      DD_DOMAIN:         ${{ vars.DD_CF_DOMAIN || 'devopsdefender.com' }}
+      GH_TOKEN:          ${{ github.token }}
+      DD_LOCAL_HOST:     ${{ secrets.DD_LOCAL_HOST }}
+      DD_LOCAL_SSH_KEY:  ${{ secrets.DD_LOCAL_SSH_KEY }}
+      EVENT_NAME:        ${{ github.event_name }}
+      DELETED_REF:       ${{ github.event.ref }}
+      REPO:              ${{ github.repository }}
+    steps:
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: 'projects/654815109728/locations/global/workloadIdentityPools/github-actions-pool/providers/github-provider'
+          service_account: 'easyenclave-staging-ci@eestaging.iam.gserviceaccount.com'
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Cleanup
+        run: |
+          set -euo pipefail
+          AUTH=(-H "Authorization: Bearer $CF_API_TOKEN")
+
+          # SSH key for libvirt teardown on tdx2.
+          ssh_key=$(mktemp)
+          trap 'rm -f "$ssh_key"' EXIT
+          printf '%s\n' "$DD_LOCAL_SSH_KEY" > "$ssh_key"
+          chmod 600 "$ssh_key"
+
+          # Fetch CF state once; reused across every env in the
+          # loop below and by the orphan-agent sweep at the end.
+          # per_page=200 for tunnels so a predecessor doesn't sort
+          # off page 1 on a busy account (same cap as src/cf.rs).
+          echo "Fetching CF state..."
+          apps=$(curl -fsS "${AUTH[@]}" \
+            "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/access/apps?per_page=1000")
+          tunnels=$(curl -fsS "${AUTH[@]}" \
+            "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/cfd_tunnel?is_deleted=false&per_page=200")
+          dns=$(curl -fsS "${AUTH[@]}" \
+            "https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/dns_records?per_page=500&type=CNAME")
+
+          # Per-env teardown. Best-effort per resource so a transient
+          # failure on one doesn't abort the rest of the sweep.
+          teardown_env() {
+            local env="$1"
+            echo "== $env =="
+
+            # 1. libvirt CP domain on tdx2. `|| true` around the
+            #    whole ssh so a transient tdx2-unreachable doesn't
+            #    kill the CF work that follows; next run catches
+            #    anything missed.
+            ssh -i "$ssh_key" -T \
+                -o StrictHostKeyChecking=accept-new \
+                -o ServerAliveInterval=30 \
+                -o ConnectTimeout=15 \
+                tdx2@"$DD_LOCAL_HOST" bash -s -- "$env" <<'EOSSH' || true
+          set -euo pipefail
+          env="$1"
+          vm="dd-local-$env-cp"
+          if virsh dominfo "$vm" >/dev/null 2>&1; then
+            virsh destroy "$vm" 2>/dev/null || true
+            virsh undefine "$vm" --managed-save --snapshots-metadata 2>/dev/null || true
+            echo "  - libvirt $vm"
+          fi
+          sudo rm -f \
+            "/var/lib/libvirt/images/$vm.qcow2" \
+            "/var/lib/libvirt/images/$vm-config.iso" \
+            "/var/log/ee-local-$env-cp.log" \
+            2>/dev/null || true
+          EOSSH
+
+            # 2. CF Access apps named dd-{env}-…
+            echo "$apps" | jq -r --arg p "dd-$env-" \
+              '.result[] | select(.name | startswith($p)) | "\(.id) \(.name)"' \
+              | while read -r id name; do
+                  [ -z "$id" ] && continue
+                  curl -fsS -X DELETE "${AUTH[@]}" \
+                    "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/access/apps/$id" \
+                    >/dev/null 2>&1 && echo "  - app $name" || echo "  ! app $name FAILED"
+                done
+
+            # 3. CF tunnels named dd-{env}-… (drain connections
+            #    first — tunnel delete 400s otherwise).
+            echo "$tunnels" | jq -r --arg p "dd-$env-" \
+              '.result[] | select(.name | startswith($p)) | "\(.id) \(.name)"' \
+              | while read -r id name; do
+                  [ -z "$id" ] && continue
+                  curl -fsS -X DELETE "${AUTH[@]}" \
+                    "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/cfd_tunnel/$id/connections" \
+                    >/dev/null 2>&1 || true
+                  curl -fsS -X DELETE "${AUTH[@]}" \
+                    "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/cfd_tunnel/$id" \
+                    >/dev/null 2>&1 && echo "  - tun $name" || echo "  ! tun $name FAILED"
+                done
+
+            # 4. DNS CNAMEs:
+            #      {env}.            CP hostname       (pr-42.devopsdefender.com)
+            #      {env}-            CP workload label (pr-42-gpu.*)
+            #      dd-{env}-         agent tunnels     (dd-pr-42-agent-*.)
+            echo "$dns" | jq -r --arg dot "$env." --arg dash "$env-" --arg dd "dd-$env-" \
+              '.result[] | select((.name | startswith($dot)) or (.name | startswith($dash)) or (.name | startswith($dd))) | "\(.id) \(.name)"' \
+              | while read -r id name; do
+                  [ -z "$id" ] && continue
+                  curl -fsS -X DELETE "${AUTH[@]}" \
+                    "https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/dns_records/$id" \
+                    >/dev/null 2>&1 && echo "  - dns $name" || echo "  ! dns $name FAILED"
+                done
+
+            # 5. GCE instances (legacy target=gcp path).
+            local env_vms
+            env_vms=$(gcloud compute instances list \
+              --project="$GCP_PROJECT_ID" \
+              --filter="labels.devopsdefender=managed AND labels.dd_env=$env" \
+              --format='value(name)')
+            if [ -n "$env_vms" ]; then
+              # shellcheck disable=SC2086
+              gcloud compute instances delete $env_vms \
+                --project="$GCP_PROJECT_ID" --zone="$GCP_ZONE" --quiet || true
+              echo "  - gce $(echo "$env_vms" | tr '\n' ' ')"
+            fi
+          }
+
+          # Pick which envs to tear down based on trigger.
+          envs=""
+          if [ "$EVENT_NAME" = "delete" ]; then
+            # Fast path: resolve the deleted branch to its PR number.
+            # `--state all` so the usual post-merge branch-delete
+            # flow resolves. Newest wins if the branch was ever
+            # reused across multiple PRs.
+            PR=$(gh pr list --repo "$REPO" \
+                   --head "$DELETED_REF" --state all --limit 1 \
+                   --json number --jq '.[0].number // empty')
+            if [ -n "$PR" ]; then
+              echo "Branch-delete $DELETED_REF → PR #$PR → env pr-$PR"
+              envs="pr-$PR"
+            else
+              echo "No PR ever existed for branch $DELETED_REF; nothing to tear down."
+            fi
+          else
+            # Sweep path: every pr-N named anywhere in CF state or
+            # among RUNNING GCE VMs whose PR is closed/merged.
+            vm_envs=$(gcloud compute instances list \
+              --project="$GCP_PROJECT_ID" \
+              --filter='labels.devopsdefender=managed AND labels.dd_env~"^pr-" AND status=RUNNING' \
+              --format='value(labels.dd_env)' | sort -u)
+            # `grep -oE` returns 1 on no match, which would trip
+            # pipefail the moment the account is clean (happy state);
+            # swallow that specific case.
+            all_envs=$( {
+              echo "$apps"    | jq -r '.result[].name // empty'
+              echo "$tunnels" | jq -r '.result[].name // empty'
+              echo "$dns"     | jq -r '.result[].name // empty'
+              echo "$vm_envs"
+            } | grep -oE 'pr-[0-9]+' | sort -u || true )
+            for env in $all_envs; do
+              pr="${env#pr-}"
+              state=$(gh pr view "$pr" --repo "$REPO" \
+                       --json state --jq .state 2>/dev/null || echo UNKNOWN)
+              case "$state" in
+                OPEN)    echo "== $env — PR #$pr OPEN, skipping ==" ;;
+                UNKNOWN) echo "::warning::pr-$pr state unknown; leaving alone" ;;
+                *)       envs="$envs $env" ;;
+              esac
+            done
+          fi
+
+          if [ -z "$envs" ]; then
+            echo "No envs to tear down."
+          else
+            for env in $envs; do
+              teardown_env "$env"
+            done
+          fi
+
+          # Orphan agent-hostname sweep — scheduled runs only. Agent
+          # tunnels are `dd-{env}-agent-{uuid}`; every agent relaunch
+          # mints a fresh UUID, STONITH kills the old tunnel, but the
+          # old tunnel's Access apps and DNS records linger. The
+          # per-env pass above matches by `dd-{env}-` prefix so it
+          # catches these for CLOSED envs; this catch-up pass covers
+          # them for OPEN envs (where the env-level sweep intentionally
+          # skips). Branch-delete doesn't need this — that path's
+          # env-level sweep already cleared the env's orphans.
+          if [ "$EVENT_NAME" != "delete" ]; then
+            echo ""
+            echo "Orphan agent-hostname sweep..."
+
+            live_tunnel_names=$(echo "$tunnels" | jq -r '.result[].name' \
+              | grep -E '^dd-[a-zA-Z0-9-]+-agent-' | sort -u)
+            live_hostnames=$(for t in $live_tunnel_names; do
+              echo "$t.$DD_DOMAIN"
+            done | sort -u)
+
+            orphan_apps=$(echo "$apps" | jq -r \
+              '.result[] | select(.name | test("^dd-[a-zA-Z0-9-]+-agent-dd-[a-zA-Z0-9-]+-agent-")) | "\(.id) \(.name)"' \
+              | while read -r id name; do
+                  host=$(echo "$name" | grep -oE 'dd-[a-zA-Z0-9-]+-agent-[a-f0-9-]+\.devopsdefender\.com' | head -1)
+                  [ -z "$host" ] && continue
+                  if ! echo "$live_hostnames" | grep -qx "$host"; then
+                    echo "$id $name"
+                  fi
+              done)
+
+            orphan_dns=$(echo "$dns" | jq -r \
+              '.result[] | select(.name | test("dd-[a-zA-Z0-9-]+-agent-[a-f0-9-]+\\.devopsdefender\\.com")) | "\(.id) \(.name)"' \
+              | while read -r id name; do
+                  host=$(echo "$name" | grep -oE 'dd-[a-zA-Z0-9-]+-agent-[a-f0-9-]+\.devopsdefender\.com' | head -1)
+                  [ -z "$host" ] && continue
+                  if ! echo "$live_hostnames" | grep -qx "$host"; then
+                    echo "$id $name"
+                  fi
+              done)
+
+            oa=$(printf '%s\n' "$orphan_apps" | grep -c . || true)
+            od=$(printf '%s\n' "$orphan_dns"  | grep -c . || true)
+            echo "Orphan-agent: apps=$oa dns=$od"
+
+            if [ -n "$orphan_apps" ]; then
+              echo "$orphan_apps" | while read -r id name; do
+                [ -z "$id" ] && continue
+                curl -fsS -X DELETE "${AUTH[@]}" \
+                  "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/access/apps/$id" \
+                  >/dev/null 2>&1 && echo "  - app $name" || echo "  ! app $name FAILED"
+              done
+            fi
+            if [ -n "$orphan_dns" ]; then
+              echo "$orphan_dns" | while read -r id name; do
+                [ -z "$id" ] && continue
+                curl -fsS -X DELETE "${AUTH[@]}" \
+                  "https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/dns_records/$id" \
+                  >/dev/null 2>&1 && echo "  - dns $name" || echo "  ! dns $name FAILED"
+              done
+            fi
+          fi
+
+          # Explicit success — prior `[ -n "$x" ] && cmd` short-circuit
+          # would leave `$?=1` when both orphan lists were empty (the
+          # happy state), and `set -e` turned that into a script failure
+          # with no visible error. Trailing no-op restores exit 0.
+          echo "cleanup done."
+
+  # TERMINATED GCE VMs accumulate for *open* envs (STONITH moves a
+  # prior VM to TERMINATED; deploy-cp.yml's verify step force-deletes
+  # zombies, but only on target=gcp). Keyed on status, not PR state,
+  # so it's distinct from `teardown-pr-envs` above. Skipped on
+  # branch-delete events — nothing env-scoped to the deleted branch
+  # lives here on target=ssh.
+  reap-terminated-gce:
+    if: github.event_name != 'delete'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - env: staging
+            wip: 'projects/654815109728/locations/global/workloadIdentityPools/github-actions-pool/providers/github-provider'
+            sa: 'easyenclave-staging-ci@eestaging.iam.gserviceaccount.com'
+            filter: 'labels.devopsdefender=managed AND labels.dd_env~"^pr-" AND status=TERMINATED'
+            label: 'dd-pr-*'
+          - env: production
+            wip: 'projects/779946350556/locations/global/workloadIdentityPools/github-actions-pool/providers/github-provider'
+            sa: 'easyenclave-production-ci@easyenclave.iam.gserviceaccount.com'
+            filter: 'labels.devopsdefender=managed AND labels.dd_env=production AND status=TERMINATED'
+            label: 'dd-production'
+    environment: ${{ matrix.env }}
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ matrix.wip }}
+          service_account: ${{ matrix.sa }}
+      - uses: google-github-actions/setup-gcloud@v2
+      - name: Reap TERMINATED ${{ matrix.label }} VMs
+        env:
+          GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+          FILTER: ${{ matrix.filter }}
+          LABEL: ${{ matrix.label }}
+        run: |
+          DEAD=$(gcloud compute instances list \
+            --project="$GCP_PROJECT_ID" \
+            --filter="$FILTER" \
+            --format="value(name)")
+          if [ -z "$DEAD" ]; then
+            echo "No TERMINATED $LABEL VMs to reap."
+            exit 0
+          fi
+          echo "Reaping: $(echo "$DEAD" | tr '\n' ' ')"
+          # shellcheck disable=SC2086
+          gcloud compute instances delete $DEAD \
+            --project="$GCP_PROJECT_ID" --zone="$GCP_ZONE" --quiet

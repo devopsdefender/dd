@@ -1,0 +1,208 @@
+name: Release
+
+# One workflow to rule them all: build the static musl binary, publish
+# it as a GitHub release asset, and deploy it to either the PR preview
+# (per-PR ephemeral CP at pr-N.domain) or production (app.domain). Both
+# paths cascade into a relaunch of the matching dd-local agent VM on
+# the tdx2 host, and the Release run only goes green when that agent
+# re-registers with the freshly-deployed CP.
+#
+# Paths:
+#   pull_request        → build → deploy-preview → dd-local-preview relaunch
+#   push main           → build → deploy-production → dd-local-prod relaunch
+#   push v*             → build only (versioned release, no deploy)
+#   workflow_dispatch   → build → deploy-production (rollback tool;
+#                          release_tag input picks which tag to deploy)
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+    paths-ignore:
+      - "README.md"
+  pull_request:
+    paths-ignore:
+      - "README.md"
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Release tag to deploy to production (rollback tool; default: latest)'
+        required: false
+        default: 'latest'
+      ee_tag:
+        description: 'Pin the libvirt base qcow2 to a specific easyenclave release (e.g. v0.3.1 or image-abc123456) for pre-flight testing a candidate EE. Empty = workflow default (prod + preview both pinned to the same v-tag in their with: blocks below).'
+        required: false
+        default: ''
+
+concurrency:
+  group: dd-release-${{ github.ref }}
+  # PR pushes cancel old runs. Main / tag / manual dispatch queue —
+  # we never want to cancel an in-progress prod deploy.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: write
+  # GitHub release attestations (actions/attest-build-provenance).
+  # We sign every published `devopsdefender` binary so the CP can later
+  # verify a registering agent's artifact came from this workflow.
+  id-token: write
+  attestations: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      sha12: ${{ steps.meta.outputs.sha12 }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install musl tools
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Folded in from the old ci.yml so we don't duplicate the compile
+      # pass. clippy + test run against the musl target we're about to
+      # build the release binary for — same toolchain, shared sccache,
+      # one compile of the dep graph for the whole job.
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets --target x86_64-unknown-linux-musl -- -D warnings
+
+      - name: cargo test
+        run: cargo test --workspace --target x86_64-unknown-linux-musl
+
+      - name: Build static binaries
+        run: |
+          cargo build --release -p devopsdefender --target x86_64-unknown-linux-musl
+
+      - name: Resolve release tag
+        id: meta
+        run: |
+          SHA12=$(echo "${{ github.sha }}" | cut -c1-12)
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            TAG="${GITHUB_REF#refs/tags/}"
+            PRERELEASE=""
+          elif [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            TAG="pr-${SHA12}"
+            PRERELEASE="--prerelease"
+          else
+            TAG="latest"
+            PRERELEASE=""
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "prerelease=${PRERELEASE}" >> "$GITHUB_OUTPUT"
+          echo "sha12=${SHA12}" >> "$GITHUB_OUTPUT"
+
+      # Attest the binary's SHA256 against this workflow's identity
+      # (GitHub's Sigstore-backed signing OIDC'd as
+      #  `https://github.com/devopsdefender/dd/.github/workflows/release.yml@<ref>`).
+      # The attestation is stored on the repo's /attestations endpoint
+      # and retrievable via `gh attestation verify` or the REST API.
+      # Skipped on fork PRs (they lack id-token).
+      - name: Attest devopsdefender binary
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: target/x86_64-unknown-linux-musl/release/devopsdefender
+          subject-name: devopsdefender
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          PRERELEASE: ${{ steps.meta.outputs.prerelease }}
+        run: |
+          DD_BINARY=target/x86_64-unknown-linux-musl/release/devopsdefender
+          # Rolling tags (latest, pr-*) get recreated each run. Versioned
+          # v* tags are immutable.
+          if [[ "$TAG" == "latest" || "$TAG" == pr-* ]]; then
+            gh release delete "$TAG" --yes --cleanup-tag 2>/dev/null || true
+          fi
+          gh release create "$TAG" $PRERELEASE \
+            --title "$TAG" \
+            --notes "Built from ${GITHUB_SHA}" \
+            "$DD_BINARY"
+
+      - name: Rotate old PR pre-releases
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release list --limit 200 --json tagName,isPrerelease,createdAt \
+            | jq -r '.[] | select(.isPrerelease and (.tagName | startswith("pr-"))) | .tagName' \
+            | tail -n +12 \
+            | xargs -rI{} gh release delete {} --yes --cleanup-tag
+
+  # Per-PR ephemeral preview at pr-{N}.{domain}. Browser auth is CF
+  # Access GitHub OAuth (public org membership) across all envs; there
+  # is no longer a preview-vs-prod auth difference. Cascades into
+  # dd-local-preview relaunch.
+  deploy-preview:
+    if: github.event_name == 'pull_request'
+    needs: build
+    permissions:
+      contents: read
+      id-token: write
+      pull-requests: write
+    uses: ./.github/workflows/deploy-cp.yml
+    with:
+      env: pr-${{ github.event.number }}
+      hostname: pr-${{ github.event.number }}.${{ vars.DD_CF_DOMAIN || 'devopsdefender.com' }}
+      gcp_environment: staging
+      workload_identity_provider: 'projects/654815109728/locations/global/workloadIdentityPools/github-actions-pool/providers/github-provider'
+      service_account: 'easyenclave-staging-ci@eestaging.iam.gserviceaccount.com'
+      release_tag: ${{ needs.build.outputs.tag }}
+      comment_on_pr: true
+      ref: ${{ github.event.pull_request.head.ref }}
+      # Preview used to track the `staging` channel (newest image-*
+      # prerelease on EE main) for early regression signal, but an
+      # unreleasable EE main snapshot blocked every dd PR's CI until
+      # EE shipped a fix. Pin preview to the same tag as prod — one
+      # bump, one PR — so dd development isn't coupled to EE main's
+      # release health. Bump in lockstep with the prod pin below.
+      ee_tag: ${{ inputs.ee_tag || 'v0.3.1' }}
+      owner: devopsdefender
+    secrets: inherit
+
+  # Production deploy at app.{domain}. Fires on push-to-main OR on a
+  # manual workflow_dispatch (rollback to a specific release_tag).
+  # Tag pushes (v*) intentionally do not auto-deploy — they just
+  # publish the artifact. Cascades into dd-local-prod relaunch.
+  deploy-production:
+    if: >-
+      (github.event_name == 'push' && github.ref == 'refs/heads/main')
+      || github.event_name == 'workflow_dispatch'
+    needs: build
+    permissions:
+      contents: read
+      id-token: write
+      # Granted (though unused — comment_on_pr=false here) so the
+      # permissions intersection with deploy-cp.yml's job matches.
+      pull-requests: write
+    uses: ./.github/workflows/deploy-cp.yml
+    with:
+      env: production
+      hostname: app.${{ vars.DD_CF_DOMAIN || 'devopsdefender.com' }}
+      gcp_environment: production
+      workload_identity_provider: 'projects/779946350556/locations/global/workloadIdentityPools/github-actions-pool/providers/github-provider'
+      service_account: 'easyenclave-production-ci@easyenclave.iam.gserviceaccount.com'
+      release_tag: ${{ inputs.release_tag || 'latest' }}
+      comment_on_pr: false
+      ref: main
+      # Production EE base image pin. Bump this (single-line PR) when
+      # we want prod to move to a newer easyenclave release. Static
+      # pinning is the whole point — prod should never silently pick
+      # up whatever EE shipped most recently. Preview still tracks
+      # the staging channel (see deploy-preview block above).
+      ee_tag: ${{ inputs.ee_tag || 'v0.3.1' }}
+      owner: devopsdefender
+    secrets: inherit
