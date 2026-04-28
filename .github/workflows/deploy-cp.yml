@@ -151,6 +151,7 @@ jobs:
           release-tag:   ${{ inputs.release_tag }}
           ee-channel:    ${{ steps.ee.outputs.channel }}
           ee-tag:        ${{ inputs.ee_tag }}
+          owner:         ${{ inputs.owner }}
 
       - name: Create TDX VM (boots from easyenclave, fetches dd from GitHub releases)
         if: inputs.target == 'gcp'
@@ -520,6 +521,7 @@ jobs:
           release-tag: ${{ inputs.release_tag }}
           ee-channel: ${{ steps.ee.outputs.channel }}
           ee-tag: ${{ inputs.ee_tag }}
+          owner: ${{ inputs.owner }}
 
       # Preview only: deploy hello-world as the end-to-end canary.
       # Exercises the full GH-OIDC auth path (mint → agent verify
