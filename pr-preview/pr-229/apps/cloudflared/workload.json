@@ -1,0 +1,8 @@
+{
+  "app_name": "cloudflared",
+  "github_release": {
+    "repo": "cloudflare/cloudflared",
+    "asset": "cloudflared-linux-amd64",
+    "rename": "cloudflared"
+  }
+}
