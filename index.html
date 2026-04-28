@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>DevOps Defender - Confidential MCP Servers and Oracles</title>
-  <meta name="description" content="Run attestable MCP servers, crypto oracles, and private AI bots on hardware-sealed Intel TDX VMs. Powered by EasyEnclave.">
+  <meta name="description" content="Run attestable MCP servers, crypto oracles, and private AI bots on hardware-sealed Intel TDX VMs. Powered by EasyEnclave &mdash; the Linux distribution replacement for confidential VMs. No Go, no systemd.">
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -24,7 +24,7 @@
 
   <div class="hero">
     <h1>Confidential apps, <span class="accent">attestable by design</span></h1>
-    <p>EasyEnclave gives you a pristine, confidential TDX base. From there, install an open-source MCP server or crypto oracle whose code can be attested, or install a Noise + LLM confidential endpoint for a private bot with durable history. Verify either path via the TDX quote on <code>/health</code>.</p>
+    <p>Enclave computing is hard. <strong>EasyEnclave makes it easy.</strong> It's a drop-in replacement for a Linux distribution inside Intel TDX VMs &mdash; no Go, no systemd, no package manager. From this pristine confidential base, install an open-source MCP server or crypto oracle whose code can be attested, or install a Noise + LLM confidential endpoint for a private bot with durable history. Verify either path via the TDX quote on <code>/health</code>.</p>
     <div class="buttons">
       <a href="https://app.devopsdefender.com" class="btn btn-primary">Fleet Dashboard</a>
       <a href="https://github.com/devopsdefender/dd" class="btn btn-outline">View Source</a>
@@ -45,7 +45,7 @@
           <div class="step-num">1</div>
           <div class="step-content">
             <h3>Start pristine</h3>
-            <p>Boot an EasyEnclave-based TDX VM with a known image and a measured agent. Before any customer workload runs, the node is pristine: sealed memory, no tenant deploy authority, and an empty taint profile.</p>
+            <p>Boot a TDX VM where EasyEnclave <em>replaces the Linux distribution</em>: a single Rust PID 1, no systemd, no Go runtime, no apt or yum. Sealed memory, no tenant deploy authority, an empty taint profile &mdash; the smallest measurable surface that still runs your apps.</p>
           </div>
         </div>
         <div class="step">
@@ -99,7 +99,7 @@
         <div class="card">
           <div class="icon">&#x1f6e1;</div>
           <h3>EasyEnclave Runtime</h3>
-          <p>Powered by EasyEnclave &mdash; the open-source PID 1 that runs inside the sealed VM. Unix socket API. No networking in the runtime. Minimal attack surface for confidential apps.</p>
+          <p>EasyEnclave replaces your Linux distribution inside the sealed VM &mdash; an open-source Rust PID 1 with a Unix socket API. No systemd, no Go, no networking in the runtime. Enclave computing was hard; this is the boring base layer that makes it easy.</p>
         </div>
         <div class="card">
           <div class="icon">&#x20bf;</div>
@@ -233,7 +233,7 @@
     <div class="container">
       <div class="callout">
         <h3>Powered by <a href="https://easyenclave.com">EasyEnclave</a></h3>
-        <p>The open-source enclave runtime that makes confidential computing simple. Runs as PID 1 in Intel TDX VMs. Unix socket API. No networking in the runtime. DevOps Defender layers attestable app installation, fleet health, and confidential endpoint patterns on top.</p>
+        <p>A Linux distribution replacement for confidential VMs. Enclave computing is hard; EasyEnclave makes it easy. One Rust binary as PID 1 inside Intel TDX &mdash; no systemd, no Go, no package manager, no shell to attack. Unix socket API. No networking in the runtime. DevOps Defender layers attestable app installation, fleet health, and confidential endpoint patterns on top.</p>
         <a href="https://easyenclave.com" class="btn btn-outline">Learn More</a>
       </div>
     </div>
