@@ -63,8 +63,8 @@ impl Common {
         //
         // All three are required at boot. Existing agents from before
         // this change must be re-provisioned.
-        let owner_name = std::env::var("DD_OWNER")
-            .map_err(|_| Error::Internal("DD_OWNER required".into()))?;
+        let owner_name =
+            std::env::var("DD_OWNER").map_err(|_| Error::Internal("DD_OWNER required".into()))?;
         let owner_id: u64 = std::env::var("DD_OWNER_ID")
             .map_err(|_| Error::Internal("DD_OWNER_ID required (numeric GitHub id)".into()))?
             .parse()
