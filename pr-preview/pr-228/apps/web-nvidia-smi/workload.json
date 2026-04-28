@@ -1,8 +1,0 @@
-{
-  "app_name": "web-nvidia-smi",
-  "expose": { "hostname_label": "gpu", "port": 8081 },
-  "cmd": [
-    "/bin/busybox", "sh", "-c",
-    "until [ -x /var/lib/easyenclave/bin/podman ]; do sleep 2; done\nexec /var/lib/easyenclave/bin/podman run --rm --name web-nvidia-smi --network=host --device=/dev/nvidia0 --device=/dev/nvidiactl --device=/dev/nvidia-uvm docker.io/nvidia/cuda:12.6.1-base-ubuntu22.04 sh -c 'set -e; apt-get update -qq && apt-get install -y -qq --no-install-recommends netcat-openbsd >/dev/null; while true; do (printf \"HTTP/1.0 200 OK\\r\\nContent-Type: text/plain\\r\\n\\r\\n\"; nvidia-smi) | nc -l -p 8081 -q 1; done'"
-  ]
-}
