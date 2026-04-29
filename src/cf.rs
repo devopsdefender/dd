@@ -212,8 +212,20 @@ async fn apply_ingress(
 
 async fn upsert_cname(http: &Client, cf: &CfCreds, tunnel_id: &str, hostname: &str) -> Result<()> {
     let content = format!("{tunnel_id}.cfargotunnel.com");
+    upsert_cname_raw(http, cf, hostname, &content).await
+}
+
+/// Upsert a CNAME at `hostname` with an arbitrary `target`. Used by
+/// `cp::create_deployment` to point a vanity at an agent's tunnel
+/// without re-creating the tunnel.
+pub async fn upsert_cname_raw(
+    http: &Client,
+    cf: &CfCreds,
+    hostname: &str,
+    target: &str,
+) -> Result<()> {
     let body = serde_json::json!({
-        "type": "CNAME", "name": hostname, "content": content, "proxied": true,
+        "type": "CNAME", "name": hostname, "content": target, "proxied": true,
     });
     match find_record_id(http, cf, hostname).await? {
         Some(rec) => {
