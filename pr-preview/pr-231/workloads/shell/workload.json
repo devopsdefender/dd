@@ -1,0 +1,11 @@
+{
+  "name": "shell",
+  "kind": "shell",
+  "image": "docker.io/library/debian:stable-slim",
+  "expose": [{"label": "shell", "port": 8080, "auth": "owner"}],
+  "kind_config": {
+    "kind": "shell",
+    "session_ttl_secs": 3600,
+    "allowed_users": []
+  }
+}

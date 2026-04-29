@@ -1,0 +1,13 @@
+{
+  "name": "llm-proxy",
+  "kind": "llm",
+  "image": "ghcr.io/devopsdefender/llm-proxy:latest",
+  "expose": [{"label": "api", "port": 8080, "auth": "owner"}],
+  "env": ["ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}"],
+  "kind_config": {
+    "kind": "llm",
+    "mode": "proxy",
+    "upstream": "https://api.anthropic.com",
+    "key_env": "ANTHROPIC_API_KEY"
+  }
+}
