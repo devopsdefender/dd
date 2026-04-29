@@ -357,493 +357,130 @@ pub async fn exists(http: &Client, cf: &CfCreds, tunnel_id: &str) -> Option<bool
     }
 }
 
-// ── CF Access (Zero Trust) provisioning ────────────────────────────────
-//
-// The CP provisions a handful of Access apps at startup and one human
-// app per agent at /register. Everything machine-to-machine uses
-// bypass apps + in-code auth (ITA for /register + /ingress/replace,
-// GitHub Actions OIDC for agent /deploy + /exec). No service tokens,
-// no External Evaluation — just CF Access for humans and bypass for
-// everything else.
+/// List every CNAME in the zone. Used by `deployment::list` to
+/// enumerate vanity claims (CP is stateless; CF DNS is the truth).
+pub async fn list_cnames(http: &Client, cf: &CfCreds) -> Result<Vec<(String, String)>> {
+    let mut out = Vec::new();
+    let mut page = 1u32;
+    loop {
+        let resp = call(
+            http,
+            cf,
+            Method::GET,
+            &format!(
+                "/zones/{}/dns_records?type=CNAME&per_page=100&page={page}",
+                cf.zone_id
+            ),
+            None,
+        )
+        .await?;
+        let arr = resp["result"].as_array().cloned().unwrap_or_default();
+        let n = arr.len();
+        for r in arr {
+            let name = r["name"].as_str().unwrap_or("").to_string();
+            let content = r["content"].as_str().unwrap_or("").to_string();
+            if !name.is_empty() && !content.is_empty() {
+                out.push((name, content));
+            }
+        }
+        if n < 100 || page >= 50 {
+            break;
+        }
+        page += 1;
+    }
+    Ok(out)
+}
 
-/// Return the UUID of the GitHub login method in this CF Access
-/// account, if configured. Manual one-time setup in the Cloudflare
-/// dashboard (Zero Trust → Settings → Authentication → Login methods
-/// → add GitHub) is required before the CP can provision org-based
-/// policies.
-pub async fn github_idp_uuid(http: &Client, cf: &CfCreds) -> Result<String> {
+/// List TXT records whose name starts with `prefix`.
+pub async fn list_txt(http: &Client, cf: &CfCreds, prefix: &str) -> Result<Vec<(String, String)>> {
     let resp = call(
         http,
         cf,
         Method::GET,
-        &format!("/accounts/{}/access/identity_providers", cf.account_id),
+        &format!("/zones/{}/dns_records?type=TXT&per_page=200", cf.zone_id),
         None,
     )
     .await?;
-    resp["result"]
+    let arr = resp["result"].as_array().cloned().unwrap_or_default();
+    let mut out = Vec::new();
+    for r in arr {
+        let name = r["name"].as_str().unwrap_or("").to_string();
+        if !name.starts_with(prefix) {
+            continue;
+        }
+        let content = r["content"].as_str().unwrap_or("").to_string();
+        out.push((name, content));
+    }
+    Ok(out)
+}
+
+/// Upsert a TXT record at `name` with `content`. Idempotent.
+pub async fn upsert_txt(http: &Client, cf: &CfCreds, name: &str, content: &str) -> Result<()> {
+    let body = serde_json::json!({"type": "TXT", "name": name, "content": content});
+    let existing = call(
+        http,
+        cf,
+        Method::GET,
+        &format!("/zones/{}/dns_records?type=TXT&name={name}", cf.zone_id),
+        None,
+    )
+    .await?;
+    let id = existing["result"]
         .as_array()
-        .and_then(|items| items.iter().find(|i| i["type"].as_str() == Some("github")))
-        .and_then(|i| i["id"].as_str())
-        .map(String::from)
-        .ok_or_else(|| {
-            Error::Upstream(
-                "CF Access has no GitHub identity provider — add one in \
-                 Zero Trust → Settings → Authentication → Login methods"
-                    .into(),
+        .and_then(|a| a.first())
+        .and_then(|r| r["id"].as_str())
+        .map(String::from);
+    match id {
+        Some(rec) => {
+            call(
+                http,
+                cf,
+                Method::PUT,
+                &format!("/zones/{}/dns_records/{rec}", cf.zone_id),
+                Some(body),
             )
-        })
-}
-
-/// List all Access apps, return the full app JSON for one whose primary
-/// or included `domain` exactly matches `domain`, or `None`.
-async fn find_app_by_domain(
-    http: &Client,
-    cf: &CfCreds,
-    domain: &str,
-) -> Result<Option<serde_json::Value>> {
-    let resp = call(
-        http,
-        cf,
-        Method::GET,
-        &format!("/accounts/{}/access/apps?per_page=1000", cf.account_id),
-        None,
-    )
-    .await?;
-    Ok(resp["result"].as_array().and_then(|items| {
-        items
-            .iter()
-            .find(|a| a["domain"].as_str() == Some(domain))
-            .cloned()
-    }))
-}
-
-/// Build the human-facing CF Access policy used for the CP root and
-/// each per-agent dashboard. `admin_email` is always included as the
-/// operator escape hatch. The GitHub-side rule depends on the
-/// principal's kind, because Cloudflare Access has no include rule
-/// for "specific GitHub user login" or "specific repository":
-///
-///   kind=org  → adds a `github-organization` include — anyone in
-///                that org login is admitted.
-///   kind=user → admin_email-only. CF Access can't gate on a
-///                specific GitHub user login by name; the operator
-///                gets in by email.
-///   kind=repo → admin_email-only, same reason.
-///
-/// The two non-org kinds losing GitHub-side dashboard access is not
-/// a regression: the prior behavior — a `github-organization` rule
-/// configured with a user login — silently matched nobody.
-fn human_policy(
-    owner: &crate::gh_oidc::Principal,
-    admin_email: &str,
-    gh_idp_uuid: &str,
-) -> serde_json::Value {
-    let mut includes = vec![serde_json::json!({
-        "email": { "email": admin_email }
-    })];
-    if let crate::gh_oidc::PrincipalKind::Org = owner.kind {
-        includes.push(serde_json::json!({
-            "github-organization": {
-                "name": owner.name,
-                "identity_provider_id": gh_idp_uuid,
-            }
-        }));
+            .await?;
+        }
+        None => {
+            call(
+                http,
+                cf,
+                Method::POST,
+                &format!("/zones/{}/dns_records", cf.zone_id),
+                Some(body),
+            )
+            .await?;
+        }
     }
-    serde_json::json!({
-        "name": "dd-human",
-        "decision": "allow",
-        "include": includes,
-    })
-}
-
-fn bypass_policy() -> serde_json::Value {
-    serde_json::json!({
-        "name": "dd-bypass",
-        "decision": "bypass",
-        "include": [ { "everyone": {} } ],
-    })
-}
-
-/// Idempotently upsert a self-hosted Access app at `domain` with the
-/// provided policy list. Matches on exact `domain`; updates in place
-/// if present, creates otherwise.
-async fn ensure_app(
-    http: &Client,
-    cf: &CfCreds,
-    name: &str,
-    domain: &str,
-    policies: Vec<serde_json::Value>,
-) -> Result<String> {
-    let body = serde_json::json!({
-        "name": name,
-        "domain": domain,
-        "type": "self_hosted",
-        "session_duration": "24h",
-        "app_launcher_visible": false,
-        "policies": policies,
-    });
-    if let Some(existing) = find_app_by_domain(http, cf, domain).await? {
-        let id = existing["id"].as_str().unwrap_or_default().to_string();
-        call(
-            http,
-            cf,
-            Method::PUT,
-            &format!("/accounts/{}/access/apps/{id}", cf.account_id),
-            Some(body),
-        )
-        .await?;
-        return Ok(id);
-    }
-    let resp = call(
-        http,
-        cf,
-        Method::POST,
-        &format!("/accounts/{}/access/apps", cf.account_id),
-        Some(body),
-    )
-    .await?;
-    resp["result"]["id"]
-        .as_str()
-        .map(String::from)
-        .ok_or_else(|| Error::Upstream(format!("Access app create missing id for {domain}")))
-}
-
-/// Idempotently upsert a path-scoped bypass Access app. Anyone can
-/// reach `domain/path` without authentication; used for /health,
-/// /register (which is authenticated by ITA in-app), and every
-/// workload-exposed URL.
-async fn ensure_bypass_app(http: &Client, cf: &CfCreds, name: &str, domain: &str) -> Result<()> {
-    ensure_app(http, cf, name, domain, vec![bypass_policy()]).await?;
     Ok(())
 }
 
-/// Hostname labels that run admin workloads (shell access, future
-/// log viewer, future metrics panel). These get a human CF Access
-/// app, not a public bypass — otherwise exposing ttyd on a public
-/// subdomain would be a free shell for the internet.
-///
-/// - `term` — legacy ttyd subdomain (kept admin-gated for older deploys).
-/// - `block` — ttyd workload; exposing it without auth is the same
-///   "free shell for the internet" risk.
-const ADMIN_LABELS: &[&str] = &["term", "block"];
-
-fn is_admin_label(label: &str) -> bool {
-    ADMIN_LABELS.contains(&label)
-}
-
-/// Provision the CP's Access apps at startup.
-///
-/// Apps created:
-///   - Human: `{hostname}` — GitHub org or admin email (dashboard, /agent/*, /cp/*)
-///   - Human: `term.{hostname}` — ttyd shell, org members only
-///   - Bypass: `{hostname}/health` — public (read-only fleet health;
-///     also carries the Noise pre-handshake `{quote_b64, pubkey_hex}`)
-///   - Bypass: `{hostname}/api/agents` — read-only agent list
-///   - Bypass: `{hostname}/noise/ws` — Noise_IK-gated in code
-///   - Bypass: `{hostname}/register` — ITA-gated in code
-///   - Bypass: `{hostname}/ingress/replace` — ITA-gated in code
-pub async fn provision_cp_access(
-    http: &Client,
-    cf: &CfCreds,
-    env: &str,
-    hostname: &str,
-    owner: &crate::gh_oidc::Principal,
-    admin_email: &str,
-    workload_labels: &[String],
-) -> Result<()> {
-    let idp = github_idp_uuid(http, cf).await?;
-    let human = human_policy(owner, admin_email, &idp);
-
-    ensure_app(
-        http,
-        cf,
-        &format!("dd-{env}-cp"),
-        hostname,
-        vec![human.clone()],
-    )
-    .await?;
-
-    // One CF Access app per CP-exposed workload label. Admin labels
-    // (from `ADMIN_LABELS` — e.g. the ttyd terminal at `block`) get
-    // the human policy; anything else gets a public bypass.
-    let desired: std::collections::HashSet<String> = workload_labels
-        .iter()
-        .map(|l| label_hostname(hostname, l))
-        .collect();
-    for label in workload_labels {
-        let domain = label_hostname(hostname, label);
-        if is_admin_label(label) {
-            ensure_app(
-                http,
-                cf,
-                &format!("dd-{env}-cp-{label}"),
-                &domain,
-                vec![human_policy(owner, admin_email, &idp)],
-            )
-            .await?;
-        } else {
-            ensure_bypass_app(http, cf, &format!("dd-{env}-cp-{label}"), &domain).await?;
-        }
-    }
-
-    // Reap any stale workload apps under the CP's flat subdomain space
-    // that are no longer in the desired label set. Shape is
-    // `{base}-{label}.{tld}` — prefix+suffix match so we don't touch
-    // the CP's own root human app or any bypass-path apps.
-    let (base, tld) = hostname.split_once('.').unwrap_or((hostname, ""));
-    let prefix = format!("{base}-");
-    let suffix_tld = format!(".{tld}");
-    if let Ok(resp) = call(
+/// Delete a TXT record by name. Best-effort.
+pub async fn delete_txt(http: &Client, cf: &CfCreds, name: &str) -> Result<()> {
+    let existing = call(
         http,
         cf,
         Method::GET,
-        &format!("/accounts/{}/access/apps?per_page=1000", cf.account_id),
+        &format!("/zones/{}/dns_records?type=TXT&name={name}", cf.zone_id),
         None,
     )
     .await
+    .unwrap_or(serde_json::Value::Null);
+    if let Some(id) = existing["result"]
+        .as_array()
+        .and_then(|a| a.first())
+        .and_then(|r| r["id"].as_str())
     {
-        if let Some(items) = resp["result"].as_array() {
-            for app in items {
-                let Some(domain) = app["domain"].as_str() else {
-                    continue;
-                };
-                if !(domain.starts_with(&prefix) && domain.ends_with(&suffix_tld)) {
-                    continue;
-                }
-                if desired.contains(domain) {
-                    continue;
-                }
-                if let Some(id) = app["id"].as_str() {
-                    let _ = call(
-                        http,
-                        cf,
-                        Method::DELETE,
-                        &format!("/accounts/{}/access/apps/{id}", cf.account_id),
-                        None,
-                    )
-                    .await;
-                }
-            }
-        }
-    }
-    // One-shot reap: any prior deploy left behind a
-    // `dd-{env}-cp-noise-attest` bypass app fronting `{hostname}/attest`.
-    // The attest route is gone, so the bypass has no job. The workload
-    // sweep above is subdomain-scoped and won't catch path-bypass apps,
-    // so delete it explicitly here. Lookup-by-domain is idempotent;
-    // no-op once the app is gone.
-    if let Ok(Some(stale)) = find_app_by_domain(http, cf, &format!("{hostname}/attest")).await {
-        if let Some(id) = stale["id"].as_str() {
-            let _ = call(
-                http,
-                cf,
-                Method::DELETE,
-                &format!("/accounts/{}/access/apps/{id}", cf.account_id),
-                None,
-            )
-            .await;
-        }
-    }
-
-    for (path_suffix, label) in [
-        ("/health", "health"),
-        ("/api/agents", "api-agents"),
-        ("/api/v1/devices/trusted", "api-devices-trusted"),
-        ("/api/v1/admin/export", "api-admin-export"),
-        // The Noise pre-handshake bundle (`quote_b64` + `pubkey_hex`)
-        // now rides on `/health` — `/attest` was deleted. Only the
-        // handshake itself still needs its own bypass.
-        ("/noise/ws", "noise-ws"),
-        ("/register", "register"),
-        ("/ingress/replace", "ingress"),
-    ] {
-        ensure_bypass_app(
+        let _ = call(
             http,
             cf,
-            &format!("dd-{env}-cp-{label}"),
-            &format!("{hostname}{path_suffix}"),
+            Method::DELETE,
+            &format!("/zones/{}/dns_records/{id}", cf.zone_id),
+            None,
         )
-        .await?;
+        .await;
     }
     Ok(())
-}
-
-/// Provision Access apps for one agent. Called at /register and again
-/// at /ingress/replace so newly-exposed workload labels get their
-/// bypass apps and labels that disappeared get cleaned up.
-///
-///   - Human: `{agent}.{domain}` — browser dashboard only
-///   - Human: `<admin-label>.{agent}.{domain}` for labels in
-///     `ADMIN_LABELS` (ttyd et al) — org members only
-///   - Bypass: `{agent}.{domain}/health` — public; carries the Noise
-///     pre-handshake `{quote_b64, pubkey_hex}` in its response
-///   - Bypass: `{agent}.{domain}/deploy` — GH-OIDC-gated in code
-///   - Bypass: `{agent}.{domain}/exec` — GH-OIDC-gated in code
-///   - Bypass: `{agent}.{domain}/owner` — fleet-GH-OIDC-gated in code
-///   - Bypass: `{agent}.{domain}/logs/*` — GH-OIDC-gated in code
-///   - Bypass: `{agent}.{domain}/noise/ws` — Noise_IK-gated in code
-///     against the CP-trusted paired device pubkey set
-///   - Bypass: `{label}.{agent}.{domain}` for other labels — workload
-///     URLs are public by default (this is the nvidia-smi exemption).
-///   - Any existing `*.{agent}.{domain}` app whose label is no longer
-///     in `workload_labels` is deleted.
-pub async fn provision_agent_access(
-    http: &Client,
-    cf: &CfCreds,
-    env: &str,
-    agent_hostname: &str,
-    owner: &crate::gh_oidc::Principal,
-    admin_email: &str,
-    workload_labels: &[String],
-) -> Result<()> {
-    let idp = github_idp_uuid(http, cf).await?;
-    let human = human_policy(owner, admin_email, &idp);
-
-    ensure_app(
-        http,
-        cf,
-        &format!("dd-{env}-agent-{agent_hostname}"),
-        agent_hostname,
-        vec![human],
-    )
-    .await?;
-    for (suffix, label) in [
-        ("/health", "health"),
-        ("/deploy", "deploy"),
-        ("/exec", "exec"),
-        ("/owner", "owner"),
-        ("/logs", "logs"),
-        // The in-process Noise gateway (merged into the agent's
-        // router in agent.rs) lives on the same port + hostname as
-        // /deploy + /exec, so a direct bastion-app attach needs the
-        // same bypass treatment the CP hostname already gets. The
-        // pre-handshake quote bundle is served by /health above
-        // (collapsed from the old /attest), so only the handshake
-        // WebSocket needs its own entry here. Noise_IK against the
-        // paired device pubkey set is the gate.
-        ("/noise/ws", "noise-ws"),
-    ] {
-        ensure_bypass_app(
-            http,
-            cf,
-            &format!("dd-{env}-agent-{agent_hostname}-{label}"),
-            &format!("{agent_hostname}{suffix}"),
-        )
-        .await?;
-    }
-
-    let desired: std::collections::HashSet<String> = workload_labels
-        .iter()
-        .map(|l| label_hostname(agent_hostname, l))
-        .collect();
-    for label in workload_labels {
-        let domain = label_hostname(agent_hostname, label);
-        if is_admin_label(label) {
-            ensure_app(
-                http,
-                cf,
-                &format!("dd-{env}-workload-{domain}"),
-                &domain,
-                vec![human_policy(owner, admin_email, &idp)],
-            )
-            .await?;
-        } else {
-            ensure_bypass_app(http, cf, &format!("dd-{env}-workload-{domain}"), &domain).await?;
-        }
-    }
-
-    // Reap any stale workload apps under this agent that are no
-    // longer in the desired set. Flat-subdomain workload URLs look
-    // like `{base}-{label}.{tld}` (one level deep — see
-    // `label_hostname` for why). Prefix + suffix match so we don't
-    // accidentally delete the agent's own human app at
-    // `{base}.{tld}`.
-    let (base, tld) = agent_hostname
-        .split_once('.')
-        .unwrap_or((agent_hostname, ""));
-    let prefix = format!("{base}-");
-    let suffix_tld = format!(".{tld}");
-    let resp = call(
-        http,
-        cf,
-        Method::GET,
-        &format!("/accounts/{}/access/apps?per_page=1000", cf.account_id),
-        None,
-    )
-    .await?;
-    if let Some(items) = resp["result"].as_array() {
-        for app in items {
-            let Some(domain) = app["domain"].as_str() else {
-                continue;
-            };
-            if !(domain.starts_with(&prefix) && domain.ends_with(&suffix_tld)) {
-                continue;
-            }
-            if desired.contains(domain) {
-                continue;
-            }
-            if let Some(id) = app["id"].as_str() {
-                let _ = call(
-                    http,
-                    cf,
-                    Method::DELETE,
-                    &format!("/accounts/{}/access/apps/{id}", cf.account_id),
-                    None,
-                )
-                .await;
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Cleanup hook invoked by the collector's orphan-GC path and by any
-/// explicit reap: delete the agent's human app, its /health bypass,
-/// and every `*.{agent_hostname}` workload bypass in one sweep.
-pub async fn delete_access_apps_for(http: &Client, cf: &CfCreds, agent_hostname: &str) {
-    let Ok(resp) = call(
-        http,
-        cf,
-        Method::GET,
-        &format!("/accounts/{}/access/apps?per_page=1000", cf.account_id),
-        None,
-    )
-    .await
-    else {
-        return;
-    };
-    let Some(items) = resp["result"].as_array() else {
-        return;
-    };
-    let (base, tld) = agent_hostname
-        .split_once('.')
-        .unwrap_or((agent_hostname, ""));
-    let prefix = format!("{base}-");
-    let suffix_tld = format!(".{tld}");
-    for app in items {
-        let Some(domain) = app["domain"].as_str() else {
-            continue;
-        };
-        // Match: the agent hostname itself, any path-scoped app
-        // under it, and flat-subdomain workload URLs of the shape
-        // `{base}-*.{tld}`.
-        let matches_agent = domain == agent_hostname
-            || domain.starts_with(&format!("{agent_hostname}/"))
-            || (domain.starts_with(&prefix) && domain.ends_with(&suffix_tld));
-        if !matches_agent {
-            continue;
-        }
-        if let Some(id) = app["id"].as_str() {
-            let _ = call(
-                http,
-                cf,
-                Method::DELETE,
-                &format!("/accounts/{}/access/apps/{id}", cf.account_id),
-                None,
-            )
-            .await;
-        }
-    }
 }
 
 #[cfg(test)]

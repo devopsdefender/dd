@@ -31,7 +31,16 @@ inputs:
     description: 'Cloudflare zone id for the apex domain'
     required: true
   admin-email:
-    description: 'Break-glass email for CF Access human policy'
+    description: 'Break-glass email accepted by the CP OAuth callback'
+    required: true
+  fleet-jwt-secret:
+    description: 'HS256 secret signing dd_session cookies (32-byte hex)'
+    required: true
+  gh-oauth-client-id:
+    description: 'GitHub OAuth App client id (for CP /login)'
+    required: true
+  gh-oauth-client-secret:
+    description: 'GitHub OAuth App client secret'
     required: true
   ita-api-key:
     description: 'Intel Trust Authority API key'
@@ -64,8 +73,11 @@ runs:
         CLOUDFLARE_API_TOKEN:   ${{ inputs.cf-api-token }}
         CLOUDFLARE_ACCOUNT_ID:  ${{ inputs.cf-account-id }}
         CLOUDFLARE_ZONE_ID:     ${{ inputs.cf-zone-id }}
-        DD_ACCESS_ADMIN_EMAIL:  ${{ inputs.admin-email }}
-        DD_ITA_API_KEY:         ${{ inputs.ita-api-key }}
+        DD_ADMIN_EMAIL:           ${{ inputs.admin-email }}
+        DD_FLEET_JWT_SECRET:      ${{ inputs.fleet-jwt-secret }}
+        DD_GH_OAUTH_CLIENT_ID:    ${{ inputs.gh-oauth-client-id }}
+        DD_GH_OAUTH_CLIENT_SECRET: ${{ inputs.gh-oauth-client-secret }}
+        DD_ITA_API_KEY:           ${{ inputs.ita-api-key }}
         DD_EE_CHANNEL:          ${{ inputs.ee-channel }}
         DD_EE_TAG:              ${{ inputs.ee-tag }}
         EE_OWNER:               ${{ inputs.owner }}
@@ -73,7 +85,7 @@ runs:
         host: ${{ inputs.host }}
         username: tdx2
         key: ${{ inputs.ssh-key }}
-        envs: ENV_LABEL,CP_HOSTNAME,REF,RELEASE_TAG,CLOUDFLARE_API_TOKEN,CLOUDFLARE_ACCOUNT_ID,CLOUDFLARE_ZONE_ID,DD_ACCESS_ADMIN_EMAIL,DD_ITA_API_KEY,DD_EE_CHANNEL,DD_EE_TAG,EE_OWNER
+        envs: ENV_LABEL,CP_HOSTNAME,REF,RELEASE_TAG,CLOUDFLARE_API_TOKEN,CLOUDFLARE_ACCOUNT_ID,CLOUDFLARE_ZONE_ID,DD_ADMIN_EMAIL,DD_FLEET_JWT_SECRET,DD_GH_OAUTH_CLIENT_ID,DD_GH_OAUTH_CLIENT_SECRET,DD_ITA_API_KEY,DD_EE_CHANNEL,DD_EE_TAG,EE_OWNER
         script: |
           /home/tdx2/src/dd/apps/_infra/dd-relaunch-cp.sh \
             "$ENV_LABEL" "$CP_HOSTNAME" "$REF" "$RELEASE_TAG"
