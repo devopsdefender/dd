@@ -15,7 +15,12 @@
 #
 # Required env (all from the calling workflow's secrets):
 #   CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID, CLOUDFLARE_ZONE_ID
-#   DD_ACCESS_ADMIN_EMAIL, DD_ITA_API_KEY
+#   DD_ADMIN_EMAIL, DD_ITA_API_KEY
+#   DD_FLEET_JWT_SECRET     32-byte hex; HS256 signs `dd_session` cookies.
+#                           Required in both modes — CP signs, agents verify.
+#   DD_GH_OAUTH_CLIENT_ID, DD_GH_OAUTH_CLIENT_SECRET
+#                           GitHub OAuth App credentials. The CP hosts
+#                           `/login` + `/oauth/callback` itself; no CF Access.
 #   EE_OWNER         GitHub login or owner/repo path (no default).
 #                    Resolved at runtime via `gh api` to (id, kind);
 #                    DD_OWNER_ID + DD_OWNER_KIND are derived from it.
@@ -32,7 +37,10 @@ HOSTNAME="${2?hostname required}"
 : "${CLOUDFLARE_API_TOKEN?}"
 : "${CLOUDFLARE_ACCOUNT_ID?}"
 : "${CLOUDFLARE_ZONE_ID?}"
-: "${DD_ACCESS_ADMIN_EMAIL?}"
+: "${DD_ADMIN_EMAIL?}"
+: "${DD_FLEET_JWT_SECRET?set DD_FLEET_JWT_SECRET (32-byte hex; one per fleet)}"
+: "${DD_GH_OAUTH_CLIENT_ID?set DD_GH_OAUTH_CLIENT_ID (GitHub OAuth App)}"
+: "${DD_GH_OAUTH_CLIENT_SECRET?set DD_GH_OAUTH_CLIENT_SECRET (GitHub OAuth App)}"
 : "${DD_ITA_API_KEY?}"
 : "${EE_OWNER?set EE_OWNER (GitHub login or owner/repo path; no default)}"
 DD_RELEASE_TAG="${DD_RELEASE_TAG:-latest}"
@@ -116,7 +124,10 @@ build_config_iso() {
       DD_DOMAIN="$DD_DOMAIN" \
       DD_HOSTNAME="$HOSTNAME" \
       DD_ENV="$ENV_LABEL" \
-      DD_ACCESS_ADMIN_EMAIL="$DD_ACCESS_ADMIN_EMAIL" \
+      DD_ADMIN_EMAIL="$DD_ADMIN_EMAIL" \
+      DD_FLEET_JWT_SECRET="$DD_FLEET_JWT_SECRET" \
+      DD_GH_OAUTH_CLIENT_ID="$DD_GH_OAUTH_CLIENT_ID" \
+      DD_GH_OAUTH_CLIENT_SECRET="$DD_GH_OAUTH_CLIENT_SECRET" \
       DD_ITA_API_KEY="$DD_ITA_API_KEY" \
       DD_ITA_BASE_URL="$DD_ITA_BASE_URL" \
       DD_ITA_JWKS_URL="$DD_ITA_JWKS_URL" \
@@ -124,8 +135,9 @@ build_config_iso() {
       DD_OWNER="$EE_OWNER" \
       DD_OWNER_ID="$EE_OWNER_ID" \
       DD_OWNER_KIND="$EE_OWNER_KIND" \
-      bake "$REPO_ROOT/apps/dd-management/workload.json.tmpl"
-    bake "$REPO_ROOT/apps/ttyd/workload.json"
+      bake "$REPO_ROOT/apps/dd-cp/workload.json.tmpl"
+    # ttyd is gone — the shell kind binds /session/shell directly to
+    # EE's attach() PTY socket, no separate ttyd workload needed.
   } | jq -cs '.')
 
   {
