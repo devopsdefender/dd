@@ -265,6 +265,18 @@ async fn create_deployment(
     let target = format!("{}.cfargotunnel.com", host.tunnel_id);
     cf::upsert_cname_raw(&s.http, &s.cfg.cf, &body.vanity, &target).await?;
 
+    // Persist the workload spec as an encrypted TXT record next to
+    // the vanity. The collector uses this on failover so the new host
+    // gets the real spec without the CP needing in-memory state.
+    deployment::write_spec(
+        &s.http,
+        &s.cfg.cf,
+        &s.cfg.common.fleet_jwt_secret,
+        &body.vanity,
+        &body.workload,
+    )
+    .await?;
+
     // Optional TXT for non-default failover policy.
     if let Some(pol) = body.failover.as_ref() {
         let txt = FailoverPolicyTxt::from_policy(pol);
@@ -289,6 +301,7 @@ async fn delete_deployment(
 ) -> Result<Json<serde_json::Value>> {
     cf::delete_cname(&s.http, &s.cfg.cf, &name).await?;
     let _ = cf::delete_txt(&s.http, &s.cfg.cf, &format!("_dd.{name}")).await;
+    let _ = deployment::delete_spec(&s.http, &s.cfg.cf, &name).await;
     Ok(Json(serde_json::json!({"deleted": name})))
 }
 

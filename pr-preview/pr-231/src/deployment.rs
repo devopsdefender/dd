@@ -22,6 +22,13 @@ use crate::error::{Error, Result};
 use crate::workload::Workload;
 
 pub const TXT_PREFIX: &str = "_dd.";
+pub const SPEC_TXT_PREFIX: &str = "_dds.";
+
+/// Maximum size (after base64 encoding) of a workload spec TXT record.
+/// Cloudflare allows ~2KB total per TXT value across multiple 255-char
+/// strings; we conservatively cap at 1.5KB to leave room for protocol
+/// overhead + the encryption nonce.
+pub const MAX_SPEC_TXT_BYTES: usize = 1500;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FailoverPolicy {
@@ -202,4 +209,178 @@ pub fn delete_deployment_vanity_records(_d: &Deployment) -> Result<()> {
     // function is a no-op placeholder retained so callers don't drift
     // on signature.
     Err(Error::Internal("call cf::delete_cname directly".into()))
+}
+
+// ─── Workload spec persistence (TXT-backed) ────────────────────────────
+//
+// On `POST /cp/deployments`, the CP encodes the workload spec as
+// base64(ChaCha20-Poly1305(spec_json)) and writes it to a TXT record
+// at `_dds.<vanity>`. On failover, the collector reads that record,
+// decrypts it, and pushes the actual workload spec to the new host.
+//
+// The AEAD key is derived from `DD_FLEET_JWT_SECRET` so external DNS
+// observers see opaque ciphertext. (The operator has the fleet
+// secret, so this protects against off-fleet observation, not against
+// the operator themselves — that's a TDX-isolation problem, not a
+// DNS problem.)
+
+use chacha20poly1305::{
+    aead::{Aead, KeyInit},
+    ChaCha20Poly1305, Nonce,
+};
+use rand::RngCore;
+use sha2::{Digest, Sha256};
+
+fn derive_spec_key(fleet_jwt_secret: &str) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(fleet_jwt_secret.as_bytes());
+    h.update(b"|spec-aead-key|");
+    h.finalize().into()
+}
+
+/// Encrypt a workload spec for storage in DNS TXT. Format:
+///   base64( nonce[12] || ciphertext )
+pub fn encrypt_spec(fleet_jwt_secret: &str, w: &Workload) -> Result<String> {
+    use base64::Engine;
+    let key = derive_spec_key(fleet_jwt_secret);
+    let cipher = ChaCha20Poly1305::new_from_slice(&key)
+        .map_err(|e| Error::Internal(format!("aead key: {e}")))?;
+    let mut nonce_bytes = [0u8; 12];
+    rand::thread_rng().fill_bytes(&mut nonce_bytes);
+    let nonce = Nonce::from_slice(&nonce_bytes);
+
+    let plaintext = serde_json::to_vec(w)?;
+    let ciphertext = cipher
+        .encrypt(nonce, plaintext.as_ref())
+        .map_err(|e| Error::Internal(format!("aead encrypt: {e}")))?;
+
+    let mut combined = Vec::with_capacity(12 + ciphertext.len());
+    combined.extend_from_slice(&nonce_bytes);
+    combined.extend_from_slice(&ciphertext);
+
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&combined);
+    if encoded.len() > MAX_SPEC_TXT_BYTES {
+        return Err(Error::BadRequest(format!(
+            "encoded workload spec is {} bytes (limit {}). Trim env vars or move secrets to a sidecar fetch.",
+            encoded.len(),
+            MAX_SPEC_TXT_BYTES,
+        )));
+    }
+    Ok(encoded)
+}
+
+pub fn decrypt_spec(fleet_jwt_secret: &str, encoded: &str) -> Result<Workload> {
+    use base64::Engine;
+    let combined = base64::engine::general_purpose::STANDARD
+        .decode(encoded.as_bytes())
+        .map_err(|e| Error::BadRequest(format!("spec base64: {e}")))?;
+    if combined.len() < 12 + 16 {
+        return Err(Error::BadRequest("spec ciphertext too short".into()));
+    }
+    let nonce = Nonce::from_slice(&combined[..12]);
+    let ct = &combined[12..];
+    let key = derive_spec_key(fleet_jwt_secret);
+    let cipher = ChaCha20Poly1305::new_from_slice(&key)
+        .map_err(|e| Error::Internal(format!("aead key: {e}")))?;
+    let plaintext = cipher
+        .decrypt(nonce, ct)
+        .map_err(|e| Error::BadRequest(format!("aead decrypt: {e}")))?;
+    let w: Workload = serde_json::from_slice(&plaintext)?;
+    Ok(w)
+}
+
+pub async fn write_spec(
+    http: &Client,
+    cf: &CfCreds,
+    fleet_jwt_secret: &str,
+    vanity: &str,
+    workload: &Workload,
+) -> Result<()> {
+    let encoded = encrypt_spec(fleet_jwt_secret, workload)?;
+    let name = format!("{}{}", SPEC_TXT_PREFIX, vanity);
+    cf::upsert_txt(http, cf, &name, &encoded).await
+}
+
+pub async fn read_spec(
+    http: &Client,
+    cf: &CfCreds,
+    fleet_jwt_secret: &str,
+    vanity: &str,
+) -> Result<Option<Workload>> {
+    let name = format!("{}{}", SPEC_TXT_PREFIX, vanity);
+    let records = cf::list_txt(http, cf, &name).await?;
+    for (n, content) in records {
+        if n == name {
+            return decrypt_spec(fleet_jwt_secret, &content).map(Some);
+        }
+    }
+    Ok(None)
+}
+
+pub async fn delete_spec(http: &Client, cf: &CfCreds, vanity: &str) -> Result<()> {
+    let name = format!("{}{}", SPEC_TXT_PREFIX, vanity);
+    cf::delete_txt(http, cf, &name).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::workload::{Kind, KindConfig};
+
+    fn sample_workload() -> Workload {
+        Workload {
+            name: "myoracle".into(),
+            kind: Kind::Oracle,
+            image: Some("ghcr.io/example/oracle:latest".into()),
+            github_release: None,
+            expose: vec![],
+            env: vec!["ORACLE_KEY=value123".into()],
+            post_deploy: None,
+            kind_config: KindConfig::Oracle {
+                schedule: Some("every 60s".into()),
+                signer_env: Some("ORACLE_KEY".into()),
+                public_log: true,
+            },
+        }
+    }
+
+    #[test]
+    fn spec_roundtrip() {
+        let secret = "0123456789abcdef0123456789abcdef0123456789abcdef".to_string();
+        let original = sample_workload();
+        let encoded = encrypt_spec(&secret, &original).unwrap();
+        let decoded = decrypt_spec(&secret, &encoded).unwrap();
+        assert_eq!(decoded.name, original.name);
+        assert_eq!(decoded.kind, original.kind);
+        assert_eq!(decoded.env, original.env);
+    }
+
+    #[test]
+    fn spec_wrong_secret_fails() {
+        let s1 = "0123456789abcdef0123456789abcdef0123456789abcdef".to_string();
+        let s2 = "FEDCBA9876543210FEDCBA9876543210FEDCBA9876543210".to_string();
+        let original = sample_workload();
+        let encoded = encrypt_spec(&s1, &original).unwrap();
+        assert!(decrypt_spec(&s2, &encoded).is_err());
+    }
+
+    #[test]
+    fn spec_ciphertext_is_opaque() {
+        let secret = "0123456789abcdef0123456789abcdef0123456789abcdef".to_string();
+        let original = sample_workload();
+        let encoded = encrypt_spec(&secret, &original).unwrap();
+        // The plaintext shouldn't appear in the encoded form.
+        assert!(!encoded.contains("ORACLE_KEY"));
+        assert!(!encoded.contains("value123"));
+        assert!(!encoded.contains("myoracle"));
+    }
+
+    #[test]
+    fn spec_size_limit_enforced() {
+        let secret = "0123456789abcdef0123456789abcdef0123456789abcdef".to_string();
+        let mut w = sample_workload();
+        // Bloat env to exceed the limit.
+        w.env = vec![format!("BIG={}", "x".repeat(2000))];
+        assert!(encrypt_spec(&secret, &w).is_err());
+    }
 }

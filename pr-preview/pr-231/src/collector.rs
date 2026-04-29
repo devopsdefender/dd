@@ -175,22 +175,26 @@ async fn fail_over(s: &CollectorState, d: &Deployment) -> Result<()> {
         .ok_or(Error::Internal("no eligible failover host".into()))?;
     drop(agents);
 
-    // Push the workload to the new host. The collector doesn't have
-    // the workload spec — only the vanity. v1 fallback: the CP mints
-    // a __cp__ JWT and POSTs an empty body; the agent's /deploy
-    // currently requires a workload spec, so this branch is
-    // best-effort and primarily useful when the workload spec is
-    // already cached on the new agent (e.g. cooldown after a hiccup).
-    // Real failover with spec recovery is a follow-up that fetches
-    // ee.list() from the old host or stores the spec in CF as a TXT
-    // record next to the vanity. Documented in the plan.
+    // Recover the workload spec from the encrypted TXT record at
+    // `_dds.<vanity>`. DNS-as-truth means we never lost the spec —
+    // we read it back, decrypt with the fleet secret, and push it
+    // to the new host.
+    let workload = deployment::read_spec(&s.http, &s.cf, &s.fleet_jwt_secret, &d.vanity)
+        .await?
+        .ok_or_else(|| {
+            Error::Internal(format!(
+                "no spec record at _dds.{} — deployment may have been created before TXT-spec persistence landed",
+                d.vanity
+            ))
+        })?;
+
     let cp_bearer = mint_cp_bearer(&s.fleet_jwt_secret, &s.owner_name)?;
     let push_url = format!("https://{}/deploy", new_host.hostname);
     let _ = s
         .http
         .post(&push_url)
         .bearer_auth(&cp_bearer)
-        .json(&serde_json::json!({"vanity": d.vanity, "workload": null}))
+        .json(&serde_json::json!({"vanity": d.vanity, "workload": workload}))
         .send()
         .await
         .map_err(|e| Error::Upstream(format!("push /deploy {push_url}: {e}")))?;
