@@ -10,6 +10,7 @@ pub mod error;
 pub mod gh_oidc;
 pub mod ita;
 pub mod kinds;
+pub mod noise;
 pub mod oauth;
 pub mod stonith;
 pub mod workload;
