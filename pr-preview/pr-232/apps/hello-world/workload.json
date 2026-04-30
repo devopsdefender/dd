@@ -1,0 +1,7 @@
+{
+  "app_name": "hello-world",
+  "cmd": [
+    "/bin/busybox", "sh", "-c",
+    "until [ -x /var/lib/easyenclave/bin/podman ]; do sleep 2; done\nexec /var/lib/easyenclave/bin/podman run --rm --name hello-world docker.io/library/busybox echo 'hello-world from dd preview'"
+  ]
+}
