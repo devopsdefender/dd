@@ -27,7 +27,14 @@
 # caller's pipefail kills the relaunch before anything destructive.
 
 EE_REPO="${EE_REPO:-easyenclave/easyenclave}"
-EE_ASSET_PATTERN="${EE_ASSET_PATTERN:-easyenclave-*-local-tdx-qcow2.qcow2}"
+# Released asset name for the libvirt-backing-file qcow2. easyenclave#95
+# retired the `local-tdx-qcow2` target and made `llm-cuda` the canonical
+# qcow2 with the qemu vendor stage; the artifact is a strict superset
+# (same TDX boot path + dm-verity squashfs root + the vLLM/CUDA bake).
+# Size grows from ~50 MB to ~7 GB — the CUDA + PyTorch + vLLM stack is
+# most of it. The `easyenclave-local.qcow2` *path* on the host stays
+# the same, only the upstream asset we download into it changes.
+EE_ASSET_PATTERN="${EE_ASSET_PATTERN:-easyenclave-*-llm-cuda.qcow2}"
 
 sync_base() {
   local base="${1:?usage: sync_base <path-to-base-qcow2>}"
