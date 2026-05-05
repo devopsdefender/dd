@@ -62,6 +62,13 @@ DD_DOMAIN="${DD_DOMAIN:-devopsdefender.com}"
 DD_ITA_BASE_URL="${DD_ITA_BASE_URL:-https://api.trustauthority.intel.com}"
 DD_ITA_JWKS_URL="${DD_ITA_JWKS_URL:-https://portal.trustauthority.intel.com/certs}"
 DD_ITA_ISSUER="${DD_ITA_ISSUER:-https://portal.trustauthority.intel.com}"
+if [ -z "${DD_ITA_MODE:-}" ]; then
+  case "$ENV_LABEL" in
+    production|staging) DD_ITA_MODE=intel ;;
+    *)                  DD_ITA_MODE=local ;;
+  esac
+fi
+echo "  DD_ITA_MODE=$DD_ITA_MODE"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
@@ -116,6 +123,7 @@ build_config_iso() {
       DD_HOSTNAME="$HOSTNAME" \
       DD_ENV="$ENV_LABEL" \
       DD_ACCESS_ADMIN_EMAIL="$DD_ACCESS_ADMIN_EMAIL" \
+      DD_ITA_MODE="$DD_ITA_MODE" \
       DD_ITA_API_KEY="$DD_ITA_API_KEY" \
       DD_ITA_BASE_URL="$DD_ITA_BASE_URL" \
       DD_ITA_JWKS_URL="$DD_ITA_JWKS_URL" \
