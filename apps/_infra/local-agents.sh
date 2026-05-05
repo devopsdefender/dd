@@ -157,6 +157,13 @@ env_from_url() {
 build_config_iso() {
   # $1=name, $2=cp_url, $3=env_label
   local name="$1" cp="$2" env="$3"
+  local ita_mode="${DD_ITA_MODE:-}"
+  if [ -z "$ita_mode" ]; then
+    case "$env" in
+      production|staging) ita_mode=intel ;;
+      *)                  ita_mode=local ;;
+    esac
+  fi
   local out="$IMG_DIR/dd-local-$name-config.iso"
   local tmp
   tmp=$(mktemp -d)
@@ -191,6 +198,7 @@ build_config_iso() {
   workloads=$({
     echo "$bare_workloads"
     DD_CP_URL="$cp" \
+      DD_ITA_MODE="$ita_mode" \
       DD_ITA_API_KEY="$DD_ITA_API_KEY" \
       DD_ENV="$env" \
       DD_VM_NAME="dd-local-$name" \
@@ -221,7 +229,7 @@ build_config_iso() {
   # silences "Filesystem too small for a journal". Config volume is
   # read-only so journaling isn't needed anyway.
   mkfs.ext4 -q -O ^has_journal -d "$tmp" "$out"
-  echo "  wrote $out (env=$env, extra_ingress=$extra_ingress)"
+  echo "  wrote $out (env=$env, ita_mode=$ita_mode, extra_ingress=$extra_ingress)"
 }
 
 build_overlay() {

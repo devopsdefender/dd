@@ -392,7 +392,7 @@ jobs:
           echo "::error::CP not healthy within 5 minutes (SSH target)"
           exit 1
 
-      - name: Verify NEW VM via TDX attestation
+      - name: Verify NEW VM health / TDX attestation
         env:
           AGENT_URL: https://${{ inputs.hostname }}
         run: |
@@ -409,6 +409,11 @@ jobs:
             CODE=$(echo "$BODY" | tail -n1)
             JSON=$(echo "$BODY" | sed '$d')
             if [ "$CODE" = "200" ]; then
+              ITA_MODE=$(echo "$JSON" | jq -r '.ita_mode // "intel"')
+              if [ "$ITA_MODE" = "local" ]; then
+                echo "NEW VM healthy in local attestation mode — skipping Intel TDX quote check"
+                exit 0
+              fi
               QUOTE_B64=$(echo "$JSON" | jq -r '.noise.quote_b64 // empty')
               if [ -n "$QUOTE_B64" ] && [ "$QUOTE_B64" != "null" ]; then
                 MRTD=$(echo "$QUOTE_B64" | base64 -d \
