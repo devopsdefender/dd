@@ -212,7 +212,7 @@ pub struct Agent {
     pub ita: Ita,
     /// Extra cloudflared ingress rules requested at register time,
     /// parsed from `DD_EXTRA_INGRESS` (a comma-separated list of
-    /// `label:port` pairs, e.g. `gpu:8081,web:9000`). The boot-workload
+    /// `label:port` pairs, e.g. `api:8081,web:9000`). The boot-workload
     /// builder (`apps/_infra/local-agents.sh`) collects these from
     /// `expose` hints on individual workload specs. Empty is fine —
     /// the agent just gets the default dashboard rule.
@@ -264,7 +264,7 @@ fn parse_truthy(key: &str) -> bool {
 }
 
 /// Parse `DD_EXTRA_INGRESS` as a comma-separated list of `label:port`
-/// pairs — e.g. `"gpu:8081"` or `"gpu:8081,web:9000"`. Chosen over
+/// pairs — e.g. `"api:8081"` or `"api:8081,web:9000"`. Chosen over
 /// JSON to sidestep `"`-escaping when the value is substituted into
 /// the dd-agent workload template's `"DD_EXTRA_INGRESS=${…}"` env
 /// entry (embedded quotes would close the outer JSON string early).
@@ -330,34 +330,34 @@ mod tests {
 
     #[test]
     fn single_entry() {
-        assert_eq!(parse("gpu:8081").unwrap(), vec![("gpu".into(), 8081)]);
+        assert_eq!(parse("api:8081").unwrap(), vec![("api".into(), 8081)]);
     }
 
     #[test]
     fn multiple_entries() {
         assert_eq!(
-            parse("gpu:8081,web:9000").unwrap(),
-            vec![("gpu".into(), 8081), ("web".into(), 9000)]
+            parse("api:8081,web:9000").unwrap(),
+            vec![("api".into(), 8081), ("web".into(), 9000)]
         );
     }
 
     #[test]
     fn tolerates_whitespace_and_trailing_commas() {
         assert_eq!(
-            parse("gpu:8081, , web:9000,").unwrap(),
-            vec![("gpu".into(), 8081), ("web".into(), 9000)]
+            parse("api:8081, , web:9000,").unwrap(),
+            vec![("api".into(), 8081), ("web".into(), 9000)]
         );
     }
 
     #[test]
     fn bad_port_errors() {
-        assert!(parse("gpu:notaport").is_err());
-        assert!(parse("gpu:99999").is_err()); // > u16
+        assert!(parse("api:notaport").is_err());
+        assert!(parse("api:99999").is_err()); // > u16
     }
 
     #[test]
     fn missing_colon_errors() {
-        assert!(parse("gpu").is_err());
+        assert!(parse("api").is_err());
     }
 
     #[test]

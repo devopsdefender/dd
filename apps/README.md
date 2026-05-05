@@ -2,9 +2,8 @@
 
 This directory is **a worked example**, not a bundle dd ships to users. Every
 directory here is one easyenclave workload. Together they describe a complete
-DD agent VM: the minimum infra to boot podman, run one demo container
-(`web-nvidia-smi`), register with a control plane, and expose the demo on a
-stable hostname.
+DD agent VM: the minimum infra to boot podman, register with a control plane,
+and optionally expose workload ports on stable hostnames.
 
 The goal is to be the shortest legible "agent VM from scratch" that you can
 copy and adapt. For orchestrating many workloads, assembling them from
@@ -60,8 +59,8 @@ Add `expose` to ask DD to route a public hostname to a workload's port:
 
 ```json
 {
-  "app_name": "web-nvidia-smi",
-  "expose": { "hostname_label": "gpu", "port": 8081 },
+  "app_name": "web",
+  "expose": { "hostname_label": "web", "port": 8081 },
   "cmd": [...]
 }
 ```
@@ -69,8 +68,8 @@ Add `expose` to ask DD to route a public hostname to a workload's port:
 At agent boot, `apps/_infra/local-agents.sh` collects every `expose` entry
 into `DD_EXTRA_INGRESS`. dd-agent forwards them on `/register` and the CP
 prepends them to the agent's cloudflared tunnel ingress. A workload declaring
-`{"hostname_label": "gpu", "port": 8081}` becomes reachable at
-`gpu.<agent-hostname>` — in addition to the default dashboard at
+`{"hostname_label": "web", "port": 8081}` becomes reachable at
+`web.<agent-hostname>` — in addition to the default dashboard at
 `<agent-hostname>`. easyenclave itself ignores the field; it's a DD-level
 hint about tunnel routing.
 
@@ -102,14 +101,12 @@ inline in two places so both lifecycle points behave identically:
 | `cloudflared` | ✅ | ✅ | ✅ |
 | `dd-agent` | | ✅ | ✅ |
 | `dd-management` | ✅ | | |
-| `nv` | | | ✅ (GPU insmod) |
 | `podman-static` | | ✅ | ✅ |
 | `podman-bootstrap` | | ✅ | ✅ |
-| `web-nvidia-smi` | | | ✅ (`gpu.<agent-host>`) |
 
 CP stays slim: just `cloudflared` + `dd-management`. Preview agent VMs run a
 bare agent + podman for CI to prove registration end-to-end. Prod agent VMs
-add the GPU insmod and the `web-nvidia-smi` demo on `gpu.<agent-host>`.
+use the same CPU-only boot shape for now.
 
 ## Ordering
 
@@ -119,8 +116,6 @@ Worked examples from this tree:
 
 - `podman-bootstrap` waits for `podman-static`'s tarball
   (`until [ -x $SRC/usr/local/bin/podman ]; do sleep 1; done`).
-- `web-nvidia-smi`'s cmd waits for the wrapper
-  (`until [ -x /var/lib/easyenclave/bin/podman ]; do sleep 2; done`).
 
 Costs seconds of wasted polling at boot; easy to reason about; no
 workload-runner changes needed.

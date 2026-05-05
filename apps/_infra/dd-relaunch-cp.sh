@@ -37,7 +37,7 @@ git fetch --quiet origin "$REF"
 git checkout --quiet "origin/$REF" -- apps/
 echo "dd-relaunch-cp: refreshed apps/ from origin/$REF"
 
-# Sync the libvirt base qcow2 from the easyenclave release channel
+# Sync the libvirt base qcow2 from the easyenclave-mini release channel
 # for this env. `production` tracks `stable` (v*); anything else
 # (pr-N, dev) tracks `staging`. `DD_EE_TAG` overrides the channel
 # default for pre-flight-testing a candidate release.

@@ -21,9 +21,7 @@
 #                    DD_OWNER_ID + DD_OWNER_KIND are derived from it.
 #   DD_RELEASE_TAG  (defaults to "latest")
 #
-# Sizing: 16 GiB RAM / 4 vCPU / 160 GB qcow2 overlay — general shape
-# from the DD capacity rule. CP doesn't need GPU; GPU stays on the
-# prod agent VM (H100 passthrough).
+# Sizing: 16 GiB RAM / 4 vCPU / 160 GB qcow2 overlay.
 
 set -euo pipefail
 
@@ -166,16 +164,14 @@ render_domain_xml() {
   sed -i "s|$IMG_DIR/$BASE_DOMAIN-config.iso|$IMG_DIR/$VM-config.iso|g" "$out"
   sed -i "s|/var/log/ee-local\\.log|/var/log/ee-local-$NAME.log|g" "$out"
 
-  # CP sizing (general shape — no GPU).
+  # CP sizing.
   local mem_kib=16777216   # 16 GiB
   local vcpus=4
   sed -i -E "s|<memory unit='KiB'>[0-9]+</memory>|<memory unit='KiB'>$mem_kib</memory>|" "$out"
   sed -i -E "s|<currentMemory unit='KiB'>[0-9]+</currentMemory>|<currentMemory unit='KiB'>$mem_kib</currentMemory>|" "$out"
   sed -i -E "s|<vcpu placement='static'>[0-9]+</vcpu>|<vcpu placement='static'>$vcpus</vcpu>|" "$out"
 
-  # Strip GPU passthrough — CP doesn't need it and having two domains
-  # claim the same host device collides.
-  # Remove any <hostdev> blocks (vfio-pci H100).
+  # Remove any inherited passthrough devices from the base domain.
   python3 - "$out" <<'PY'
 import re, sys
 p = sys.argv[1]

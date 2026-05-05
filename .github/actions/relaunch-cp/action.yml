@@ -40,11 +40,11 @@ inputs:
     description: 'devopsdefender release tag (e.g. pr-abc123, latest)'
     required: true
   ee-channel:
-    description: 'easyenclave release channel to sync the libvirt base qcow2 from (stable | staging)'
+    description: 'easyenclave-mini release channel to sync the libvirt base qcow2 from (stable | staging)'
     required: false
     default: 'staging'
   ee-tag:
-    description: 'Explicit easyenclave release tag override for pre-flight testing a candidate (e.g. image-abc123456). Wins over `ee-channel`.'
+    description: 'Explicit easyenclave-mini release tag override for pre-flight testing a candidate (e.g. image-1c6062146153 or mini-image-abc123456). Wins over `ee-channel`.'
     required: false
     default: ''
   owner:

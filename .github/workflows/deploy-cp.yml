@@ -63,7 +63,7 @@ on:
         type: string
         default: ssh
       ee_tag:
-        description: 'Explicit easyenclave release tag to pin this deploy to (pre-flight-test a candidate before promoting staging→stable). Empty = default to channel resolved from env.'
+        description: 'Explicit easyenclave-mini release tag to pin this deploy to (pre-flight-test a candidate before promoting staging→stable). Empty = default to channel resolved from env.'
         required: false
         type: string
         default: ''
@@ -99,20 +99,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Map dd env → easyenclave channel. Prod (CP and local) tracks
-      # `stable` (EE v* tags); everything else (pr-N previews) tracks
-      # `staging` (EE prereleases from main). Keeps dd prod off
-      # in-flight-main EE builds while preview deploys catch EE
-      # regressions early. Applies to both target=gcp (image family
-      # lookup) and target=ssh (release-asset sync on tdx2).
-      - name: Resolve easyenclave channel
+      # Map dd env → easyenclave-mini channel. Prod tracks `stable`
+      # when a stable mini image exists; previews track `staging`.
+      # Applies to both target=gcp (image family lookup) and target=ssh
+      # (release-asset sync on tdx2).
+      - name: Resolve easyenclave-mini channel
         id: ee
         env:
           ENV: ${{ inputs.env }}
         run: |
           case "$ENV" in
-            production) channel=stable;  family=easyenclave-stable  ;;
-            *)          channel=staging; family=easyenclave-staging ;;
+            production) channel=stable;  family=easyenclave-mini-stable  ;;
+            *)          channel=staging; family=easyenclave-mini-staging ;;
           esac
           {
             echo "channel=$channel"
@@ -153,7 +151,7 @@ jobs:
           ee-tag:        ${{ inputs.ee_tag }}
           owner:         ${{ inputs.owner }}
 
-      - name: Create TDX VM (boots from easyenclave, fetches dd from GitHub releases)
+      - name: Create TDX VM (boots from easyenclave-mini, fetches dd from GitHub releases)
         if: inputs.target == 'gcp'
         env:
           GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}

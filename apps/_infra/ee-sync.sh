@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ee-sync.sh — keep `/var/lib/libvirt/images/easyenclave-local.qcow2` on
-# the tdx2 host in sync with the right easyenclave release channel.
+# the tdx2 host in sync with the right easyenclave-mini release channel.
 #
 # Sourced by dd-relaunch.sh + dd-relaunch-cp.sh. Each relaunch:
 #   1. Resolves the desired EE tag — explicit `DD_EE_TAG` wins, else
@@ -26,8 +26,8 @@
 # We return a non-zero code from sync_base on hard failure so the
 # caller's pipefail kills the relaunch before anything destructive.
 
-EE_REPO="${EE_REPO:-easyenclave/easyenclave}"
-EE_ASSET_PATTERN="${EE_ASSET_PATTERN:-easyenclave-*-local-tdx-qcow2.qcow2}"
+EE_REPO="${EE_REPO:-easyenclave/easyenclave-mini}"
+EE_ASSET_PATTERN="${EE_ASSET_PATTERN:-easyenclave*-*-local-tdx-qcow2.qcow2}"
 
 sync_base() {
   local base="${1:?usage: sync_base <path-to-base-qcow2>}"
@@ -46,12 +46,13 @@ sync_base() {
         ;;
       staging)
         # Staging = newest prerelease. NOT `--limit 1` unfiltered: the
-        # day easyenclave cuts a `v*` stable tag, that release gets a
+        # day easyenclave-mini cuts a `v*` stable tag, that release gets a
         # later `createdAt` than every existing prerelease, and an
         # unfiltered newest-first query would collapse staging onto
         # stable — defeating the whole channel-split. Explicitly keep
-        # only `isPrerelease: true` entries. The first `image-*` tag
-        # cut on main before the v* release always wins.
+        # only `isPrerelease: true` entries. The newest mini prerelease
+        # wins, regardless of whether the tag uses `image-*` or
+        # `mini-image-*`.
         target=$(gh release list --repo "$EE_REPO" --limit 20 \
                  --json tagName,isPrerelease \
                  -q '[.[] | select(.isPrerelease)][0].tagName' 2>/dev/null)
@@ -78,8 +79,8 @@ sync_base() {
   local tmp="$base.tmp.$$"
   trap 'rm -f "$tmp"' RETURN
   # Download is best-effort: if the candidate release doesn't yet carry
-  # a matching asset (e.g. a pre-merge-of-easyenclave#87 release, or a
-  # partial release-staging failure), keep the existing base rather
+  # a matching asset (e.g. a partial release-staging failure), keep the
+  # existing base rather
   # than aborting the deploy. The tag sidecar is NOT updated in that
   # case, so the next run retries. An existing base is always
   # preferable to no base — worst-case we just keep running slightly
