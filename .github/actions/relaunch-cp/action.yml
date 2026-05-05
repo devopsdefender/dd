@@ -84,6 +84,9 @@ runs:
         key: ${{ inputs.ssh-key }}
         envs: ENV_LABEL,CP_HOSTNAME,REF,RELEASE_TAG,CLOUDFLARE_API_TOKEN,CLOUDFLARE_ACCOUNT_ID,CLOUDFLARE_ZONE_ID,DD_ACCESS_ADMIN_EMAIL,DD_ITA_API_KEY,DD_EE_CHANNEL,DD_EE_TAG,EE_OWNER,DD_REPO_ROOT
         script: |
+          export ENV_LABEL CP_HOSTNAME REF RELEASE_TAG
+          export CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID CLOUDFLARE_ZONE_ID
+          export DD_ACCESS_ADMIN_EMAIL DD_ITA_API_KEY DD_EE_CHANNEL DD_EE_TAG EE_OWNER DD_REPO_ROOT
           if [ ! -d "$DD_REPO_ROOT/.git" ]; then
             mkdir -p "$(dirname "$DD_REPO_ROOT")"
             git clone https://github.com/devopsdefender/dd.git "$DD_REPO_ROOT"

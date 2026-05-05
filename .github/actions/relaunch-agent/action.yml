@@ -88,6 +88,8 @@ runs:
         key: ${{ inputs.ssh-key }}
         envs: KIND,URL,REF,RELEASE_TAG,DD_ITA_API_KEY,DD_EE_CHANNEL,DD_EE_TAG,EE_OWNER,DD_REPO_ROOT
         script: |
+          export KIND URL REF RELEASE_TAG
+          export DD_ITA_API_KEY DD_EE_CHANNEL DD_EE_TAG EE_OWNER DD_REPO_ROOT
           if [ ! -d "$DD_REPO_ROOT/.git" ]; then
             mkdir -p "$(dirname "$DD_REPO_ROOT")"
             git clone https://github.com/devopsdefender/dd.git "$DD_REPO_ROOT"
