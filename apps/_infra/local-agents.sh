@@ -333,7 +333,9 @@ PY
   # register. Idempotent: skips if the launchSecurity element is
   # already expanded.
   if grep -q "<launchSecurity type='tdx'/>" "$out"; then
-    sed -i "s|<launchSecurity type='tdx'/>|<launchSecurity type='tdx'><quoteGenerationService path='/var/run/tdx-qgs/qgs.socket'/></launchSecurity>|" "$out"
+    sed -i "s|<launchSecurity type='tdx'/>|<launchSecurity type='tdx'><policy>0x10000000</policy><quoteGenerationService path='/var/run/tdx-qgs/qgs.socket'/></launchSecurity>|" "$out"
+  elif grep -q "<launchSecurity type='tdx'>" "$out" && ! grep -q "quoteGenerationService" "$out"; then
+    sed -i "s|</launchSecurity>|  <quoteGenerationService path='/var/run/tdx-qgs/qgs.socket'/>\n  </launchSecurity>|" "$out"
   fi
 
   # Strip any inherited passthrough devices from the base domain.

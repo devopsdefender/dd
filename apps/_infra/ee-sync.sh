@@ -29,6 +29,18 @@
 EE_REPO="${EE_REPO:-easyenclave/easyenclave-mini}"
 EE_ASSET_PATTERN="${EE_ASSET_PATTERN:-easyenclave*-*-local-tdx-qcow2.qcow2}"
 
+qemu_owner() {
+  local conf="/etc/libvirt/qemu.conf"
+  local user="" group=""
+
+  if [ -r "$conf" ]; then
+    user=$(sed -nE 's/^[[:space:]]*user[[:space:]]*=[[:space:]]*"?([^"#]+)"?.*/\1/p' "$conf" | tail -1)
+    group=$(sed -nE 's/^[[:space:]]*group[[:space:]]*=[[:space:]]*"?([^"#]+)"?.*/\1/p' "$conf" | tail -1)
+  fi
+
+  printf '%s:%s\n' "${user:-libvirt-qemu}" "${group:-kvm}"
+}
+
 sync_base() {
   local base="${1:?usage: sync_base <path-to-base-qcow2>}"
   local channel="${DD_EE_CHANNEL:-staging}"
@@ -95,8 +107,10 @@ sync_base() {
     return 3
   fi
 
-  # Ensure libvirt can read it — qemu runs as libvirt-qemu:kvm.
-  chown libvirt-qemu:kvm "$tmp" 2>/dev/null || true
+  # Ensure libvirt can read/write it. Some DD hosts run qemu as
+  # ubuntu:ubuntu with dynamic ownership disabled; others use the
+  # distro default libvirt-qemu:kvm.
+  chown "$(qemu_owner)" "$tmp" 2>/dev/null || chmod 0644 "$tmp" 2>/dev/null || true
   mv "$tmp" "$base"
   echo "$target" > "$base.tag"
   echo "ee-sync: $base ${current:-<none>} -> $target (channel=$channel)"
