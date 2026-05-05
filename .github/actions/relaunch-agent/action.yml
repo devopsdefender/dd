@@ -16,11 +16,19 @@ inputs:
     description: 'git ref whose scripts/apps tree dd-relaunch.sh should check out on the host'
     required: true
   ssh-key:
-    description: 'Private SSH key for tdx2@host'
+    description: 'Private SSH key for ssh-user@host'
     required: true
   host:
     description: 'Public host address of the tdx2 node'
     required: true
+  ssh-user:
+    description: 'SSH username on the host'
+    required: false
+    default: tdx2
+  repo-root:
+    description: 'Path to the dd checkout on the host'
+    required: false
+    default: /home/tdx2/src/dd
   ita-api-key:
     description: 'Intel Trust Authority API key for attestation'
     required: true
@@ -73,13 +81,18 @@ runs:
         DD_EE_CHANNEL: ${{ inputs.ee-channel }}
         DD_EE_TAG: ${{ inputs.ee-tag }}
         EE_OWNER: ${{ inputs.owner }}
+        DD_REPO_ROOT: ${{ inputs.repo-root }}
       with:
         host: ${{ inputs.host }}
-        username: tdx2
+        username: ${{ inputs.ssh-user }}
         key: ${{ inputs.ssh-key }}
-        envs: KIND,URL,REF,RELEASE_TAG,DD_ITA_API_KEY,DD_EE_CHANNEL,DD_EE_TAG,EE_OWNER
+        envs: KIND,URL,REF,RELEASE_TAG,DD_ITA_API_KEY,DD_EE_CHANNEL,DD_EE_TAG,EE_OWNER,DD_REPO_ROOT
         script: |
-          /home/tdx2/src/dd/apps/_infra/dd-relaunch.sh "$KIND" "$URL" "$REF" "$RELEASE_TAG"
+          if [ ! -d "$DD_REPO_ROOT/.git" ]; then
+            mkdir -p "$(dirname "$DD_REPO_ROOT")"
+            git clone https://github.com/devopsdefender/dd.git "$DD_REPO_ROOT"
+          fi
+          "$DD_REPO_ROOT/apps/_infra/dd-relaunch.sh" "$KIND" "$URL" "$REF" "$RELEASE_TAG"
 
     # Block until the freshly-booted agent VM registers with the CP.
     # This is the "I can see the local agent deployment worked"
@@ -109,6 +122,7 @@ runs:
         URL:             ${{ inputs.url }}
         KIND:            ${{ inputs.kind }}
         HOST:            ${{ inputs.host }}
+        SSH_USER:        ${{ inputs.ssh-user }}
         SSH_KEY:         ${{ inputs.ssh-key }}
         STREAM_CONSOLE:  ${{ inputs.stream-console }}
       run: |
@@ -147,7 +161,7 @@ runs:
           ssh -i "$key" -T \
               -o StrictHostKeyChecking=accept-new \
               -o ServerAliveInterval=30 \
-              tdx2@"$HOST" \
+              "$SSH_USER@$HOST" \
               "sudo stdbuf -oL tail -n +1 -F /var/log/ee-local-$KIND.log || true" \
             2>&1 | stdbuf -oL sed -u "s/^/  [$vm console] /" \
                  | stdbuf -oL tee -a "$mirror" &

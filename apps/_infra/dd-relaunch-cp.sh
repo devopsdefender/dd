@@ -29,7 +29,7 @@ export DD_RELEASE_TAG="${4:-${DD_RELEASE_TAG:-latest}}"
 : "${DD_ACCESS_ADMIN_EMAIL?}"
 : "${DD_ITA_API_KEY?}"
 
-cd /home/tdx2/src/dd
+cd "${DD_REPO_ROOT:-/home/tdx2/src/dd}"
 
 # Refresh apps/ from the caller's ref. Limited checkout so unrelated
 # dirty state doesn't block the deploy. Matches the agent path.
