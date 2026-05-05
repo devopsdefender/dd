@@ -21,6 +21,7 @@ use tokio::sync::{Mutex, RwLock};
 use crate::cf;
 use crate::collector::{self, Store};
 use crate::config::Cp as Cfg;
+use crate::config::ItaMode;
 use crate::ee::Ee;
 use crate::error::{Error, Result};
 use crate::html::{self, shell};
@@ -69,8 +70,14 @@ pub async fn run() -> Result<()> {
     // We need the token as a Bearer for the hydrate call below; if
     // the old CP is still serving at `cfg.hostname`, it'll verify
     // our ITA and hand over its state.
-    let verifier = ita::Verifier::new(cfg.ita.jwks_url.clone(), cfg.ita.issuer.clone());
-    eprintln!("cp: ITA verifier enabled (issuer={})", cfg.ita.issuer);
+    let verifier = match cfg.ita.mode {
+        ItaMode::Intel => ita::Verifier::new(cfg.ita.jwks_url.clone(), cfg.ita.issuer.clone()),
+        ItaMode::Local => ita::Verifier::new_local(cfg.ita.api_key.clone(), cfg.ita.issuer.clone()),
+    };
+    eprintln!(
+        "cp: ITA verifier enabled (mode={:?}, issuer={})",
+        cfg.ita.mode, cfg.ita.issuer
+    );
     let initial_token = match mint_cp_ita(&cfg, &ee).await {
         Ok(t) => t,
         Err(e) => {
@@ -186,18 +193,31 @@ pub async fn run() -> Result<()> {
     // also carries the Noise pre-handshake quote + pubkey (the former
     // `/attest` — now inlined to save a bootstrap round-trip).
     let cp_labels: Vec<String> = cp_extras.iter().map(|(l, _)| l.clone()).collect();
-    if let Err(e) = cf::provision_cp_access(
-        &http,
-        &cfg.cf,
-        &cfg.common.env_label,
-        &cfg.hostname,
-        &cfg.common.owner,
-        &cfg.access.admin_email,
-        &cp_labels,
-    )
-    .await
-    {
-        eprintln!("cp: CF Access provisioning failed: {e}");
+    let mut access_ready = false;
+    for attempt in 1..=5 {
+        match cf::provision_cp_access(
+            &http,
+            &cfg.cf,
+            &cfg.common.env_label,
+            &cfg.hostname,
+            &cfg.common.owner,
+            &cfg.access.admin_email,
+            &cp_labels,
+        )
+        .await
+        {
+            Ok(()) => {
+                access_ready = true;
+                break;
+            }
+            Err(e) => {
+                eprintln!("cp: CF Access provisioning attempt {attempt}/5 failed: {e}");
+                tokio::time::sleep(Duration::from_secs(5 * attempt)).await;
+            }
+        }
+    }
+    if !access_ready {
+        eprintln!("cp: CF Access provisioning failed after retries");
         stonith::poweroff();
     }
     eprintln!("cp: CF Access ready");
@@ -477,6 +497,7 @@ async fn health(
         "service": "cp",
         "hostname": s.cfg.hostname,
         "env": s.cfg.common.env_label,
+        "ita_mode": s.cfg.ita.mode.as_str(),
         "uptime_secs": s.started.elapsed().as_secs(),
         "agent_count": agents.len(),
         "healthy_count": agents.values().filter(|a| a.status == "healthy").count(),
@@ -719,6 +740,9 @@ async fn ingress_replace(
 /// Mint the CP's own ITA token at startup. Fatal on any failure —
 /// the CP refuses to start without proving its own TDX measurement.
 async fn mint_cp_ita(cfg: &Cfg, ee: &Ee) -> Result<String> {
+    if cfg.ita.mode == ItaMode::Local {
+        return ita::mint_local(&cfg.ita.issuer, &cfg.ita.api_key, "control-plane");
+    }
     use base64::Engine;
     let nonce = base64::engine::general_purpose::STANDARD.encode(uuid::Uuid::new_v4().as_bytes());
     let quote_b64 = ee.attest(&nonce).await?["quote_b64"]

@@ -18,7 +18,7 @@ Source layout (all under `src/`, flat module tree):
 | `cp.rs` | CP HTTP: fleet dashboard, `/register` for agents, `/api/agents` public read, `/cp/attest`. Runs the collector + per-agent CF Access app + STONITH. |
 | `agent.rs` | Agent HTTP: per-VM dashboard, `/deploy` + `/exec` + `/logs/{app}` + `/ingress/replace`, GitHub-OIDC and ITA verification. |
 | `cf.rs` | Cloudflare API: tunnel CRUD, DNS CNAME, Access app provisioning, flat `label_hostname`, orphan reaping. |
-| `ee.rs` | Thin client for [EasyEnclave](https://github.com/easyenclave/easyenclave)'s unix socket — `Deploy`, `List`, `Logs`. |
+| `ee.rs` | Thin client for [EasyEnclave Mini](https://github.com/easyenclave/easyenclave-mini)'s unix socket — `Deploy`, `List`, `Logs`. |
 | `ita.rs` | Mint + verify Intel Trust Authority tokens (quote-v4 MRTD extraction). |
 | `gh_oidc.rs` | Verify GitHub Actions OIDC JWTs against GitHub's JWKS (`repository_owner == DD_OWNER`). |
 | `collector.rs` | CP-side scrape of agent `/health` over the tunnel; tracks claims + ingress. |
@@ -27,7 +27,7 @@ Source layout (all under `src/`, flat module tree):
 | `config.rs` | Env → typed config for both modes. |
 | `html.rs` | Dashboard templates. |
 
-The sealed enclave runtime is [EasyEnclave](https://github.com/easyenclave/easyenclave) — a separate project.
+The sealed enclave runtime is [EasyEnclave Mini](https://github.com/easyenclave/easyenclave-mini) — a separate project.
 
 ## Public website
 
@@ -37,11 +37,11 @@ To change the website: PR against `gh-pages` (not `main`). The branch's own `.gi
 
 ## Deployment
 
-Every fleet VM boots from a sealed easyenclave image published by [easyenclave/easyenclave](https://github.com/easyenclave/easyenclave/releases). No cloud-init, no stock Ubuntu, no runtime `apt-get install`. The TDX VM's rootfs is the latest image in the `easyenclave-staging` (or `-stable`) family, attestable against a single UKI SHA256.
+Every fleet VM boots from a sealed easyenclave-mini image published by [easyenclave/easyenclave-mini](https://github.com/easyenclave/easyenclave-mini/releases). No cloud-init, no stock Ubuntu, no runtime `apt-get install`. The local TDX base qcow2 is synced from the latest `stable` or `staging` mini release channel by `apps/_infra/ee-sync.sh`, attestable against a single UKI SHA256.
 
 Every workload is a JSON spec consumed by easyenclave's `DeployRequest`. Boot-time and runtime-deployed workloads share one schema; both the `devopsdefender` binary and `cloudflared` ship as **GitHub release assets** — not OCI images — and easyenclave fetches them via its `github_release` source. The full set of specs and a guide to writing your own lives in [`apps/README.md`](apps/README.md).
 
-Per-VM configuration (CF credentials, GitHub OAuth, the workload spec itself) is passed to easyenclave at boot via **GCE instance metadata** (`ee-config` attribute), read by `easyenclave::init::fetch_gce_metadata_config()` and applied as env vars. The CP-deploy step in `.github/workflows/deploy-cp.yml` builds the spec and invokes `gcloud compute instances create --image-family=easyenclave-staging --metadata-from-file=ee-config=...`.
+Per-VM configuration (CF credentials, GitHub OAuth, the workload spec itself) is passed to easyenclave-mini at boot via the local config disk consumed by the qemu vendor stage. The deploy/relaunch scripts build `agent.env`, sync the mini qcow2 base, and recreate the matching local TDX VM.
 
 ## CI/CD
 

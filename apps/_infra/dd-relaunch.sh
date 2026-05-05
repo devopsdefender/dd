@@ -16,6 +16,7 @@
 # for subsequent machine-to-machine calls.
 
 set -euo pipefail
+export LIBVIRT_DEFAULT_URI="${LIBVIRT_DEFAULT_URI:-qemu:///system}"
 
 KIND="${1?usage: dd-relaunch.sh <prod|preview> <cp-url> [ref] [release-tag]}"
 CP="${2?cp url required}"
@@ -31,7 +32,7 @@ case "$KIND" in
   *) echo "unknown kind: $KIND (want prod|preview)" >&2; exit 2 ;;
 esac
 
-cd /home/tdx2/src/dd
+cd "${DD_REPO_ROOT:-/home/tdx2/src/dd}"
 
 # Refresh the infra scripts + apps/ tree from the caller's ref. Limited
 # checkout so a dirty working tree elsewhere doesn't block the deploy.
@@ -41,7 +42,7 @@ git fetch --quiet origin "$REF"
 git checkout --quiet "origin/$REF" -- apps/
 echo "dd-relaunch: refreshed apps/ from origin/$REF"
 
-# Keep the libvirt base qcow2 aligned with the easyenclave release
+# Keep the libvirt base qcow2 aligned with the easyenclave-mini release
 # channel for this env. `prod` tracks `stable` (v*); `preview` tracks
 # `staging` (main-branch prereleases). `DD_EE_TAG` from CI pins a
 # specific release for pre-flight testing a candidate. Running VMs

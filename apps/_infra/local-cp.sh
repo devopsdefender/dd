@@ -21,11 +21,10 @@
 #                    DD_OWNER_ID + DD_OWNER_KIND are derived from it.
 #   DD_RELEASE_TAG  (defaults to "latest")
 #
-# Sizing: 16 GiB RAM / 4 vCPU / 160 GB qcow2 overlay — general shape
-# from the DD capacity rule. CP doesn't need GPU; GPU stays on the
-# prod agent VM (H100 passthrough).
+# Sizing: 16 GiB RAM / 4 vCPU / 160 GB qcow2 overlay.
 
 set -euo pipefail
+export LIBVIRT_DEFAULT_URI="${LIBVIRT_DEFAULT_URI:-qemu:///system}"
 
 ENV_LABEL="${1?usage: $0 <env> <hostname>}"
 HOSTNAME="${2?hostname required}"
@@ -63,6 +62,13 @@ DD_DOMAIN="${DD_DOMAIN:-devopsdefender.com}"
 DD_ITA_BASE_URL="${DD_ITA_BASE_URL:-https://api.trustauthority.intel.com}"
 DD_ITA_JWKS_URL="${DD_ITA_JWKS_URL:-https://portal.trustauthority.intel.com/certs}"
 DD_ITA_ISSUER="${DD_ITA_ISSUER:-https://portal.trustauthority.intel.com}"
+if [ -z "${DD_ITA_MODE:-}" ]; then
+  case "$ENV_LABEL" in
+    production|staging) DD_ITA_MODE=intel ;;
+    *)                  DD_ITA_MODE=local ;;
+  esac
+fi
+echo "  DD_ITA_MODE=$DD_ITA_MODE"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
@@ -117,6 +123,7 @@ build_config_iso() {
       DD_HOSTNAME="$HOSTNAME" \
       DD_ENV="$ENV_LABEL" \
       DD_ACCESS_ADMIN_EMAIL="$DD_ACCESS_ADMIN_EMAIL" \
+      DD_ITA_MODE="$DD_ITA_MODE" \
       DD_ITA_API_KEY="$DD_ITA_API_KEY" \
       DD_ITA_BASE_URL="$DD_ITA_BASE_URL" \
       DD_ITA_JWKS_URL="$DD_ITA_JWKS_URL" \
@@ -165,17 +172,23 @@ render_domain_xml() {
   sed -i "s|$IMG_DIR/$BASE_DOMAIN.qcow2|$IMG_DIR/$VM.qcow2|g" "$out"
   sed -i "s|$IMG_DIR/$BASE_DOMAIN-config.iso|$IMG_DIR/$VM-config.iso|g" "$out"
   sed -i "s|/var/log/ee-local\\.log|/var/log/ee-local-$NAME.log|g" "$out"
+  sed -i "s|<model type='e1000e'/>|<model type='virtio'/>|g" "$out"
 
-  # CP sizing (general shape — no GPU).
+  # The local-tdx-qcow2 UKI is intentionally unsigned; this host's
+  # OVMF.tdx.fd rejects it with UEFI "Access Denied". Use the non-secure
+  # TDVF build when present while keeping launchSecurity type=tdx below.
+  if [ -r /usr/share/ovmf/OVMF.fd ]; then
+    sed -i -E "s|<loader([^>]*)>/usr/share/ovmf/OVMF\\.tdx\\.fd</loader>|<loader\\1>/usr/share/ovmf/OVMF.fd</loader>|" "$out"
+  fi
+
+  # CP sizing.
   local mem_kib=16777216   # 16 GiB
   local vcpus=4
   sed -i -E "s|<memory unit='KiB'>[0-9]+</memory>|<memory unit='KiB'>$mem_kib</memory>|" "$out"
   sed -i -E "s|<currentMemory unit='KiB'>[0-9]+</currentMemory>|<currentMemory unit='KiB'>$mem_kib</currentMemory>|" "$out"
   sed -i -E "s|<vcpu placement='static'>[0-9]+</vcpu>|<vcpu placement='static'>$vcpus</vcpu>|" "$out"
 
-  # Strip GPU passthrough — CP doesn't need it and having two domains
-  # claim the same host device collides.
-  # Remove any <hostdev> blocks (vfio-pci H100).
+  # Remove any inherited passthrough devices from the base domain.
   python3 - "$out" <<'PY'
 import re, sys
 p = sys.argv[1]
@@ -184,17 +197,18 @@ x = re.sub(r"\s*<hostdev[^>]*>.*?</hostdev>\n?", "", x, flags=re.DOTALL)
 with open(p, "w") as f: f.write(x)
 PY
 
-  # Wire QEMU's tdx-guest to host's QGS unix socket — same treatment
+  # Wire QEMU's tdx-guest to host QGS over vsock — same treatment
   # local-agents.sh does so ITA quotes work inside the CP VM. Must use
-  # libvirt's schema-valid form: `<quoteGenerationService path='...'/>`
-  # (camelCase, path attribute). The earlier
+  # libvirt's schema-valid form from Canonical's TDX templates. The earlier
   # `<Quote-Generation-Service>vsock:2:4050</Quote-Generation-Service>`
   # form is not in libvirt's RNG — `virsh define` accepts it but
   # canonicalizes it away, leaving `<launchSecurity type='tdx'/>` with
   # no QGS wired → guest can't produce a quote → dd-management's ITA
   # mint fails with "Quote cannot be empty" → CP poweroffs.
   if grep -q "<launchSecurity type='tdx'/>" "$out"; then
-    sed -i "s|<launchSecurity type='tdx'/>|<launchSecurity type='tdx'><quoteGenerationService path='/var/run/tdx-qgs/qgs.socket'/></launchSecurity>|" "$out"
+    sed -i "s|<launchSecurity type='tdx'/>|<launchSecurity type='tdx'><policy>0x10000000</policy><quoteGenerationService><SocketAddress type='vsock' cid='2' port='4050'/></quoteGenerationService></launchSecurity>|" "$out"
+  elif grep -q "<launchSecurity type='tdx'>" "$out" && ! grep -q "quoteGenerationService" "$out"; then
+    sed -i "s|</launchSecurity>|  <quoteGenerationService><SocketAddress type='vsock' cid='2' port='4050'/></quoteGenerationService>\n  </launchSecurity>|" "$out"
   fi
 
   cat "$out"

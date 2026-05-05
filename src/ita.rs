@@ -13,7 +13,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use jsonwebtoken::{Algorithm, DecodingKey, Validation};
+use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
@@ -115,6 +115,7 @@ pub struct Verifier {
     issuer: String,
     http: Client,
     keys: RwLock<HashMap<String, DecodingKey>>,
+    local_key: Option<Vec<u8>>,
 }
 
 impl Verifier {
@@ -124,6 +125,17 @@ impl Verifier {
             issuer,
             http: Client::new(),
             keys: RwLock::new(HashMap::new()),
+            local_key: None,
+        })
+    }
+
+    pub fn new_local(secret: String, issuer: String) -> Arc<Self> {
+        Arc::new(Self {
+            jwks_url: String::new(),
+            issuer,
+            http: Client::new(),
+            keys: RwLock::new(HashMap::new()),
+            local_key: Some(secret.into_bytes()),
         })
     }
 
@@ -131,6 +143,25 @@ impl Verifier {
     pub async fn verify(&self, token: &str) -> Result<Claims> {
         let header = jsonwebtoken::decode_header(token)
             .map_err(|e| Error::BadRequest(format!("ita header: {e}")))?;
+        if let Some(local_key) = &self.local_key {
+            if header.alg != Algorithm::HS256 {
+                return Err(Error::BadRequest(format!(
+                    "local ita alg {:?} not allowed",
+                    header.alg
+                )));
+            }
+            let mut v = Validation::new(Algorithm::HS256);
+            v.set_issuer(&[&self.issuer]);
+            v.leeway = LEEWAY_SECS;
+            v.set_required_spec_claims(&["exp", "iat", "iss"]);
+            let data = jsonwebtoken::decode::<serde_json::Value>(
+                token,
+                &DecodingKey::from_secret(local_key),
+                &v,
+            )
+            .map_err(|e| Error::BadRequest(format!("local ita verify: {e}")))?;
+            return Ok(Claims::from_value(data.claims));
+        }
         if !ALLOWED_ALGS.contains(&header.alg) {
             return Err(Error::BadRequest(format!(
                 "ita alg {:?} not allowed",
@@ -202,6 +233,30 @@ impl Verifier {
     }
 }
 
+pub fn mint_local(issuer: &str, secret: &str, subject: &str) -> Result<String> {
+    let now = chrono::Utc::now().timestamp();
+    let claims = serde_json::json!({
+        "iss": issuer,
+        "sub": subject,
+        "iat": now,
+        "exp": now + 600,
+        "attester_type": "LOCAL",
+        "attester_tcb_status": "LocalPreview",
+        "tdx_mrtd": "local-preview",
+        "tdx_mrsigner": "local-preview",
+        "attester_held_data": subject,
+        "dd_local_attestation": true,
+    });
+    let mut header = Header::new(Algorithm::HS256);
+    header.kid = Some("dd-local-attestation".into());
+    jsonwebtoken::encode(
+        &header,
+        &claims,
+        &EncodingKey::from_secret(secret.as_bytes()),
+    )
+    .map_err(|e| Error::Internal(format!("local ita mint: {e}")))
+}
+
 // ── Convenience for DecodingKey cloning ─────────────────────────────────
 // jsonwebtoken::DecodingKey is Clone in 9.x, so the HashMap<String, DecodingKey>
 // above works directly. (Left as a comment so we notice if that changes.)
@@ -230,6 +285,16 @@ mod tests {
             Error::BadRequest(m) => assert!(m.contains("alg"), "msg: {m}"),
             e => panic!("expected BadRequest, got {e:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn local_mode_accepts_local_hs256() {
+        let token = mint_local("local-issuer", "secret", "vm-1").unwrap();
+        let v = Verifier::new_local("secret".into(), "local-issuer".into());
+        let claims = v.verify(&token).await.unwrap();
+        assert_eq!(claims.attester_type.as_deref(), Some("LOCAL"));
+        assert_eq!(claims.tcb_status.as_deref(), Some("LocalPreview"));
+        assert_eq!(claims.report_data.as_deref(), Some("vm-1"));
     }
 
     #[test]

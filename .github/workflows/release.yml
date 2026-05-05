@@ -30,7 +30,7 @@ on:
         required: false
         default: 'latest'
       ee_tag:
-        description: 'Pin the libvirt base qcow2 to a specific easyenclave release (e.g. v0.3.1 or image-abc123456) for pre-flight testing a candidate EE. Empty = workflow default (prod + preview both pinned to the same v-tag in their with: blocks below).'
+        description: 'Pin the libvirt base qcow2 to a specific easyenclave-mini release (e.g. image-1c6062146153 or mini-image-abc123456) for pre-flight testing a candidate EE Mini. Empty = workflow default.'
         required: false
         default: ''
 
@@ -163,13 +163,9 @@ jobs:
       release_tag: ${{ needs.build.outputs.tag }}
       comment_on_pr: true
       ref: ${{ github.event.pull_request.head.ref }}
-      # Preview used to track the `staging` channel (newest image-*
-      # prerelease on EE main) for early regression signal, but an
-      # unreleasable EE main snapshot blocked every dd PR's CI until
-      # EE shipped a fix. Pin preview to the same tag as prod — one
-      # bump, one PR — so dd development isn't coupled to EE main's
-      # release health. Bump in lockstep with the prod pin below.
-      ee_tag: ${{ inputs.ee_tag || 'v0.3.1' }}
+      # Pin preview to the same mini release as prod — one bump, one PR.
+      # Latest verified mini release as of 2026-05-05.
+      ee_tag: ${{ inputs.ee_tag || 'image-1c6062146153' }}
       owner: devopsdefender
     secrets: inherit
 
@@ -198,11 +194,10 @@ jobs:
       release_tag: ${{ inputs.release_tag || 'latest' }}
       comment_on_pr: false
       ref: main
-      # Production EE base image pin. Bump this (single-line PR) when
-      # we want prod to move to a newer easyenclave release. Static
+      # Production EE Mini base image pin. Bump this (single-line PR)
+      # when we want prod to move to a newer mini release. Static
       # pinning is the whole point — prod should never silently pick
-      # up whatever EE shipped most recently. Preview still tracks
-      # the staging channel (see deploy-preview block above).
-      ee_tag: ${{ inputs.ee_tag || 'v0.3.1' }}
+      # up whatever mini shipped most recently.
+      ee_tag: ${{ inputs.ee_tag || 'image-1c6062146153' }}
       owner: devopsdefender
     secrets: inherit

@@ -17,6 +17,7 @@
 # DD_RELEASE_TAG (optional) — passed positionally as $4.
 
 set -euo pipefail
+export LIBVIRT_DEFAULT_URI="${LIBVIRT_DEFAULT_URI:-qemu:///system}"
 
 ENV_LABEL="${1?usage: dd-relaunch-cp.sh <env> <hostname> [ref] [release-tag]}"
 HOSTNAME="${2?hostname required}"
@@ -29,7 +30,7 @@ export DD_RELEASE_TAG="${4:-${DD_RELEASE_TAG:-latest}}"
 : "${DD_ACCESS_ADMIN_EMAIL?}"
 : "${DD_ITA_API_KEY?}"
 
-cd /home/tdx2/src/dd
+cd "${DD_REPO_ROOT:-/home/tdx2/src/dd}"
 
 # Refresh apps/ from the caller's ref. Limited checkout so unrelated
 # dirty state doesn't block the deploy. Matches the agent path.
@@ -37,7 +38,7 @@ git fetch --quiet origin "$REF"
 git checkout --quiet "origin/$REF" -- apps/
 echo "dd-relaunch-cp: refreshed apps/ from origin/$REF"
 
-# Sync the libvirt base qcow2 from the easyenclave release channel
+# Sync the libvirt base qcow2 from the easyenclave-mini release channel
 # for this env. `production` tracks `stable` (v*); anything else
 # (pr-N, dev) tracks `staging`. `DD_EE_TAG` overrides the channel
 # default for pre-flight-testing a candidate release.

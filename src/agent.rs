@@ -32,6 +32,7 @@ use serde::Deserialize;
 use tokio::sync::RwLock;
 
 use crate::config::Agent as Cfg;
+use crate::config::ItaMode;
 use crate::ee::Ee;
 use crate::error::{Error, Result};
 use crate::gh_oidc;
@@ -104,6 +105,7 @@ pub async fn run() -> Result<()> {
         "agent: EE connected (attestation={})",
         h["attestation_type"].as_str().unwrap_or("?")
     );
+    eprintln!("agent: ITA mode={:?}", cfg.ita.mode);
 
     let initial_token = mint_ita(&cfg, &ee).await?;
     eprintln!("agent: ITA token minted");
@@ -412,6 +414,9 @@ async fn register(cfg: &Cfg, ita_token: &str) -> Result<Bootstrap> {
 /// Mint an Intel-signed TDX attestation JWT. Fatal on any failure —
 /// the agent refuses to start without a valid token.
 async fn mint_ita(cfg: &Cfg, ee: &Ee) -> Result<String> {
+    if cfg.ita.mode == ItaMode::Local {
+        return ita::mint_local(&cfg.ita.issuer, &cfg.ita.api_key, &cfg.common.vm_name);
+    }
     use base64::Engine;
     let nonce = base64::engine::general_purpose::STANDARD.encode(uuid::Uuid::new_v4().as_bytes());
     let quote_b64 = ee.attest(&nonce).await?["quote_b64"]
@@ -504,6 +509,7 @@ async fn health(State(s): State<St>) -> Json<serde_json::Value> {
         "agent_id": s.agent_id,
         "vm_name": s.cfg.common.vm_name,
         "hostname": s.hostname,
+        "ita_mode": s.cfg.ita.mode.as_str(),
         // `owner` / `agent_owner`: strings, principal name only —
         // back-compat for pre-Principal consumers. Structured form
         // (with id and kind) is on the `*_principal` keys below.

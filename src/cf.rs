@@ -684,7 +684,7 @@ pub async fn provision_cp_access(
 ///   - Bypass: `{agent}.{domain}/noise/ws` — Noise_IK-gated in code
 ///     against the CP-trusted paired device pubkey set
 ///   - Bypass: `{label}.{agent}.{domain}` for other labels — workload
-///     URLs are public by default (this is the nvidia-smi exemption).
+///     URLs are public by default.
 ///   - Any existing `*.{agent}.{domain}` app whose label is no longer
 ///     in `workload_labels` is deleted.
 pub async fn provision_agent_access(
@@ -857,8 +857,8 @@ mod tests {
             "pr-144-term.devopsdefender.com"
         );
         assert_eq!(
-            label_hostname("dd-pr-144-agent-abc.devopsdefender.com", "gpu"),
-            "dd-pr-144-agent-abc-gpu.devopsdefender.com"
+            label_hostname("dd-pr-144-agent-abc.devopsdefender.com", "api"),
+            "dd-pr-144-agent-abc-api.devopsdefender.com"
         );
         assert_eq!(
             label_hostname("app.devopsdefender.com", "term"),

@@ -16,11 +16,19 @@ inputs:
     description: 'Git ref whose apps/ tree the host should check out'
     required: true
   ssh-key:
-    description: 'Private SSH key for tdx2@host'
+    description: 'Private SSH key for ssh-user@host'
     required: true
   host:
     description: 'Public host address of the tdx2 node'
     required: true
+  ssh-user:
+    description: 'SSH username on the host'
+    required: false
+    default: tdx2
+  repo-root:
+    description: 'Path to the dd checkout on the host'
+    required: false
+    default: /home/tdx2/src/dd
   cf-api-token:
     description: 'Cloudflare API token (tunnel + DNS + Access scopes)'
     required: true
@@ -40,11 +48,11 @@ inputs:
     description: 'devopsdefender release tag (e.g. pr-abc123, latest)'
     required: true
   ee-channel:
-    description: 'easyenclave release channel to sync the libvirt base qcow2 from (stable | staging)'
+    description: 'easyenclave-mini release channel to sync the libvirt base qcow2 from (stable | staging)'
     required: false
     default: 'staging'
   ee-tag:
-    description: 'Explicit easyenclave release tag override for pre-flight testing a candidate (e.g. image-abc123456). Wins over `ee-channel`.'
+    description: 'Explicit easyenclave-mini release tag override for pre-flight testing a candidate (e.g. image-1c6062146153 or mini-image-abc123456). Wins over `ee-channel`.'
     required: false
     default: ''
   owner:
@@ -69,11 +77,18 @@ runs:
         DD_EE_CHANNEL:          ${{ inputs.ee-channel }}
         DD_EE_TAG:              ${{ inputs.ee-tag }}
         EE_OWNER:               ${{ inputs.owner }}
+        DD_REPO_ROOT:           ${{ inputs.repo-root }}
       with:
         host: ${{ inputs.host }}
-        username: tdx2
+        username: ${{ inputs.ssh-user }}
         key: ${{ inputs.ssh-key }}
-        envs: ENV_LABEL,CP_HOSTNAME,REF,RELEASE_TAG,CLOUDFLARE_API_TOKEN,CLOUDFLARE_ACCOUNT_ID,CLOUDFLARE_ZONE_ID,DD_ACCESS_ADMIN_EMAIL,DD_ITA_API_KEY,DD_EE_CHANNEL,DD_EE_TAG,EE_OWNER
+        envs: ENV_LABEL,CP_HOSTNAME,REF,RELEASE_TAG,CLOUDFLARE_API_TOKEN,CLOUDFLARE_ACCOUNT_ID,CLOUDFLARE_ZONE_ID,DD_ACCESS_ADMIN_EMAIL,DD_ITA_API_KEY,DD_EE_CHANNEL,DD_EE_TAG,EE_OWNER,DD_REPO_ROOT
         script: |
-          /home/tdx2/src/dd/apps/_infra/dd-relaunch-cp.sh \
-            "$ENV_LABEL" "$CP_HOSTNAME" "$REF" "$RELEASE_TAG"
+          export ENV_LABEL CP_HOSTNAME REF RELEASE_TAG
+          export CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID CLOUDFLARE_ZONE_ID
+          export DD_ACCESS_ADMIN_EMAIL DD_ITA_API_KEY DD_EE_CHANNEL DD_EE_TAG EE_OWNER DD_REPO_ROOT
+          if [ ! -d "$DD_REPO_ROOT/.git" ]; then
+            mkdir -p "$(dirname "$DD_REPO_ROOT")"
+            git clone https://github.com/devopsdefender/dd.git "$DD_REPO_ROOT"
+          fi
+          env DD_REPO_ROOT="$DD_REPO_ROOT" CLOUDFLARE_API_TOKEN="$CLOUDFLARE_API_TOKEN" CLOUDFLARE_ACCOUNT_ID="$CLOUDFLARE_ACCOUNT_ID" CLOUDFLARE_ZONE_ID="$CLOUDFLARE_ZONE_ID" DD_ACCESS_ADMIN_EMAIL="$DD_ACCESS_ADMIN_EMAIL" DD_ITA_API_KEY="$DD_ITA_API_KEY" DD_EE_CHANNEL="$DD_EE_CHANNEL" DD_EE_TAG="$DD_EE_TAG" EE_OWNER="$EE_OWNER" "$DD_REPO_ROOT/apps/_infra/dd-relaunch-cp.sh" "$ENV_LABEL" "$CP_HOSTNAME" "$REF" "$RELEASE_TAG"

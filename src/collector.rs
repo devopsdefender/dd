@@ -337,14 +337,14 @@ mod tests {
     fn parses_valid_extra_ingress() {
         let h = serde_json::json!({
             "extra_ingress": [
-                {"hostname_label": "gpu", "port": 8081},
+                {"hostname_label": "api", "port": 8081},
                 {"hostname_label": "web", "port": 9000}
             ]
         });
 
         assert_eq!(
             parse_extra_ingress(&h),
-            Some(vec![("gpu".into(), 8081), ("web".into(), 9000)])
+            Some(vec![("api".into(), 8081), ("web".into(), 9000)])
         );
     }
 
@@ -352,7 +352,7 @@ mod tests {
     fn drops_malformed_extra_ingress_entries() {
         let h = serde_json::json!({
             "extra_ingress": [
-                {"hostname_label": "gpu", "port": 8081},
+                {"hostname_label": "api", "port": 8081},
                 {"hostname_label": "", "port": 8082},
                 {"hostname_label": "bad-zero", "port": 0},
                 {"hostname_label": "bad-wide", "port": 70000},
@@ -360,6 +360,6 @@ mod tests {
             ]
         });
 
-        assert_eq!(parse_extra_ingress(&h), Some(vec![("gpu".into(), 8081)]));
+        assert_eq!(parse_extra_ingress(&h), Some(vec![("api".into(), 8081)]));
     }
 }

@@ -90,13 +90,15 @@ impl Common {
     }
 }
 
-/// ITA (Intel Trust Authority) configuration. All fields required —
-/// attestation is mandatory in both modes.
+/// ITA (Intel Trust Authority) configuration. Production uses Intel ITA.
+/// Local PR previews may use a signed local token so they can test the
+/// Mini boot/deploy path when the host's Intel PCCS collateral is absent.
 #[derive(Clone)]
 pub struct Ita {
+    pub mode: ItaMode,
     /// URL for Intel's ITA mint endpoint, e.g. `https://api.trustauthority.intel.com`.
     pub base_url: String,
-    /// API key for the mint endpoint.
+    /// API key for Intel mode; shared signing key for local mode.
     pub api_key: String,
     /// JWKS endpoint for verifier.
     pub jwks_url: String,
@@ -104,15 +106,52 @@ pub struct Ita {
     pub issuer: String,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ItaMode {
+    Intel,
+    Local,
+}
+
+impl ItaMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Intel => "intel",
+            Self::Local => "local",
+        }
+    }
+}
+
 impl Ita {
-    pub fn from_env() -> Result<Self> {
+    pub fn from_env(env_label: &str) -> Result<Self> {
         let get = |k: &str| {
             std::env::var(k)
                 .ok()
                 .filter(|s| !s.is_empty())
                 .ok_or_else(|| Error::Internal(format!("{k} required")))
         };
+        let mode = match std::env::var("DD_ITA_MODE")
+            .unwrap_or_else(|_| "intel".into())
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "" | "intel" => ItaMode::Intel,
+            "local" => {
+                if env_label == "production" || env_label == "staging" {
+                    return Err(Error::Internal(
+                        "DD_ITA_MODE=local is not allowed for production or staging".into(),
+                    ));
+                }
+                ItaMode::Local
+            }
+            other => {
+                return Err(Error::Internal(format!(
+                    "DD_ITA_MODE must be intel or local, got {other}"
+                )))
+            }
+        };
         Ok(Self {
+            mode,
             base_url: get("DD_ITA_BASE_URL")?,
             api_key: get("DD_ITA_API_KEY")?,
             jwks_url: get("DD_ITA_JWKS_URL")?,
@@ -189,13 +228,14 @@ impl Cp {
         let noise_key_path = std::env::var("DD_NOISE_KEY_PATH")
             .unwrap_or_else(|_| "/run/devopsdefender/noise.key".into())
             .into();
+        let ita = Ita::from_env(&common.env_label)?;
         Ok(Self {
             common,
             cf,
             access,
             hostname,
             scrape_interval_secs,
-            ita: Ita::from_env()?,
+            ita,
             devices_path,
             noise_key_path,
         })
@@ -212,7 +252,7 @@ pub struct Agent {
     pub ita: Ita,
     /// Extra cloudflared ingress rules requested at register time,
     /// parsed from `DD_EXTRA_INGRESS` (a comma-separated list of
-    /// `label:port` pairs, e.g. `gpu:8081,web:9000`). The boot-workload
+    /// `label:port` pairs, e.g. `api:8081,web:9000`). The boot-workload
     /// builder (`apps/_infra/local-agents.sh`) collects these from
     /// `expose` hints on individual workload specs. Empty is fine —
     /// the agent just gets the default dashboard rule.
@@ -238,11 +278,12 @@ impl Agent {
             .unwrap_or_else(|_| "/var/lib/easyenclave/agent.sock".into());
         let extra_ingress = parse_extra_ingress()?;
         let confidential = parse_truthy("DD_CONFIDENTIAL");
+        let ita = Ita::from_env(&common.env_label)?;
         Ok(Self {
             common,
             cp_url,
             ee_socket,
-            ita: Ita::from_env()?,
+            ita,
             extra_ingress,
             confidential,
         })
@@ -264,7 +305,7 @@ fn parse_truthy(key: &str) -> bool {
 }
 
 /// Parse `DD_EXTRA_INGRESS` as a comma-separated list of `label:port`
-/// pairs — e.g. `"gpu:8081"` or `"gpu:8081,web:9000"`. Chosen over
+/// pairs — e.g. `"api:8081"` or `"api:8081,web:9000"`. Chosen over
 /// JSON to sidestep `"`-escaping when the value is substituted into
 /// the dd-agent workload template's `"DD_EXTRA_INGRESS=${…}"` env
 /// entry (embedded quotes would close the outer JSON string early).
@@ -330,34 +371,34 @@ mod tests {
 
     #[test]
     fn single_entry() {
-        assert_eq!(parse("gpu:8081").unwrap(), vec![("gpu".into(), 8081)]);
+        assert_eq!(parse("api:8081").unwrap(), vec![("api".into(), 8081)]);
     }
 
     #[test]
     fn multiple_entries() {
         assert_eq!(
-            parse("gpu:8081,web:9000").unwrap(),
-            vec![("gpu".into(), 8081), ("web".into(), 9000)]
+            parse("api:8081,web:9000").unwrap(),
+            vec![("api".into(), 8081), ("web".into(), 9000)]
         );
     }
 
     #[test]
     fn tolerates_whitespace_and_trailing_commas() {
         assert_eq!(
-            parse("gpu:8081, , web:9000,").unwrap(),
-            vec![("gpu".into(), 8081), ("web".into(), 9000)]
+            parse("api:8081, , web:9000,").unwrap(),
+            vec![("api".into(), 8081), ("web".into(), 9000)]
         );
     }
 
     #[test]
     fn bad_port_errors() {
-        assert!(parse("gpu:notaport").is_err());
-        assert!(parse("gpu:99999").is_err()); // > u16
+        assert!(parse("api:notaport").is_err());
+        assert!(parse("api:99999").is_err()); // > u16
     }
 
     #[test]
     fn missing_colon_errors() {
-        assert!(parse("gpu").is_err());
+        assert!(parse("api").is_err());
     }
 
     #[test]

@@ -63,7 +63,7 @@ on:
         type: string
         default: ssh
       ee_tag:
-        description: 'Explicit easyenclave release tag to pin this deploy to (pre-flight-test a candidate before promoting staging→stable). Empty = default to channel resolved from env.'
+        description: 'Explicit easyenclave-mini release tag to pin this deploy to (pre-flight-test a candidate before promoting staging→stable). Empty = default to channel resolved from env.'
         required: false
         type: string
         default: ''
@@ -99,20 +99,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Map dd env → easyenclave channel. Prod (CP and local) tracks
-      # `stable` (EE v* tags); everything else (pr-N previews) tracks
-      # `staging` (EE prereleases from main). Keeps dd prod off
-      # in-flight-main EE builds while preview deploys catch EE
-      # regressions early. Applies to both target=gcp (image family
-      # lookup) and target=ssh (release-asset sync on tdx2).
-      - name: Resolve easyenclave channel
+      # Map dd env → easyenclave-mini channel. Prod tracks `stable`
+      # when a stable mini image exists; previews track `staging`.
+      # Applies to both target=gcp (image family lookup) and target=ssh
+      # (release-asset sync on tdx2).
+      - name: Resolve easyenclave-mini channel
         id: ee
         env:
           ENV: ${{ inputs.env }}
         run: |
           case "$ENV" in
-            production) channel=stable;  family=easyenclave-stable  ;;
-            *)          channel=staging; family=easyenclave-staging ;;
+            production) channel=stable;  family=easyenclave-mini-stable  ;;
+            *)          channel=staging; family=easyenclave-mini-staging ;;
           esac
           {
             echo "channel=$channel"
@@ -142,7 +140,9 @@ jobs:
           hostname: ${{ inputs.hostname }}
           ref: ${{ inputs.ref }}
           ssh-key:       ${{ secrets.DD_LOCAL_SSH_KEY }}
-          host:          ${{ secrets.DD_LOCAL_HOST }}
+          host:          ${{ inputs.env == 'production' && secrets.DD_LOCAL_HOST || vars.BAREMETAL_STAGING_HOST }}
+          ssh-user:      ${{ inputs.env == 'production' && 'tdx2' || vars.BAREMETAL_STAGING_USER }}
+          repo-root:     ${{ inputs.env == 'production' && '/home/tdx2/src/dd' || '/home/ubuntu/src/dd' }}
           cf-api-token:  ${{ secrets.DD_CP_CF_API_TOKEN }}
           cf-account-id: ${{ secrets.DD_CP_CF_ACCOUNT_ID }}
           cf-zone-id:    ${{ secrets.DD_CP_CF_ZONE_ID }}
@@ -153,7 +153,7 @@ jobs:
           ee-tag:        ${{ inputs.ee_tag }}
           owner:         ${{ inputs.owner }}
 
-      - name: Create TDX VM (boots from easyenclave, fetches dd from GitHub releases)
+      - name: Create TDX VM (boots from easyenclave-mini, fetches dd from GitHub releases)
         if: inputs.target == 'gcp'
         env:
           GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
@@ -322,7 +322,8 @@ jobs:
         env:
           AGENT_URL: https://${{ inputs.hostname }}
           ENV_LABEL: ${{ inputs.env }}
-          HOST:      ${{ secrets.DD_LOCAL_HOST }}
+          HOST:      ${{ inputs.env == 'production' && secrets.DD_LOCAL_HOST || vars.BAREMETAL_STAGING_HOST }}
+          SSH_USER:  ${{ inputs.env == 'production' && 'tdx2' || vars.BAREMETAL_STAGING_USER }}
           SSH_KEY:   ${{ secrets.DD_LOCAL_SSH_KEY }}
         run: |
           set -uo pipefail
@@ -366,7 +367,7 @@ jobs:
           ssh -i "$key" -T \
               -o StrictHostKeyChecking=accept-new \
               -o ServerAliveInterval=30 \
-              tdx2@"$HOST" \
+              "$SSH_USER@$HOST" \
               "sudo stdbuf -oL tail -n +1 -F /var/log/ee-local-${ENV_LABEL}-cp.log || true" \
             2>&1 | stdbuf -oL sed -u "s/^/  [dd-local-${ENV_LABEL}-cp console] /" \
                  | stdbuf -oL tee -a "$mirror" &
@@ -391,7 +392,7 @@ jobs:
           echo "::error::CP not healthy within 5 minutes (SSH target)"
           exit 1
 
-      - name: Verify NEW VM via TDX attestation
+      - name: Verify NEW VM health / TDX attestation
         env:
           AGENT_URL: https://${{ inputs.hostname }}
         run: |
@@ -408,6 +409,11 @@ jobs:
             CODE=$(echo "$BODY" | tail -n1)
             JSON=$(echo "$BODY" | sed '$d')
             if [ "$CODE" = "200" ]; then
+              ITA_MODE=$(echo "$JSON" | jq -r '.ita_mode // "intel"')
+              if [ "$ITA_MODE" = "local" ]; then
+                echo "NEW VM healthy in local attestation mode — skipping Intel TDX quote check"
+                exit 0
+              fi
               QUOTE_B64=$(echo "$JSON" | jq -r '.noise.quote_b64 // empty')
               if [ -n "$QUOTE_B64" ] && [ "$QUOTE_B64" != "null" ]; then
                 MRTD=$(echo "$QUOTE_B64" | base64 -d \
@@ -515,8 +521,10 @@ jobs:
           kind: ${{ inputs.env == 'production' && 'prod' || 'preview' }}
           url: https://${{ inputs.hostname }}
           ref: ${{ inputs.ref }}
+          host: ${{ inputs.env == 'production' && secrets.DD_LOCAL_HOST || vars.BAREMETAL_STAGING_HOST }}
+          ssh-user: ${{ inputs.env == 'production' && 'tdx2' || vars.BAREMETAL_STAGING_USER }}
+          repo-root: ${{ inputs.env == 'production' && '/home/tdx2/src/dd' || '/home/ubuntu/src/dd' }}
           ssh-key: ${{ secrets.DD_LOCAL_SSH_KEY }}
-          host: ${{ secrets.DD_LOCAL_HOST }}
           ita-api-key: ${{ secrets.DD_ITA_API_KEY }}
           release-tag: ${{ inputs.release_tag }}
           ee-channel: ${{ steps.ee.outputs.channel }}
@@ -526,9 +534,7 @@ jobs:
       # Preview only: deploy hello-world as the end-to-end canary.
       # Exercises the full GH-OIDC auth path (mint → agent verify
       # against GitHub JWKS → repository_owner check) AND proves
-      # podman bootstrapped correctly on the agent. Prod uses
-      # web-nvidia-smi (below) for the same verification, so running
-      # hello-world there too is just noise.
+      # podman bootstrapped correctly on the agent.
       #
       # `continue-on-error` while an outstanding bug is investigated:
       # `POST /deploy` consistently returns 2xx with empty body from
@@ -545,24 +551,6 @@ jobs:
           cp-url: https://${{ inputs.hostname }}
           vm-name: dd-local-preview
           workload: apps/hello-world/workload.json
-
-      # Prod only: redeploy the nvidia-smi demo every main-push so
-      # `<agent-base>-gpu.devopsdefender.com` stays live and pinned to
-      # the freshly-booted prod agent. Preview agents have no GPU, so
-      # the workload's podman run with /dev/nvidia* devices would fail.
-      # `continue-on-error`: same bug as above.
-      - name: Deploy web-nvidia-smi via GH OIDC
-        if: inputs.relaunch_agent && inputs.env == 'production'
-        continue-on-error: true
-        uses: ./.github/actions/dd-deploy
-        with:
-          cp-url: https://${{ inputs.hostname }}
-          vm-name: dd-local-prod
-          workload: apps/web-nvidia-smi/workload.json
-          # nvidia-smi's container needs a `podman pull` + apt-get
-          # install of netcat in the first run — give it headroom
-          # past the default 120s so the /health poll catches it.
-          wait-for-deployment-seconds: '300'
 
       # Runs last so the relaunch cascade's own STONITH wave (old agent
       # re-registers → old CP's CF tunnel is deleted → old CP poweroffs)
