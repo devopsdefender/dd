@@ -17,6 +17,7 @@
 # DD_RELEASE_TAG (optional) — passed positionally as $4.
 
 set -euo pipefail
+export LIBVIRT_DEFAULT_URI="${LIBVIRT_DEFAULT_URI:-qemu:///system}"
 
 ENV_LABEL="${1?usage: dd-relaunch-cp.sh <env> <hostname> [ref] [release-tag]}"
 HOSTNAME="${2?hostname required}"
