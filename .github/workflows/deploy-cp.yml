@@ -139,7 +139,7 @@ jobs:
           env: ${{ inputs.env }}
           hostname: ${{ inputs.hostname }}
           ref: ${{ inputs.ref }}
-          ssh-key:       ${{ inputs.env == 'production' && secrets.DD_LOCAL_SSH_KEY || secrets.BAREMETAL_SSH_KEY }}
+          ssh-key:       ${{ secrets.DD_LOCAL_SSH_KEY }}
           host:          ${{ inputs.env == 'production' && secrets.DD_LOCAL_HOST || vars.BAREMETAL_STAGING_HOST }}
           ssh-user:      ${{ inputs.env == 'production' && 'tdx2' || vars.BAREMETAL_STAGING_USER }}
           repo-root:     ${{ inputs.env == 'production' && '/home/tdx2/src/dd' || '/home/ubuntu/src/dd' }}
@@ -324,7 +324,7 @@ jobs:
           ENV_LABEL: ${{ inputs.env }}
           HOST:      ${{ inputs.env == 'production' && secrets.DD_LOCAL_HOST || vars.BAREMETAL_STAGING_HOST }}
           SSH_USER:  ${{ inputs.env == 'production' && 'tdx2' || vars.BAREMETAL_STAGING_USER }}
-          SSH_KEY:   ${{ inputs.env == 'production' && secrets.DD_LOCAL_SSH_KEY || secrets.BAREMETAL_SSH_KEY }}
+          SSH_KEY:   ${{ secrets.DD_LOCAL_SSH_KEY }}
         run: |
           set -uo pipefail
           # SSH CP boot fires asynchronously via `virsh start` on the
@@ -519,7 +519,7 @@ jobs:
           host: ${{ inputs.env == 'production' && secrets.DD_LOCAL_HOST || vars.BAREMETAL_STAGING_HOST }}
           ssh-user: ${{ inputs.env == 'production' && 'tdx2' || vars.BAREMETAL_STAGING_USER }}
           repo-root: ${{ inputs.env == 'production' && '/home/tdx2/src/dd' || '/home/ubuntu/src/dd' }}
-          ssh-key: ${{ inputs.env == 'production' && secrets.DD_LOCAL_SSH_KEY || secrets.BAREMETAL_SSH_KEY }}
+          ssh-key: ${{ secrets.DD_LOCAL_SSH_KEY }}
           ita-api-key: ${{ secrets.DD_ITA_API_KEY }}
           release-tag: ${{ inputs.release_tag }}
           ee-channel: ${{ steps.ee.outputs.channel }}
