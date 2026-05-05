@@ -141,8 +141,8 @@ jobs:
           ref: ${{ inputs.ref }}
           ssh-key:       ${{ secrets.DD_LOCAL_SSH_KEY }}
           host:          ${{ inputs.env == 'production' && secrets.DD_LOCAL_HOST || vars.BAREMETAL_STAGING_HOST }}
-          ssh-user:      ${{ inputs.env == 'production' && 'tdx2' || vars.BAREMETAL_STAGING_USER }}
-          repo-root:     ${{ inputs.env == 'production' && '/home/tdx2/src/dd' || '/home/ubuntu/src/dd' }}
+          ssh-user:      tdx2
+          repo-root:     /home/tdx2/src/dd
           cf-api-token:  ${{ secrets.DD_CP_CF_API_TOKEN }}
           cf-account-id: ${{ secrets.DD_CP_CF_ACCOUNT_ID }}
           cf-zone-id:    ${{ secrets.DD_CP_CF_ZONE_ID }}
@@ -323,7 +323,7 @@ jobs:
           AGENT_URL: https://${{ inputs.hostname }}
           ENV_LABEL: ${{ inputs.env }}
           HOST:      ${{ inputs.env == 'production' && secrets.DD_LOCAL_HOST || vars.BAREMETAL_STAGING_HOST }}
-          SSH_USER:  ${{ inputs.env == 'production' && 'tdx2' || vars.BAREMETAL_STAGING_USER }}
+          SSH_USER:  tdx2
           SSH_KEY:   ${{ secrets.DD_LOCAL_SSH_KEY }}
         run: |
           set -uo pipefail
@@ -517,8 +517,8 @@ jobs:
           url: https://${{ inputs.hostname }}
           ref: ${{ inputs.ref }}
           host: ${{ inputs.env == 'production' && secrets.DD_LOCAL_HOST || vars.BAREMETAL_STAGING_HOST }}
-          ssh-user: ${{ inputs.env == 'production' && 'tdx2' || vars.BAREMETAL_STAGING_USER }}
-          repo-root: ${{ inputs.env == 'production' && '/home/tdx2/src/dd' || '/home/ubuntu/src/dd' }}
+          ssh-user: tdx2
+          repo-root: /home/tdx2/src/dd
           ssh-key: ${{ secrets.DD_LOCAL_SSH_KEY }}
           ita-api-key: ${{ secrets.DD_ITA_API_KEY }}
           release-tag: ${{ inputs.release_tag }}
