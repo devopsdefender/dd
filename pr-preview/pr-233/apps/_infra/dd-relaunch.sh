@@ -31,7 +31,7 @@ case "$KIND" in
   *) echo "unknown kind: $KIND (want prod|preview)" >&2; exit 2 ;;
 esac
 
-cd /home/tdx2/src/dd
+cd "${DD_REPO_ROOT:-/home/tdx2/src/dd}"
 
 # Refresh the infra scripts + apps/ tree from the caller's ref. Limited
 # checkout so a dirty working tree elsewhere doesn't block the deploy.
