@@ -91,5 +91,14 @@ runs:
             mkdir -p "$(dirname "$DD_REPO_ROOT")"
             git clone https://github.com/devopsdefender/dd.git "$DD_REPO_ROOT"
           fi
+          DD_REPO_ROOT="$DD_REPO_ROOT" \
+          CLOUDFLARE_API_TOKEN="$CLOUDFLARE_API_TOKEN" \
+          CLOUDFLARE_ACCOUNT_ID="$CLOUDFLARE_ACCOUNT_ID" \
+          CLOUDFLARE_ZONE_ID="$CLOUDFLARE_ZONE_ID" \
+          DD_ACCESS_ADMIN_EMAIL="$DD_ACCESS_ADMIN_EMAIL" \
+          DD_ITA_API_KEY="$DD_ITA_API_KEY" \
+          DD_EE_CHANNEL="$DD_EE_CHANNEL" \
+          DD_EE_TAG="$DD_EE_TAG" \
+          EE_OWNER="$EE_OWNER" \
           "$DD_REPO_ROOT/apps/_infra/dd-relaunch-cp.sh" \
             "$ENV_LABEL" "$CP_HOSTNAME" "$REF" "$RELEASE_TAG"
