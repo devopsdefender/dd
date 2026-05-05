@@ -52,6 +52,7 @@
 # After: virsh start dd-local-preview && virsh start dd-local-prod && virsh start dd-local-bot
 
 set -euo pipefail
+export LIBVIRT_DEFAULT_URI="${LIBVIRT_DEFAULT_URI:-qemu:///system}"
 
 PREVIEW_CP="${1-}"
 PROD_CP="${2-}"
@@ -326,16 +327,16 @@ PY
   sed -i -E "s|<currentMemory unit='KiB'>[0-9]+</currentMemory>|<currentMemory unit='KiB'>$mem_kib</currentMemory>|" "$out"
   sed -i -E "s|<vcpu placement='static'>[0-9]+</vcpu>|<vcpu placement='static'>$vcpus</vcpu>|" "$out"
 
-  # Wire QEMU's tdx-guest to the host's QGS unix socket so the guest's
+  # Wire QEMU's tdx-guest to the host's QGS vsock so the guest's
   # TDVMCALL for a quote actually reaches Intel's quote-generation
   # service. Without this, configfs-tsm `outblob` returns 0 bytes →
   # ITA mint POSTs an empty quote → Intel rejects → agent fails to
   # register. Idempotent: skips if the launchSecurity element is
   # already expanded.
   if grep -q "<launchSecurity type='tdx'/>" "$out"; then
-    sed -i "s|<launchSecurity type='tdx'/>|<launchSecurity type='tdx'><policy>0x10000000</policy><quoteGenerationService path='/var/run/tdx-qgs/qgs.socket'/></launchSecurity>|" "$out"
+    sed -i "s|<launchSecurity type='tdx'/>|<launchSecurity type='tdx'><policy>0x10000000</policy><quoteGenerationService><SocketAddress type='vsock' cid='2' port='4050'/></quoteGenerationService></launchSecurity>|" "$out"
   elif grep -q "<launchSecurity type='tdx'>" "$out" && ! grep -q "quoteGenerationService" "$out"; then
-    sed -i "s|</launchSecurity>|  <quoteGenerationService path='/var/run/tdx-qgs/qgs.socket'/>\n  </launchSecurity>|" "$out"
+    sed -i "s|</launchSecurity>|  <quoteGenerationService><SocketAddress type='vsock' cid='2' port='4050'/></quoteGenerationService>\n  </launchSecurity>|" "$out"
   fi
 
   # Strip any inherited passthrough devices from the base domain.

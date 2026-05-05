@@ -16,6 +16,7 @@
 # for subsequent machine-to-machine calls.
 
 set -euo pipefail
+export LIBVIRT_DEFAULT_URI="${LIBVIRT_DEFAULT_URI:-qemu:///system}"
 
 KIND="${1?usage: dd-relaunch.sh <prod|preview> <cp-url> [ref] [release-tag]}"
 CP="${2?cp url required}"
