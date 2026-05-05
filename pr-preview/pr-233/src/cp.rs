@@ -193,18 +193,31 @@ pub async fn run() -> Result<()> {
     // also carries the Noise pre-handshake quote + pubkey (the former
     // `/attest` — now inlined to save a bootstrap round-trip).
     let cp_labels: Vec<String> = cp_extras.iter().map(|(l, _)| l.clone()).collect();
-    if let Err(e) = cf::provision_cp_access(
-        &http,
-        &cfg.cf,
-        &cfg.common.env_label,
-        &cfg.hostname,
-        &cfg.common.owner,
-        &cfg.access.admin_email,
-        &cp_labels,
-    )
-    .await
-    {
-        eprintln!("cp: CF Access provisioning failed: {e}");
+    let mut access_ready = false;
+    for attempt in 1..=5 {
+        match cf::provision_cp_access(
+            &http,
+            &cfg.cf,
+            &cfg.common.env_label,
+            &cfg.hostname,
+            &cfg.common.owner,
+            &cfg.access.admin_email,
+            &cp_labels,
+        )
+        .await
+        {
+            Ok(()) => {
+                access_ready = true;
+                break;
+            }
+            Err(e) => {
+                eprintln!("cp: CF Access provisioning attempt {attempt}/5 failed: {e}");
+                tokio::time::sleep(Duration::from_secs(5 * attempt)).await;
+            }
+        }
+    }
+    if !access_ready {
+        eprintln!("cp: CF Access provisioning failed after retries");
         stonith::poweroff();
     }
     eprintln!("cp: CF Access ready");
