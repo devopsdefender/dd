@@ -164,6 +164,14 @@ render_domain_xml() {
   sed -i "s|$IMG_DIR/$BASE_DOMAIN.qcow2|$IMG_DIR/$VM.qcow2|g" "$out"
   sed -i "s|$IMG_DIR/$BASE_DOMAIN-config.iso|$IMG_DIR/$VM-config.iso|g" "$out"
   sed -i "s|/var/log/ee-local\\.log|/var/log/ee-local-$NAME.log|g" "$out"
+  sed -i "s|<model type='e1000e'/>|<model type='virtio'/>|g" "$out"
+
+  # The local-tdx-qcow2 UKI is intentionally unsigned; this host's
+  # OVMF.tdx.fd rejects it with UEFI "Access Denied". Use the non-secure
+  # TDVF build when present while keeping launchSecurity type=tdx below.
+  if [ -r /usr/share/ovmf/OVMF.fd ]; then
+    sed -i -E "s|<loader([^>]*)>/usr/share/ovmf/OVMF\\.tdx\\.fd</loader>|<loader\\1>/usr/share/ovmf/OVMF.fd</loader>|" "$out"
+  fi
 
   # CP sizing.
   local mem_kib=16777216   # 16 GiB
