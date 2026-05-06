@@ -525,7 +525,8 @@ async fn ensure_bypass_app(http: &Client, cf: &CfCreds, name: &str, domain: &str
 /// - `term` — legacy ttyd subdomain (kept admin-gated for older deploys).
 /// - `block` — ttyd workload; exposing it without auth is the same
 ///   "free shell for the internet" risk.
-const ADMIN_LABELS: &[&str] = &["term", "block"];
+/// - `shell` — dd-shell multi-session shell service.
+const ADMIN_LABELS: &[&str] = &["term", "block", "shell"];
 
 fn is_admin_label(label: &str) -> bool {
     ADMIN_LABELS.contains(&label)
