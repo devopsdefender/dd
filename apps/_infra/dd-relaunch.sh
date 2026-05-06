@@ -54,6 +54,7 @@ case "$KIND" in
   preview) export DD_EE_CHANNEL="${DD_EE_CHANNEL:-staging}" ;;
 esac
 sync_base /var/lib/libvirt/images/easyenclave-local.qcow2
+ensure_base_domain /var/lib/libvirt/images/easyenclave-local.qcow2 easyenclave-local
 
 vm="dd-local-$KIND"
 overlay="/var/lib/libvirt/images/$vm.qcow2"

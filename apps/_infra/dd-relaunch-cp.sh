@@ -49,6 +49,7 @@ case "$ENV_LABEL" in
   *)          export DD_EE_CHANNEL="${DD_EE_CHANNEL:-staging}" ;;
 esac
 sync_base /var/lib/libvirt/images/easyenclave-local.qcow2
+ensure_base_domain /var/lib/libvirt/images/easyenclave-local.qcow2 easyenclave-local
 
 VM="dd-local-$ENV_LABEL-cp"
 

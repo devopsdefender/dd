@@ -41,6 +41,69 @@ qemu_owner() {
   printf '%s:%s\n' "${user:-libvirt-qemu}" "${group:-kvm}"
 }
 
+ensure_base_domain() {
+  local base="${1:?usage: ensure_base_domain <path-to-base-qcow2> [domain-name]}"
+  local domain="${2:-easyenclave-local}"
+  local img_dir config tmp loader owner
+
+  if virsh dominfo "$domain" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  [ -r "$base" ] || {
+    echo "ee-sync: missing base image $base; cannot define $domain" >&2
+    return 1
+  }
+  command -v virt-install >/dev/null || {
+    echo "ee-sync: virt-install required to define missing $domain template" >&2
+    return 1
+  }
+
+  img_dir="$(dirname "$base")"
+  config="$img_dir/$domain-config.iso"
+  if [ ! -f "$config" ]; then
+    tmp=$(mktemp -d)
+    {
+      echo "EE_OWNER=bootstrap"
+      echo "EE_BOOT_WORKLOADS=[]"
+    } > "$tmp/agent.env"
+    truncate -s 4M "$config"
+    mkfs.ext4 -q -O ^has_journal -d "$tmp" "$config"
+    rm -rf "$tmp"
+  fi
+
+  owner=$(qemu_owner)
+  chown "$owner" "$base" "$config" 2>/dev/null || chmod 0644 "$base" "$config" 2>/dev/null || true
+
+  for loader in /usr/share/ovmf/OVMF.fd /usr/share/ovmf/OVMF.tdx.fd /usr/share/OVMF/OVMF_CODE.fd; do
+    [ -r "$loader" ] && break
+  done
+  [ -r "$loader" ] || {
+    echo "ee-sync: no readable OVMF firmware found for $domain" >&2
+    return 1
+  }
+
+  echo "ee-sync: defining missing libvirt template $domain from $base"
+  virt-install \
+    --connect "${LIBVIRT_DEFAULT_URI:-qemu:///system}" \
+    --name "$domain" \
+    --memory 16384 \
+    --vcpus 4 \
+    --cpu host-passthrough \
+    --import \
+    --disk "path=$base,format=qcow2,bus=virtio" \
+    --disk "path=$config,device=cdrom" \
+    --network "network=default,model=virtio" \
+    --graphics none \
+    --console "pty,target_type=serial,log.file=/var/log/ee-local.log,log.append=on" \
+    --boot "loader=$loader,loader.readonly=yes,loader.type=pflash" \
+    --launchSecurity type=tdx \
+    --osinfo detect=on,require=off \
+    --noautoconsole \
+    --print-xml \
+    | virsh define /dev/stdin >/dev/null
+}
+
 sync_base() {
   local base="${1:?usage: sync_base <path-to-base-qcow2>}"
   local channel="${DD_EE_CHANNEL:-staging}"
