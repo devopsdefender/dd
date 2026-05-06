@@ -198,6 +198,19 @@ x = re.sub(r"\s*<tpm[^>]*>.*?</tpm>\n?", "", x, flags=re.DOTALL)
 with open(p, "w") as f: f.write(x)
 PY
 
+  # TDX guests cannot run with SMM enabled. Some libvirt UEFI templates
+  # add `<smm state='on'/>`; force it off in the rendered VM XML.
+  python3 - "$out" <<'PY'
+import re, sys
+p = sys.argv[1]
+with open(p) as f: x = f.read()
+if re.search(r"<smm\b[^>]*/>", x):
+    x = re.sub(r"<smm\b[^>]*/>", "<smm state='off'/>", x, count=1)
+else:
+    x = re.sub(r"(<features>\n)", r"\1    <smm state='off'/>\n", x, count=1)
+with open(p, "w") as f: f.write(x)
+PY
+
   # Wire QEMU's tdx-guest to host QGS over vsock — same treatment
   # local-agents.sh does so ITA quotes work inside the CP VM. Must use
   # libvirt's schema-valid form from Canonical's TDX templates. The earlier

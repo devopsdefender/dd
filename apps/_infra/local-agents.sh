@@ -343,6 +343,19 @@ PY
   sed -i -E "s|<currentMemory unit='KiB'>[0-9]+</currentMemory>|<currentMemory unit='KiB'>$mem_kib</currentMemory>|" "$out"
   sed -i -E "s|<vcpu placement='static'>[0-9]+</vcpu>|<vcpu placement='static'>$vcpus</vcpu>|" "$out"
 
+  # TDX guests cannot run with SMM enabled. Some libvirt UEFI templates
+  # add `<smm state='on'/>`; force it off in the rendered VM XML.
+  python3 - "$out" <<'PY'
+import re, sys
+p = sys.argv[1]
+with open(p) as f: x = f.read()
+if re.search(r"<smm\b[^>]*/>", x):
+    x = re.sub(r"<smm\b[^>]*/>", "<smm state='off'/>", x, count=1)
+else:
+    x = re.sub(r"(<features>\n)", r"\1    <smm state='off'/>\n", x, count=1)
+with open(p, "w") as f: f.write(x)
+PY
+
   # Wire QEMU's tdx-guest to the host's QGS vsock so the guest's
   # TDVMCALL for a quote actually reaches Intel's quote-generation
   # service. Without this, configfs-tsm `outblob` returns 0 bytes →
