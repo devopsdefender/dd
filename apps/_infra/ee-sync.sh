@@ -97,7 +97,7 @@ ensure_base_domain() {
     --graphics none \
     --console "pty,target_type=serial,log.file=/var/log/ee-local.log,log.append=on" \
     --boot "loader=$loader,loader.readonly=yes,loader.type=pflash" \
-    --launchSecurity type=tdx \
+    --launchSecurity type=tdx,policy=0x10000000 \
     --osinfo detect=on,require=off \
     --check path_in_use=off \
     --noautoconsole \
