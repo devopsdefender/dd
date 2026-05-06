@@ -302,6 +302,25 @@ render_domain_xml() {
   sed -i "s|$IMG_DIR/$BASE_DOMAIN.qcow2|$IMG_DIR/dd-local-$name.qcow2|g" "$out"
   sed -i "s|$IMG_DIR/$BASE_DOMAIN-config.iso|$IMG_DIR/dd-local-$name-config.iso|g" "$out"
 
+  # easyenclave init probes the config volume at /dev/vdb or /dev/sdb.
+  # Attach it as a virtio disk instead of inheriting the base template's
+  # SATA CD-ROM shape. The workload disk below remains /dev/vdc.
+  python3 - "$out" "$IMG_DIR/dd-local-$name-config.iso" <<'PY'
+import re, sys
+p, config = sys.argv[1], sys.argv[2]
+with open(p) as f: x = f.read()
+pattern = re.compile(r"\s*<disk\b[^>]*>\s*(?:(?!</disk>).)*?" + re.escape(config) + r".*?</disk>\n?", re.DOTALL)
+replacement = f"""    <disk type='file' device='disk'>
+      <driver name='qemu' type='raw'/>
+      <source file='{config}'/>
+      <target dev='vdb' bus='virtio'/>
+      <readonly/>
+    </disk>
+"""
+x = pattern.sub("\n" + replacement, x, count=1)
+with open(p, "w") as f: f.write(x)
+PY
+
   # Inject the workload disk as /dev/vdc right after the config iso
   # (vdb). podman-bootstrap waits for a `mountpoint` at
   # /data — mount-data satisfies that from
