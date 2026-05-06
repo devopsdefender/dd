@@ -44,10 +44,15 @@ qemu_owner() {
 ensure_base_domain() {
   local base="${1:?usage: ensure_base_domain <path-to-base-qcow2> [domain-name]}"
   local domain="${2:-easyenclave-local}"
-  local img_dir config tmp loader owner
+  local img_dir config tmp owner
 
   if virsh dominfo "$domain" >/dev/null 2>&1; then
-    return 0
+    if virsh dumpxml "$domain" 2>/dev/null | grep -q '/usr/share/ovmf/OVMF\.fd'; then
+      echo "ee-sync: redefining $domain template to fix OVMF var-store loader"
+      virsh undefine "$domain" --managed-save --snapshots-metadata 2>/dev/null || true
+    else
+      return 0
+    fi
   fi
 
   [ -r "$base" ] || {
@@ -75,14 +80,6 @@ ensure_base_domain() {
   owner=$(qemu_owner)
   chown "$owner" "$base" "$config" 2>/dev/null || chmod 0644 "$base" "$config" 2>/dev/null || true
 
-  for loader in /usr/share/ovmf/OVMF.fd /usr/share/ovmf/OVMF.tdx.fd /usr/share/OVMF/OVMF_CODE.fd; do
-    [ -r "$loader" ] && break
-  done
-  [ -r "$loader" ] || {
-    echo "ee-sync: no readable OVMF firmware found for $domain" >&2
-    return 1
-  }
-
   echo "ee-sync: defining missing libvirt template $domain from $base"
   virt-install \
     --connect "${LIBVIRT_DEFAULT_URI:-qemu:///system}" \
@@ -98,7 +95,7 @@ ensure_base_domain() {
     --network "network=default,model=virtio" \
     --graphics none \
     --console "pty,target_type=serial,log.file=/var/log/ee-local.log,log.append=on" \
-    --boot "loader=$loader,loader.readonly=yes,loader.type=pflash" \
+    --boot uefi \
     --launchSecurity type=tdx,policy=0x10000000 \
     --osinfo detect=on,require=off \
     --check path_in_use=off \
