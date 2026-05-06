@@ -412,9 +412,29 @@ async fn find_app_by_domain(
     Ok(resp["result"].as_array().and_then(|items| {
         items
             .iter()
-            .find(|a| a["domain"].as_str() == Some(domain))
+            .find(|a| access_app_matches_domain(a, domain))
             .cloned()
     }))
+}
+
+fn access_app_matches_domain(app: &serde_json::Value, domain: &str) -> bool {
+    if app["domain"].as_str() == Some(domain) {
+        return true;
+    }
+    if app["destinations"].as_array().is_some_and(|items| {
+        items
+            .iter()
+            .any(|d| d["type"].as_str() == Some("public") && d["uri"].as_str() == Some(domain))
+    }) {
+        return true;
+    }
+    app["self_hosted_domains"].as_array().is_some_and(|items| {
+        items.iter().any(|d| {
+            d.as_str() == Some(domain)
+                || d["domain"].as_str() == Some(domain)
+                || d["uri"].as_str() == Some(domain)
+        })
+    })
 }
 
 /// Build the human-facing CF Access policy used for the CP root and
@@ -477,6 +497,12 @@ async fn ensure_app(
     let body = serde_json::json!({
         "name": name,
         "domain": domain,
+        "destinations": [
+            {
+                "type": "public",
+                "uri": domain,
+            }
+        ],
         "type": "self_hosted",
         "session_duration": "24h",
         "app_launcher_visible": false,
@@ -870,5 +896,28 @@ mod tests {
     #[test]
     fn label_hostname_handles_dotless_hostname() {
         assert_eq!(label_hostname("localhost", "term"), "localhost-term");
+    }
+
+    #[test]
+    fn access_app_matches_primary_domain() {
+        let app = serde_json::json!({
+            "domain": "agent.example.com/health",
+            "type": "self_hosted",
+        });
+        assert!(access_app_matches_domain(&app, "agent.example.com/health"));
+        assert!(!access_app_matches_domain(&app, "agent.example.com/deploy"));
+    }
+
+    #[test]
+    fn access_app_matches_public_destination() {
+        let app = serde_json::json!({
+            "domain": "agent.example.com",
+            "destinations": [
+                { "type": "public", "uri": "agent.example.com/health" },
+                { "type": "private", "hostname": "agent.internal" }
+            ],
+        });
+        assert!(access_app_matches_domain(&app, "agent.example.com/health"));
+        assert!(!access_app_matches_domain(&app, "agent.example.com/deploy"));
     }
 }
