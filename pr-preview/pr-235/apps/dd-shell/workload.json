@@ -4,7 +4,7 @@
   "env": [
     "DD_MODE=shell",
     "DD_SHELL_PORT=7682",
-    "DD_SHELL_DIR=/data/dd-shell"
+    "DD_SHELL_DIR=/tmp/dd-shell"
   ],
   "cmd": ["devopsdefender", "shell"]
 }
