@@ -215,6 +215,23 @@ PY
   cat "$out"
 }
 
+undefine_domain() {
+  local vm="$1"
+
+  virsh destroy "$vm" 2>/dev/null || true
+  virsh dominfo "$vm" >/dev/null 2>&1 || return 0
+
+  virsh undefine "$vm" --managed-save --snapshots-metadata --nvram 2>/dev/null \
+    || virsh undefine "$vm" --managed-save --snapshots-metadata 2>/dev/null \
+    || virsh undefine "$vm" 2>/dev/null \
+    || true
+
+  if virsh dominfo "$vm" >/dev/null 2>&1; then
+    echo "failed to undefine existing libvirt domain '$vm'" >&2
+    exit 1
+  fi
+}
+
 echo "== $VM → https://$HOSTNAME (env=$ENV_LABEL) =="
 build_overlay
 build_config_iso
@@ -222,8 +239,7 @@ xml=$(render_domain_xml)
 # Destroy any previous instance. rm on /var/log needs sudo (root-owned
 # by libvirt); || true so a missing file or permission denial doesn't
 # fail the deploy — libvirt will overwrite on domain start anyway.
-virsh destroy "$VM" 2>/dev/null || true
-virsh undefine "$VM" --managed-save --snapshots-metadata 2>/dev/null || true
+undefine_domain "$VM"
 sudo rm -f "/var/log/ee-local-$NAME.log" 2>/dev/null || true
 echo "$xml" | virsh define /dev/stdin >/dev/null
 echo "  defined $VM"

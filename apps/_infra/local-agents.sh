@@ -368,6 +368,23 @@ PY
   echo "$out"
 }
 
+undefine_domain() {
+  local vm="$1"
+
+  virsh destroy "$vm" 2>/dev/null || true
+  virsh dominfo "$vm" >/dev/null 2>&1 || return 0
+
+  virsh undefine "$vm" --managed-save --snapshots-metadata --nvram 2>/dev/null \
+    || virsh undefine "$vm" --managed-save --snapshots-metadata 2>/dev/null \
+    || virsh undefine "$vm" 2>/dev/null \
+    || true
+
+  if virsh dominfo "$vm" >/dev/null 2>&1; then
+    echo "failed to undefine existing libvirt domain '$vm'" >&2
+    exit 1
+  fi
+}
+
 define_agent() {
   # $1=name, $2=cp_url
   local name="$1" cp="$2"
@@ -382,8 +399,7 @@ define_agent() {
   build_config_iso "$name" "$cp" "$env_label"
   local xml
   xml=$(render_domain_xml "$name")
-  virsh destroy "dd-local-$name" 2>/dev/null || true
-  virsh undefine "dd-local-$name" --managed-save --snapshots-metadata 2>/dev/null || true
+  undefine_domain "dd-local-$name"
   virsh define "$xml" >/dev/null
   echo "  defined dd-local-$name (xml at $xml)"
 }
