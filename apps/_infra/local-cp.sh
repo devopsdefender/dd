@@ -188,12 +188,13 @@ render_domain_xml() {
   sed -i -E "s|<currentMemory unit='KiB'>[0-9]+</currentMemory>|<currentMemory unit='KiB'>$mem_kib</currentMemory>|" "$out"
   sed -i -E "s|<vcpu placement='static'>[0-9]+</vcpu>|<vcpu placement='static'>$vcpus</vcpu>|" "$out"
 
-  # Remove any inherited passthrough devices from the base domain.
+  # Remove any inherited passthrough / TPM devices from the base domain.
   python3 - "$out" <<'PY'
 import re, sys
 p = sys.argv[1]
 with open(p) as f: x = f.read()
 x = re.sub(r"\s*<hostdev[^>]*>.*?</hostdev>\n?", "", x, flags=re.DOTALL)
+x = re.sub(r"\s*<tpm[^>]*>.*?</tpm>\n?", "", x, flags=re.DOTALL)
 with open(p, "w") as f: f.write(x)
 PY
 

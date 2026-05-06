@@ -360,6 +360,10 @@ PY
        /<hostdev /{skip=1}
        !skip{print}
        /<\/hostdev>/{skip=0}' "$out" > "$out.tmp" && mv "$out.tmp" "$out"
+  awk 'BEGIN{skip=0}
+       /<tpm/{skip=1}
+       !skip{print}
+       /<\/tpm>/{skip=0}' "$out" > "$out.tmp" && mv "$out.tmp" "$out"
 
   echo "$out"
 }
