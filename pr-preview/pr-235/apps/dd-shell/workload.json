@@ -6,5 +6,8 @@
     "DD_SHELL_PORT=7682",
     "DD_SHELL_DIR=/tmp/dd-shell"
   ],
-  "cmd": ["devopsdefender", "shell"]
+  "cmd": [
+    "/bin/busybox", "sh", "-c",
+    "set -e; until [ -x /var/lib/easyenclave/bin/devopsdefender ]; do sleep 1; done; sleep 5; cp /var/lib/easyenclave/bin/devopsdefender /tmp/dd-shell-bin; chmod +x /tmp/dd-shell-bin; exec /tmp/dd-shell-bin shell"
+  ]
 }
