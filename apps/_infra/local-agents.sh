@@ -302,6 +302,25 @@ render_domain_xml() {
   sed -i "s|$IMG_DIR/$BASE_DOMAIN.qcow2|$IMG_DIR/dd-local-$name.qcow2|g" "$out"
   sed -i "s|$IMG_DIR/$BASE_DOMAIN-config.iso|$IMG_DIR/dd-local-$name-config.iso|g" "$out"
 
+  # easyenclave init probes the config volume at /dev/vdb or /dev/sdb.
+  # Attach it as a virtio disk instead of inheriting the base template's
+  # SATA CD-ROM shape. The workload disk below remains /dev/vdc.
+  python3 - "$out" "$IMG_DIR/dd-local-$name-config.iso" <<'PY'
+import re, sys
+p, config = sys.argv[1], sys.argv[2]
+with open(p) as f: x = f.read()
+pattern = re.compile(r"\s*<disk\b[^>]*>\s*(?:(?!</disk>).)*?" + re.escape(config) + r".*?</disk>\n?", re.DOTALL)
+replacement = f"""    <disk type='file' device='disk'>
+      <driver name='qemu' type='raw'/>
+      <source file='{config}'/>
+      <target dev='vdb' bus='virtio'/>
+      <readonly/>
+    </disk>
+"""
+x = pattern.sub("\n" + replacement, x, count=1)
+with open(p, "w") as f: f.write(x)
+PY
+
   # Inject the workload disk as /dev/vdc right after the config iso
   # (vdb). podman-bootstrap waits for a `mountpoint` at
   # /data — mount-data satisfies that from
@@ -329,11 +348,25 @@ PY
   sed -i "s|/var/log/ee-local\\.log|/var/log/ee-local-$name.log|g" "$out"
   sed -i "s|<model type='e1000e'/>|<model type='virtio'/>|g" "$out"
 
-  # The local-tdx-qcow2 UKI is intentionally unsigned; this host's
-  # OVMF.tdx.fd rejects it with UEFI "Access Denied". Use the non-secure
-  # TDVF build when present while keeping launchSecurity type=tdx below.
+  # The local-tdx-qcow2 UKI is intentionally unsigned; this host's secure
+  # boot OVMF rejects it with UEFI "Access Denied". Use the non-secure
+  # ROM loader when present and disable firmware auto-selection below.
   if [ -r /usr/share/ovmf/OVMF.fd ]; then
-    sed -i -E "s|<loader([^>]*)>/usr/share/ovmf/OVMF\\.tdx\\.fd</loader>|<loader\\1>/usr/share/ovmf/OVMF.fd</loader>|" "$out"
+    python3 - "$out" <<'PY'
+import re, sys
+p = sys.argv[1]
+with open(p) as f: x = f.read()
+x = re.sub(r"<os\s+firmware=['\"]efi['\"]>", "<os>", x, count=1)
+x = re.sub(r"\n\s*<firmware>.*?</firmware>", "", x, count=1, flags=re.DOTALL)
+x = re.sub(r"\n\s*<nvram[^>]*>.*?</nvram>", "", x, count=1, flags=re.DOTALL)
+x = re.sub(
+    r"<loader[^>]*>.*?</loader>",
+    "<loader readonly='yes' secure='no' type='rom'>/usr/share/ovmf/OVMF.fd</loader>",
+    x,
+    count=1,
+)
+with open(p, "w") as f: f.write(x)
+PY
   fi
 
   # CPU-only agent sizing.
