@@ -1,0 +1,15 @@
+{
+  "app_name": "dd-shell",
+  "github_release": {
+    "repo": "devopsdefender/dd",
+    "asset": "devopsdefender",
+    "rename": "devopsdefender"
+  },
+  "expose": { "hostname_label": "shell", "port": 7681 },
+  "env": [
+    "DD_MODE=shell",
+    "DD_SHELL_PORT=7681",
+    "DD_SHELL_DIR=/data/dd-shell"
+  ],
+  "cmd": ["devopsdefender", "shell"]
+}
