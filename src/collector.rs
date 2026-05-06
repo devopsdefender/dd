@@ -318,7 +318,7 @@ async fn mark_stale_or_orphan(
     let mut s = store.lock().await;
     if let Some(a) = s.values_mut().find(|a| a.hostname == *host) {
         let age = now.signed_duration_since(a.last_seen).num_seconds();
-        if age > DEAD_THRESHOLD_SECS {
+        if age > DEAD_THRESHOLD_SECS && scrape_failure_is_dead_signal(err) {
             let extras = a.extras.clone();
             a.status = "dead".into();
             orphans.push(Orphan {
@@ -328,6 +328,12 @@ async fn mark_stale_or_orphan(
             });
         } else {
             a.status = "stale".into();
+            if age > DEAD_THRESHOLD_SECS {
+                eprintln!(
+                    "cp: collector: preserving {name} despite old scrape failure: {}",
+                    err.as_deref().unwrap_or("unknown error")
+                );
+            }
         }
     } else if let Some(e) = err {
         eprintln!(
@@ -336,9 +342,25 @@ async fn mark_stale_or_orphan(
     }
 }
 
+fn scrape_failure_is_dead_signal(err: &Option<String>) -> bool {
+    let Some(err) = err.as_deref() else {
+        return false;
+    };
+    !matches!(
+        err,
+        "status 301 Moved Permanently"
+            | "status 302 Found"
+            | "status 303 See Other"
+            | "status 307 Temporary Redirect"
+            | "status 308 Permanent Redirect"
+            | "status 401 Unauthorized"
+            | "status 403 Forbidden"
+    )
+}
+
 #[cfg(test)]
 mod tests {
-    use super::parse_extra_ingress;
+    use super::{parse_extra_ingress, scrape_failure_is_dead_signal};
 
     #[test]
     fn missing_extra_ingress_preserves_existing_state() {
@@ -375,5 +397,27 @@ mod tests {
         });
 
         assert_eq!(parse_extra_ingress(&h), Some(vec![("api".into(), 8081)]));
+    }
+
+    #[test]
+    fn access_policy_scrape_failures_are_not_dead_signals() {
+        for err in [
+            None,
+            Some("status 302 Found".to_string()),
+            Some("status 401 Unauthorized".to_string()),
+            Some("status 403 Forbidden".to_string()),
+        ] {
+            assert!(!scrape_failure_is_dead_signal(&err));
+        }
+    }
+
+    #[test]
+    fn origin_scrape_failures_are_dead_signals() {
+        for err in [
+            Some("status 530 <unknown status code>".to_string()),
+            Some("error sending request".to_string()),
+        ] {
+            assert!(scrape_failure_is_dead_signal(&err));
+        }
     }
 }
