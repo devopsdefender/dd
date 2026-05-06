@@ -516,6 +516,7 @@ jobs:
       # local agent is back online talking to the new CP.
       - name: Relaunch dd-local-${{ inputs.env == 'production' && 'prod' || 'preview' }}
         if: inputs.relaunch_agent
+        timeout-minutes: 15
         uses: ./.github/actions/relaunch-agent
         with:
           kind: ${{ inputs.env == 'production' && 'prod' || 'preview' }}
@@ -530,6 +531,7 @@ jobs:
           ee-channel: ${{ steps.ee.outputs.channel }}
           ee-tag: ${{ inputs.ee_tag }}
           owner: ${{ inputs.owner }}
+          stream-console: 'false'
 
       # Preview only: deploy hello-world as the end-to-end canary.
       # Exercises the full GH-OIDC auth path (mint → agent verify
