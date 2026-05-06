@@ -99,6 +99,7 @@ ensure_base_domain() {
     --boot "loader=$loader,loader.readonly=yes,loader.type=pflash" \
     --launchSecurity type=tdx \
     --osinfo detect=on,require=off \
+    --check path_in_use=off \
     --noautoconsole \
     --print-xml \
     | virsh define /dev/stdin >/dev/null
