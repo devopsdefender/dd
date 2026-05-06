@@ -91,6 +91,7 @@ ensure_base_domain() {
     --vcpus 4 \
     --cpu host-passthrough \
     --machine q35 \
+    --features ioapic.driver=qemu \
     --import \
     --disk "path=$base,format=qcow2,bus=virtio" \
     --disk "path=$config,device=cdrom" \
