@@ -35,8 +35,8 @@ cd "${DD_REPO_ROOT:-/home/tdx2/src/dd}"
 # Refresh apps/ from the caller's ref. Limited checkout so unrelated
 # dirty state doesn't block the deploy. Matches the agent path.
 git fetch --quiet origin "$REF"
-git checkout --quiet "origin/$REF" -- apps/
-echo "dd-relaunch-cp: refreshed apps/ from origin/$REF"
+git checkout --quiet FETCH_HEAD -- apps/
+echo "dd-relaunch-cp: refreshed apps/ from $REF"
 
 # Sync the libvirt base qcow2 from the easyenclave-mini release channel
 # for this env. `production` tracks `stable` (v*); anything else

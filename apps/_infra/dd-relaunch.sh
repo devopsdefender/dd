@@ -39,8 +39,8 @@ cd "${DD_REPO_ROOT:-/home/tdx2/src/dd}"
 # This script is already in memory, so the refresh takes effect on the
 # *next* invocation.
 git fetch --quiet origin "$REF"
-git checkout --quiet "origin/$REF" -- apps/
-echo "dd-relaunch: refreshed apps/ from origin/$REF"
+git checkout --quiet FETCH_HEAD -- apps/
+echo "dd-relaunch: refreshed apps/ from $REF"
 
 # Keep the libvirt base qcow2 aligned with the easyenclave-mini release
 # channel for this env. `prod` tracks `stable` (v*); `preview` tracks

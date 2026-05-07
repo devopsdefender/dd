@@ -40,7 +40,7 @@ use crate::html::{self, shell};
 use crate::ita;
 use crate::metrics;
 use crate::noise_gateway;
-use crate::taint::{TaintReason, TaintSet};
+use crate::taint::{IntegrityState, TaintReason, TaintSet};
 
 /// Re-mint interval. Intel ITA tokens typically expire in a few
 /// minutes; refresh well before so `/health` always serves a live
@@ -517,6 +517,7 @@ async fn health(State(s): State<St>) -> Json<serde_json::Value> {
     let ita_token = s.ita_token.read().await.clone();
     let agent_owner = s.agent_owner.read().await.clone();
     let taint_reasons = s.taint.snapshot().await;
+    let integrity_state = IntegrityState::from_taint_reasons(&taint_reasons);
     let extra_ingress: Vec<serde_json::Value> = s
         .extras
         .read()
@@ -552,10 +553,16 @@ async fn health(State(s): State<St>) -> Json<serde_json::Value> {
         // `confidential_mode`: boot-time flag; true → /deploy + /exec
         // + /owner were NOT registered on this agent. Set from
         // `DD_CONFIDENTIAL`.
-        // `taint_reasons`: current set, sorted for diff-friendliness.
-        // Empty set = pristine. v0: informational — DD doesn't block
-        // actions based on the set.
+        // `integrity_state`: user-facing label derived from the
+        // internal taint set. Empty set = clean; any reason =
+        // controlled. v0: informational — DD doesn't block actions
+        // based on the set.
+        // `integrity_reasons`: current set, sorted for
+        // diff-friendliness. `taint_reasons` is kept as a diagnostic
+        // compatibility alias for existing consumers.
         "confidential_mode": s.cfg.confidential,
+        "integrity_state": integrity_state,
+        "integrity_reasons": taint_reasons.clone(),
         "taint_reasons": taint_reasons,
         "attestation_type": ee_health["attestation_type"].as_str().unwrap_or("unknown"),
         "deployments": deployments,

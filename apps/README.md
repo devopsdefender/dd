@@ -80,16 +80,20 @@ DD separates terminal access by capability:
 - **Read-only workload terminals** show workload logs in the dd-shell xterm UI.
   They are for oracle-style services where an operator should be able to inspect
   output without sending input, resizing a PTY, interrupting, or closing the
-  process.
+  process. Opening a read-only terminal is observation only, so it leaves the
+  workload's user-facing integrity state clean.
 - **Read-write PTY sessions** are created inside `dd-shell`. They are for
   confidential shells and ZDR coding agents such as Codex or Claude. These
   sessions are reconnectable and write encrypted transcript records under
-  `DD_SHELL_DIR`.
+  `DD_SHELL_DIR`. A read-write PTY is controlled as soon as it exists because
+  the holder can send stdin, resize the terminal, and deliver terminal signals.
 
 The shell UI treats both as terminal views, but only read-write sessions get
 WebSocket input, resize, and close controls. Workloads do not opt into
 read-write access by putting metadata in `workload.json`; the boundary is the
-dd-shell API surface.
+dd-shell API surface. Internally DD may still call this taint tracking, but the
+API/UI should speak in integrity terms: clean for observed-only logs,
+controlled for interactive PTYs or other human control paths.
 
 The renderer uses vendored xterm assets and recognizes WezTerm-compatible
 notification escapes after the user grants browser notification permission:
@@ -137,10 +141,20 @@ inline in two places so both lifecycle points behave identically:
 
 Additional examples:
 
+- `apps/human-readonly`: tiny human-facing log producer. It is intentionally
+  not exposed directly; inspect it from dd-shell's read-only workload terminal.
+  The same shape should eventually move to a separate demo app repo.
 - `apps/oracle-readonly`: emits periodic oracle-style logs. It is meant to be
   inspected through dd-shell's read-only workload terminal.
 - `apps/confidential-shell`: runs dd-shell with `DD_SHELL_DIR=/data/dd-shell`
   so read-write PTY transcript history survives on the workload disk.
+- `apps/codex-podman-shell`: alternative read-write shell workload. It exposes
+  the normal `-shell` label, stores encrypted dd-shell history under
+  `/data/dd-shell`, and makes each new PTY enter a Podman-backed Node container.
+  The container installs `@openai/codex` on first use and persists login/config
+  under `/data/codex/home`, so `codex login` can be completed interactively from
+  the browser terminal. Use this instead of `dd-shell`, not alongside it, unless
+  you give one of them a different `hostname_label`.
 
 CP stays slim: just `cloudflared` + `dd-management`. Preview agent VMs run a
 bare agent + podman for CI to prove registration end-to-end. Prod agent VMs

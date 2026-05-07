@@ -1,0 +1,15 @@
+{
+  "app_name": "codex-podman-shell",
+  "expose": { "hostname_label": "shell", "port": 7682 },
+  "env": [
+    "DD_MODE=shell",
+    "DD_SHELL_PORT=7682",
+    "DD_SHELL_DIR=/data/dd-shell",
+    "DD_SHELL_EE_SOCKET=/var/lib/easyenclave/agent.sock",
+    "SHELL=/data/codex/codex-podman-shell"
+  ],
+  "cmd": [
+    "/bin/busybox", "sh", "-c",
+    "set -e\nuntil [ -x /var/lib/easyenclave/bin/devopsdefender ]; do sleep 1; done\nmkdir -p /data/codex/home /data/codex/work /data/dd-shell /data/codex/bin\ncat > /data/codex/codex-podman-shell <<'EOF'\n#!/bin/sh\nset -e\nBIN=/var/lib/easyenclave/bin\nuntil [ -x \"$BIN/podman\" ]; do echo 'codex-podman-shell: waiting for podman'; sleep 2; done\nmkdir -p /data/codex/home /data/codex/work\nexec \"$BIN/podman\" run --rm -it \\\n  --name codex-shell-$$ \\\n  -e HOME=/root \\\n  -e TERM=xterm-256color \\\n  -e COLORTERM=truecolor \\\n  -e NPM_CONFIG_PREFIX=/root/.npm-global \\\n  -v /data/codex/home:/root \\\n  -v /data/codex/work:/workspace \\\n  -w /workspace \\\n  docker.io/library/node:22-bookworm \\\n  sh -lc 'set -e; mkdir -p \"$HOME/.npm-global/bin\"; printf \"%s\\n\" \"export PATH=\\$HOME/.npm-global/bin:\\$PATH\" >> \"$HOME/.profile\"; export PATH=\"$HOME/.npm-global/bin:$PATH\"; if ! command -v codex >/dev/null 2>&1; then npm install -g @openai/codex; fi; exec bash -l'\nEOF\nchmod +x /data/codex/codex-podman-shell\ncp /var/lib/easyenclave/bin/devopsdefender /data/codex/bin/devopsdefender\nchmod +x /data/codex/bin/devopsdefender\nexec /data/codex/bin/devopsdefender shell"
+  ]
+}

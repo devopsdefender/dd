@@ -35,6 +35,7 @@ use uuid::Uuid;
 use crate::ee::Ee;
 use crate::error::{Error, Result};
 use crate::html;
+use crate::taint::IntegrityState;
 
 const DEFAULT_PORT: u16 = 7681;
 const DEFAULT_DIR: &str = "/var/lib/devopsdefender/shell";
@@ -64,10 +65,20 @@ struct SessionMeta {
     name: String,
     command: String,
     cwd: String,
+    terminal_mode: TerminalMode,
+    integrity_state: IntegrityState,
+    integrity_reason: &'static str,
     created_at: i64,
     updated_at: i64,
     status: SessionStatus,
     exit_code: Option<i32>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum TerminalMode {
+    ReadOnly,
+    ReadWrite,
 }
 
 #[derive(Clone, Serialize)]
@@ -119,7 +130,9 @@ struct WorkloadTerminal {
     id: String,
     app_name: String,
     status: String,
-    terminal_mode: &'static str,
+    terminal_mode: TerminalMode,
+    integrity_state: IntegrityState,
+    integrity_reason: &'static str,
 }
 
 pub async fn run() -> Result<()> {
@@ -230,6 +243,9 @@ async fn create_session(
         name,
         command,
         cwd,
+        terminal_mode: TerminalMode::ReadWrite,
+        integrity_state: IntegrityState::Controlled,
+        integrity_reason: "interactive_pty_control",
         created_at: now,
         updated_at: now,
         status: SessionStatus::Running,
@@ -355,7 +371,9 @@ async fn list_workloads(State(app): State<App>) -> Result<Json<Vec<WorkloadTermi
                         id: d["id"].as_str()?.to_string(),
                         app_name: d["app_name"].as_str()?.to_string(),
                         status: d["status"].as_str().unwrap_or("unknown").to_string(),
-                        terminal_mode: "read_only",
+                        terminal_mode: TerminalMode::ReadOnly,
+                        integrity_state: IntegrityState::Clean,
+                        integrity_reason: "read_only_observation",
                     })
                 })
                 .collect()
@@ -720,7 +738,7 @@ button.secondary { background:#252a36; color:#d7deea; }
 </style>
 <div class="sidebar">
   <h1>Shell</h1>
-  <div class="sub">Read-only workload logs and read-write PTYs</div>
+  <div class="sub">Observed logs and controlled PTYs</div>
   <button class="new" id="new-session">New session</button>
   <div class="groups">
     <div>
@@ -796,7 +814,7 @@ async function refresh() {
   sessions.forEach(s => {
     const el = document.createElement("button");
     el.className = "session" + (currentKind === "session" && s.id === current ? " active" : "");
-    el.innerHTML = `<div class="name">${escapeHtml(s.name)}</div><div class="meta">read-write - ${s.status} - ${new Date(s.updated_at*1000).toLocaleString()}</div>`;
+    el.innerHTML = `<div class="name">${escapeHtml(s.name)}</div><div class="meta">read-write - controlled - ${s.status} - ${new Date(s.updated_at*1000).toLocaleString()}</div>`;
     el.onclick = () => attach(s.id);
     root.appendChild(el);
   });
@@ -805,7 +823,7 @@ async function refresh() {
   workloads.forEach(w => {
     const el = document.createElement("button");
     el.className = "session readonly" + (currentKind === "workload" && w.app_name === current ? " active" : "");
-    el.innerHTML = `<div class="name">${escapeHtml(w.app_name)}</div><div class="meta">read-only - ${escapeHtml(w.status)}</div>`;
+    el.innerHTML = `<div class="name">${escapeHtml(w.app_name)}</div><div class="meta">read-only - clean - ${escapeHtml(w.status)}</div>`;
     el.onclick = () => attachWorkload(w.app_name);
     workloadRoot.appendChild(el);
   });
@@ -835,7 +853,7 @@ async function attach(id) {
   ws = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws/sessions/${id}?tail=false`);
   ws.binaryType = "arraybuffer";
   ws.onopen = () => {
-    document.getElementById("status").textContent = "Attached";
+    document.getElementById("status").textContent = "Controlled PTY";
     fitAndResize();
     term.focus();
   };
@@ -869,12 +887,12 @@ async function loadWorkload(name) {
   term.reset();
   term.focus();
   document.getElementById("close").disabled = true;
-  document.getElementById("status").textContent = "Loading read-only logs";
+  document.getElementById("status").textContent = "Loading observed logs";
   const history = await api(`/api/workloads/${encodeURIComponent(name)}/replay`).catch(() => null);
   if (currentKind !== "workload" || current !== name) return;
   if (history) await writeTerminal(base64Bytes(history.bytes_b64));
   term.scrollToBottom();
-  document.getElementById("status").textContent = "Read-only";
+  document.getElementById("status").textContent = "Observed read-only";
   refresh();
 }
 

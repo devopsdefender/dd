@@ -1,0 +1,7 @@
+{
+  "app_name": "human-readonly",
+  "cmd": [
+    "/bin/busybox", "sh", "-c",
+    "set -e\nprintf '\\033]9;%s\\033\\\\' 'human-readonly started'\ni=0\nwhile true; do\n  i=$((i+1))\n  ts=$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || true)\n  echo \"human-readonly: tick=$i ts=$ts event=review_needed actor=human status=ok\"\n  if [ $((i % 6)) -eq 0 ]; then printf '\\033]777;notify;%s;%s\\033\\\\' 'human-readonly' \"review checkpoint $i\"; fi\n  sleep 10\ndone"
+  ]
+}
