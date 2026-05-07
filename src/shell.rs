@@ -137,6 +137,7 @@ struct WorkloadTerminal {
     terminal_mode: TerminalMode,
     integrity_state: IntegrityState,
     integrity_reason: &'static str,
+    oracle: Option<OracleStatus>,
 }
 
 #[derive(Serialize)]
@@ -388,34 +389,60 @@ async fn replay_session(
 }
 
 async fn list_workloads(State(app): State<App>) -> Result<Json<Vec<WorkloadTerminal>>> {
-    let list = app.ee.list().await?;
-    let mut workloads: Vec<WorkloadTerminal> = list["deployments"]
-        .as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(|d| {
-                    Some(WorkloadTerminal {
-                        id: d["id"].as_str()?.to_string(),
-                        app_name: d["app_name"].as_str()?.to_string(),
+    let oracles = load_oracles(&app).await;
+    let mut oracle_by_app: HashMap<String, OracleStatus> = oracles
+        .into_iter()
+        .map(|oracle| (oracle.app_name.clone(), oracle))
+        .collect();
+    let mut workloads = Vec::new();
+
+    match app.ee.list().await {
+        Ok(list) => {
+            if let Some(deployments) = list["deployments"].as_array() {
+                for d in deployments {
+                    let Some(app_name) = d["app_name"].as_str() else {
+                        continue;
+                    };
+                    workloads.push(WorkloadTerminal {
+                        id: d["id"].as_str().unwrap_or(app_name).to_string(),
+                        app_name: app_name.to_string(),
                         status: d["status"].as_str().unwrap_or("unknown").to_string(),
                         terminal_mode: TerminalMode::ReadOnly,
                         integrity_state: IntegrityState::Clean,
                         integrity_reason: "read_only_observation",
-                    })
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+                        oracle: oracle_by_app.remove(app_name),
+                    });
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("dd-shell: ee workload probe unavailable: {e}");
+        }
+    }
+
+    workloads.extend(oracle_by_app.into_values().map(|oracle| WorkloadTerminal {
+        id: oracle.app_name.clone(),
+        app_name: oracle.app_name.clone(),
+        status: oracle.status.clone(),
+        terminal_mode: TerminalMode::ReadOnly,
+        integrity_state: IntegrityState::Clean,
+        integrity_reason: "read_only_observation",
+        oracle: Some(oracle),
+    }));
     workloads.sort_by(|a, b| a.app_name.cmp(&b.app_name));
     Ok(Json(workloads))
 }
 
 async fn list_oracles(State(app): State<App>) -> Json<Vec<OracleStatus>> {
-    match agent_get(&app, "/api/oracles").await {
-        Ok(oracles) => Json(oracles),
+    Json(load_oracles(&app).await)
+}
+
+async fn load_oracles(app: &App) -> Vec<OracleStatus> {
+    match agent_get(app, "/api/oracles").await {
+        Ok(oracles) => oracles,
         Err(e) => {
             eprintln!("dd-shell: agent oracle probe unavailable: {e}");
-            Json(Vec::new())
+            Vec::new()
         }
     }
 }
@@ -839,6 +866,10 @@ main { max-width:none; padding:0; height:100vh; display:grid; grid-template-colu
 .session .name { font-weight:700; font-size:13px; }
 .session .meta { margin:3px 0 0; font-size:11px; color:#8791a5; }
 .session.readonly { background:#131720; border-style:dashed; }
+.badges { display:flex; flex-wrap:wrap; gap:5px; margin-top:7px; }
+.badge { border:1px solid #2b3242; border-radius:999px; padding:1px 6px; color:#8791a5; font-size:10px; }
+.badge.ok { color:#9ece6a; border-color:#334b35; }
+.badge.bad { color:#f7768e; border-color:#57323d; }
 .system { display:flex; flex-direction:column; gap:8px; }
 .probe { color:#d7deea; background:#171c29; border:1px solid #2b3242; border-radius:6px; padding:10px; }
 .probe .row { display:flex; align-items:center; justify-content:space-between; gap:8px; }
@@ -864,10 +895,6 @@ button.secondary { background:#252a36; color:#d7deea; }
     <div>
       <div class="group-title">Read-write sessions</div>
       <div class="sessions" id="sessions"></div>
-    </div>
-    <div>
-      <div class="group-title">Read-only oracles</div>
-      <div class="sessions" id="oracles"></div>
     </div>
     <div>
       <div class="group-title">Read-only workloads</div>
@@ -917,7 +944,6 @@ let currentKind = null;
 let ws = null;
 let resizeTimer = null;
 let workloadTimer = null;
-let oracleTimer = null;
 let notifyMode = localStorage.getItem("dd-shell-notify") || "always";
 let oscBuffer = "";
 const decoder = new TextDecoder();
@@ -930,10 +956,9 @@ async function api(path, opts) {
 }
 
 async function refresh() {
-  const [system, sessions, oracles, workloads] = await Promise.all([
+  const [system, sessions, workloads] = await Promise.all([
     api("/api/system").catch(() => null),
     api("/api/sessions").catch(() => []),
-    api("/api/oracles").catch(() => []),
     api("/api/workloads").catch(() => [])
   ]);
   renderSystem(system);
@@ -946,22 +971,12 @@ async function refresh() {
     el.onclick = () => attach(s.id);
     root.appendChild(el);
   });
-  const oracleRoot = document.getElementById("oracles");
-  oracleRoot.innerHTML = "";
-  oracles.forEach(o => {
-    const el = document.createElement("button");
-    el.className = "session readonly" + (currentKind === "oracle" && o.app_name === current ? " active" : "");
-    const last = o.last_ok ? new Date(o.last_ok).toLocaleString() : "never";
-    el.innerHTML = `<div class="name">${escapeHtml(o.title || o.app_name)}</div><div class="meta">oracle - ${escapeHtml(o.status)} - ${escapeHtml(last)}</div>`;
-    el.onclick = () => attachOracle(o.app_name);
-    oracleRoot.appendChild(el);
-  });
   const workloadRoot = document.getElementById("workloads");
   workloadRoot.innerHTML = "";
   workloads.forEach(w => {
     const el = document.createElement("button");
     el.className = "session readonly" + (currentKind === "workload" && w.app_name === current ? " active" : "");
-    el.innerHTML = `<div class="name">${escapeHtml(w.app_name)}</div><div class="meta">read-only - clean - ${escapeHtml(w.status)}</div>`;
+    el.innerHTML = workloadButtonHtml(w);
     el.onclick = () => attachWorkload(w.app_name);
     workloadRoot.appendChild(el);
   });
@@ -1009,7 +1024,6 @@ async function createSession() {
 async function attach(id) {
   if (ws) ws.close();
   stopWorkloadRefresh();
-  stopOracleRefresh();
   current = id;
   currentKind = "session";
   term.reset();
@@ -1047,7 +1061,6 @@ async function attach(id) {
 async function attachWorkload(name) {
   if (ws) ws.close();
   ws = null;
-  stopOracleRefresh();
   stopWorkloadRefresh();
   current = name;
   currentKind = "workload";
@@ -1060,50 +1073,23 @@ async function loadWorkload(name) {
   term.reset();
   term.focus();
   document.getElementById("close").disabled = true;
-  document.getElementById("status").textContent = "Loading observed logs";
-  const history = await api(`/api/workloads/${encodeURIComponent(name)}/replay`).catch(() => null);
+  document.getElementById("status").textContent = "Loading read-only workload";
+  const [workloads, history] = await Promise.all([
+    api("/api/workloads").catch(() => []),
+    api(`/api/workloads/${encodeURIComponent(name)}/replay`).catch(() => null)
+  ]);
   if (currentKind !== "workload" || current !== name) return;
+  const workload = workloads.find(w => w.app_name === name);
+  if (workload) await writeTerminal(workloadText(workload));
   if (history) await writeTerminal(base64Bytes(history.bytes_b64));
   term.scrollToBottom();
   document.getElementById("status").textContent = "Observed read-only";
   refresh();
 }
 
-async function attachOracle(name) {
-  if (ws) ws.close();
-  ws = null;
-  stopWorkloadRefresh();
-  stopOracleRefresh();
-  current = name;
-  currentKind = "oracle";
-  await loadOracle(name);
-  oracleTimer = setInterval(() => loadOracle(name), 5000);
-}
-
-async function loadOracle(name) {
-  if (currentKind !== "oracle" || current !== name) return;
-  term.reset();
-  term.focus();
-  document.getElementById("close").disabled = true;
-  document.getElementById("status").textContent = "Loading oracle";
-  const oracles = await api("/api/oracles").catch(() => []);
-  const oracle = oracles.find(o => o.app_name === name);
-  if (currentKind !== "oracle" || current !== name) return;
-  if (oracle) await writeTerminal(oracleText(oracle));
-  else await writeTerminal(`oracle ${name} unavailable\r\n`);
-  term.scrollToBottom();
-  document.getElementById("status").textContent = "Observed oracle";
-  refresh();
-}
-
 function stopWorkloadRefresh() {
   if (workloadTimer) clearInterval(workloadTimer);
   workloadTimer = null;
-}
-
-function stopOracleRefresh() {
-  if (oracleTimer) clearInterval(oracleTimer);
-  oracleTimer = null;
 }
 
 term.onData(data => {
@@ -1142,20 +1128,44 @@ function base64Bytes(value) {
 function writeTerminal(data) {
   return new Promise(resolve => term.write(data, resolve));
 }
-function oracleText(o) {
+
+function workloadButtonHtml(w) {
+  const oracle = w.oracle;
+  const badges = [
+    `<span class="badge">logs</span>`,
+    oracle ? `<span class="badge ${oracle.status === "healthy" ? "ok" : oracle.status === "error" ? "bad" : ""}">oracle</span>` : "",
+    oracle && oracle.vanity_url ? `<span class="badge">vanity</span>` : ""
+  ].filter(Boolean).join("");
+  const status = oracle ? `${w.status} / oracle ${oracle.status}` : w.status;
+  return `<div class="name">${escapeHtml(w.app_name)}</div><div class="meta">read-only - clean - ${escapeHtml(status)}</div><div class="badges">${badges}</div>`;
+}
+
+function workloadText(w) {
   const lines = [
-    `${o.title || o.app_name}`,
-    `app: ${o.app_name}`,
+    `${w.app_name}`,
     `mode: read-only`,
+    `integrity: clean`,
+    `workload status: ${w.status}`
+  ];
+  const o = w.oracle;
+  if (!o) {
+    lines.push("", "logs:");
+    return lines.join("\r\n") + "\r\n";
+  }
+  lines.push(
+    "",
+    "oracle:",
+    `title: ${o.title || o.app_name}`,
     `status: ${o.status}`,
     `last ok: ${o.last_ok || "never"}`,
     `local: ${o.local_url || "unknown"}`
-  ];
+  );
   if (o.vanity_url) lines.push(`vanity: ${o.vanity_url}`);
   if (o.last_error) lines.push(`error: ${o.last_error}`);
   if (o.sample !== null && o.sample !== undefined) {
     lines.push("", "sample:", JSON.stringify(o.sample, null, 2));
   }
+  lines.push("", "logs:");
   return lines.join("\r\n") + "\r\n";
 }
 function fitAndResize() {
