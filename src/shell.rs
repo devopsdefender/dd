@@ -7,6 +7,7 @@ use std::cmp::Reverse;
 use std::collections::{HashMap, VecDeque};
 use std::fs::File as StdFile;
 use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -51,7 +52,8 @@ struct App {
     ee: Arc<Ee>,
     http: reqwest::Client,
     agent_api: String,
-    default_shell: String,
+    recipes: Arc<Vec<Recipe>>,
+    scratch_root: PathBuf,
 }
 
 struct Session {
@@ -62,12 +64,17 @@ struct Session {
     pgid: i32,
     tx: broadcast::Sender<Vec<u8>>,
     ring: Mutex<VecDeque<u8>>,
+    scratch_dir: Option<PathBuf>,
+    cleanup_scratch_on_exit: bool,
 }
 
 #[derive(Clone, Serialize)]
 struct SessionMeta {
     id: String,
     name: String,
+    recipe_id: String,
+    recipe_title: String,
+    workspace_policy: WorkspacePolicy,
     command: String,
     cwd: String,
     terminal_mode: TerminalMode,
@@ -92,9 +99,26 @@ enum SessionStatus {
     Exited,
 }
 
+#[derive(Clone, Serialize)]
+struct Recipe {
+    id: String,
+    title: String,
+    description: String,
+    command: String,
+    cwd: String,
+    workspace_policy: WorkspacePolicy,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum WorkspacePolicy {
+    EphemeralScratch,
+}
+
 #[derive(Deserialize)]
 struct CreateSession {
     name: Option<String>,
+    recipe_id: Option<String>,
     command: Option<String>,
     cwd: Option<String>,
 }
@@ -150,11 +174,17 @@ pub async fn run() -> Result<()> {
         .unwrap_or(DEFAULT_PORT);
     let dir = std::env::var("DD_SHELL_DIR").unwrap_or_else(|_| DEFAULT_DIR.into());
     let default_shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+    let scratch_root = std::env::var("DD_SHELL_SCRATCH_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(&dir).join("sessions"));
     let ee_socket = std::env::var("DD_SHELL_EE_SOCKET")
         .unwrap_or_else(|_| "/var/lib/easyenclave/agent.sock".into());
     let agent_api = std::env::var("DD_SHELL_AGENT_API_URL")
         .unwrap_or_else(|_| format!("http://127.0.0.1:{}", crate::cf::AGENT_API_PORT));
     let store = TranscriptStore::new(PathBuf::from(dir)).await?;
+    tokio::fs::create_dir_all(&scratch_root).await?;
+    set_private_dir_permissions(&scratch_root).await?;
+    let recipes = Arc::new(load_recipes(&default_shell));
 
     let app_state = App {
         sessions: Arc::new(RwLock::new(HashMap::new())),
@@ -165,7 +195,8 @@ pub async fn run() -> Result<()> {
             .build()
             .unwrap_or_else(|_| reqwest::Client::new()),
         agent_api,
-        default_shell,
+        recipes,
+        scratch_root,
     };
 
     let app = Router::new()
@@ -174,6 +205,7 @@ pub async fn run() -> Result<()> {
         .route("/assets/xterm/xterm.css", get(xterm_css))
         .route("/assets/xterm/xterm.js", get(xterm_js))
         .route("/assets/xterm/addon-fit.js", get(xterm_fit_js))
+        .route("/api/recipes", get(list_recipes))
         .route("/api/sessions", get(list_sessions).post(create_session))
         .route("/api/sessions/{id}/replay", get(replay_session))
         .route("/api/sessions/{id}/resize", post(resize_session))
@@ -231,6 +263,10 @@ async fn xterm_fit_js() -> impl IntoResponse {
     )
 }
 
+async fn list_recipes(State(app): State<App>) -> Json<Vec<Recipe>> {
+    Json((*app.recipes).clone())
+}
+
 async fn list_sessions(State(app): State<App>) -> Json<Vec<SessionMeta>> {
     let sessions: Vec<Arc<Session>> = app.sessions.read().await.values().cloned().collect();
     let mut out = Vec::with_capacity(sessions.len());
@@ -246,18 +282,24 @@ async fn create_session(
     Json(req): Json<CreateSession>,
 ) -> Result<Json<CreateSessionResponse>> {
     let id = Uuid::new_v4().to_string();
-    let command = req.command.unwrap_or_else(|| app.default_shell.clone());
-    let cwd = req.cwd.unwrap_or_else(|| "/".into());
-    let name = req.name.unwrap_or_else(|| short_name(&id));
+    let recipe = select_recipe(&app, req.recipe_id.as_deref(), req.command)?;
+    let command = recipe.command.clone();
+    let cwd = req.cwd.unwrap_or_else(|| recipe.cwd.clone());
+    let name = req.name.unwrap_or_else(|| session_name(&recipe, &id));
     let now = unix_ts();
+    let scratch_dir = prepare_scratch_dir(&app, &id, &recipe.workspace_policy).await?;
+    let env = session_env(&id, scratch_dir.as_deref());
 
-    let (child, output, input, pgid) = spawn_pty(&command, &cwd)?;
+    let (child, output, input, pgid) = spawn_pty(&command, &cwd, &env)?;
     let master_fd = input.as_raw_fd();
     let (tx, _) = broadcast::channel(512);
 
     let meta = SessionMeta {
         id: id.clone(),
         name,
+        recipe_id: recipe.id,
+        recipe_title: recipe.title,
+        workspace_policy: recipe.workspace_policy,
         command,
         cwd,
         terminal_mode: TerminalMode::ReadWrite,
@@ -278,6 +320,8 @@ async fn create_session(
         pgid,
         tx,
         ring: Mutex::new(VecDeque::with_capacity(RING_LIMIT)),
+        scratch_dir,
+        cleanup_scratch_on_exit: true,
     });
 
     app.sessions
@@ -290,7 +334,111 @@ async fn create_session(
     Ok(Json(CreateSessionResponse { id }))
 }
 
-fn spawn_pty(command: &str, cwd: &str) -> Result<(Child, TokioFile, TokioFile, i32)> {
+fn select_recipe(app: &App, recipe_id: Option<&str>, command: Option<String>) -> Result<Recipe> {
+    if let Some(command) = command {
+        let command = command.trim();
+        if command.is_empty() {
+            return Err(Error::BadRequest("command must not be empty".into()));
+        }
+        return Ok(Recipe {
+            id: "custom".into(),
+            title: "Custom".into(),
+            description: "Custom command".into(),
+            command: command.into(),
+            cwd: "/".into(),
+            workspace_policy: WorkspacePolicy::EphemeralScratch,
+        });
+    }
+
+    let id = recipe_id.unwrap_or("shell");
+    app.recipes
+        .iter()
+        .find(|recipe| recipe.id == id)
+        .cloned()
+        .ok_or_else(|| Error::BadRequest(format!("unknown recipe: {id}")))
+}
+
+fn load_recipes(default_shell: &str) -> Vec<Recipe> {
+    let mut recipes = vec![Recipe {
+        id: "shell".into(),
+        title: "Shell".into(),
+        description: "Plain interactive shell with encrypted transcript history".into(),
+        command: default_shell.into(),
+        cwd: "/".into(),
+        workspace_policy: WorkspacePolicy::EphemeralScratch,
+    }];
+
+    if let Ok(command) = std::env::var("DD_SHELL_CODEX_COMMAND") {
+        let command = command.trim();
+        if !command.is_empty() {
+            recipes.push(Recipe {
+                id: "codex-podman".into(),
+                title: "Codex".into(),
+                description: "Podman-backed Codex development session".into(),
+                command: command.into(),
+                cwd: "/".into(),
+                workspace_policy: WorkspacePolicy::EphemeralScratch,
+            });
+        }
+    }
+
+    recipes
+}
+
+async fn prepare_scratch_dir(
+    app: &App,
+    id: &str,
+    policy: &WorkspacePolicy,
+) -> Result<Option<PathBuf>> {
+    match policy {
+        WorkspacePolicy::EphemeralScratch => {
+            let root = app.scratch_root.join(id);
+            tokio::fs::create_dir_all(&root).await?;
+            set_private_dir_permissions(&root).await?;
+            for name in ["workspace", "home", "containers", "cache", "tmp"] {
+                let path = root.join(name);
+                tokio::fs::create_dir_all(&path).await?;
+                set_private_dir_permissions(&path).await?;
+            }
+            Ok(Some(root))
+        }
+    }
+}
+
+async fn set_private_dir_permissions(path: &Path) -> Result<()> {
+    let permissions = std::fs::Permissions::from_mode(0o700);
+    tokio::fs::set_permissions(path, permissions).await?;
+    Ok(())
+}
+
+fn session_env(id: &str, scratch_dir: Option<&Path>) -> Vec<(String, String)> {
+    let mut env = vec![("DD_SESSION_ID".into(), id.into())];
+    if let Some(root) = scratch_dir {
+        env.push(("DD_SESSION_DIR".into(), root.display().to_string()));
+        env.push((
+            "DD_WORKSPACE".into(),
+            root.join("workspace").display().to_string(),
+        ));
+        env.push(("DD_HOME".into(), root.join("home").display().to_string()));
+        env.push((
+            "DD_CONTAINER_ROOT".into(),
+            root.join("containers").display().to_string(),
+        ));
+        env.push(("DD_CACHE".into(), root.join("cache").display().to_string()));
+        env.push(("TMPDIR".into(), root.join("tmp").display().to_string()));
+    }
+    env
+}
+
+fn session_name(recipe: &Recipe, id: &str) -> String {
+    format!("{}-{}", recipe.id, &id[..8])
+}
+
+fn spawn_pty(
+    command: &str,
+    cwd: &str,
+    env_vars: &[(String, String)],
+) -> Result<(Child, TokioFile, TokioFile, i32)> {
     let mut master = -1;
     let mut slave = -1;
     let winsize = libc::winsize {
@@ -347,6 +495,9 @@ fn spawn_pty(command: &str, cwd: &str) -> Result<(Child, TokioFile, TokioFile, i
         .stderr(Stdio::from(
             dup_slave().map_err(|e| Error::Internal(format!("pty stderr dup: {e}")))?,
         ));
+    for (key, value) in env_vars {
+        cmd.env(key, value);
+    }
     unsafe {
         cmd.pre_exec(move || {
             if libc::setsid() < 0 {
@@ -745,6 +896,7 @@ fn spawn_waiter(store: TranscriptStore, session: Arc<Session>) {
             child.wait().await
         };
         mark_session_exited(&store, &session, status.ok().and_then(|s| s.code())).await;
+        cleanup_session_scratch(&session).await;
     });
 }
 
@@ -758,6 +910,23 @@ async fn mark_session_exited(store: &TranscriptStore, session: &Session, exit_co
     meta.exit_code = exit_code;
     if let Err(e) = store.append_meta(&meta).await {
         eprintln!("dd-shell: exit meta append failed: {e}");
+    }
+}
+
+async fn cleanup_session_scratch(session: &Session) {
+    if !session.cleanup_scratch_on_exit {
+        return;
+    }
+    let Some(path) = &session.scratch_dir else {
+        return;
+    };
+    match tokio::fs::remove_dir_all(path).await {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => eprintln!(
+            "dd-shell: scratch cleanup failed for {}: {e}",
+            path.display()
+        ),
     }
 }
 
@@ -895,10 +1064,6 @@ fn unix_ts() -> i64 {
         .as_secs() as i64
 }
 
-fn short_name(id: &str) -> String {
-    format!("shell-{}", &id[..8])
-}
-
 const XTERM_CSS: &str = include_str!("../assets/xterm/xterm.css");
 const XTERM_JS: &str = include_str!("../assets/xterm/xterm.js");
 const XTERM_FIT_JS: &str = include_str!("../assets/xterm/addon-fit.js");
@@ -918,11 +1083,11 @@ main { max-width:none; padding:0; height:100vh; display:grid; grid-template-colu
 .term .xterm-viewport { background:#05070a !important; }
 .groups { display:flex; flex-direction:column; gap:18px; }
 .group-title { position:sticky; top:126px; z-index:4; color:#8791a5; font-size:11px; font-weight:700; letter-spacing:0; text-transform:uppercase; margin:0 -16px 8px; padding:8px 16px; background:#111520; border-bottom:1px solid #202634; }
-.sessions { display:flex; flex-direction:column; gap:8px; }
-.session { text-align:left; color:#d7deea; background:#171c29; border:1px solid #2b3242; border-radius:6px; padding:10px; cursor:pointer; }
+.sessions, .recipes { display:flex; flex-direction:column; gap:8px; }
+.session, .recipe { text-align:left; color:#d7deea; background:#171c29; border:1px solid #2b3242; border-radius:6px; padding:10px; cursor:pointer; }
 .session.active { border-color:#7aa2f7; }
-.session .name { font-weight:700; font-size:13px; }
-.session .meta { margin:3px 0 0; font-size:11px; color:#8791a5; }
+.session .name, .recipe .name { font-weight:700; font-size:13px; }
+.session .meta, .recipe .meta { margin:3px 0 0; font-size:11px; color:#8791a5; }
 .session.readonly { background:#131720; border-style:dashed; }
 .badges { display:flex; flex-wrap:wrap; gap:5px; margin-top:7px; }
 .badge { border:1px solid #2b3242; border-radius:999px; padding:1px 6px; color:#8791a5; font-size:10px; }
@@ -936,7 +1101,6 @@ main { max-width:none; padding:0; height:100vh; display:grid; grid-template-colu
 .pill { border:1px solid #2b3242; border-radius:999px; padding:2px 7px; color:#8791a5; font-size:11px; }
 .pill.ok { color:#9ece6a; border-color:#334b35; }
 .pill.bad { color:#f7768e; border-color:#57323d; }
-.new { width:100%; }
 .filter { width:100%; margin-top:10px; box-sizing:border-box; background:#0b0d12; color:#d7deea; border:1px solid #2b3242; border-radius:6px; padding:9px 10px; font:inherit; font-size:13px; }
 .filter:focus { outline:1px solid #7aa2f7; border-color:#7aa2f7; }
 .empty-mini { color:#8791a5; font-size:12px; padding:8px 2px; }
@@ -948,7 +1112,6 @@ button.secondary { background:#252a36; color:#d7deea; }
   <div class="sidebar-top">
     <h1>Shell</h1>
     <div class="sub">Observed logs and controlled PTYs</div>
-    <button class="new" id="new-session">New session</button>
     <input class="filter" id="workload-filter" type="search" placeholder="Filter workloads">
   </div>
   <div class="sidebar-scroll">
@@ -956,6 +1119,10 @@ button.secondary { background:#252a36; color:#d7deea; }
       <div>
         <div class="group-title">System</div>
         <div class="system" id="system"></div>
+      </div>
+      <div>
+        <div class="group-title">Recipes</div>
+        <div class="recipes" id="recipes"></div>
       </div>
       <div>
         <div class="group-title">Read-write sessions</div>
@@ -1012,6 +1179,7 @@ let resizeTimer = null;
 let workloadTimer = null;
 let notifyMode = localStorage.getItem("dd-shell-notify") || "always";
 let oscBuffer = "";
+let cachedRecipes = [];
 let cachedWorkloads = [];
 const decoder = new TextDecoder();
 
@@ -1023,23 +1191,43 @@ async function api(path, opts) {
 }
 
 async function refresh() {
-  const [system, sessions, workloads] = await Promise.all([
+  const [system, recipes, sessions, workloads] = await Promise.all([
     api("/api/system").catch(() => null),
+    api("/api/recipes").catch(() => []),
     api("/api/sessions").catch(() => []),
     api("/api/workloads").catch(() => [])
   ]);
   renderSystem(system);
+  cachedRecipes = recipes;
+  renderRecipes();
   cachedWorkloads = workloads;
   const root = document.getElementById("sessions");
   root.innerHTML = "";
   sessions.forEach(s => {
     const el = document.createElement("button");
     el.className = "session" + (currentKind === "session" && s.id === current ? " active" : "");
-    el.innerHTML = `<div class="name">${escapeHtml(s.name)}</div><div class="meta">read-write - controlled - ${s.status} - ${new Date(s.updated_at*1000).toLocaleString()}</div>`;
+    const recipe = s.recipe_title || s.recipe_id || "Shell";
+    el.innerHTML = `<div class="name">${escapeHtml(s.name)}</div><div class="meta">${escapeHtml(recipe)} - read-write - controlled - ${s.status} - ${new Date(s.updated_at*1000).toLocaleString()}</div>`;
     el.onclick = () => attach(s.id);
     root.appendChild(el);
   });
   renderWorkloads();
+}
+
+function renderRecipes() {
+  const root = document.getElementById("recipes");
+  root.innerHTML = "";
+  if (!cachedRecipes.length) {
+    root.innerHTML = `<div class="empty-mini">No recipes</div>`;
+    return;
+  }
+  cachedRecipes.forEach(recipe => {
+    const el = document.createElement("button");
+    el.className = "recipe";
+    el.innerHTML = `<div class="name">${escapeHtml(recipe.title || recipe.id)}</div><div class="meta">${escapeHtml(recipe.description || recipe.command || "")}</div>`;
+    el.onclick = () => createSession(recipe.id);
+    root.appendChild(el);
+  });
 }
 
 function renderWorkloads() {
@@ -1099,8 +1287,9 @@ function probeSummary(probe) {
   return parts.length ? parts.join(" - ") : "reachable";
 }
 
-async function createSession() {
-  const r = await api("/api/sessions", {method:"POST", headers:{"content-type":"application/json"}, body:JSON.stringify({})});
+async function createSession(recipeId) {
+  const body = recipeId ? {recipe_id: recipeId} : {};
+  const r = await api("/api/sessions", {method:"POST", headers:{"content-type":"application/json"}, body:JSON.stringify(body)});
   await refresh();
   attach(r.id);
 }
@@ -1182,7 +1371,6 @@ term.onData(data => {
   if (currentKind === "session" && ws && ws.readyState === WebSocket.OPEN) ws.send(data);
 });
 
-document.getElementById("new-session").onclick = createSession;
 document.getElementById("workload-filter").oninput = renderWorkloads;
 document.getElementById("close").onclick = async () => {
   if (!current || currentKind !== "session") return;
