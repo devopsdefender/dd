@@ -73,6 +73,36 @@ prepends them to the agent's cloudflared tunnel ingress. A workload declaring
 `<agent-hostname>`. easyenclave itself ignores the field; it's a DD-level
 hint about tunnel routing.
 
+## Terminal access model
+
+DD separates terminal access by capability:
+
+- **Read-only workload terminals** show workload logs in the dd-shell xterm UI.
+  They are for oracle-style services where an operator should be able to inspect
+  output without sending input, resizing a PTY, interrupting, or closing the
+  process.
+- **Read-write PTY sessions** are created inside `dd-shell`. They are for
+  confidential shells and ZDR coding agents such as Codex or Claude. These
+  sessions are reconnectable and write encrypted transcript records under
+  `DD_SHELL_DIR`.
+
+The shell UI treats both as terminal views, but only read-write sessions get
+WebSocket input, resize, and close controls. Workloads do not opt into
+read-write access by putting metadata in `workload.json`; the boundary is the
+dd-shell API surface.
+
+The renderer uses vendored xterm assets and recognizes WezTerm-compatible
+notification escapes after the user grants browser notification permission:
+
+```sh
+printf '\033]9;%s\033\\' 'job finished'
+printf '\033]777;notify;%s;%s\033\\' 'oracle' 'new result available'
+```
+
+For mobile web, this is the first step toward a PWA-style shell inbox: read-only
+workload cards, read-write Codex/Claude session cards, and push-backed
+notifications for long-running jobs.
+
 Per-workload ingress is **boot-time only** today. Workloads POSTed later via
 `/deploy` don't get auto-exposed — declare your exposure on boot workloads in
 this tree.
@@ -100,9 +130,17 @@ inline in two places so both lifecycle points behave identically:
 |---|---|---|---|
 | `cloudflared` | ✅ | ✅ | ✅ |
 | `dd-agent` | | ✅ | ✅ |
+| `dd-shell` | | ✅ | ✅ |
 | `dd-management` | ✅ | | |
 | `podman-static` | | ✅ | ✅ |
 | `podman-bootstrap` | | ✅ | ✅ |
+
+Additional examples:
+
+- `apps/oracle-readonly`: emits periodic oracle-style logs. It is meant to be
+  inspected through dd-shell's read-only workload terminal.
+- `apps/confidential-shell`: runs dd-shell with `DD_SHELL_DIR=/data/dd-shell`
+  so read-write PTY transcript history survives on the workload disk.
 
 CP stays slim: just `cloudflared` + `dd-management`. Preview agent VMs run a
 bare agent + podman for CI to prove registration end-to-end. Prod agent VMs

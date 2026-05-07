@@ -624,10 +624,10 @@ async fn dashboard(State(s): State<St>) -> Response {
         )
     };
 
-    // `{hostname-base}-block.{tld}` is the ttyd subdomain provisioned
+    // `{hostname-base}-shell.{tld}` is the dd-shell subdomain provisioned
     // at register time. Human-gated by CF Access. Flat shape so
     // Universal SSL covers the cert.
-    let term_host = html::escape(&crate::cf::label_hostname(&s.hostname, "block"));
+    let term_host = html::escape(&crate::cf::label_hostname(&s.hostname, "shell"));
 
     let body = format!(
         r#"<h1>{hostname}</h1>
