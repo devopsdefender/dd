@@ -42,6 +42,7 @@ use crate::metrics;
 use crate::noise_gateway;
 use crate::oracle;
 use crate::taint::{IntegrityState, TaintReason, TaintSet};
+use crate::units::{self, AgentMode, ManagedUnit, UnitKind};
 
 /// Re-mint interval. Intel ITA tokens typically expire in a few
 /// minutes; refresh well before so `/health` always serves a live
@@ -231,6 +232,7 @@ pub async fn run() -> Result<()> {
         .route("/", get(dashboard))
         .route("/health", get(health))
         .route("/api/oracles", get(api_oracles))
+        .route("/api/units", get(api_units))
         .route("/workload/{id}", get(workload_page))
         .route("/logs/{app}", get(logs));
     if !cfg.confidential {
@@ -255,6 +257,7 @@ pub async fn run() -> Result<()> {
     let mut api = Router::new()
         .route("/health", get(health))
         .route("/api/oracles", get(api_oracles))
+        .route("/api/units", get(api_units))
         .route("/logs/{app}", get(logs));
     if !cfg.confidential {
         api = api
@@ -527,6 +530,8 @@ async fn health(State(s): State<St>) -> Json<serde_json::Value> {
     let oracles = s.oracles.read().await.clone();
     let taint_reasons = s.taint.snapshot().await;
     let integrity_state = IntegrityState::from_taint_reasons(&taint_reasons);
+    let agent_mode = AgentMode::from_confidential(s.cfg.confidential);
+    let units = managed_units(&s, &list, &oracles, agent_mode, integrity_state).await;
     let extra_ingress: Vec<serde_json::Value> = s
         .extras
         .read()
@@ -570,6 +575,7 @@ async fn health(State(s): State<St>) -> Json<serde_json::Value> {
         // diff-friendliness. `taint_reasons` is kept as a diagnostic
         // compatibility alias for existing consumers.
         "confidential_mode": s.cfg.confidential,
+        "agent_mode": agent_mode,
         "integrity_state": integrity_state,
         "integrity_reasons": taint_reasons.clone(),
         "taint_reasons": taint_reasons,
@@ -578,6 +584,8 @@ async fn health(State(s): State<St>) -> Json<serde_json::Value> {
         "deployment_count": list["deployments"].as_array().map(|a| a.len()).unwrap_or(0),
         "oracle_count": oracles.len(),
         "oracles": oracles,
+        "unit_count": units.len(),
+        "units": units,
         "cpu_percent": m.cpu_pct,
         "memory_used_mb": m.mem_used_mb,
         "memory_total_mb": m.mem_total_mb,
@@ -716,6 +724,176 @@ async fn dashboard(State(s): State<St>) -> Response {
 
 async fn api_oracles(State(s): State<St>) -> Json<Vec<oracle::OracleStatus>> {
     Json(s.oracles.read().await.clone())
+}
+
+async fn api_units(State(s): State<St>) -> Json<Vec<ManagedUnit>> {
+    let list = s.ee.list().await.unwrap_or_default();
+    let oracles = s.oracles.read().await.clone();
+    let taint_reasons = s.taint.snapshot().await;
+    let integrity_state = IntegrityState::from_taint_reasons(&taint_reasons);
+    let agent_mode = AgentMode::from_confidential(s.cfg.confidential);
+    Json(managed_units(&s, &list, &oracles, agent_mode, integrity_state).await)
+}
+
+async fn managed_units(
+    s: &St,
+    list: &serde_json::Value,
+    oracles: &[oracle::OracleStatus],
+    agent_mode: AgentMode,
+    agent_integrity_state: IntegrityState,
+) -> Vec<ManagedUnit> {
+    let mut oracle_by_app: std::collections::HashMap<String, oracle::OracleStatus> = oracles
+        .iter()
+        .cloned()
+        .map(|oracle| (oracle.app_name.clone(), oracle))
+        .collect();
+    let mut out = Vec::new();
+    if let Some(deployments) = list["deployments"].as_array() {
+        for d in deployments {
+            let Some(app_name) = d["app_name"].as_str() else {
+                continue;
+            };
+            let id = d["id"].as_str().unwrap_or(app_name).to_string();
+            let oracle = oracle_by_app.remove(app_name);
+            let kind = units::kind_for_app(app_name);
+            let log_line_count = workload_log_line_count(&s.ee, &id).await;
+            let mut capabilities = units::base_capabilities(kind);
+            if kind == UnitKind::Agent && agent_mode == AgentMode::ReadWrite {
+                capabilities.extend(["deploy".into(), "exec".into()]);
+            }
+            capabilities.push("logs".into());
+            if oracle.is_some() {
+                capabilities.push("oracle".into());
+            }
+            let refs = unit_refs(s, app_name, kind, oracle.as_ref()).await;
+            out.push(ManagedUnit {
+                id,
+                app_name: app_name.to_string(),
+                title: units::title_for_app(app_name),
+                kind,
+                agent_mode,
+                agent_integrity_state,
+                status: d["status"].as_str().unwrap_or("unknown").to_string(),
+                image: non_empty_string(&d["image"]),
+                started_at: non_empty_string(&d["started_at"]),
+                error_message: non_empty_string(&d["error_message"]),
+                source: units::source_for_app(app_name),
+                log_line_count,
+                capabilities,
+                refs,
+                oracle,
+            });
+        }
+    }
+
+    for oracle in oracle_by_app.into_values() {
+        let refs = unit_refs(s, &oracle.app_name, UnitKind::Workload, Some(&oracle)).await;
+        out.push(ManagedUnit {
+            id: oracle.app_name.clone(),
+            app_name: oracle.app_name.clone(),
+            title: oracle.title.clone(),
+            kind: UnitKind::Workload,
+            agent_mode,
+            agent_integrity_state,
+            status: oracle.status.clone(),
+            image: None,
+            started_at: None,
+            error_message: oracle.last_error.clone(),
+            source: units::source_for_app(&oracle.app_name),
+            log_line_count: 0,
+            capabilities: vec!["oracle".into()],
+            refs,
+            oracle: Some(oracle),
+        });
+    }
+    out.sort_by(|a, b| a.app_name.cmp(&b.app_name));
+    out
+}
+
+async fn unit_refs(
+    s: &St,
+    app_name: &str,
+    kind: UnitKind,
+    oracle: Option<&oracle::OracleStatus>,
+) -> Vec<units::UnitRef> {
+    let mut refs = Vec::new();
+    if let Some(source) = units::source_for_app(app_name) {
+        refs.push(units::ref_item("source", "source", source));
+    }
+    match kind {
+        UnitKind::Agent => {
+            refs.push(units::ref_item(
+                "url",
+                "dashboard",
+                format!("https://{}", s.hostname),
+            ));
+            refs.push(units::ref_item(
+                "url",
+                "agent-api",
+                format!("https://{}", crate::cf::agent_api_hostname(&s.hostname)),
+            ));
+        }
+        UnitKind::Shell => refs.push(units::ref_item(
+            "url",
+            "shell",
+            format!(
+                "https://{}",
+                crate::cf::label_hostname(&s.hostname, "shell")
+            ),
+        )),
+        UnitKind::Tunnel => {
+            refs.push(units::ref_item(
+                "url",
+                "dashboard",
+                format!("https://{}", s.hostname),
+            ));
+            refs.push(units::ref_item(
+                "url",
+                "agent-api",
+                format!("https://{}", crate::cf::agent_api_hostname(&s.hostname)),
+            ));
+            for (label, port) in s.extras.read().await.iter() {
+                refs.push(units::ref_item(
+                    "ingress",
+                    label,
+                    format!(
+                        "https://{} -> localhost:{port}",
+                        crate::cf::label_hostname(&s.hostname, label)
+                    ),
+                ));
+            }
+        }
+        UnitKind::Storage | UnitKind::Runtime | UnitKind::Workload => {}
+    }
+    if let Some(oracle) = oracle {
+        if let Some(url) = &oracle.vanity_url {
+            refs.push(units::ref_item("url", "oracle", url.clone()));
+        }
+        refs.push(units::ref_item(
+            "url",
+            "oracle-local",
+            oracle.local_url.clone(),
+        ));
+    }
+    refs
+}
+
+async fn workload_log_line_count(ee: &Ee, id: &str) -> usize {
+    match ee.logs(id).await {
+        Ok(logs) => logs["lines"].as_array().map(|a| a.len()).unwrap_or(0),
+        Err(e) => {
+            eprintln!("agent: log count unavailable for {id}: {e}");
+            0
+        }
+    }
+}
+
+fn non_empty_string(value: &serde_json::Value) -> Option<String> {
+    value
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
 }
 
 async fn workload_page(State(s): State<St>, Path(id): Path<String>) -> Result<Response> {

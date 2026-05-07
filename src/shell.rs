@@ -38,6 +38,7 @@ use crate::error::{Error, Result};
 use crate::html;
 use crate::oracle::OracleStatus;
 use crate::taint::IntegrityState;
+use crate::units::{self, AgentMode, ManagedUnit, UnitKind};
 
 const DEFAULT_PORT: u16 = 7681;
 const DEFAULT_DIR: &str = "/var/lib/devopsdefender/shell";
@@ -81,7 +82,6 @@ struct SessionMeta {
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum TerminalMode {
-    ReadOnly,
     ReadWrite,
 }
 
@@ -127,17 +127,6 @@ struct TranscriptRecord {
 struct ReplayResponse {
     id: String,
     bytes_b64: String,
-}
-
-#[derive(Serialize)]
-struct WorkloadTerminal {
-    id: String,
-    app_name: String,
-    status: String,
-    terminal_mode: TerminalMode,
-    integrity_state: IntegrityState,
-    integrity_reason: &'static str,
-    oracle: Option<OracleStatus>,
 }
 
 #[derive(Serialize)]
@@ -388,7 +377,11 @@ async fn replay_session(
     }))
 }
 
-async fn list_workloads(State(app): State<App>) -> Result<Json<Vec<WorkloadTerminal>>> {
+async fn list_workloads(State(app): State<App>) -> Result<Json<Vec<ManagedUnit>>> {
+    if let Ok(units) = agent_get(&app, "/api/units").await {
+        return Ok(Json(units));
+    }
+
     let oracles = load_oracles(&app).await;
     let mut oracle_by_app: HashMap<String, OracleStatus> = oracles
         .into_iter()
@@ -403,14 +396,30 @@ async fn list_workloads(State(app): State<App>) -> Result<Json<Vec<WorkloadTermi
                     let Some(app_name) = d["app_name"].as_str() else {
                         continue;
                     };
-                    workloads.push(WorkloadTerminal {
-                        id: d["id"].as_str().unwrap_or(app_name).to_string(),
+                    let id = d["id"].as_str().unwrap_or(app_name).to_string();
+                    let oracle = oracle_by_app.remove(app_name);
+                    let kind = units::kind_for_app(app_name);
+                    let mut capabilities = units::base_capabilities(kind);
+                    capabilities.push("logs".into());
+                    if oracle.is_some() {
+                        capabilities.push("oracle".into());
+                    }
+                    workloads.push(ManagedUnit {
+                        id: id.clone(),
                         app_name: app_name.to_string(),
+                        title: units::title_for_app(app_name),
+                        kind,
+                        agent_mode: AgentMode::ReadWrite,
+                        agent_integrity_state: IntegrityState::Controlled,
                         status: d["status"].as_str().unwrap_or("unknown").to_string(),
-                        terminal_mode: TerminalMode::ReadOnly,
-                        integrity_state: IntegrityState::Clean,
-                        integrity_reason: "read_only_observation",
-                        oracle: oracle_by_app.remove(app_name),
+                        image: non_empty_string(&d["image"]),
+                        started_at: non_empty_string(&d["started_at"]),
+                        error_message: non_empty_string(&d["error_message"]),
+                        source: units::source_for_app(app_name),
+                        log_line_count: workload_log_line_count(&app.ee, &id).await,
+                        capabilities,
+                        refs: fallback_refs(app_name, kind, oracle.as_ref()),
+                        oracle,
                     });
                 }
             }
@@ -420,17 +429,64 @@ async fn list_workloads(State(app): State<App>) -> Result<Json<Vec<WorkloadTermi
         }
     }
 
-    workloads.extend(oracle_by_app.into_values().map(|oracle| WorkloadTerminal {
+    workloads.extend(oracle_by_app.into_values().map(|oracle| ManagedUnit {
         id: oracle.app_name.clone(),
         app_name: oracle.app_name.clone(),
+        title: oracle.title.clone(),
+        kind: UnitKind::Workload,
+        agent_mode: AgentMode::ReadWrite,
+        agent_integrity_state: IntegrityState::Controlled,
         status: oracle.status.clone(),
-        terminal_mode: TerminalMode::ReadOnly,
-        integrity_state: IntegrityState::Clean,
-        integrity_reason: "read_only_observation",
+        image: None,
+        started_at: None,
+        error_message: oracle.last_error.clone(),
+        source: units::source_for_app(&oracle.app_name),
+        log_line_count: 0,
+        capabilities: vec!["oracle".into()],
+        refs: fallback_refs(&oracle.app_name, UnitKind::Workload, Some(&oracle)),
         oracle: Some(oracle),
     }));
     workloads.sort_by(|a, b| a.app_name.cmp(&b.app_name));
     Ok(Json(workloads))
+}
+
+async fn workload_log_line_count(ee: &Ee, id: &str) -> usize {
+    match ee.logs(id).await {
+        Ok(logs) => logs["lines"].as_array().map(|a| a.len()).unwrap_or(0),
+        Err(e) => {
+            eprintln!("dd-shell: workload log probe unavailable for {id}: {e}");
+            0
+        }
+    }
+}
+
+fn fallback_refs(
+    app_name: &str,
+    _kind: UnitKind,
+    oracle: Option<&OracleStatus>,
+) -> Vec<units::UnitRef> {
+    let mut refs = units::source_for_app(app_name)
+        .map(|source| vec![units::ref_item("source", "source", source)])
+        .unwrap_or_default();
+    if let Some(oracle) = oracle {
+        if let Some(url) = &oracle.vanity_url {
+            refs.push(units::ref_item("url", "oracle", url.clone()));
+        }
+        refs.push(units::ref_item(
+            "url",
+            "oracle-local",
+            oracle.local_url.clone(),
+        ));
+    }
+    refs
+}
+
+fn non_empty_string(value: &serde_json::Value) -> Option<String> {
+    value
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
 }
 
 async fn list_oracles(State(app): State<App>) -> Json<Vec<OracleStatus>> {
@@ -1081,7 +1137,9 @@ async function loadWorkload(name) {
   if (currentKind !== "workload" || current !== name) return;
   const workload = workloads.find(w => w.app_name === name);
   if (workload) await writeTerminal(workloadText(workload));
-  if (history) await writeTerminal(base64Bytes(history.bytes_b64));
+  const logBytes = history ? base64Bytes(history.bytes_b64) : new Uint8Array();
+  if (logBytes.length) await writeTerminal(logBytes);
+  else await writeTerminal("No logs yet\r\n");
   term.scrollToBottom();
   document.getElementById("status").textContent = "Observed read-only";
   refresh();
@@ -1131,22 +1189,37 @@ function writeTerminal(data) {
 
 function workloadButtonHtml(w) {
   const oracle = w.oracle;
-  const badges = [
-    `<span class="badge">logs</span>`,
-    oracle ? `<span class="badge ${oracle.status === "healthy" ? "ok" : oracle.status === "error" ? "bad" : ""}">oracle</span>` : "",
-    oracle && oracle.vanity_url ? `<span class="badge">vanity</span>` : ""
-  ].filter(Boolean).join("");
+  const caps = Array.isArray(w.capabilities) ? w.capabilities : [];
+  const badges = caps.map(cap => {
+    const cls = cap === "oracle" && oracle && oracle.status === "healthy" ? " ok" : cap === "oracle" && oracle && oracle.status === "error" ? " bad" : "";
+    return `<span class="badge${cls}">${escapeHtml(cap)}</span>`;
+  }).join("");
   const status = oracle ? `${w.status} / oracle ${oracle.status}` : w.status;
-  return `<div class="name">${escapeHtml(w.app_name)}</div><div class="meta">read-only - clean - ${escapeHtml(status)}</div><div class="badges">${badges}</div>`;
+  const kind = String(w.kind || "workload").replaceAll("_", " ");
+  const logs = Number.isFinite(w.log_line_count) ? `${w.log_line_count} log line(s)` : "logs unknown";
+  return `<div class="name">${escapeHtml(w.title || w.app_name)}</div><div class="meta">${escapeHtml(kind)} - ${escapeHtml(w.agent_mode || "unknown")} - ${escapeHtml(w.agent_integrity_state || "unknown")} - ${escapeHtml(status)} - ${escapeHtml(logs)}</div><div class="badges">${badges}</div>`;
 }
 
 function workloadText(w) {
   const lines = [
-    `${w.app_name}`,
-    `mode: read-only`,
-    `integrity: clean`,
-    `workload status: ${w.status}`
+    `${w.title || w.app_name}`,
+    `app: ${w.app_name}`,
+    `kind: ${w.kind || "workload"}`,
+    `agent mode: ${w.agent_mode || "unknown"}`,
+    `agent integrity: ${w.agent_integrity_state || "unknown"}`,
+    `status: ${w.status}`,
+    `deployment id: ${w.id || "unknown"}`,
+    `source: ${w.source || "unknown"}`,
+    `image: ${w.image || "none"}`,
+    `started: ${w.started_at || "unknown"}`,
+    `log lines: ${w.log_line_count ?? 0}`
   ];
+  if (w.error_message) lines.push(`error: ${w.error_message}`);
+  const refs = Array.isArray(w.refs) ? w.refs : [];
+  if (refs.length) {
+    lines.push("", "refs:");
+    refs.forEach(ref => lines.push(`${ref.label}: ${ref.value}`));
+  }
   const o = w.oracle;
   if (!o) {
     lines.push("", "logs:");

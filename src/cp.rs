@@ -29,6 +29,8 @@ use crate::ita;
 use crate::metrics;
 use crate::noise_gateway;
 use crate::stonith;
+use crate::taint::IntegrityState;
+use crate::units::AgentMode;
 
 /// Re-mint interval for the CP's own ITA token. The CP isn't scraped
 /// by its own collector (different tunnel prefix), so a background
@@ -237,8 +239,12 @@ pub async fn run() -> Result<()> {
             attestation_type: "tdx".into(),
             status: "healthy".into(),
             last_seen: chrono::Utc::now(),
+            agent_mode: AgentMode::ReadWrite,
+            integrity_state: IntegrityState::Controlled,
             deployment_count: 0,
             deployment_names: Vec::new(),
+            unit_count: 0,
+            units: Vec::new(),
             cpu_percent: cp_m.cpu_pct,
             memory_used_mb: cp_m.mem_used_mb,
             memory_total_mb: cp_m.mem_total_mb,
@@ -625,8 +631,12 @@ async fn register(
                 attestation_type: "tdx".into(),
                 status: "healthy".into(),
                 last_seen: now,
+                agent_mode: AgentMode::ReadWrite,
+                integrity_state: IntegrityState::Controlled,
                 deployment_count: 0,
                 deployment_names: Vec::new(),
+                unit_count: 0,
+                units: Vec::new(),
                 cpu_percent: 0,
                 memory_used_mb: 0,
                 memory_total_mb: 0,
@@ -785,24 +795,84 @@ async fn fleet(State(s): State<St>) -> Response {
         rows.push_str(&format!(
             r#"<tr><td><a href="/agent/{id}">{vm}</a></td>
 <td><span class="pill {st}">{st}</span></td><td>{att}</td>
-<td>{cpu}%</td><td>{mem}</td><td>{n}</td><td>{o}</td>
+<td>{mode}</td><td>{integrity}</td>
+<td>{cpu}%</td><td>{mem}</td><td>{n}</td><td>{u}</td><td>{o}</td>
 <td class="dim">{host}</td></tr>"#,
             id = html::escape(&a.agent_id),
             vm = html::escape(&a.vm_name),
             st = html::escape(&a.status),
             att = html::escape(&a.attestation_type),
+            mode = html::escape(a.agent_mode.as_str()),
+            integrity = html::escape(&format!("{:?}", a.integrity_state).to_lowercase()),
             cpu = a.cpu_percent,
             n = a.deployment_count,
+            u = a.unit_count,
             o = a.oracles.len(),
             host = html::escape(&a.hostname),
         ));
+    }
+
+    let mut unit_rows = String::new();
+    for (_, a) in &by_id {
+        for u in &a.units {
+            let refs = if u.refs.is_empty() {
+                r#"<span class="dim">none</span>"#.into()
+            } else {
+                u.refs
+                    .iter()
+                    .take(3)
+                    .map(|r| {
+                        if r.value.starts_with("https://") {
+                            format!(
+                                r#"<a href="{url}" target="_blank">{label}</a>"#,
+                                url = html::escape(&r.value),
+                                label = html::escape(&r.label)
+                            )
+                        } else {
+                            html::escape(&r.label)
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" · ")
+            };
+            unit_rows.push_str(&format!(
+                r#"<tr><td><a href="/agent/{id}">{vm}</a></td><td>{title}<div class="dim">{app}</div></td><td>{kind}</td><td>{mode}</td><td>{integrity}</td><td><span class="pill {cls}">{status}</span></td><td>{logs}</td><td>{refs}</td></tr>"#,
+                id = html::escape(&a.agent_id),
+                vm = html::escape(&a.vm_name),
+                title = html::escape(&u.title),
+                app = html::escape(&u.app_name),
+                kind = html::escape(u.kind.as_str()),
+                mode = html::escape(u.agent_mode.as_str()),
+                integrity = html::escape(&format!("{:?}", u.agent_integrity_state).to_lowercase()),
+                cls = match u.status.as_str() {
+                    "running" | "healthy" => "running",
+                    "deploying" | "unknown" => "deploying",
+                    "failed" | "exited" | "error" => "failed",
+                    _ => "idle",
+                },
+                status = html::escape(&u.status),
+                logs = if u.log_line_count == 0 {
+                    r#"<span class="dim">No logs yet</span>"#.into()
+                } else {
+                    format!("{} line(s)", u.log_line_count)
+                },
+                refs = refs,
+            ));
+        }
     }
 
     let table = if by_id.is_empty() {
         r#"<div class="empty">No agents registered</div>"#.to_string()
     } else {
         format!(
-            r#"<table><tr><th>vm</th><th>status</th><th>att</th><th>cpu</th><th>mem</th><th>wl</th><th>oracles</th><th>host</th></tr>{rows}</table>"#
+            r#"<table><tr><th>vm</th><th>status</th><th>att</th><th>mode</th><th>integrity</th><th>cpu</th><th>mem</th><th>wl</th><th>units</th><th>oracles</th><th>host</th></tr>{rows}</table>"#
+        )
+    };
+    let unit_table = if unit_rows.is_empty() {
+        r#"<div class="empty">No managed units reported yet</div>"#.to_string()
+    } else {
+        format!(
+            r#"<div class="section">Managed units</div><table><tr><th>agent</th><th>unit</th><th>kind</th><th>mode</th><th>integrity</th><th>status</th><th>logs</th><th>refs</th></tr>{unit_rows}</table>"#
         )
     };
 
@@ -810,10 +880,11 @@ async fn fleet(State(s): State<St>) -> Response {
         "DD Fleet",
         &html::nav(&[("Fleet", "/", true)]),
         &format!(
-            r#"<h1>Fleet</h1><div class="sub">{host} · env {env} · {n} agent(s)</div>{table}"#,
+            r#"<h1>Fleet</h1><div class="sub">{host} · env {env} · {n} agent(s)</div>{table}{unit_table}"#,
             host = html::escape(&s.cfg.hostname),
             env = html::escape(&s.cfg.common.env_label),
             n = by_id.len(),
+            unit_table = unit_table,
         ),
     ))
     .into_response()
@@ -1059,7 +1130,12 @@ async fn api_agents(
                     "vm_name": a.vm_name,
                     "hostname": a.hostname,
                     "status": a.status,
+                    "agent_mode": a.agent_mode,
+                    "integrity_state": a.integrity_state,
                     "last_seen": a.last_seen.to_rfc3339(),
+                    "deployment_count": a.deployment_count,
+                    "unit_count": a.unit_count,
+                    "units": a.units,
                     "oracle_count": a.oracles.len(),
                     "oracles": a.oracles,
                 })
@@ -1116,58 +1192,86 @@ async fn agent_detail(State(s): State<St>, Path(id): Path<String>) -> Response {
 
     let is_cp = a.agent_id == "control-plane";
     let mut workloads = String::new();
-    for w in &a.deployment_names {
-        let link = if is_cp {
-            format!(
-                r#"<a href="/agent/{id}/logs/{w}">logs</a>"#,
-                id = html::escape(&a.agent_id),
-                w = html::escape(w)
-            )
-        } else {
-            String::new()
-        };
-        workloads.push_str(&format!(
-            r#"<tr><td>{w}</td><td>{link}</td></tr>"#,
-            w = html::escape(w)
-        ));
-    }
-    let wl_table = if a.deployment_names.is_empty() {
-        r#"<div class="empty">No workloads</div>"#.to_string()
-    } else {
-        format!(r#"<table><tr><th>workload</th><th></th></tr>{workloads}</table>"#)
-    };
-
-    let oracle_section = if a.oracles.is_empty() {
-        String::new()
-    } else {
-        let mut rows = String::new();
-        for o in &a.oracles {
-            let cls = match o.status.as_str() {
-                "healthy" => "healthy",
-                "error" => "failed",
-                _ => "idle",
+    if !a.units.is_empty() {
+        for u in &a.units {
+            let refs = if u.refs.is_empty() {
+                r#"<span class="dim">none</span>"#.into()
+            } else {
+                u.refs
+                    .iter()
+                    .map(|r| {
+                        if r.value.starts_with("https://") {
+                            format!(
+                                r#"<a href="{url}" target="_blank">{label}</a>"#,
+                                url = html::escape(&r.value),
+                                label = html::escape(&r.label)
+                            )
+                        } else {
+                            format!(
+                                r#"<span class="dim">{label}: {value}</span>"#,
+                                label = html::escape(&r.label),
+                                value = html::escape(&r.value)
+                            )
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" · ")
             };
-            let vanity = o
-                .vanity_url
-                .as_ref()
-                .map(|u| {
-                    format!(
-                        r#"<a href="{url}" target="_blank">open</a>"#,
-                        url = html::escape(u)
-                    )
-                })
-                .unwrap_or_else(|| r#"<span class="dim">none</span>"#.into());
-            rows.push_str(&format!(
-                r#"<tr><td>{title}</td><td><span class="pill {cls}">{status}</span></td><td>{vanity}</td><td class="dim">{path}</td><td class="dim">{last}</td></tr>"#,
-                title = html::escape(&o.title),
-                status = html::escape(&o.status),
-                path = html::escape(&o.path),
-                last = html::escape(o.last_ok.as_deref().unwrap_or("never")),
+            let caps = if u.capabilities.is_empty() {
+                String::new()
+            } else {
+                u.capabilities
+                    .iter()
+                    .map(|c| format!(r#"<span class="pill idle">{}</span>"#, html::escape(c)))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            };
+            workloads.push_str(&format!(
+                r#"<tr><td>{title}<div class="dim">{app}</div></td><td>{kind}</td><td><span class="pill {cls}">{status}</span></td><td>{logs}</td><td>{caps}</td><td>{refs}</td></tr>"#,
+                title = html::escape(&u.title),
+                app = html::escape(&u.app_name),
+                kind = html::escape(u.kind.as_str()),
+                cls = match u.status.as_str() {
+                    "running" | "healthy" => "running",
+                    "deploying" | "unknown" => "deploying",
+                    "failed" | "exited" | "error" => "failed",
+                    _ => "idle",
+                },
+                status = html::escape(&u.status),
+                logs = if u.log_line_count == 0 {
+                    r#"<span class="dim">No logs yet</span>"#.into()
+                } else {
+                    format!("{} line(s)", u.log_line_count)
+                },
+                caps = caps,
+                refs = refs,
             ));
         }
+    } else {
+        for w in &a.deployment_names {
+            let link = if is_cp {
+                format!(
+                    r#"<a href="/agent/{id}/logs/{w}">logs</a>"#,
+                    id = html::escape(&a.agent_id),
+                    w = html::escape(w)
+                )
+            } else {
+                String::new()
+            };
+            workloads.push_str(&format!(
+                r#"<tr><td>{w}</td><td>{link}</td></tr>"#,
+                w = html::escape(w)
+            ));
+        }
+    }
+    let wl_table = if workloads.is_empty() {
+        r#"<div class="empty">No managed units</div>"#.to_string()
+    } else if !a.units.is_empty() {
         format!(
-            r#"<div class="section">Read-only oracles</div><table><tr><th>oracle</th><th>status</th><th>vanity</th><th>path</th><th>last ok</th></tr>{rows}</table>"#
+            r#"<table><tr><th>unit</th><th>kind</th><th>status</th><th>logs</th><th>capabilities</th><th>refs</th></tr>{workloads}</table>"#
         )
+    } else {
+        format!(r#"<table><tr><th>workload</th><th></th></tr>{workloads}</table>"#)
     };
 
     let ita_card = {
@@ -1265,6 +1369,8 @@ async fn agent_detail(State(s): State<St>, Path(id): Path<String>) -> Response {
 <h1>{vm}</h1><div class="sub">{id} · {host}</div>
 <div class="card">
   <div class="row"><span>Status</span><span class="pill {st}">{st}</span></div>
+  <div class="row"><span>Mode</span><span>{mode}</span></div>
+  <div class="row"><span>Integrity</span><span>{integrity}</span></div>
   <div class="row"><span>Attestation</span><span>{att}</span></div>
   <div class="row"><span>Last seen</span><span>{ls}</span></div>
   <div class="row"><span>CPU</span><span>{cpu}%</span></div>
@@ -1273,13 +1379,14 @@ async fn agent_detail(State(s): State<St>, Path(id): Path<String>) -> Response {
 {disks_table}
 {nets_table}
 {ita_card}
-{oracle_section}
-<div class="section">Workloads</div>{wl_table}
+<div class="section">Managed units</div>{wl_table}
 {extra}"#,
             vm = html::escape(&a.vm_name),
             id = html::escape(&a.agent_id),
             host = html::escape(&a.hostname),
             st = html::escape(&a.status),
+            mode = html::escape(a.agent_mode.as_str()),
+            integrity = html::escape(&format!("{:?}", a.integrity_state).to_lowercase()),
             att = html::escape(&a.attestation_type),
             ls = a.last_seen.to_rfc3339(),
             cpu = a.cpu_percent,
@@ -1288,7 +1395,6 @@ async fn agent_detail(State(s): State<St>, Path(id): Path<String>) -> Response {
             disks_table = disks_table,
             nets_table = nets_table,
             ita_card = ita_card,
-            oracle_section = oracle_section,
         ),
     ))
     .into_response()

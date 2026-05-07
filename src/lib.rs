@@ -15,3 +15,4 @@ pub mod oracle;
 pub mod shell;
 pub mod stonith;
 pub mod taint;
+pub mod units;
