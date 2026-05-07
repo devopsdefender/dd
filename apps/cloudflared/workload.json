@@ -3,6 +3,7 @@
   "github_release": {
     "repo": "cloudflare/cloudflared",
     "asset": "cloudflared-linux-amd64",
+    "tag": "2026.3.0",
     "rename": "cloudflared"
   }
 }

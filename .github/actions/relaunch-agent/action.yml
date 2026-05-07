@@ -50,6 +50,10 @@ inputs:
   owner:
     description: 'Fleet principal — GitHub login or owner/repo path. Forwarded as EE_OWNER to local-agents.sh on the tdx2 host, which resolves it to id+kind via gh api and bakes all three into agent.env.'
     required: true
+  github-token:
+    description: 'GitHub token forwarded into EasyEnclave as EE_GITHUB_TOKEN for authenticated boot-time release asset fetches.'
+    required: false
+    default: ''
 
 runs:
   using: composite
@@ -81,22 +85,23 @@ runs:
         DD_EE_CHANNEL: ${{ inputs.ee-channel }}
         DD_EE_TAG: ${{ inputs.ee-tag }}
         EE_OWNER: ${{ inputs.owner }}
+        EE_GITHUB_TOKEN: ${{ inputs.github-token }}
         DD_REPO_ROOT: ${{ inputs.repo-root }}
       with:
         host: ${{ inputs.host }}
         username: ${{ inputs.ssh-user }}
         key: ${{ inputs.ssh-key }}
-        envs: KIND,URL,REF,RELEASE_TAG,DD_ITA_API_KEY,DD_EE_CHANNEL,DD_EE_TAG,EE_OWNER,DD_REPO_ROOT
+        envs: KIND,URL,REF,RELEASE_TAG,DD_ITA_API_KEY,DD_EE_CHANNEL,DD_EE_TAG,EE_OWNER,EE_GITHUB_TOKEN,DD_REPO_ROOT
         script: |
           export KIND URL REF RELEASE_TAG
-          export DD_ITA_API_KEY DD_EE_CHANNEL DD_EE_TAG EE_OWNER DD_REPO_ROOT
+          export DD_ITA_API_KEY DD_EE_CHANNEL DD_EE_TAG EE_OWNER EE_GITHUB_TOKEN DD_REPO_ROOT
           if [ ! -d "$DD_REPO_ROOT/.git" ]; then
             mkdir -p "$(dirname "$DD_REPO_ROOT")"
             git clone https://github.com/devopsdefender/dd.git "$DD_REPO_ROOT"
           fi
           git -C "$DD_REPO_ROOT" fetch --quiet origin "$REF"
           git -C "$DD_REPO_ROOT" checkout --quiet FETCH_HEAD -- apps/
-          env DD_REPO_ROOT="$DD_REPO_ROOT" DD_ITA_API_KEY="$DD_ITA_API_KEY" DD_EE_CHANNEL="$DD_EE_CHANNEL" DD_EE_TAG="$DD_EE_TAG" EE_OWNER="$EE_OWNER" "$DD_REPO_ROOT/apps/_infra/dd-relaunch.sh" "$KIND" "$URL" "$REF" "$RELEASE_TAG"
+          env DD_REPO_ROOT="$DD_REPO_ROOT" DD_ITA_API_KEY="$DD_ITA_API_KEY" DD_EE_CHANNEL="$DD_EE_CHANNEL" DD_EE_TAG="$DD_EE_TAG" EE_OWNER="$EE_OWNER" EE_GITHUB_TOKEN="$EE_GITHUB_TOKEN" "$DD_REPO_ROOT/apps/_infra/dd-relaunch.sh" "$KIND" "$URL" "$REF" "$RELEASE_TAG"
 
     # Block until the freshly-booted agent VM registers with the CP.
     # This is the "I can see the local agent deployment worked"

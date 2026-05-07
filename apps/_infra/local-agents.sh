@@ -71,6 +71,10 @@ fi
 # Defaults to "latest" for ad-hoc runs; the relaunch-agent action sets
 # it to the PR's release tag so preview deploys test the PR binary.
 DD_RELEASE_TAG="${DD_RELEASE_TAG:-latest}"
+# Optional GitHub token for EasyEnclave's boot-time GitHub release
+# asset fetches. CI forwards github.token here to avoid anonymous API
+# rate limits during cold boots.
+EE_GITHUB_TOKEN="${EE_GITHUB_TOKEN:-${GITHUB_TOKEN:-}}"
 
 # Resolve EE_OWNER to (id, kind) once via `gh api`. Hard-fails if the
 # login or repo doesn't exist — better than baking a typo into a
@@ -252,6 +256,9 @@ build_config_iso() {
     echo "EE_OWNER=$EE_OWNER"
     echo "EE_OWNER_ID=$EE_OWNER_ID"
     echo "EE_OWNER_KIND=$EE_OWNER_KIND"
+    if [ -n "$EE_GITHUB_TOKEN" ]; then
+      echo "EE_GITHUB_TOKEN=$EE_GITHUB_TOKEN"
+    fi
     echo "EE_BOOT_WORKLOADS=$workloads"
     # EE capture-socket tee target. Kept for forward compatibility: a
     # future workload (e.g. an attested proxy) can bind + listen on it.

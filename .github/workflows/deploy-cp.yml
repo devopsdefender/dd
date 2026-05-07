@@ -95,6 +95,7 @@ jobs:
     env:
       DD_ENV: ${{ inputs.env }}
       DD_HOSTNAME: ${{ inputs.hostname }}
+      DD_BOOT_GITHUB_TOKEN: ${{ github.token }}
       GCP_ZONE: us-central1-c
     steps:
       - uses: actions/checkout@v4
@@ -152,6 +153,7 @@ jobs:
           ee-channel:    ${{ steps.ee.outputs.channel }}
           ee-tag:        ${{ inputs.ee_tag }}
           owner:         ${{ inputs.owner }}
+          github-token:  ${{ github.token }}
 
       - name: Create TDX VM (boots from easyenclave-mini, fetches dd from GitHub releases)
         if: inputs.target == 'gcp'
@@ -244,11 +246,13 @@ jobs:
             --arg owner "$EE_OWNER" \
             --argjson owner_id "$EE_OWNER_ID" \
             --arg owner_kind "$EE_OWNER_KIND" \
+            --arg github_token "$DD_BOOT_GITHUB_TOKEN" \
             '{
                "EE_BOOT_WORKLOADS": $workloads,
                "EE_OWNER": $owner,
                "EE_OWNER_ID": ($owner_id | tostring),
                "EE_OWNER_KIND": $owner_kind,
+               "EE_GITHUB_TOKEN": $github_token,
                "EE_CAPTURE_SOCKET": "/run/ee/capture.sock"
              }' \
             > /tmp/ee-config.json
@@ -531,6 +535,7 @@ jobs:
           ee-channel: ${{ steps.ee.outputs.channel }}
           ee-tag: ${{ inputs.ee_tag }}
           owner: ${{ inputs.owner }}
+          github-token: ${{ github.token }}
 
       # Preview only: deploy hello-world as the end-to-end canary.
       # Exercises the full GH-OIDC auth path (mint → agent verify
