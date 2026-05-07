@@ -908,14 +908,16 @@ const SHELL_HTML: &str = r##"
 <style>
 body { background:#0b0d12; color:#d7deea; }
 main { max-width:none; padding:0; height:100vh; display:grid; grid-template-columns:280px 1fr; }
-.sidebar { border-right:1px solid #252a36; padding:16px; background:#111520; overflow:auto; }
+.sidebar { border-right:1px solid #252a36; background:#111520; overflow:auto; min-height:0; }
+.sidebar-top { position:sticky; top:0; z-index:5; background:#111520; padding:16px 16px 12px; border-bottom:1px solid #252a36; }
+.sidebar-scroll { padding:0 16px 16px; }
 .terminal-wrap { height:100vh; display:flex; flex-direction:column; min-width:0; }
 .toolbar { height:48px; border-bottom:1px solid #252a36; display:flex; align-items:center; gap:8px; padding:0 12px; background:#111520; }
 .term { flex:1; min-height:0; background:#05070a; overflow:hidden; padding:8px; }
 .term .xterm { height:100%; }
 .term .xterm-viewport { background:#05070a !important; }
-.groups { display:flex; flex-direction:column; gap:18px; margin-top:14px; }
-.group-title { color:#8791a5; font-size:11px; font-weight:700; letter-spacing:0; text-transform:uppercase; margin-bottom:8px; }
+.groups { display:flex; flex-direction:column; gap:18px; }
+.group-title { position:sticky; top:126px; z-index:4; color:#8791a5; font-size:11px; font-weight:700; letter-spacing:0; text-transform:uppercase; margin:0 -16px 8px; padding:8px 16px; background:#111520; border-bottom:1px solid #202634; }
 .sessions { display:flex; flex-direction:column; gap:8px; }
 .session { text-align:left; color:#d7deea; background:#171c29; border:1px solid #2b3242; border-radius:6px; padding:10px; cursor:pointer; }
 .session.active { border-color:#7aa2f7; }
@@ -935,26 +937,34 @@ main { max-width:none; padding:0; height:100vh; display:grid; grid-template-colu
 .pill.ok { color:#9ece6a; border-color:#334b35; }
 .pill.bad { color:#f7768e; border-color:#57323d; }
 .new { width:100%; }
+.filter { width:100%; margin-top:10px; box-sizing:border-box; background:#0b0d12; color:#d7deea; border:1px solid #2b3242; border-radius:6px; padding:9px 10px; font:inherit; font-size:13px; }
+.filter:focus { outline:1px solid #7aa2f7; border-color:#7aa2f7; }
+.empty-mini { color:#8791a5; font-size:12px; padding:8px 2px; }
 .status { color:#8791a5; font-size:12px; margin-left:auto; }
 button.secondary { background:#252a36; color:#d7deea; }
-@media (max-width:760px) { main { grid-template-columns:1fr; } .sidebar { height:220px; border-right:0; border-bottom:1px solid #252a36; } }
+@media (max-width:760px) { main { grid-template-columns:1fr; grid-template-rows:240px 1fr; } .sidebar { height:240px; border-right:0; border-bottom:1px solid #252a36; } .group-title { top:126px; } .terminal-wrap { height:calc(100vh - 240px); } }
 </style>
 <div class="sidebar">
-  <h1>Shell</h1>
-  <div class="sub">Observed logs and controlled PTYs</div>
-  <button class="new" id="new-session">New session</button>
-  <div class="groups">
-    <div>
-      <div class="group-title">System</div>
-      <div class="system" id="system"></div>
-    </div>
-    <div>
-      <div class="group-title">Read-write sessions</div>
-      <div class="sessions" id="sessions"></div>
-    </div>
-    <div>
-      <div class="group-title">Read-only workloads</div>
-      <div class="sessions" id="workloads"></div>
+  <div class="sidebar-top">
+    <h1>Shell</h1>
+    <div class="sub">Observed logs and controlled PTYs</div>
+    <button class="new" id="new-session">New session</button>
+    <input class="filter" id="workload-filter" type="search" placeholder="Filter workloads">
+  </div>
+  <div class="sidebar-scroll">
+    <div class="groups">
+      <div>
+        <div class="group-title">System</div>
+        <div class="system" id="system"></div>
+      </div>
+      <div>
+        <div class="group-title">Read-write sessions</div>
+        <div class="sessions" id="sessions"></div>
+      </div>
+      <div>
+        <div class="group-title">Read-only workloads</div>
+        <div class="sessions" id="workloads"></div>
+      </div>
     </div>
   </div>
 </div>
@@ -1002,6 +1012,7 @@ let resizeTimer = null;
 let workloadTimer = null;
 let notifyMode = localStorage.getItem("dd-shell-notify") || "always";
 let oscBuffer = "";
+let cachedWorkloads = [];
 const decoder = new TextDecoder();
 
 async function api(path, opts) {
@@ -1018,6 +1029,7 @@ async function refresh() {
     api("/api/workloads").catch(() => [])
   ]);
   renderSystem(system);
+  cachedWorkloads = workloads;
   const root = document.getElementById("sessions");
   root.innerHTML = "";
   sessions.forEach(s => {
@@ -1027,8 +1039,18 @@ async function refresh() {
     el.onclick = () => attach(s.id);
     root.appendChild(el);
   });
+  renderWorkloads();
+}
+
+function renderWorkloads() {
   const workloadRoot = document.getElementById("workloads");
+  const query = document.getElementById("workload-filter").value.trim().toLowerCase();
+  const workloads = cachedWorkloads.filter(w => workloadSearchText(w).includes(query));
   workloadRoot.innerHTML = "";
+  if (workloads.length === 0) {
+    workloadRoot.innerHTML = `<div class="empty-mini">${query ? "No matching workloads" : "No workloads"}</div>`;
+    return;
+  }
   workloads.forEach(w => {
     const el = document.createElement("button");
     el.className = "session readonly" + (currentKind === "workload" && w.app_name === current ? " active" : "");
@@ -1036,6 +1058,12 @@ async function refresh() {
     el.onclick = () => attachWorkload(w.app_name);
     workloadRoot.appendChild(el);
   });
+}
+
+function workloadSearchText(w) {
+  const caps = Array.isArray(w.capabilities) ? w.capabilities.join(" ") : "";
+  const refs = Array.isArray(w.refs) ? w.refs.map(r => `${r.label} ${r.value}`).join(" ") : "";
+  return `${w.title || ""} ${w.app_name || ""} ${w.kind || ""} ${w.status || ""} ${caps} ${refs}`.toLowerCase();
 }
 
 function renderSystem(system) {
@@ -1155,6 +1183,7 @@ term.onData(data => {
 });
 
 document.getElementById("new-session").onclick = createSession;
+document.getElementById("workload-filter").oninput = renderWorkloads;
 document.getElementById("close").onclick = async () => {
   if (!current || currentKind !== "session") return;
   await api(`/api/sessions/${current}/close`, {method:"POST"});
