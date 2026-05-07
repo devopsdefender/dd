@@ -119,6 +119,7 @@ pub async fn run() -> Result<()> {
 
     let app = Router::new()
         .route("/", get(index))
+        .route("/favicon.ico", get(favicon))
         .route("/api/sessions", get(list_sessions).post(create_session))
         .route("/api/sessions/{id}/replay", get(replay_session))
         .route("/api/sessions/{id}/close", post(close_session))
@@ -135,6 +136,10 @@ pub async fn run() -> Result<()> {
 
 async fn index() -> Html<String> {
     Html(html::shell("DD Shell", "", SHELL_HTML))
+}
+
+async fn favicon() -> StatusCode {
+    StatusCode::NO_CONTENT
 }
 
 async fn list_sessions(State(app): State<App>) -> Json<Vec<SessionMeta>> {
@@ -479,7 +484,9 @@ main { max-width:none; padding:0; height:100vh; display:grid; grid-template-colu
 .sidebar { border-right:1px solid #252a36; padding:16px; background:#111520; overflow:auto; }
 .terminal-wrap { height:100vh; display:flex; flex-direction:column; min-width:0; }
 .toolbar { height:48px; border-bottom:1px solid #252a36; display:flex; align-items:center; gap:8px; padding:0 12px; background:#111520; }
-.term { flex:1; min-height:0; background:#05070a; }
+.term { flex:1; min-height:0; background:#05070a; overflow:auto; }
+.fallback-term { min-height:100%; padding:12px; white-space:pre-wrap; overflow-wrap:anywhere; outline:none; color:#d7deea; font:13px/1.45 "JetBrains Mono", ui-monospace, monospace; }
+.fallback-term:focus { box-shadow:inset 0 0 0 1px #7aa2f7; }
 .sessions { display:flex; flex-direction:column; gap:8px; margin-top:14px; }
 .session { text-align:left; color:#d7deea; background:#171c29; border:1px solid #2b3242; border-radius:6px; padding:10px; cursor:pointer; }
 .session.active { border-color:#7aa2f7; }
@@ -490,7 +497,6 @@ main { max-width:none; padding:0; height:100vh; display:grid; grid-template-colu
 button.secondary { background:#252a36; color:#d7deea; }
 @media (max-width:760px) { main { grid-template-columns:1fr; } .sidebar { height:220px; border-right:0; border-bottom:1px solid #252a36; } }
 </style>
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.5.0/css/xterm.css">
 <div class="sidebar">
   <h1>Shell</h1>
   <div class="sub">Reconnectable sessions on this agent</div>
@@ -505,9 +511,54 @@ button.secondary { background:#252a36; color:#d7deea; }
   </div>
   <div class="term" id="terminal"></div>
 </div>
-<script src="https://cdn.jsdelivr.net/npm/xterm@5.5.0/lib/xterm.min.js"></script>
 <script>
-const term = new Terminal({cursorBlink:true, convertEol:true, fontFamily:"JetBrains Mono, ui-monospace, monospace", theme:{background:"#05070a", foreground:"#d7deea"}});
+function makeTerminal() {
+  let onData = () => {};
+  let screen = null;
+  let text = "";
+  const clean = s => String(s)
+    .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "")
+    .replace(/\x1b\][^\x07]*(\x07|\x1b\\)/g, "");
+  const render = () => {
+    screen.textContent = text;
+    screen.parentElement.scrollTop = screen.parentElement.scrollHeight;
+  };
+  return {
+    open(parent) {
+      screen = document.createElement("div");
+      screen.className = "fallback-term";
+      screen.tabIndex = 0;
+      parent.appendChild(screen);
+      screen.addEventListener("keydown", ev => {
+        let data = "";
+        if (ev.ctrlKey && ev.key.length === 1) data = String.fromCharCode(ev.key.toUpperCase().charCodeAt(0) - 64);
+        else if (ev.key === "Enter") data = "\r";
+        else if (ev.key === "Backspace") data = "\x7f";
+        else if (ev.key === "Tab") data = "\t";
+        else if (ev.key.length === 1) data = ev.key;
+        if (data) { ev.preventDefault(); onData(data); }
+      });
+      screen.addEventListener("paste", ev => {
+        const data = ev.clipboardData.getData("text");
+        if (data) { ev.preventDefault(); onData(data); }
+      });
+      screen.focus();
+    },
+    write(data) {
+      if (data instanceof Uint8Array) data = new TextDecoder().decode(data);
+      text += clean(data).replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+      render();
+    },
+    clear() {
+      text = "";
+      render();
+    },
+    onData(fn) {
+      onData = fn;
+    }
+  };
+}
+const term = makeTerminal();
 term.open(document.getElementById("terminal"));
 let current = null;
 let ws = null;
