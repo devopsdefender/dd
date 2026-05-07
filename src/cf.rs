@@ -153,8 +153,8 @@ pub async fn update_ingress(
     apply_ingress(http, cf, tunnel_id, hostname, extras).await
 }
 
-/// Turn `(hostname="pr-144.devopsdefender.com", label="term")` into
-/// `"pr-144-term.devopsdefender.com"`. Cloudflare's Universal SSL
+/// Turn `(hostname="pr-144.devopsdefender.com", label="shell")` into
+/// `"pr-144-shell.devopsdefender.com"`. Cloudflare's Universal SSL
 /// only covers one level of wildcard (`*.devopsdefender.com`), so
 /// we can't nest sub-workload subdomains under the agent's hostname
 /// — the TLS handshake fails for `foo.bar.devopsdefender.com`.
@@ -548,16 +548,9 @@ async fn ensure_bypass_app(http: &Client, cf: &CfCreds, name: &str, domain: &str
     Ok(())
 }
 
-/// Hostname labels that run admin workloads (shell access, future
-/// log viewer, future metrics panel). These get a human CF Access
-/// app, not a public bypass — otherwise exposing ttyd on a public
-/// subdomain would be a free shell for the internet.
-///
-/// - `term` — legacy ttyd subdomain (kept admin-gated for older deploys).
-/// - `block` — ttyd workload; exposing it without auth is the same
-///   "free shell for the internet" risk.
-/// - `shell` — dd-shell multi-session shell service.
-const ADMIN_LABELS: &[&str] = &["term", "block", "shell"];
+/// Hostname labels that run admin workloads. These get a human CF
+/// Access app, not a public bypass.
+const ADMIN_LABELS: &[&str] = &["shell"];
 
 fn is_admin_label(label: &str) -> bool {
     ADMIN_LABELS.contains(&label)
@@ -567,7 +560,7 @@ fn is_admin_label(label: &str) -> bool {
 ///
 /// Apps created:
 ///   - Human: `{hostname}` — GitHub org or admin email (dashboard, /agent/*, /cp/*)
-///   - Human: `term.{hostname}` — ttyd shell, org members only
+///   - Human: `{hostname}-shell` — dd-shell, org members only
 ///   - Bypass: `{hostname}/health` — public (read-only fleet health;
 ///     also carries the Noise pre-handshake `{quote_b64, pubkey_hex}`)
 ///   - Bypass: `{hostname}/api/agents` — read-only agent list
@@ -596,8 +589,8 @@ pub async fn provision_cp_access(
     .await?;
 
     // One CF Access app per CP-exposed workload label. Admin labels
-    // (from `ADMIN_LABELS` — e.g. the ttyd terminal at `block`) get
-    // the human policy; anything else gets a public bypass.
+    // (from `ADMIN_LABELS`) get the human policy; anything else gets
+    // a public bypass.
     let desired: std::collections::HashSet<String> = workload_labels
         .iter()
         .map(|l| label_hostname(hostname, l))
@@ -706,7 +699,7 @@ pub async fn provision_cp_access(
 ///
 ///   - Human: `{agent}.{domain}` — browser dashboard only
 ///   - Human: `<admin-label>.{agent}.{domain}` for labels in
-///     `ADMIN_LABELS` (ttyd et al) — org members only
+///     `ADMIN_LABELS` — org members only
 ///   - Bypass: `{agent}-agent-api.{domain}` — machine API only
 ///   - Bypass: `{agent}.{domain}/health` — public; carries the Noise
 ///     pre-handshake `{quote_b64, pubkey_hex}` in its response
@@ -886,16 +879,16 @@ mod tests {
     #[test]
     fn label_hostname_flattens_to_one_level() {
         assert_eq!(
-            label_hostname("pr-144.devopsdefender.com", "term"),
-            "pr-144-term.devopsdefender.com"
+            label_hostname("pr-144.devopsdefender.com", "shell"),
+            "pr-144-shell.devopsdefender.com"
         );
         assert_eq!(
             label_hostname("dd-pr-144-agent-abc.devopsdefender.com", "api"),
             "dd-pr-144-agent-abc-api.devopsdefender.com"
         );
         assert_eq!(
-            label_hostname("app.devopsdefender.com", "term"),
-            "app-term.devopsdefender.com"
+            label_hostname("app.devopsdefender.com", "shell"),
+            "app-shell.devopsdefender.com"
         );
     }
 
@@ -909,7 +902,7 @@ mod tests {
 
     #[test]
     fn label_hostname_handles_dotless_hostname() {
-        assert_eq!(label_hostname("localhost", "term"), "localhost-term");
+        assert_eq!(label_hostname("localhost", "shell"), "localhost-shell");
     }
 
     #[test]

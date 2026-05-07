@@ -15,7 +15,7 @@
 #                      satsforcompute repo just dd-deploys the bot
 #                      workload onto this agent's /deploy. Same boot
 #                      chain as preview/prod (cloudflared + dd-agent +
-#                      ttyd + podman). Modest sizing.
+#                      dd-shell + podman). Modest sizing.
 #
 # All three reuse the existing easyenclave base qcow2 via copy-on-write
 # overlays; each gets its own config.iso baking in DD_CP_URL +
@@ -188,7 +188,6 @@ build_config_iso() {
     bake "$REPO_ROOT/apps/podman-static/workload.json"
     bake "$REPO_ROOT/apps/podman-bootstrap/workload.json"
     bake "$REPO_ROOT/apps/cloudflared/workload.json"
-    bake "$REPO_ROOT/apps/ttyd/workload.json"
     bake "$REPO_ROOT/apps/dd-shell/workload.json"
   })
 

@@ -67,14 +67,14 @@ Zero shared secrets. Every CP and agent URL is fronted by [Cloudflare Access](ht
 
 | Caller | Endpoint | Auth |
 | --- | --- | --- |
-| Human browser | CP `/`, agent `/`, ttyd terminal | CF Access → GitHub OAuth → `github-organization:DD_OWNER` or `emails:DD_ACCESS_ADMIN_EMAIL` |
+| Human browser | CP `/`, agent `/`, dd-shell terminal | CF Access → GitHub OAuth → `github-organization:DD_OWNER` or `emails:DD_ACCESS_ADMIN_EMAIL` |
 | Agent → CP | `/register`, `/ingress/replace` | CF Access bypass + Intel ITA token verified in-code |
 | CI → agent | `/deploy`, `/exec`, `/logs/{app}` | CF Access bypass + GitHub Actions OIDC JWT verified in-code (`repository_owner == DD_OWNER`) |
 | Anyone | `/health`, `/cp/attest`, `/api/agents`, workload URLs | CF Access bypass; read-only or self-authenticating content |
 
 No PATs. No CF Access service tokens. No Worker. Agents ship with nothing but an ITA API key; CI ships with nothing but its per-job GitHub OIDC token.
 
-CF Access apps are provisioned programmatically by the CP at boot — one application per hostname (CP, agent, each admin-gated workload label like `-term`). Orphan apps from torn-down preview VMs are reaped on the next CP boot.
+CF Access apps are provisioned programmatically by the CP at boot — one application per hostname (CP, agent, each admin-gated workload label like `-shell`). Orphan apps from torn-down preview VMs are reaped on the next CP boot.
 
 First-time setup on a fresh Cloudflare account:
 1. Zero Trust → Settings → Authentication → Login methods → add GitHub (`read:user` scope only).
@@ -106,7 +106,7 @@ The agent verifies the OIDC token against GitHub's JWKS, checks `repository_owne
 
 ## Terminal access
 
-Each VM runs [ttyd](https://github.com/tsl0922/ttyd) as a workload on a `-term` labelled subdomain (e.g. `app-term.devopsdefender.com`, `<agent>-term.devopsdefender.com`). CF Access gates it behind the same GitHub OAuth + admin-email policy as the dashboards — no SSH, no shared keys.
+Each VM runs `dd-shell` as a workload on a `-shell` labelled subdomain (for example `app-shell.devopsdefender.com` or `<agent>-shell.devopsdefender.com`). CF Access gates it behind the same GitHub OAuth + admin-email policy as the dashboards. The shell UI separates read-only workload log terminals from read-write PTY sessions, and read-write sessions keep encrypted transcript history inside the enclave.
 
 ## STONITH
 

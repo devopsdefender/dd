@@ -1,8 +1,7 @@
 //! Multi-session shell sidecar.
 //!
-//! This is the replacement target for the current ttyd workload: one process
-//! per agent VM, multiple reconnectable PTY sessions, and encrypted append-only
-//! transcripts on disk.
+//! One process per VM, multiple reconnectable PTY sessions, read-only workload
+//! terminals, and encrypted append-only transcripts on disk.
 
 use std::cmp::Reverse;
 use std::collections::{HashMap, VecDeque};

@@ -41,9 +41,9 @@ pub enum TaintReason {
     /// the mutation endpoints aren't registered at all. Derived at
     /// boot from config; never toggled at runtime.
     ArbitraryExecEnabled,
-    /// Interactive shell (ttyd or equivalent) is in the running
-    /// workload set. Reserved — not populated by v0. Left in the
-    /// enum so the `/health` schema is stable when it lands.
+    /// Interactive shell access is enabled through a shell workload.
+    /// Reserved — not populated by v0. Left in the enum so the
+    /// `/health` schema is stable when it lands.
     #[allow(dead_code)]
     InteractiveShellEnabled,
 }
