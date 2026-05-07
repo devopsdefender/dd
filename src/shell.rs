@@ -6,6 +6,8 @@
 
 use std::cmp::Reverse;
 use std::collections::{HashMap, VecDeque};
+use std::fs::File as StdFile;
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -24,9 +26,10 @@ use futures_util::{SinkExt, StreamExt};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use tokio::fs::File as TokioFile;
 use tokio::fs::OpenOptions;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::process::{Child, ChildStdin, Command};
+use tokio::process::{Child, Command};
 use tokio::sync::{broadcast, Mutex, RwLock};
 use uuid::Uuid;
 
@@ -46,8 +49,9 @@ struct App {
 
 struct Session {
     meta: RwLock<SessionMeta>,
-    stdin: Mutex<ChildStdin>,
+    input: Mutex<TokioFile>,
     child: Mutex<Child>,
+    pgid: i32,
     tx: broadcast::Sender<Vec<u8>>,
     ring: Mutex<VecDeque<u8>>,
 }
@@ -162,28 +166,7 @@ async fn create_session(
     let name = req.name.unwrap_or_else(|| short_name(&id));
     let now = unix_ts();
 
-    let mut cmd = Command::new(&command);
-    cmd.current_dir(&cwd)
-        .env("TERM", "xterm-256color")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| Error::BadRequest(format!("spawn {command}: {e}")))?;
-
-    let stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| Error::Internal("child stdin unavailable".into()))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| Error::Internal("child stdout unavailable".into()))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| Error::Internal("child stderr unavailable".into()))?;
+    let (child, output, input, pgid) = spawn_pty(&command, &cwd)?;
     let (tx, _) = broadcast::channel(512);
 
     let meta = SessionMeta {
@@ -200,8 +183,9 @@ async fn create_session(
 
     let session = Arc::new(Session {
         meta: RwLock::new(meta),
-        stdin: Mutex::new(stdin),
+        input: Mutex::new(input),
         child: Mutex::new(child),
+        pgid,
         tx,
         ring: Mutex::new(VecDeque::with_capacity(RING_LIMIT)),
     });
@@ -210,11 +194,86 @@ async fn create_session(
         .write()
         .await
         .insert(id.clone(), session.clone());
-    spawn_reader(app.store.clone(), session.clone(), stdout, "stdout");
-    spawn_reader(app.store.clone(), session.clone(), stderr, "stderr");
+    spawn_reader(app.store.clone(), session.clone(), output, "pty");
     spawn_waiter(app.store.clone(), session.clone());
 
     Ok(Json(CreateSessionResponse { id }))
+}
+
+fn spawn_pty(command: &str, cwd: &str) -> Result<(Child, TokioFile, TokioFile, i32)> {
+    let mut master = -1;
+    let mut slave = -1;
+    let winsize = libc::winsize {
+        ws_row: 24,
+        ws_col: 80,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    let open_rc = unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            &winsize,
+        )
+    };
+    if open_rc != 0 {
+        return Err(Error::Internal(format!(
+            "openpty: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+
+    let master = unsafe { StdFile::from_raw_fd(master) };
+    let output = TokioFile::from_std(
+        master
+            .try_clone()
+            .map_err(|e| Error::Internal(format!("pty master clone: {e}")))?,
+    );
+    let input = TokioFile::from_std(master);
+    let slave = unsafe { StdFile::from_raw_fd(slave) };
+    let slave_fd = slave.as_raw_fd();
+
+    let dup_slave = || -> std::io::Result<StdFile> {
+        let fd = unsafe { libc::dup(slave_fd) };
+        if fd < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(unsafe { StdFile::from_raw_fd(fd) })
+        }
+    };
+
+    let mut cmd = Command::new(command);
+    cmd.current_dir(cwd)
+        .env("TERM", "xterm-256color")
+        .env("COLORTERM", "truecolor")
+        .stdin(Stdio::from(
+            dup_slave().map_err(|e| Error::Internal(format!("pty stdin dup: {e}")))?,
+        ))
+        .stdout(Stdio::from(
+            dup_slave().map_err(|e| Error::Internal(format!("pty stdout dup: {e}")))?,
+        ))
+        .stderr(Stdio::from(
+            dup_slave().map_err(|e| Error::Internal(format!("pty stderr dup: {e}")))?,
+        ));
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::setsid() < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::ioctl(slave_fd, libc::TIOCSCTTY, 0) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let child = cmd
+        .spawn()
+        .map_err(|e| Error::BadRequest(format!("spawn {command}: {e}")))?;
+    let pgid = child.id().map(|pid| pid as i32).unwrap_or_default();
+    drop(slave);
+    Ok((child, output, input, pgid))
 }
 
 async fn replay_session(
@@ -232,6 +291,11 @@ async fn close_session(State(app): State<App>, AxPath(id): AxPath<String>) -> Re
     let Some(session) = app.sessions.read().await.get(&id).cloned() else {
         return Err(Error::NotFound);
     };
+    if session.pgid > 0 {
+        unsafe {
+            libc::kill(-session.pgid, libc::SIGHUP);
+        }
+    }
     let mut child = session.child.lock().await;
     if let Err(e) = child.kill().await {
         eprintln!("dd-shell: kill {id}: {e}");
@@ -283,11 +347,11 @@ async fn attach(socket: WebSocket, session: Arc<Session>, tail: bool) -> anyhow:
     while let Some(msg) = ws_rx.next().await {
         match msg? {
             Message::Binary(bytes) => {
-                session.stdin.lock().await.write_all(&bytes).await?;
+                session.input.lock().await.write_all(&bytes).await?;
             }
             Message::Text(text) => {
                 session
-                    .stdin
+                    .input
                     .lock()
                     .await
                     .write_all(text.as_bytes())
@@ -521,7 +585,17 @@ function makeTerminal() {
   let onData = () => {};
   let screen = null;
   let text = "";
-  let input = "";
+  const keyMap = {
+    ArrowUp: "\x1b[A",
+    ArrowDown: "\x1b[B",
+    ArrowRight: "\x1b[C",
+    ArrowLeft: "\x1b[D",
+    Home: "\x1b[H",
+    End: "\x1b[F",
+    Delete: "\x1b[3~",
+    PageUp: "\x1b[5~",
+    PageDown: "\x1b[6~"
+  };
   const clean = s => String(s)
     .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "")
     .replace(/\x1b\][^\x07]*(\x07|\x1b\\)/g, "");
@@ -542,44 +616,24 @@ function makeTerminal() {
           onData(String.fromCharCode(ev.key.toUpperCase().charCodeAt(0) - 64));
           return;
         }
-        if (ev.key === "Enter") {
+        if (keyMap[ev.key]) {
           ev.preventDefault();
-          text += "\n";
-          render();
-          onData(input + "\n");
-          input = "";
+          onData(keyMap[ev.key]);
           return;
         }
-        if (ev.key === "Backspace") {
-          ev.preventDefault();
-          if (input.length > 0) {
-            input = input.slice(0, -1);
-            text = text.slice(0, -1);
-            render();
-          }
-          return;
-        }
-        if (ev.key === "Tab") {
-          ev.preventDefault();
-          input += "\t";
-          text += "\t";
-          render();
-          return;
-        }
-        if (ev.key.length === 1) {
-          ev.preventDefault();
-          input += ev.key;
-          text += ev.key;
-          render();
-        }
+        let data = "";
+        if (ev.key === "Enter") data = "\r";
+        else if (ev.key === "Backspace") data = "\x7f";
+        else if (ev.key === "Tab") data = "\t";
+        else if (ev.key === "Escape") data = "\x1b";
+        else if (ev.key.length === 1) data = ev.key;
+        if (data) { ev.preventDefault(); onData(data); }
       });
       screen.addEventListener("paste", ev => {
         const data = ev.clipboardData.getData("text");
         if (data) {
           ev.preventDefault();
-          input += data;
-          text += data;
-          render();
+          onData(data);
         }
       });
       screen.focus();
@@ -591,7 +645,6 @@ function makeTerminal() {
     },
     clear() {
       text = "";
-      input = "";
       render();
     },
     focus() {
