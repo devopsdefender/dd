@@ -339,15 +339,7 @@ async fn mark_stale_or_orphan(
     let mut s = store.lock().await;
     if let Some(a) = s.values_mut().find(|a| a.hostname == *host) {
         let age = now.signed_duration_since(a.last_seen).num_seconds();
-        if age <= DEAD_THRESHOLD_SECS {
-            // A freshly registered tunnel often appears in Cloudflare's
-            // tunnel list before its agent-api hostname is consistently
-            // routable from every edge. Preserve the register-seeded
-            // status during that grace window; a successful scrape will
-            // refresh the entry, and an old failure is handled below.
-            return;
-        }
-        if scrape_failure_is_dead_signal(err) {
+        if age > DEAD_THRESHOLD_SECS && scrape_failure_is_dead_signal(err) {
             let extras = a.extras.clone();
             a.status = "dead".into();
             orphans.push(Orphan {
@@ -358,7 +350,7 @@ async fn mark_stale_or_orphan(
         } else {
             a.status = "stale".into();
             eprintln!(
-                "cp: collector: preserving {name} despite old scrape failure: {}",
+                "cp: collector: {name} scrape failed: {}",
                 err.as_deref().unwrap_or("unknown error")
             );
         }

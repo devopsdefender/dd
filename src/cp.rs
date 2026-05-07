@@ -629,7 +629,7 @@ async fn register(
                 hostname: tunnel.hostname.clone(),
                 vm_name: req.vm_name.clone(),
                 attestation_type: "tdx".into(),
-                status: "healthy".into(),
+                status: "registering".into(),
                 last_seen: now,
                 agent_mode: AgentMode::ReadWrite,
                 integrity_state: IntegrityState::Controlled,
@@ -794,12 +794,13 @@ async fn fleet(State(s): State<St>) -> Response {
         };
         rows.push_str(&format!(
             r#"<tr><td><a href="/agent/{id}">{vm}</a></td>
-<td><span class="pill {st}">{st}</span></td><td>{att}</td>
+<td><span class="pill {st_cls}">{st}</span></td><td>{att}</td>
 <td>{mode}</td><td>{integrity}</td>
 <td>{cpu}%</td><td>{mem}</td><td>{n}</td><td>{u}</td><td>{o}</td>
 <td class="dim">{host}</td></tr>"#,
             id = html::escape(&a.agent_id),
             vm = html::escape(&a.vm_name),
+            st_cls = status_class(&a.status),
             st = html::escape(&a.status),
             att = html::escape(&a.attestation_type),
             mode = html::escape(a.agent_mode.as_str()),
@@ -844,12 +845,7 @@ async fn fleet(State(s): State<St>) -> Response {
                 kind = html::escape(u.kind.as_str()),
                 mode = html::escape(u.agent_mode.as_str()),
                 integrity = html::escape(&format!("{:?}", u.agent_integrity_state).to_lowercase()),
-                cls = match u.status.as_str() {
-                    "running" | "healthy" => "running",
-                    "deploying" | "unknown" => "deploying",
-                    "failed" | "exited" | "error" => "failed",
-                    _ => "idle",
-                },
+                cls = status_class(&u.status),
                 status = html::escape(&u.status),
                 logs = if u.log_line_count == 0 {
                     r#"<span class="dim">No logs yet</span>"#.into()
@@ -1231,12 +1227,7 @@ async fn agent_detail(State(s): State<St>, Path(id): Path<String>) -> Response {
                 title = html::escape(&u.title),
                 app = html::escape(&u.app_name),
                 kind = html::escape(u.kind.as_str()),
-                cls = match u.status.as_str() {
-                    "running" | "healthy" => "running",
-                    "deploying" | "unknown" => "deploying",
-                    "failed" | "exited" | "error" => "failed",
-                    _ => "idle",
-                },
+                cls = status_class(&u.status),
                 status = html::escape(&u.status),
                 logs = if u.log_line_count == 0 {
                     r#"<span class="dim">No logs yet</span>"#.into()
@@ -1405,6 +1396,15 @@ async fn agent_detail(State(s): State<St>, Path(id): Path<String>) -> Response {
         ),
     ))
     .into_response()
+}
+
+fn status_class(status: &str) -> &'static str {
+    match status {
+        "healthy" | "running" => "running",
+        "deploying" | "registering" | "unknown" | "stale" => "deploying",
+        "failed" | "exited" | "error" | "dead" => "failed",
+        _ => "idle",
+    }
 }
 
 /// GET /agent/control-plane/logs/{app} — show logs for a CP workload via the
