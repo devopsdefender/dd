@@ -620,21 +620,124 @@ async fn dashboard(State(s): State<St>) -> Response {
     let ee_health = s.ee.health().await.unwrap_or_default();
     let att = ee_health["attestation_type"].as_str().unwrap_or("unknown");
     let oracles = s.oracles.read().await.clone();
+    let taint_reasons = s.taint.snapshot().await;
+    let integrity_state = IntegrityState::from_taint_reasons(&taint_reasons);
+    let agent_mode = AgentMode::from_confidential(s.cfg.confidential);
+    let units = managed_units(&s, &list, &oracles, agent_mode, integrity_state).await;
 
     let deployments: Vec<&serde_json::Value> = list["deployments"]
         .as_array()
         .map(|a| a.iter().collect())
         .unwrap_or_default();
 
+    if agent_mode == AgentMode::ReadOnly && !oracles.is_empty() {
+        let primary = &oracles[0];
+        let primary_unit = units.iter().find(|u| u.app_name == primary.app_name);
+        let public_view = primary
+            .vanity_url
+            .as_ref()
+            .map(|url| {
+                format!(
+                    r#"<a class="break" href="{url}" target="_blank">{url}</a>"#,
+                    url = html::escape(url)
+                )
+            })
+            .unwrap_or_else(|| r#"<span class="dim">not exposed</span>"#.into());
+        let sample = primary
+            .sample
+            .as_ref()
+            .and_then(|v| serde_json::to_string_pretty(v).ok())
+            .map(|s| html::escape(&s))
+            .unwrap_or_else(|| r#"<span class="dim">No successful scrape yet</span>"#.into());
+        let logs = primary_unit
+            .map(|u| {
+                if u.log_line_count == 0 {
+                    r#"<span class="dim">No logs yet</span>"#.to_string()
+                } else {
+                    format!(
+                        r#"<a href="/workload/{id}">{n} line(s)</a>"#,
+                        id = html::escape(&u.id),
+                        n = u.log_line_count
+                    )
+                }
+            })
+            .unwrap_or_else(|| r#"<span class="dim">not attached</span>"#.into());
+
+        let mut unit_rows = String::new();
+        for u in &units {
+            let refs = if u.refs.is_empty() {
+                r#"<span class="dim">none</span>"#.to_string()
+            } else {
+                u.refs
+                    .iter()
+                    .map(|r| {
+                        if r.value.starts_with("https://") || r.value.starts_with("http://") {
+                            format!(
+                                r#"<a class="break" href="{url}" target="_blank">{label}</a>"#,
+                                url = html::escape(&r.value),
+                                label = html::escape(&r.label)
+                            )
+                        } else {
+                            format!(
+                                r#"<span class="dim">{label}: {value}</span>"#,
+                                label = html::escape(&r.label),
+                                value = html::escape(&r.value)
+                            )
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" · ")
+            };
+            unit_rows.push_str(&format!(
+                r#"<tr><td>{title}<div class="dim">{app}</div></td><td>{kind}</td><td><span class="pill {cls}">{status}</span></td><td>{refs}</td></tr>"#,
+                title = html::escape(&u.title),
+                app = html::escape(&u.app_name),
+                kind = html::escape(u.kind.as_str()),
+                cls = status_class(&u.status),
+                status = html::escape(&u.status),
+                refs = refs,
+            ));
+        }
+
+        let body = format!(
+            r#"<h1>{title}</h1>
+<div class="sub">{host} · {vm} · {att}</div>
+<div class="meta"><span class="ok">read-only</span> · integrity {integrity} · public oracle view</div>
+<div class="cards">
+  <div class="card"><div class="label">Oracle status</div><div class="value green">{status}</div></div>
+  <div class="card"><div class="label">Public view</div><div class="value small">{public_view}</div></div>
+  <div class="card"><div class="label">Last ok</div><div class="value small">{last_ok}</div></div>
+  <div class="card"><div class="label">Logs</div><div class="value small">{logs}</div></div>
+</div>
+<div class="section">Latest public sample</div>
+<pre style="max-height:42vh">{sample}</pre>
+<div class="section">Managed components</div>
+<table><tr><th>component</th><th>kind</th><th>status</th><th>refs</th></tr>{unit_rows}</table>"#,
+            title = html::escape(&primary.title),
+            host = html::escape(&s.hostname),
+            vm = html::escape(&s.cfg.common.vm_name),
+            att = html::escape(att),
+            integrity = html::escape(integrity_label(integrity_state)),
+            status = html::escape(&primary.status),
+            public_view = public_view,
+            last_ok = html::escape(primary.last_ok.as_deref().unwrap_or("never")),
+            logs = logs,
+            sample = sample,
+            unit_rows = unit_rows,
+        );
+
+        return Html(shell(
+            &format!("DD — {}", primary.title),
+            &html::nav(&[("Oracle", "/", true)]),
+            &body,
+        ))
+        .into_response();
+    }
+
     let mut rows = String::new();
     for d in &deployments {
         let status = d["status"].as_str().unwrap_or("idle");
-        let cls = match status {
-            "running" => "running",
-            "deploying" => "deploying",
-            "failed" | "exited" => "failed",
-            _ => "idle",
-        };
+        let cls = status_class(status);
         let id = d["id"].as_str().unwrap_or("");
         let app = d["app_name"].as_str().unwrap_or("unnamed");
         let image = d["image"].as_str().unwrap_or("");
@@ -685,15 +788,20 @@ async fn dashboard(State(s): State<St>) -> Response {
         )
     };
 
-    // `{hostname-base}-shell.{tld}` is the dd-shell subdomain provisioned
-    // at register time. Human-gated by CF Access. Flat shape so
-    // Universal SSL covers the cert.
-    let term_host = html::escape(&crate::cf::label_hostname(&s.hostname, "shell"));
+    let terminal_link = if units.iter().any(|u| u.kind == UnitKind::Shell) {
+        // `{hostname-base}-shell.{tld}` is the dd-shell subdomain provisioned
+        // at register time. Human-gated by CF Access. Flat shape so
+        // Universal SSL covers the cert.
+        let term_host = html::escape(&crate::cf::label_hostname(&s.hostname, "shell"));
+        format!(r#" · <a href="https://{term_host}/" target="_blank">Terminal ↗</a>"#)
+    } else {
+        String::new()
+    };
 
     let body = format!(
         r#"<h1>{hostname}</h1>
 <div class="sub">{vm} · {att}</div>
-<div class="meta"><span class="ok">healthy</span> · uptime {up} · {count} workload(s) · <a href="https://{term_host}/" target="_blank">Terminal ↗</a></div>
+<div class="meta"><span class="ok">healthy</span> · uptime {up} · {count} workload(s){terminal_link}</div>
 <div class="cards">
   <div class="card"><div class="label">CPU</div><div class="value green">{cpu}%</div></div>
   <div class="card"><div class="label">Memory</div><div class="value blue">{mu} / {mt}</div></div>
@@ -701,7 +809,7 @@ async fn dashboard(State(s): State<St>) -> Response {
 </div>
 {oracle_section}
 <div class="section">Workloads</div>{table}"#,
-        term_host = term_host,
+        terminal_link = terminal_link,
         oracle_section = oracle_section,
         hostname = html::escape(&s.hostname),
         vm = html::escape(&s.cfg.common.vm_name),
@@ -885,6 +993,22 @@ async fn workload_log_line_count(ee: &Ee, id: &str) -> usize {
             eprintln!("agent: log count unavailable for {id}: {e}");
             0
         }
+    }
+}
+
+fn status_class(status: &str) -> &'static str {
+    match status {
+        "healthy" | "running" => "running",
+        "deploying" | "unknown" | "stale" => "deploying",
+        "error" | "failed" | "exited" | "dead" => "failed",
+        _ => "idle",
+    }
+}
+
+fn integrity_label(integrity_state: IntegrityState) -> &'static str {
+    match integrity_state {
+        IntegrityState::Clean => "clean",
+        IntegrityState::Controlled => "controlled",
     }
 }
 

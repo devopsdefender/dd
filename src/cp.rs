@@ -30,7 +30,7 @@ use crate::metrics;
 use crate::noise_gateway;
 use crate::stonith;
 use crate::taint::IntegrityState;
-use crate::units::AgentMode;
+use crate::units::{AgentMode, UnitKind};
 
 /// Re-mint interval for the CP's own ITA token. The CP isn't scraped
 /// by its own collector (different tunnel prefix), so a background
@@ -1310,18 +1310,25 @@ async fn agent_detail(State(s): State<St>, Path(id): Path<String>) -> Response {
         )
     };
 
-    // `{hostname-base}-shell.{tld}` is the dd-shell subdomain (CP's own
-    // tunnel publishes it; agents publish it via their register-time
-    // `extra_ingress`). Flat shape so Universal SSL covers the cert.
-    // Human-gated by CF Access.
-    let term_host = html::escape(&cf::label_hostname(&a.hostname, "shell"));
+    let has_shell = is_cp || a.units.iter().any(|u| u.kind == UnitKind::Shell);
     let extra = if is_cp {
+        // `{hostname-base}-shell.{tld}` is the dd-shell subdomain (CP's own
+        // tunnel publishes it; agents publish it via their register-time
+        // `extra_ingress`). Flat shape so Universal SSL covers the cert.
+        // Human-gated by CF Access.
+        let term_host = html::escape(&cf::label_hostname(&a.hostname, "shell"));
         format!(
             r#"<p><a href="https://{term_host}/" target="_blank">Terminal ↗</a> · <a href="/health">health (incl. noise quote)</a> · <a href="/health?verbose=1">health?verbose=1 (incl. ita)</a></p>"#
         )
-    } else {
+    } else if has_shell {
+        let term_host = html::escape(&cf::label_hostname(&a.hostname, "shell"));
         format!(
             r#"<p><a href="https://{h}/">open agent dashboard ↗</a> · <a href="https://{term_host}/" target="_blank">Terminal ↗</a></p>"#,
+            h = html::escape(&a.hostname)
+        )
+    } else {
+        format!(
+            r#"<p><a href="https://{h}/">open agent dashboard ↗</a></p>"#,
             h = html::escape(&a.hostname)
         )
     };
