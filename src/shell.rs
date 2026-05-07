@@ -23,6 +23,7 @@ use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use futures_util::{SinkExt, StreamExt};
 use rand::RngCore;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::fs::File as TokioFile;
@@ -35,6 +36,7 @@ use uuid::Uuid;
 use crate::ee::Ee;
 use crate::error::{Error, Result};
 use crate::html;
+use crate::oracle::OracleStatus;
 use crate::taint::IntegrityState;
 
 const DEFAULT_PORT: u16 = 7681;
@@ -46,6 +48,8 @@ struct App {
     sessions: Arc<RwLock<HashMap<String, Arc<Session>>>>,
     store: TranscriptStore,
     ee: Arc<Ee>,
+    http: reqwest::Client,
+    agent_api: String,
     default_shell: String,
 }
 
@@ -135,6 +139,20 @@ struct WorkloadTerminal {
     integrity_reason: &'static str,
 }
 
+#[derive(Serialize)]
+struct SystemProbe {
+    ok: bool,
+    status: String,
+    detail: Option<String>,
+    data: Option<serde_json::Value>,
+}
+
+#[derive(Serialize)]
+struct SystemStatus {
+    ee: SystemProbe,
+    agent: SystemProbe,
+}
+
 pub async fn run() -> Result<()> {
     let port = std::env::var("DD_SHELL_PORT")
         .ok()
@@ -144,12 +162,19 @@ pub async fn run() -> Result<()> {
     let default_shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
     let ee_socket = std::env::var("DD_SHELL_EE_SOCKET")
         .unwrap_or_else(|_| "/var/lib/easyenclave/agent.sock".into());
+    let agent_api = std::env::var("DD_SHELL_AGENT_API_URL")
+        .unwrap_or_else(|_| format!("http://127.0.0.1:{}", crate::cf::AGENT_API_PORT));
     let store = TranscriptStore::new(PathBuf::from(dir)).await?;
 
     let app_state = App {
         sessions: Arc::new(RwLock::new(HashMap::new())),
         store,
         ee: Arc::new(Ee::new(ee_socket)),
+        http: reqwest::Client::builder()
+            .timeout(Duration::from_secs(3))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new()),
+        agent_api,
         default_shell,
     };
 
@@ -163,6 +188,8 @@ pub async fn run() -> Result<()> {
         .route("/api/sessions/{id}/replay", get(replay_session))
         .route("/api/sessions/{id}/resize", post(resize_session))
         .route("/api/sessions/{id}/close", post(close_session))
+        .route("/api/system", get(system_status))
+        .route("/api/oracles", get(list_oracles))
         .route("/api/workloads", get(list_workloads))
         .route("/api/workloads/{app}/replay", get(replay_workload))
         .route("/ws/sessions/{id}", get(attach_session))
@@ -381,6 +408,61 @@ async fn list_workloads(State(app): State<App>) -> Result<Json<Vec<WorkloadTermi
         .unwrap_or_default();
     workloads.sort_by(|a, b| a.app_name.cmp(&b.app_name));
     Ok(Json(workloads))
+}
+
+async fn list_oracles(State(app): State<App>) -> Json<Vec<OracleStatus>> {
+    match agent_get(&app, "/api/oracles").await {
+        Ok(oracles) => Json(oracles),
+        Err(e) => {
+            eprintln!("dd-shell: agent oracle probe unavailable: {e}");
+            Json(Vec::new())
+        }
+    }
+}
+
+async fn system_status(State(app): State<App>) -> Json<SystemStatus> {
+    let ee = match app.ee.health().await {
+        Ok(data) => SystemProbe {
+            ok: true,
+            status: "healthy".into(),
+            detail: None,
+            data: Some(data),
+        },
+        Err(e) => SystemProbe {
+            ok: false,
+            status: "unavailable".into(),
+            detail: Some(e.to_string()),
+            data: None,
+        },
+    };
+    let agent = match agent_get(&app, "/health").await {
+        Ok(data) => SystemProbe {
+            ok: true,
+            status: "healthy".into(),
+            detail: None,
+            data: Some(data),
+        },
+        Err(e) => SystemProbe {
+            ok: false,
+            status: "unavailable".into(),
+            detail: Some(e.to_string()),
+            data: None,
+        },
+    };
+    Json(SystemStatus { ee, agent })
+}
+
+async fn agent_get<T: DeserializeOwned>(app: &App, path: &str) -> Result<T> {
+    let url = format!("{}{}", app.agent_api.trim_end_matches('/'), path);
+    let resp = app.http.get(url).send().await?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(Error::Upstream(format!(
+            "agent api {path}: HTTP {status}: {body}"
+        )));
+    }
+    Ok(resp.json().await?)
 }
 
 async fn replay_workload(
@@ -731,6 +813,14 @@ main { max-width:none; padding:0; height:100vh; display:grid; grid-template-colu
 .session .name { font-weight:700; font-size:13px; }
 .session .meta { margin:3px 0 0; font-size:11px; color:#8791a5; }
 .session.readonly { background:#131720; border-style:dashed; }
+.system { display:flex; flex-direction:column; gap:8px; }
+.probe { color:#d7deea; background:#171c29; border:1px solid #2b3242; border-radius:6px; padding:10px; }
+.probe .row { display:flex; align-items:center; justify-content:space-between; gap:8px; }
+.probe .name { font-weight:700; font-size:13px; }
+.probe .meta { margin-top:3px; color:#8791a5; font-size:11px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.pill { border:1px solid #2b3242; border-radius:999px; padding:2px 7px; color:#8791a5; font-size:11px; }
+.pill.ok { color:#9ece6a; border-color:#334b35; }
+.pill.bad { color:#f7768e; border-color:#57323d; }
 .new { width:100%; }
 .status { color:#8791a5; font-size:12px; margin-left:auto; }
 button.secondary { background:#252a36; color:#d7deea; }
@@ -742,8 +832,16 @@ button.secondary { background:#252a36; color:#d7deea; }
   <button class="new" id="new-session">New session</button>
   <div class="groups">
     <div>
+      <div class="group-title">System</div>
+      <div class="system" id="system"></div>
+    </div>
+    <div>
       <div class="group-title">Read-write sessions</div>
       <div class="sessions" id="sessions"></div>
+    </div>
+    <div>
+      <div class="group-title">Read-only oracles</div>
+      <div class="sessions" id="oracles"></div>
     </div>
     <div>
       <div class="group-title">Read-only workloads</div>
@@ -793,6 +891,7 @@ let currentKind = null;
 let ws = null;
 let resizeTimer = null;
 let workloadTimer = null;
+let oracleTimer = null;
 let notifyMode = localStorage.getItem("dd-shell-notify") || "always";
 let oscBuffer = "";
 const decoder = new TextDecoder();
@@ -805,10 +904,13 @@ async function api(path, opts) {
 }
 
 async function refresh() {
-  const [sessions, workloads] = await Promise.all([
+  const [system, sessions, oracles, workloads] = await Promise.all([
+    api("/api/system").catch(() => null),
     api("/api/sessions").catch(() => []),
+    api("/api/oracles").catch(() => []),
     api("/api/workloads").catch(() => [])
   ]);
+  renderSystem(system);
   const root = document.getElementById("sessions");
   root.innerHTML = "";
   sessions.forEach(s => {
@@ -817,6 +919,16 @@ async function refresh() {
     el.innerHTML = `<div class="name">${escapeHtml(s.name)}</div><div class="meta">read-write - controlled - ${s.status} - ${new Date(s.updated_at*1000).toLocaleString()}</div>`;
     el.onclick = () => attach(s.id);
     root.appendChild(el);
+  });
+  const oracleRoot = document.getElementById("oracles");
+  oracleRoot.innerHTML = "";
+  oracles.forEach(o => {
+    const el = document.createElement("button");
+    el.className = "session readonly" + (currentKind === "oracle" && o.app_name === current ? " active" : "");
+    const last = o.last_ok ? new Date(o.last_ok).toLocaleString() : "never";
+    el.innerHTML = `<div class="name">${escapeHtml(o.title || o.app_name)}</div><div class="meta">oracle - ${escapeHtml(o.status)} - ${escapeHtml(last)}</div>`;
+    el.onclick = () => attachOracle(o.app_name);
+    oracleRoot.appendChild(el);
   });
   const workloadRoot = document.getElementById("workloads");
   workloadRoot.innerHTML = "";
@@ -829,6 +941,39 @@ async function refresh() {
   });
 }
 
+function renderSystem(system) {
+  const root = document.getElementById("system");
+  if (!system) {
+    root.innerHTML = `<div class="probe"><div class="row"><span class="name">Shell</span><span class="pill bad">unknown</span></div><div class="meta">system probe unavailable</div></div>`;
+    return;
+  }
+  root.innerHTML = [
+    probeHtml("EasyEnclave", system.ee),
+    probeHtml("Agent API", system.agent)
+  ].join("");
+}
+
+function probeHtml(name, probe) {
+  const ok = probe && probe.ok;
+  const status = probe ? probe.status : "unknown";
+  const detail = probeSummary(probe);
+  return `<div class="probe"><div class="row"><span class="name">${escapeHtml(name)}</span><span class="pill ${ok ? "ok" : "bad"}">${escapeHtml(status)}</span></div><div class="meta">${escapeHtml(detail)}</div></div>`;
+}
+
+function probeSummary(probe) {
+  if (!probe) return "no data";
+  if (!probe.ok) return probe.detail || "unavailable";
+  const data = probe.data || {};
+  const count = data.workload_count ?? data.deployment_count ?? (Array.isArray(data.deployments) ? data.deployments.length : null);
+  const oracleCount = data.oracle_count ?? (Array.isArray(data.oracles) ? data.oracles.length : null);
+  const parts = [];
+  if (count !== null) parts.push(`${count} workload(s)`);
+  if (oracleCount !== null) parts.push(`${oracleCount} oracle(s)`);
+  if (data.integrity_state) parts.push(data.integrity_state);
+  if (data.vm_name) parts.push(data.vm_name);
+  return parts.length ? parts.join(" - ") : "reachable";
+}
+
 async function createSession() {
   const r = await api("/api/sessions", {method:"POST", headers:{"content-type":"application/json"}, body:JSON.stringify({})});
   await refresh();
@@ -838,6 +983,7 @@ async function createSession() {
 async function attach(id) {
   if (ws) ws.close();
   stopWorkloadRefresh();
+  stopOracleRefresh();
   current = id;
   currentKind = "session";
   term.reset();
@@ -875,6 +1021,7 @@ async function attach(id) {
 async function attachWorkload(name) {
   if (ws) ws.close();
   ws = null;
+  stopOracleRefresh();
   stopWorkloadRefresh();
   current = name;
   currentKind = "workload";
@@ -896,9 +1043,41 @@ async function loadWorkload(name) {
   refresh();
 }
 
+async function attachOracle(name) {
+  if (ws) ws.close();
+  ws = null;
+  stopWorkloadRefresh();
+  stopOracleRefresh();
+  current = name;
+  currentKind = "oracle";
+  await loadOracle(name);
+  oracleTimer = setInterval(() => loadOracle(name), 5000);
+}
+
+async function loadOracle(name) {
+  if (currentKind !== "oracle" || current !== name) return;
+  term.reset();
+  term.focus();
+  document.getElementById("close").disabled = true;
+  document.getElementById("status").textContent = "Loading oracle";
+  const oracles = await api("/api/oracles").catch(() => []);
+  const oracle = oracles.find(o => o.app_name === name);
+  if (currentKind !== "oracle" || current !== name) return;
+  if (oracle) await writeTerminal(oracleText(oracle));
+  else await writeTerminal(`oracle ${name} unavailable\r\n`);
+  term.scrollToBottom();
+  document.getElementById("status").textContent = "Observed oracle";
+  refresh();
+}
+
 function stopWorkloadRefresh() {
   if (workloadTimer) clearInterval(workloadTimer);
   workloadTimer = null;
+}
+
+function stopOracleRefresh() {
+  if (oracleTimer) clearInterval(oracleTimer);
+  oracleTimer = null;
 }
 
 term.onData(data => {
@@ -936,6 +1115,22 @@ function base64Bytes(value) {
 }
 function writeTerminal(data) {
   return new Promise(resolve => term.write(data, resolve));
+}
+function oracleText(o) {
+  const lines = [
+    `${o.title || o.app_name}`,
+    `app: ${o.app_name}`,
+    `mode: read-only`,
+    `status: ${o.status}`,
+    `last ok: ${o.last_ok || "never"}`,
+    `local: ${o.local_url || "unknown"}`
+  ];
+  if (o.vanity_url) lines.push(`vanity: ${o.vanity_url}`);
+  if (o.last_error) lines.push(`error: ${o.last_error}`);
+  if (o.sample !== null && o.sample !== undefined) {
+    lines.push("", "sample:", JSON.stringify(o.sample, null, 2));
+  }
+  return lines.join("\r\n") + "\r\n";
 }
 function fitAndResize() {
   try { fitAddon.fit(); } catch (_) {}
