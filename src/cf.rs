@@ -13,6 +13,8 @@ use crate::config::CfCreds;
 use crate::error::{Error, Result};
 
 const API: &str = "https://api.cloudflare.com/client/v4";
+pub const AGENT_API_LABEL: &str = "agent-api";
+pub const AGENT_API_PORT: u16 = 8081;
 
 pub fn cp_tunnel_name(env: &str) -> String {
     format!("dd-{env}-cp-{}", uuid::Uuid::new_v4())
@@ -25,6 +27,9 @@ pub fn cp_prefix(env: &str) -> String {
 }
 pub fn agent_prefix(env: &str) -> String {
     format!("dd-{env}-agent-")
+}
+pub fn agent_api_hostname(agent_hostname: &str) -> String {
+    label_hostname(agent_hostname, AGENT_API_LABEL)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -412,9 +417,29 @@ async fn find_app_by_domain(
     Ok(resp["result"].as_array().and_then(|items| {
         items
             .iter()
-            .find(|a| a["domain"].as_str() == Some(domain))
+            .find(|a| access_app_matches_domain(a, domain))
             .cloned()
     }))
+}
+
+fn access_app_matches_domain(app: &serde_json::Value, domain: &str) -> bool {
+    if app["domain"].as_str() == Some(domain) {
+        return true;
+    }
+    if app["destinations"].as_array().is_some_and(|items| {
+        items
+            .iter()
+            .any(|d| d["type"].as_str() == Some("public") && d["uri"].as_str() == Some(domain))
+    }) {
+        return true;
+    }
+    app["self_hosted_domains"].as_array().is_some_and(|items| {
+        items.iter().any(|d| {
+            d.as_str() == Some(domain)
+                || d["domain"].as_str() == Some(domain)
+                || d["uri"].as_str() == Some(domain)
+        })
+    })
 }
 
 /// Build the human-facing CF Access policy used for the CP root and
@@ -477,6 +502,12 @@ async fn ensure_app(
     let body = serde_json::json!({
         "name": name,
         "domain": domain,
+        "destinations": [
+            {
+                "type": "public",
+                "uri": domain,
+            }
+        ],
         "type": "self_hosted",
         "session_duration": "24h",
         "app_launcher_visible": false,
@@ -525,7 +556,8 @@ async fn ensure_bypass_app(http: &Client, cf: &CfCreds, name: &str, domain: &str
 /// - `term` — legacy ttyd subdomain (kept admin-gated for older deploys).
 /// - `block` — ttyd workload; exposing it without auth is the same
 ///   "free shell for the internet" risk.
-const ADMIN_LABELS: &[&str] = &["term", "block"];
+/// - `shell` — dd-shell multi-session shell service.
+const ADMIN_LABELS: &[&str] = &["term", "block", "shell"];
 
 fn is_admin_label(label: &str) -> bool {
     ADMIN_LABELS.contains(&label)
@@ -675,6 +707,7 @@ pub async fn provision_cp_access(
 ///   - Human: `{agent}.{domain}` — browser dashboard only
 ///   - Human: `<admin-label>.{agent}.{domain}` for labels in
 ///     `ADMIN_LABELS` (ttyd et al) — org members only
+///   - Bypass: `{agent}-agent-api.{domain}` — machine API only
 ///   - Bypass: `{agent}.{domain}/health` — public; carries the Noise
 ///     pre-handshake `{quote_b64, pubkey_hex}` in its response
 ///   - Bypass: `{agent}.{domain}/deploy` — GH-OIDC-gated in code
@@ -867,7 +900,38 @@ mod tests {
     }
 
     #[test]
+    fn agent_api_hostname_uses_reserved_flat_subdomain() {
+        assert_eq!(
+            agent_api_hostname("dd-pr-144-agent-abc.devopsdefender.com"),
+            "dd-pr-144-agent-abc-agent-api.devopsdefender.com"
+        );
+    }
+
+    #[test]
     fn label_hostname_handles_dotless_hostname() {
         assert_eq!(label_hostname("localhost", "term"), "localhost-term");
+    }
+
+    #[test]
+    fn access_app_matches_primary_domain() {
+        let app = serde_json::json!({
+            "domain": "agent.example.com/health",
+            "type": "self_hosted",
+        });
+        assert!(access_app_matches_domain(&app, "agent.example.com/health"));
+        assert!(!access_app_matches_domain(&app, "agent.example.com/deploy"));
+    }
+
+    #[test]
+    fn access_app_matches_public_destination() {
+        let app = serde_json::json!({
+            "domain": "agent.example.com",
+            "destinations": [
+                { "type": "public", "uri": "agent.example.com/health" },
+                { "type": "private", "hostname": "agent.internal" }
+            ],
+        });
+        assert!(access_app_matches_domain(&app, "agent.example.com/health"));
+        assert!(!access_app_matches_domain(&app, "agent.example.com/deploy"));
     }
 }

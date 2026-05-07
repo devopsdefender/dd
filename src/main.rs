@@ -2,10 +2,11 @@
 //!
 //!   DD_MODE=cp      devopsdefender    # control-plane
 //!   DD_MODE=agent   devopsdefender    # in-VM agent
+//!   DD_MODE=shell   devopsdefender    # multi-session shell service
 //!
 //! (Also accepts `devopsdefender cp` / `devopsdefender agent` for local dev.)
 
-use devopsdefender::{agent, cp};
+use devopsdefender::{agent, cp, shell};
 
 #[tokio::main]
 async fn main() {
@@ -16,9 +17,10 @@ async fn main() {
     let result = match mode.as_deref() {
         Some("cp") | Some("management") => cp::run().await,
         Some("agent") => agent::run().await,
+        Some("shell") => shell::run().await,
         _ => {
-            eprintln!("usage: devopsdefender <cp|agent>");
-            eprintln!("   or: DD_MODE=<cp|agent> devopsdefender");
+            eprintln!("usage: devopsdefender <cp|agent|shell>");
+            eprintln!("   or: DD_MODE=<cp|agent|shell> devopsdefender");
             std::process::exit(2);
         }
     };

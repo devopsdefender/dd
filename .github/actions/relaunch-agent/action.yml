@@ -166,7 +166,7 @@ runs:
               -o StrictHostKeyChecking=accept-new \
               -o ServerAliveInterval=30 \
               "$SSH_USER@$HOST" \
-              "sudo stdbuf -oL tail -n +1 -F /var/log/ee-local-$KIND.log || true" \
+              "sudo stdbuf -oL tail -n 0 -F /var/log/ee-local-$KIND.log || true" \
             2>&1 | stdbuf -oL sed -u "s/^/  [$vm console] /" \
                  | stdbuf -oL tee -a "$mirror" &
           tail_pid=$!

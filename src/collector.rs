@@ -6,7 +6,7 @@
 //! or mis-signed don't enter the store. One tick:
 //!
 //!   1. List CF tunnels whose name starts with `dd-{env}-agent-`.
-//!   2. Scrape `https://{tunnel-name}.{domain}/health` in parallel.
+//!   2. Scrape `https://{tunnel-name}-agent-api.{domain}/health` in parallel.
 //!   3. Verify the `ita_token` field from each /health body.
 //!   4. Insert on success, including tunnel id and reported ingress.
 //!   5. Mark dead / GC tunnel on repeated scrape failures.
@@ -63,6 +63,13 @@ pub struct Agent {
 }
 
 pub type Store = Arc<Mutex<HashMap<String, Agent>>>;
+
+#[derive(Debug, Clone)]
+struct Orphan {
+    name: String,
+    host: String,
+    extras: Vec<(String, u16)>,
+}
 
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
@@ -134,7 +141,11 @@ async fn tick(
         let tunnel_id = tunnel_id.clone();
         let host = host.clone();
         async move {
-            let r = http.get(format!("https://{host}/health")).send().await;
+            let health_host = cf::agent_api_hostname(&host);
+            let r = http
+                .get(format!("https://{health_host}/health"))
+                .send()
+                .await;
             match r {
                 Ok(resp) if resp.status().is_success() => {
                     let body = resp.json::<serde_json::Value>().await.ok();
@@ -154,7 +165,7 @@ async fn tick(
     let results = futures_util::future::join_all(scrapes).await;
 
     let now = Utc::now();
-    let mut orphans: Vec<(String, String)> = Vec::new();
+    let mut orphans: Vec<Orphan> = Vec::new();
     let mut verified = 0usize;
 
     for (name, tunnel_id, host, body, err) in &results {
@@ -226,15 +237,19 @@ async fn tick(
     }
 
     if !orphans.is_empty() {
-        for (name, host) in &orphans {
-            eprintln!("cp: GC dead tunnel {name}");
-            cf::delete_by_name(http, cf, name).await;
-            let _ = cf::delete_cname(http, cf, host).await;
+        for orphan in &orphans {
+            eprintln!("cp: GC dead tunnel {}", orphan.name);
+            cf::delete_by_name(http, cf, &orphan.name).await;
+            let _ = cf::delete_cname(http, cf, &orphan.host).await;
+            let _ = cf::delete_cname(http, cf, &cf::agent_api_hostname(&orphan.host)).await;
+            for (label, _) in &orphan.extras {
+                let _ = cf::delete_cname(http, cf, &cf::label_hostname(&orphan.host, label)).await;
+            }
             // Sweep the agent's CF Access apps — its human dashboard
             // app and every workload-URL bypass under this hostname.
             // Without this the account accumulates dead apps every
             // STONITH cycle.
-            cf::delete_access_apps_for(http, cf, host).await;
+            cf::delete_access_apps_for(http, cf, &orphan.host).await;
         }
     }
 
@@ -303,28 +318,54 @@ async fn mark_stale_or_orphan(
     name: &str,
     err: &Option<String>,
     now: DateTime<Utc>,
-    orphans: &mut Vec<(String, String)>,
+    orphans: &mut Vec<Orphan>,
 ) {
     let mut s = store.lock().await;
     if let Some(a) = s.values_mut().find(|a| a.hostname == *host) {
         let age = now.signed_duration_since(a.last_seen).num_seconds();
-        if age > DEAD_THRESHOLD_SECS {
+        if age > DEAD_THRESHOLD_SECS && scrape_failure_is_dead_signal(err) {
+            let extras = a.extras.clone();
             a.status = "dead".into();
-            orphans.push((name.to_string(), host.to_string()));
+            orphans.push(Orphan {
+                name: name.to_string(),
+                host: host.to_string(),
+                extras,
+            });
         } else {
             a.status = "stale".into();
+            if age > DEAD_THRESHOLD_SECS {
+                eprintln!(
+                    "cp: collector: preserving {name} despite old scrape failure: {}",
+                    err.as_deref().unwrap_or("unknown error")
+                );
+            }
         }
-    } else if err
-        .as_ref()
-        .is_some_and(|e| e.contains("connect") || e.contains("timed out"))
-    {
-        orphans.push((name.to_string(), host.to_string()));
+    } else if let Some(e) = err {
+        eprintln!(
+            "cp: collector: {name} not in store yet; preserving tunnel after scrape error: {e}"
+        );
     }
+}
+
+fn scrape_failure_is_dead_signal(err: &Option<String>) -> bool {
+    let Some(err) = err.as_deref() else {
+        return false;
+    };
+    !matches!(
+        err,
+        "status 301 Moved Permanently"
+            | "status 302 Found"
+            | "status 303 See Other"
+            | "status 307 Temporary Redirect"
+            | "status 308 Permanent Redirect"
+            | "status 401 Unauthorized"
+            | "status 403 Forbidden"
+    )
 }
 
 #[cfg(test)]
 mod tests {
-    use super::parse_extra_ingress;
+    use super::{parse_extra_ingress, scrape_failure_is_dead_signal};
 
     #[test]
     fn missing_extra_ingress_preserves_existing_state() {
@@ -361,5 +402,27 @@ mod tests {
         });
 
         assert_eq!(parse_extra_ingress(&h), Some(vec![("api".into(), 8081)]));
+    }
+
+    #[test]
+    fn access_policy_scrape_failures_are_not_dead_signals() {
+        for err in [
+            None,
+            Some("status 302 Found".to_string()),
+            Some("status 401 Unauthorized".to_string()),
+            Some("status 403 Forbidden".to_string()),
+        ] {
+            assert!(!scrape_failure_is_dead_signal(&err));
+        }
+    }
+
+    #[test]
+    fn origin_scrape_failures_are_dead_signals() {
+        for err in [
+            Some("status 530 <unknown status code>".to_string()),
+            Some("error sending request".to_string()),
+        ] {
+            assert!(scrape_failure_is_dead_signal(&err));
+        }
     }
 }

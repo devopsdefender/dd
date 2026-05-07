@@ -211,6 +211,8 @@ pub async fn run() -> Result<()> {
         agent_owner: Arc::new(RwLock::new(None)),
         taint,
     };
+    let api_state = state.clone();
+    let api_ng_state = ng_state.clone();
 
     // Confidential mode: `/deploy`, `/exec`, and `/owner` are not
     // registered at all — they 404 rather than 401. Attestation +
@@ -242,6 +244,34 @@ pub async fn run() -> Result<()> {
         // bug from GH Actions runners). One line in, one line out,
         // per request — cheap enough to keep on in prod.
         .layer(axum::middleware::from_fn(log_http));
+
+    let mut api = Router::new()
+        .route("/health", get(health))
+        .route("/logs/{app}", get(logs));
+    if !cfg.confidential {
+        api = api
+            .route("/deploy", post(deploy))
+            .route("/exec", post(exec))
+            .route("/owner", post(set_owner));
+    }
+    let api = api
+        .fallback(log_unmatched)
+        .with_state(api_state)
+        .merge(noise_gateway::router(api_ng_state))
+        .layer(axum::middleware::from_fn(log_http));
+    let api_addr = format!("0.0.0.0:{}", crate::cf::AGENT_API_PORT);
+    eprintln!("agent: api listening on {api_addr}");
+    let api_listener = tokio::net::TcpListener::bind(&api_addr).await?;
+    tokio::spawn(async move {
+        if let Err(e) = axum::serve(
+            api_listener,
+            api.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        {
+            eprintln!("agent: api listener exited: {e}");
+        }
+    });
 
     let addr = format!("0.0.0.0:{}", cfg.common.port);
     eprintln!("agent: listening on {addr}");
@@ -594,10 +624,10 @@ async fn dashboard(State(s): State<St>) -> Response {
         )
     };
 
-    // `{hostname-base}-block.{tld}` is the ttyd subdomain provisioned
+    // `{hostname-base}-shell.{tld}` is the dd-shell subdomain provisioned
     // at register time. Human-gated by CF Access. Flat shape so
     // Universal SSL covers the cert.
-    let term_host = html::escape(&crate::cf::label_hostname(&s.hostname, "block"));
+    let term_host = html::escape(&crate::cf::label_hostname(&s.hostname, "shell"));
 
     let body = format!(
         r#"<h1>{hostname}</h1>

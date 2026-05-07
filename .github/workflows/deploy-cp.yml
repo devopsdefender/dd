@@ -516,6 +516,7 @@ jobs:
       # local agent is back online talking to the new CP.
       - name: Relaunch dd-local-${{ inputs.env == 'production' && 'prod' || 'preview' }}
         if: inputs.relaunch_agent
+        timeout-minutes: 15
         uses: ./.github/actions/relaunch-agent
         with:
           kind: ${{ inputs.env == 'production' && 'prod' || 'preview' }}

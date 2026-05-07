@@ -573,7 +573,8 @@ async fn register(
         .iter()
         .map(|e| (e.hostname_label.clone(), e.port))
         .collect();
-    let tunnel = cf::create(&http, &s.cfg.cf, &name, &agent_hostname, &extras).await?;
+    let tunnel_extras = agent_tunnel_extras(&extras);
+    let tunnel = cf::create(&http, &s.cfg.cf, &name, &agent_hostname, &tunnel_extras).await?;
     if !tunnel.extra_hostnames.is_empty() {
         eprintln!(
             "cp: registered extra ingress for {}: {:?}",
@@ -581,7 +582,7 @@ async fn register(
         );
     }
 
-    let labels: Vec<String> = extras.iter().map(|(l, _)| l.clone()).collect();
+    let labels: Vec<String> = tunnel_extras.iter().map(|(l, _)| l.clone()).collect();
     if let Err(e) = cf::provision_agent_access(
         &http,
         &s.cfg.cf,
@@ -704,11 +705,13 @@ async fn ingress_replace(
         .iter()
         .map(|e| (e.hostname_label.clone(), e.port))
         .collect();
+    let tunnel_extras = agent_tunnel_extras(&extras);
 
     let http = reqwest::Client::new();
-    let hostnames = cf::update_ingress(&http, &s.cfg.cf, &tunnel_id, &hostname, &extras).await?;
+    let hostnames =
+        cf::update_ingress(&http, &s.cfg.cf, &tunnel_id, &hostname, &tunnel_extras).await?;
 
-    let labels: Vec<String> = extras.iter().map(|(l, _)| l.clone()).collect();
+    let labels: Vec<String> = tunnel_extras.iter().map(|(l, _)| l.clone()).collect();
     if let Err(e) = cf::provision_agent_access(
         &http,
         &s.cfg.cf,
@@ -735,6 +738,17 @@ async fn ingress_replace(
         "agent_id": req.agent_id,
         "extra_hostnames": hostnames,
     })))
+}
+
+fn agent_tunnel_extras(extras: &[(String, u16)]) -> Vec<(String, u16)> {
+    let mut tunnel_extras = extras.to_vec();
+    if !tunnel_extras
+        .iter()
+        .any(|(label, _)| label == cf::AGENT_API_LABEL)
+    {
+        tunnel_extras.push((cf::AGENT_API_LABEL.to_string(), cf::AGENT_API_PORT));
+    }
+    tunnel_extras
 }
 
 /// Mint the CP's own ITA token at startup. Fatal on any failure —
@@ -1153,11 +1167,11 @@ async fn agent_detail(State(s): State<St>, Path(id): Path<String>) -> Response {
         )
     };
 
-    // `{hostname-base}-block.{tld}` is the ttyd subdomain (CP's own
+    // `{hostname-base}-shell.{tld}` is the dd-shell subdomain (CP's own
     // tunnel publishes it; agents publish it via their register-time
     // `extra_ingress`). Flat shape so Universal SSL covers the cert.
     // Human-gated by CF Access.
-    let term_host = html::escape(&cf::label_hostname(&a.hostname, "block"));
+    let term_host = html::escape(&cf::label_hostname(&a.hostname, "shell"));
     let extra = if is_cp {
         format!(
             r#"<p><a href="https://{term_host}/" target="_blank">Terminal ↗</a> · <a href="/health">health (incl. noise quote)</a> · <a href="/health?verbose=1">health?verbose=1 (incl. ita)</a></p>"#
