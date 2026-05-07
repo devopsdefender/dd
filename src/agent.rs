@@ -662,6 +662,10 @@ async fn dashboard(State(s): State<St>) -> Response {
                 }
             })
             .unwrap_or_else(|| r#"<span class="dim">not attached</span>"#.into());
+        let recent_logs = match primary_unit {
+            Some(u) => recent_log_lines_html(&s.ee, &u.id, 80).await,
+            None => r#"<span class="dim">No workload log stream attached</span>"#.into(),
+        };
 
         let mut unit_rows = String::new();
         for u in &units {
@@ -711,6 +715,8 @@ async fn dashboard(State(s): State<St>) -> Response {
 </div>
 <div class="section">Latest public sample</div>
 <pre style="max-height:42vh">{sample}</pre>
+<div class="section">Recent captured logs</div>
+<pre style="max-height:42vh">{recent_logs}</pre>
 <div class="section">Managed components</div>
 <table><tr><th>component</th><th>kind</th><th>status</th><th>refs</th></tr>{unit_rows}</table>"#,
             title = html::escape(&primary.title),
@@ -723,6 +729,7 @@ async fn dashboard(State(s): State<St>) -> Response {
             last_ok = html::escape(primary.last_ok.as_deref().unwrap_or("never")),
             logs = logs,
             sample = sample,
+            recent_logs = recent_logs,
             unit_rows = unit_rows,
         );
 
@@ -874,10 +881,14 @@ async fn managed_units(
                 capabilities.push("oracle".into());
             }
             let refs = unit_refs(s, app_name, kind, oracle.as_ref()).await;
+            let title = oracle
+                .as_ref()
+                .map(|oracle| oracle.title.clone())
+                .unwrap_or_else(|| units::title_for_app(app_name));
             out.push(ManagedUnit {
                 id,
                 app_name: app_name.to_string(),
-                title: units::title_for_app(app_name),
+                title,
                 kind,
                 agent_mode,
                 agent_integrity_state,
@@ -992,6 +1003,35 @@ async fn workload_log_line_count(ee: &Ee, id: &str) -> usize {
         Err(e) => {
             eprintln!("agent: log count unavailable for {id}: {e}");
             0
+        }
+    }
+}
+
+async fn recent_log_lines_html(ee: &Ee, id: &str, limit: usize) -> String {
+    match ee.logs(id).await {
+        Ok(logs) => {
+            let Some(lines) = logs["lines"].as_array() else {
+                return r#"<span class="dim">No logs captured yet</span>"#.into();
+            };
+            let start = lines.len().saturating_sub(limit);
+            let text = lines[start..]
+                .iter()
+                .filter_map(|v| v.as_str())
+                .map(html::escape)
+                .collect::<Vec<_>>()
+                .join("\n");
+            if text.is_empty() {
+                r#"<span class="dim">No logs captured yet</span>"#.into()
+            } else {
+                text
+            }
+        }
+        Err(e) => {
+            eprintln!("agent: recent logs unavailable for {id}: {e}");
+            format!(
+                r#"<span style="color:#f38ba8">Log capture unavailable: {}</span>"#,
+                html::escape(&e.to_string())
+            )
         }
     }
 }
