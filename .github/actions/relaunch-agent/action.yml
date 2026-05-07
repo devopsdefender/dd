@@ -162,11 +162,16 @@ runs:
           # Dropping `2>/dev/null` on tail so "cannot open" / "retrying"
           # diagnostics surface — if the serial log file never appears,
           # we want the reason on-screen, not a silent wait.
+          if [ "$KIND" = "preview" ]; then
+            remote_tail='sudo stdbuf -oL tail -n 0 -F /var/log/ee-local-preview.log /var/log/ee-local-preview-oracle.log || true'
+          else
+            remote_tail="sudo stdbuf -oL tail -n 0 -F /var/log/ee-local-$KIND.log || true"
+          fi
           ssh -i "$key" -T \
               -o StrictHostKeyChecking=accept-new \
               -o ServerAliveInterval=30 \
               "$SSH_USER@$HOST" \
-              "sudo stdbuf -oL tail -n 0 -F /var/log/ee-local-$KIND.log || true" \
+              "$remote_tail" \
             2>&1 | stdbuf -oL sed -u "s/^/  [$vm console] /" \
                  | stdbuf -oL tee -a "$mirror" &
           tail_pid=$!
@@ -198,6 +203,11 @@ runs:
         oidc=$(curl -fsSL \
           -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
           "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=dd-agent" | jq -r .value)
+        expected_vms=("dd-local-$KIND")
+        if [ "$KIND" = "preview" ]; then
+          expected_vms+=("dd-local-preview-oracle")
+        fi
+        expected_json=$(printf '%s\n' "${expected_vms[@]}" | jq -R . | jq -cs .)
         last_payload=""
         for i in $(seq 1 60); do
           payload=$(curl -fsS --max-time 10 -H "Authorization: Bearer ${oidc}" \
@@ -205,11 +215,15 @@ runs:
           if [ -n "$payload" ]; then
             last_payload="$payload"
           fi
-          host_found=$(echo "$payload" | jq -r --arg since "$since" --arg vm "$vm" '
-                [.[] | select(.vm_name==$vm and .status=="healthy" and .last_seen > $since)]
-                | sort_by(.last_seen) | reverse | .[0].hostname // empty' 2>/dev/null || true)
-          if [ -n "$host_found" ]; then
-            echo "$vm registered at https://$host_found"
+          ready_count=$(echo "$payload" | jq -r --arg since "$since" --argjson expected "$expected_json" '
+                [.[] | select(.status=="healthy" and .last_seen > $since and (.vm_name as $vm | $expected | index($vm)))]
+                | unique_by(.vm_name)
+                | length' 2>/dev/null || echo 0)
+          if [ "$ready_count" = "${#expected_vms[@]}" ]; then
+            echo "registered agents:"
+            echo "$payload" | jq -r --arg since "$since" --argjson expected "$expected_json" '
+              .[] | select(.status=="healthy" and .last_seen > $since and (.vm_name as $vm | $expected | index($vm)))
+              | "  \(.vm_name) at https://\(.hostname)"' 2>/dev/null || true
             cleanup_tail
             exit 0
           fi
@@ -226,7 +240,7 @@ runs:
             echo "::error::$vm agent exited fatal; not polling /api/agents further"
             exit 1
           fi
-          echo "  waiting for $vm to register with $URL... (${i}/60)"
+          echo "  waiting for ${expected_vms[*]} to register with $URL... (${i}/60)"
           sleep 10
         done
         cleanup_tail

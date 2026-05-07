@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
 # local-agents.sh — define local TDX agent VMs on this host:
 #
-#   dd-local-preview : CPU-only, registers with the PR-preview CP. Agent +
-#                      podman + a tiny read-only oracle example so the release
-#                      pipeline proves registration, tunnel routing, scraping,
-#                      and dashboard listing end-to-end.
+#   dd-local-preview : CPU-only read/write preview agent. Agent + shell +
+#                      podman. Used for deploy/exec/shell canaries.
+#   dd-local-preview-oracle : CPU-only read-only preview oracle agent.
+#                      No shell, no deploy/exec routes; runs the tiny
+#                      human-readonly oracle so the release pipeline proves
+#                      registration, tunnel routing, scraping, and dashboard
+#                      listing end-to-end without mixing oracle trust into a
+#                      read/write host.
 #   dd-local-prod    : registers with production. Same CPU-only boot
 #                      shape as preview so prod and preview exercise the
 #                      easyenclave-mini runtime consistently.
@@ -49,7 +53,7 @@
 #   ./apps/_infra/local-agents.sh "" "" https://app.devopsdefender.com                          # bot only
 #   ./apps/_infra/local-agents.sh "" https://app.devopsdefender.com https://app.devopsdefender.com  # prod + bot
 #
-# After: virsh start dd-local-preview && virsh start dd-local-prod && virsh start dd-local-bot
+# After: virsh start dd-local-preview && virsh start dd-local-preview-oracle && virsh start dd-local-prod && virsh start dd-local-bot
 
 set -euo pipefail
 export LIBVIRT_DEFAULT_URI="${LIBVIRT_DEFAULT_URI:-qemu:///system}"
@@ -185,6 +189,8 @@ build_config_iso() {
     esac
   fi
   local out="$IMG_DIR/dd-local-$name-config.iso"
+  local confidential=""
+  [ "$name" = preview-oracle ] && confidential=true
   local tmp
   tmp=$(mktemp -d)
   trap "rm -rf $tmp" RETURN
@@ -200,18 +206,23 @@ build_config_iso() {
   #                    below from `expose` entries on baked workloads.
   local bare_workloads
   bare_workloads=$({
-    # mount-data runs first so `/dev/vdc` is at
-    # `/var/lib/easyenclave/data` by the time podman-bootstrap reaches
-    # its `mountpoint -q` wait (both spawn concurrently but EE's
-    # pre-fetch serializes binary downloads before boot-loop).
-    bake "$REPO_ROOT/apps/mount-data/workload.json"
-    bake "$REPO_ROOT/apps/podman-static/workload.json"
-    bake "$REPO_ROOT/apps/podman-bootstrap/workload.json"
-    bake "$REPO_ROOT/apps/cloudflared/workload.json"
-    bake "$REPO_ROOT/apps/dd-shell/workload.json"
-    if [ "$name" = preview ]; then
-      bake "$REPO_ROOT/apps/human-readonly/workload.json"
-    fi
+    case "$name" in
+      preview-oracle)
+        bake "$REPO_ROOT/apps/cloudflared/workload.json"
+        bake "$REPO_ROOT/apps/human-readonly/workload.json"
+        ;;
+      *)
+        # mount-data runs first so `/dev/vdc` is at
+        # `/var/lib/easyenclave/data` by the time podman-bootstrap reaches
+        # its `mountpoint -q` wait (both spawn concurrently but EE's
+        # pre-fetch serializes binary downloads before boot-loop).
+        bake "$REPO_ROOT/apps/mount-data/workload.json"
+        bake "$REPO_ROOT/apps/podman-static/workload.json"
+        bake "$REPO_ROOT/apps/podman-bootstrap/workload.json"
+        bake "$REPO_ROOT/apps/cloudflared/workload.json"
+        bake "$REPO_ROOT/apps/dd-shell/workload.json"
+        ;;
+    esac
   })
 
   local extra_ingress
@@ -227,6 +238,7 @@ build_config_iso() {
       DD_ITA_API_KEY="$DD_ITA_API_KEY" \
       DD_ENV="$env" \
       DD_VM_NAME="dd-local-$name" \
+      DD_CONFIDENTIAL="$confidential" \
       DD_EXTRA_INGRESS="$extra_ingress" \
       DD_ORACLES_B64="$oracles_b64" \
       DD_RELEASE_TAG="$DD_RELEASE_TAG" \
@@ -479,17 +491,20 @@ define_agent() {
 }
 
 [ -n "$PREVIEW_CP" ] && define_agent preview "$PREVIEW_CP"
+[ -n "$PREVIEW_CP" ] && define_agent preview-oracle "$PREVIEW_CP"
 [ -n "$PROD_CP"    ] && define_agent prod    "$PROD_CP"
 [ -n "$BOT_CP"     ] && define_agent bot     "$BOT_CP"
 
 echo
 echo "done. start with:"
 [ -n "$PREVIEW_CP" ] && echo "  virsh start dd-local-preview"
+[ -n "$PREVIEW_CP" ] && echo "  virsh start dd-local-preview-oracle"
 [ -n "$PROD_CP"    ] && echo "  virsh start dd-local-prod"
 [ -n "$BOT_CP"     ] && echo "  virsh start dd-local-bot"
 echo
 echo "watch registration (Ctrl-] to exit):"
 [ -n "$PREVIEW_CP" ] && echo "  virsh console dd-local-preview"
+[ -n "$PREVIEW_CP" ] && echo "  virsh console dd-local-preview-oracle"
 [ -n "$PROD_CP"    ] && echo "  virsh console dd-local-prod"
 [ -n "$BOT_CP"     ] && echo "  virsh console dd-local-bot"
 

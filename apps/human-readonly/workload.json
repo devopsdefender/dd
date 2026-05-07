@@ -1,5 +1,6 @@
 {
   "app_name": "human-readonly",
+  "requires_agent_mode": "read_only",
   "expose": { "hostname_label": "oracle", "port": 8082 },
   "oracle": {
     "title": "Human read-only oracle",
