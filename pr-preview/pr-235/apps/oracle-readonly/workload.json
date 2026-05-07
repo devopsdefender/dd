@@ -1,7 +1,0 @@
-{
-  "app_name": "oracle-readonly",
-  "cmd": [
-    "/bin/busybox", "sh", "-c",
-    "i=0; while true; do i=$((i+1)); echo \"oracle-readonly: tick=$i status=ok\"; sleep 10; done"
-  ]
-}

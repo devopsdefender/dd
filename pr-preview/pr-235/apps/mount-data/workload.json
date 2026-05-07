@@ -1,7 +1,0 @@
-{
-  "app_name": "mount-data",
-  "cmd": [
-    "/bin/busybox", "sh", "-c",
-    "set -e; if [ -b /dev/vdc ]; then mkdir -p /data; mount -t ext4 /dev/vdc /data && echo mount-data: mounted /dev/vdc on /data; else echo mount-data: no /dev/vdc, skipping; fi"
-  ]
-}
