@@ -1,7 +1,13 @@
 {
   "app_name": "human-readonly",
+  "expose": { "hostname_label": "oracle", "port": 8082 },
+  "oracle": {
+    "title": "Human read-only oracle",
+    "path": "/oracle.json",
+    "interval_secs": 10
+  },
   "cmd": [
     "/bin/busybox", "sh", "-c",
-    "set -e\nprintf '\\033]9;%s\\033\\\\' 'human-readonly started'\ni=0\nwhile true; do\n  i=$((i+1))\n  ts=$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || true)\n  echo \"human-readonly: tick=$i ts=$ts event=review_needed actor=human status=ok\"\n  if [ $((i % 6)) -eq 0 ]; then printf '\\033]777;notify;%s;%s\\033\\\\' 'human-readonly' \"review checkpoint $i\"; fi\n  sleep 10\ndone"
+    "set -e\nWEB=/tmp/human-readonly-www\nmkdir -p \"$WEB\"\n(\n  cd \"$WEB\"\n  /bin/busybox httpd -f -p 0.0.0.0:8082\n) &\nprintf '\\033]9;%s\\033\\\\' 'human-readonly started'\ni=0\nwhile true; do\n  i=$((i+1))\n  ts=$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || true)\n  printf '{\"ok\":true,\"oracle\":\"human-readonly\",\"tick\":%s,\"ts\":\"%s\",\"recommendation\":\"review\",\"integrity\":\"read_only\"}\\n' \"$i\" \"$ts\" > \"$WEB/oracle.json\"\n  echo \"human-readonly: tick=$i ts=$ts event=review_needed actor=human status=ok\"\n  if [ $((i % 6)) -eq 0 ]; then printf '\\033]777;notify;%s;%s\\033\\\\' 'human-readonly' \"review checkpoint $i\"; fi\n  sleep 10\ndone"
   ]
 }

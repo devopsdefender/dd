@@ -2,6 +2,7 @@
 
 use crate::error::{Error, Result};
 use crate::gh_oidc::{Principal, PrincipalKind};
+use base64::Engine as _;
 
 #[derive(Clone)]
 pub struct CfCreds {
@@ -245,6 +246,28 @@ impl Cp {
 /// Agent-mode config. No PAT — the agent authenticates to the CP with
 /// ITA attestation at /register and the CF Access service token
 /// (received in the register response) on subsequent calls.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct OracleSpec {
+    pub app_name: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub hostname_label: String,
+    pub port: u16,
+    #[serde(default = "default_oracle_path")]
+    pub path: String,
+    #[serde(default = "default_oracle_interval_secs")]
+    pub interval_secs: u64,
+}
+
+fn default_oracle_path() -> String {
+    "/oracle.json".into()
+}
+
+fn default_oracle_interval_secs() -> u64 {
+    10
+}
+
 pub struct Agent {
     pub common: Common,
     pub cp_url: String,
@@ -266,6 +289,12 @@ pub struct Agent {
     /// third parties that the code is sealed. Backward-compatible:
     /// unset = default (mutation endpoints enabled).
     pub confidential: bool,
+    /// Read-only oracle endpoints baked into the boot workload set.
+    /// `apps/_infra/local-agents.sh` extracts DD-level `oracle`
+    /// metadata from workload JSON and injects it here as base64 JSON
+    /// (`DD_ORACLES_B64`) so the agent can scrape local endpoints and
+    /// report oracle health without giving the observer process control.
+    pub oracles: Vec<OracleSpec>,
 }
 
 impl Agent {
@@ -278,6 +307,7 @@ impl Agent {
             .unwrap_or_else(|_| "/var/lib/easyenclave/agent.sock".into());
         let extra_ingress = parse_extra_ingress()?;
         let confidential = parse_truthy("DD_CONFIDENTIAL");
+        let oracles = parse_oracles()?;
         let ita = Ita::from_env(&common.env_label)?;
         Ok(Self {
             common,
@@ -286,6 +316,7 @@ impl Agent {
             ita,
             extra_ingress,
             confidential,
+            oracles,
         })
     }
 }
@@ -341,6 +372,45 @@ fn parse_extra_ingress() -> Result<Vec<(String, u16)>> {
     Ok(out)
 }
 
+fn parse_oracles() -> Result<Vec<OracleSpec>> {
+    let raw = match std::env::var("DD_ORACLES_B64") {
+        Ok(s) if !s.trim().is_empty() => s,
+        _ => return Ok(Vec::new()),
+    };
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(raw.trim())
+        .map_err(|e| Error::Internal(format!("DD_ORACLES_B64 base64 decode: {e}")))?;
+    let mut specs: Vec<OracleSpec> = serde_json::from_slice(&bytes)
+        .map_err(|e| Error::Internal(format!("DD_ORACLES_B64 JSON parse: {e}")))?;
+    for spec in &mut specs {
+        spec.app_name = spec.app_name.trim().to_string();
+        spec.title = spec.title.trim().to_string();
+        spec.hostname_label = spec.hostname_label.trim().to_string();
+        spec.path = spec.path.trim().to_string();
+        if spec.app_name.is_empty() {
+            return Err(Error::Internal(
+                "DD_ORACLES_B64 oracle entry has empty app_name".into(),
+            ));
+        }
+        if spec.title.is_empty() {
+            spec.title = spec.app_name.clone();
+        }
+        if spec.port == 0 {
+            return Err(Error::Internal(format!(
+                "DD_ORACLES_B64 oracle {} has invalid port 0",
+                spec.app_name
+            )));
+        }
+        if spec.path.is_empty() {
+            spec.path = default_oracle_path();
+        }
+        if spec.interval_secs == 0 {
+            spec.interval_secs = default_oracle_interval_secs();
+        }
+    }
+    Ok(specs)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -359,6 +429,22 @@ mod tests {
         let r = parse_extra_ingress();
         unsafe {
             std::env::remove_var("DD_EXTRA_INGRESS");
+        }
+        r
+    }
+
+    fn parse_oracles_env(json: &str) -> Result<Vec<OracleSpec>> {
+        let _guard = ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let encoded = base64::engine::general_purpose::STANDARD.encode(json);
+        unsafe {
+            std::env::set_var("DD_ORACLES_B64", encoded);
+        }
+        let r = parse_oracles();
+        unsafe {
+            std::env::remove_var("DD_ORACLES_B64");
         }
         r
     }
@@ -404,5 +490,32 @@ mod tests {
     #[test]
     fn empty_label_errors() {
         assert!(parse(":8081").is_err());
+    }
+
+    #[test]
+    fn oracle_metadata_decodes_from_base64_json() {
+        let got = parse_oracles_env(
+            r#"[{"app_name":"human-readonly","title":"Human Oracle","hostname_label":"oracle","port":8082,"path":"oracle.json","interval_secs":5}]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            got,
+            vec![OracleSpec {
+                app_name: "human-readonly".into(),
+                title: "Human Oracle".into(),
+                hostname_label: "oracle".into(),
+                port: 8082,
+                path: "oracle.json".into(),
+                interval_secs: 5,
+            }]
+        );
+    }
+
+    #[test]
+    fn oracle_metadata_defaults_title_path_and_interval() {
+        let got = parse_oracles_env(r#"[{"app_name":"oracle-readonly","port":8082}]"#).unwrap();
+        assert_eq!(got[0].title, "oracle-readonly");
+        assert_eq!(got[0].path, "/oracle.json");
+        assert_eq!(got[0].interval_secs, 10);
     }
 }

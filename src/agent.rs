@@ -40,6 +40,7 @@ use crate::html::{self, shell};
 use crate::ita;
 use crate::metrics;
 use crate::noise_gateway;
+use crate::oracle;
 use crate::taint::{IntegrityState, TaintReason, TaintSet};
 
 /// Re-mint interval. Intel ITA tokens typically expire in a few
@@ -94,6 +95,8 @@ struct St {
     /// as events happen (`/owner` → CustomerOwnerEnabled, `/deploy`
     /// ok → CustomerWorkloadDeployed). Mirrored in `/health`.
     taint: TaintSet,
+    /// Read-only oracle scrape state derived from boot workload metadata.
+    oracles: oracle::OracleStore,
 }
 
 pub async fn run() -> Result<()> {
@@ -115,6 +118,8 @@ pub async fn run() -> Result<()> {
     eprintln!("agent: registered as {}", b.hostname);
 
     spawn_cloudflared(b.tunnel_token);
+    let oracle_store = oracle::initial_store(&cfg.oracles, &b.hostname);
+    oracle::spawn_scrapers(cfg.oracles.clone(), oracle_store.clone());
 
     let ita_token = Arc::new(RwLock::new(initial_token));
 
@@ -210,6 +215,7 @@ pub async fn run() -> Result<()> {
         attest: attestor,
         agent_owner: Arc::new(RwLock::new(None)),
         taint,
+        oracles: oracle_store,
     };
     let api_state = state.clone();
     let api_ng_state = ng_state.clone();
@@ -224,6 +230,7 @@ pub async fn run() -> Result<()> {
     let mut app = Router::new()
         .route("/", get(dashboard))
         .route("/health", get(health))
+        .route("/api/oracles", get(api_oracles))
         .route("/workload/{id}", get(workload_page))
         .route("/logs/{app}", get(logs));
     if !cfg.confidential {
@@ -247,6 +254,7 @@ pub async fn run() -> Result<()> {
 
     let mut api = Router::new()
         .route("/health", get(health))
+        .route("/api/oracles", get(api_oracles))
         .route("/logs/{app}", get(logs));
     if !cfg.confidential {
         api = api
@@ -516,6 +524,7 @@ async fn health(State(s): State<St>) -> Json<serde_json::Value> {
     let m = metrics::collect().await;
     let ita_token = s.ita_token.read().await.clone();
     let agent_owner = s.agent_owner.read().await.clone();
+    let oracles = s.oracles.read().await.clone();
     let taint_reasons = s.taint.snapshot().await;
     let integrity_state = IntegrityState::from_taint_reasons(&taint_reasons);
     let extra_ingress: Vec<serde_json::Value> = s
@@ -567,6 +576,8 @@ async fn health(State(s): State<St>) -> Json<serde_json::Value> {
         "attestation_type": ee_health["attestation_type"].as_str().unwrap_or("unknown"),
         "deployments": deployments,
         "deployment_count": list["deployments"].as_array().map(|a| a.len()).unwrap_or(0),
+        "oracle_count": oracles.len(),
+        "oracles": oracles,
         "cpu_percent": m.cpu_pct,
         "memory_used_mb": m.mem_used_mb,
         "memory_total_mb": m.mem_total_mb,
@@ -600,6 +611,7 @@ async fn dashboard(State(s): State<St>) -> Response {
     let list = s.ee.list().await.unwrap_or_default();
     let ee_health = s.ee.health().await.unwrap_or_default();
     let att = ee_health["attestation_type"].as_str().unwrap_or("unknown");
+    let oracles = s.oracles.read().await.clone();
 
     let deployments: Vec<&serde_json::Value> = list["deployments"]
         .as_array()
@@ -631,6 +643,40 @@ async fn dashboard(State(s): State<St>) -> Response {
         )
     };
 
+    let oracle_section = if oracles.is_empty() {
+        String::new()
+    } else {
+        let mut rows = String::new();
+        for o in &oracles {
+            let cls = match o.status.as_str() {
+                "healthy" => "healthy",
+                "error" => "failed",
+                _ => "idle",
+            };
+            let vanity = o
+                .vanity_url
+                .as_ref()
+                .map(|u| {
+                    format!(
+                        r#"<a href="{url}" target="_blank">{label}</a>"#,
+                        url = html::escape(u),
+                        label = html::escape(&o.hostname_label)
+                    )
+                })
+                .unwrap_or_else(|| r#"<span class="dim">none</span>"#.into());
+            rows.push_str(&format!(
+                r#"<tr><td>{title}</td><td><span class="pill {cls}">{status}</span></td><td>{vanity}</td><td class="dim">{path}</td><td class="dim">{last}</td></tr>"#,
+                title = html::escape(&o.title),
+                status = html::escape(&o.status),
+                path = html::escape(&o.path),
+                last = html::escape(o.last_ok.as_deref().unwrap_or("never")),
+            ));
+        }
+        format!(
+            r#"<div class="section">Read-only oracles</div><table><tr><th>oracle</th><th>status</th><th>vanity</th><th>path</th><th>last ok</th></tr>{rows}</table>"#
+        )
+    };
+
     // `{hostname-base}-shell.{tld}` is the dd-shell subdomain provisioned
     // at register time. Human-gated by CF Access. Flat shape so
     // Universal SSL covers the cert.
@@ -645,8 +691,10 @@ async fn dashboard(State(s): State<St>) -> Response {
   <div class="card"><div class="label">Memory</div><div class="value blue">{mu} / {mt}</div></div>
   <div class="card"><div class="label">Load 1m</div><div class="value mauve">{load:.2}</div></div>
 </div>
+{oracle_section}
 <div class="section">Workloads</div>{table}"#,
         term_host = term_host,
+        oracle_section = oracle_section,
         hostname = html::escape(&s.hostname),
         vm = html::escape(&s.cfg.common.vm_name),
         att = html::escape(att),
@@ -664,6 +712,10 @@ async fn dashboard(State(s): State<St>) -> Response {
         &body,
     ))
     .into_response()
+}
+
+async fn api_oracles(State(s): State<St>) -> Json<Vec<oracle::OracleStatus>> {
+    Json(s.oracles.read().await.clone())
 }
 
 async fn workload_page(State(s): State<St>, Path(id): Path<String>) -> Result<Response> {

@@ -73,6 +73,28 @@ prepends them to the agent's cloudflared tunnel ingress. A workload declaring
 `<agent-hostname>`. easyenclave itself ignores the field; it's a DD-level
 hint about tunnel routing.
 
+Add `oracle` to declare that an exposed workload is a read-only oracle endpoint:
+
+```json
+{
+  "app_name": "human-readonly",
+  "expose": { "hostname_label": "oracle", "port": 8082 },
+  "oracle": {
+    "title": "Human read-only oracle",
+    "path": "/oracle.json",
+    "interval_secs": 10
+  },
+  "cmd": [...]
+}
+```
+
+At agent boot, DD also extracts these oracle hints into `DD_ORACLES_B64`.
+dd-agent scrapes `http://127.0.0.1:<port><path>`, publishes the current oracle
+state on `/health` and `/api/oracles`, and lists it in both the agent dashboard
+and CP fleet detail page. The vanity URL uses the `expose.hostname_label`
+(`oracle.<agent-hostname>` in the example). This is observation-only metadata:
+it does not create a read-write terminal or any input path into the workload.
+
 ## Terminal access model
 
 DD separates terminal access by capability:
@@ -135,30 +157,35 @@ inline in two places so both lifecycle points behave identically:
 | `cloudflared` | ✅ | ✅ | ✅ |
 | `dd-agent` | | ✅ | ✅ |
 | `dd-shell` | | ✅ | ✅ |
+| `human-readonly` | | ✅ | |
 | `dd-management` | ✅ | | |
 | `podman-static` | | ✅ | ✅ |
 | `podman-bootstrap` | | ✅ | ✅ |
 
 Additional examples:
 
-- `apps/human-readonly`: tiny human-facing log producer. It is intentionally
-  not exposed directly; inspect it from dd-shell's read-only workload terminal.
-  The same shape should eventually move to a separate demo app repo.
-- `apps/oracle-readonly`: emits periodic oracle-style logs. It is meant to be
-  inspected through dd-shell's read-only workload terminal.
-- `apps/confidential-shell`: runs dd-shell with `DD_SHELL_DIR=/data/dd-shell`
-  so read-write PTY transcript history survives on the workload disk.
+- `apps/human-readonly`: tiny preview-only read-only oracle. It emits logs for
+  dd-shell's read-only terminal, serves `/oracle.json` on port 8082, gets a
+  vanity `oracle.<agent-hostname>` address, and appears in the dashboards.
+- `apps/oracle-readonly`: standalone oracle example with the same scraper and
+  vanity-address metadata; copy this shape into real oracle app repos.
+- `apps/confidential-shell`: runs dd-shell with
+  `DD_SHELL_DIR=/var/lib/easyenclave/data/dd-shell` so read-write PTY
+  transcript history survives on the workload disk.
 - `apps/codex-podman-shell`: alternative read-write shell workload. It exposes
   the normal `-shell` label, stores encrypted dd-shell history under
-  `/data/dd-shell`, and makes each new PTY enter a Podman-backed Node container.
+  `/var/lib/easyenclave/data/dd-shell`, and makes each new PTY enter a
+  Podman-backed Node container.
   The container installs `@openai/codex` on first use and persists login/config
-  under `/data/codex/home`, so `codex login` can be completed interactively from
-  the browser terminal. Use this instead of `dd-shell`, not alongside it, unless
-  you give one of them a different `hostname_label`.
+  under `/var/lib/easyenclave/data/codex/home`, so `codex login` can be
+  completed interactively from the browser terminal. Use this instead of
+  `dd-shell`, not alongside it, unless you give one of them a different
+  `hostname_label`.
 
 CP stays slim: just `cloudflared` + `dd-management`. Preview agent VMs run a
-bare agent + podman for CI to prove registration end-to-end. Prod agent VMs
-use the same CPU-only boot shape for now.
+small read-only oracle plus agent + podman for CI to prove registration,
+scraping, vanity ingress, and dashboards end-to-end. Prod agent VMs use the
+same CPU-only boot shape without demo workloads for now.
 
 ## Ordering
 
@@ -211,6 +238,7 @@ workload-runner changes needed.
 - Agent VM builder:
   [`apps/_infra/local-agents.sh`](_infra/local-agents.sh) — inline `bake()` +
   agent workload set per kind.
-- Ingress plumbing: `src/cf.rs` (`create()` takes per-workload ingress),
-  `src/cp.rs` (`register` handler accepts `extra_ingress`), `src/agent.rs`
-  (reads `DD_EXTRA_INGRESS`, forwards on `/register`).
+- Ingress and oracle plumbing: `src/cf.rs` (`create()` takes per-workload
+  ingress), `src/cp.rs` (`register` handler accepts `extra_ingress`, dashboard
+  renders scraped oracle status), `src/agent.rs` (reads `DD_EXTRA_INGRESS` and
+  `DD_ORACLES_B64`, forwards ingress on `/register`, scrapes oracle endpoints).

@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # local-agents.sh — define local TDX agent VMs on this host:
 #
-#   dd-local-preview : CPU-only, registers with the PR-preview CP. Bare
-#                      agent + podman — no demo workload — so the release
-#                      pipeline can prove registration + tunnel end-to-end
-#                      against per-PR CPs without special hardware.
+#   dd-local-preview : CPU-only, registers with the PR-preview CP. Agent +
+#                      podman + a tiny read-only oracle example so the release
+#                      pipeline proves registration, tunnel routing, scraping,
+#                      and dashboard listing end-to-end.
 #   dd-local-prod    : registers with production. Same CPU-only boot
 #                      shape as preview so prod and preview exercise the
 #                      easyenclave-mini runtime consistently.
@@ -139,6 +139,26 @@ extract_extra_ingress() {
   jq -rs 'map(select(.expose) | "\(.expose.hostname_label):\(.expose.port)") | join(",")'
 }
 
+# Extract DD-level read-only oracle metadata from baked workloads and emit
+# base64-encoded JSON for dd-agent. Base64 keeps nested JSON out of the
+# workload template's env string escaping.
+extract_oracles() {
+  jq -s -r '
+    map(
+      select(.oracle and ((.oracle.port // .expose.port) != null))
+      | {
+          app_name: .app_name,
+          title: (.oracle.title // .app_name),
+          hostname_label: (.oracle.hostname_label // .expose.hostname_label // ""),
+          port: ((.oracle.port // .expose.port) | tonumber),
+          path: (.oracle.path // "/oracle.json"),
+          interval_secs: (.oracle.interval_secs // 10)
+        }
+    )
+    | @base64
+  '
+}
+
 [ -r "$BASE" ] || { echo "missing $BASE" >&2; exit 1; }
 virsh dominfo "$BASE_DOMAIN" >/dev/null 2>&1 || {
   echo "base libvirt domain '$BASE_DOMAIN' not defined — rebuild the EE image first" >&2
@@ -180,19 +200,24 @@ build_config_iso() {
   #                    below from `expose` entries on baked workloads.
   local bare_workloads
   bare_workloads=$({
-    # mount-data runs first so `/dev/vdc` is at `/data` by the time
-    # podman-bootstrap reaches its `mountpoint -q` wait (both spawn
-    # concurrently but EE's pre-fetch serializes binary downloads
-    # before boot-loop).
+    # mount-data runs first so `/dev/vdc` is at
+    # `/var/lib/easyenclave/data` by the time podman-bootstrap reaches
+    # its `mountpoint -q` wait (both spawn concurrently but EE's
+    # pre-fetch serializes binary downloads before boot-loop).
     bake "$REPO_ROOT/apps/mount-data/workload.json"
     bake "$REPO_ROOT/apps/podman-static/workload.json"
     bake "$REPO_ROOT/apps/podman-bootstrap/workload.json"
     bake "$REPO_ROOT/apps/cloudflared/workload.json"
     bake "$REPO_ROOT/apps/dd-shell/workload.json"
+    if [ "$name" = preview ]; then
+      bake "$REPO_ROOT/apps/human-readonly/workload.json"
+    fi
   })
 
   local extra_ingress
   extra_ingress=$(echo "$bare_workloads" | extract_extra_ingress)
+  local oracles_b64
+  oracles_b64=$(echo "$bare_workloads" | extract_oracles)
 
   local workloads
   workloads=$({
@@ -203,6 +228,7 @@ build_config_iso() {
       DD_ENV="$env" \
       DD_VM_NAME="dd-local-$name" \
       DD_EXTRA_INGRESS="$extra_ingress" \
+      DD_ORACLES_B64="$oracles_b64" \
       DD_RELEASE_TAG="$DD_RELEASE_TAG" \
       DD_OWNER="$EE_OWNER" \
       DD_OWNER_ID="$EE_OWNER_ID" \
@@ -253,8 +279,9 @@ build_workload_disk() {
   # $1=name   $2=size-spec (e.g. 160G, 1920G)
   #
   # Persistent podman storage as a separate qcow2, ext4-formatted
-  # so EE's `mount-data` workload can mount it at `/data` (where
-  # podman-bootstrap looks for overlay driver backing).
+  # so EE's `mount-data` workload can mount it at
+  # `/var/lib/easyenclave/data` (where podman-bootstrap looks for
+  # overlay driver backing).
   # Sparse, so it occupies little space until something actually writes.
   # Uses qemu-nbd + mkfs.ext4 for one-time format.
   local name="$1" size="${2:-160G}"
@@ -323,9 +350,9 @@ PY
 
   # Inject the workload disk as /dev/vdc right after the config iso
   # (vdb). podman-bootstrap waits for a `mountpoint` at
-  # /data — mount-data satisfies that from
-  # this disk. Without it, podman falls back to vfs-on-tmpfs and can't
-  # hold a single modern container image.
+  # /var/lib/easyenclave/data — mount-data satisfies that from this
+  # disk. Without it, podman falls back to vfs-on-tmpfs and can't hold
+  # a single modern container image.
   python3 - "$out" "$IMG_DIR/dd-local-$name-workload.qcow2" <<'PY'
 import re, sys
 xml_path, disk_path = sys.argv[1], sys.argv[2]
@@ -439,8 +466,9 @@ define_agent() {
 
   echo "== dd-local-$name → $cp (env=$env_label) =="
   build_overlay "$name"
-  # Workload disk (/dev/vdc, ext4, mounted at /data by the mount-data
-  # boot workload). Sparse qcow2, so only grows with actual writes.
+  # Workload disk (/dev/vdc, ext4, mounted at /var/lib/easyenclave/data
+  # by the mount-data boot workload). Sparse qcow2, so only grows with
+  # actual writes.
   build_workload_disk "$name" 160G
   build_config_iso "$name" "$cp" "$env_label"
   local xml

@@ -251,6 +251,7 @@ pub async fn run() -> Result<()> {
             // target "control-plane".
             tunnel_id: String::new(),
             extras: Vec::new(),
+            oracles: Vec::new(),
         },
     );
 
@@ -501,6 +502,7 @@ async fn health(
         "uptime_secs": s.started.elapsed().as_secs(),
         "agent_count": agents.len(),
         "healthy_count": agents.values().filter(|a| a.status == "healthy").count(),
+        "oracle_count": agents.values().map(|a| a.oracles.len()).sum::<usize>(),
         // Pre-Noise-handshake bundle — the former `GET /attest`
         // endpoint folded in here so bastion-app bootstraps in one
         // fetch and we drop a CF Access bypass-app per env × per
@@ -635,6 +637,7 @@ async fn register(
                 // requests extend this list via /ingress/replace (below).
                 tunnel_id: tunnel.id.clone(),
                 extras: extras.clone(),
+                oracles: Vec::new(),
             },
         );
     }
@@ -782,7 +785,7 @@ async fn fleet(State(s): State<St>) -> Response {
         rows.push_str(&format!(
             r#"<tr><td><a href="/agent/{id}">{vm}</a></td>
 <td><span class="pill {st}">{st}</span></td><td>{att}</td>
-<td>{cpu}%</td><td>{mem}</td><td>{n}</td>
+<td>{cpu}%</td><td>{mem}</td><td>{n}</td><td>{o}</td>
 <td class="dim">{host}</td></tr>"#,
             id = html::escape(&a.agent_id),
             vm = html::escape(&a.vm_name),
@@ -790,6 +793,7 @@ async fn fleet(State(s): State<St>) -> Response {
             att = html::escape(&a.attestation_type),
             cpu = a.cpu_percent,
             n = a.deployment_count,
+            o = a.oracles.len(),
             host = html::escape(&a.hostname),
         ));
     }
@@ -798,7 +802,7 @@ async fn fleet(State(s): State<St>) -> Response {
         r#"<div class="empty">No agents registered</div>"#.to_string()
     } else {
         format!(
-            r#"<table><tr><th>vm</th><th>status</th><th>att</th><th>cpu</th><th>mem</th><th>wl</th><th>host</th></tr>{rows}</table>"#
+            r#"<table><tr><th>vm</th><th>status</th><th>att</th><th>cpu</th><th>mem</th><th>wl</th><th>oracles</th><th>host</th></tr>{rows}</table>"#
         )
     };
 
@@ -1056,6 +1060,8 @@ async fn api_agents(
                     "hostname": a.hostname,
                     "status": a.status,
                     "last_seen": a.last_seen.to_rfc3339(),
+                    "oracle_count": a.oracles.len(),
+                    "oracles": a.oracles,
                 })
             })
             .collect(),
@@ -1129,6 +1135,39 @@ async fn agent_detail(State(s): State<St>, Path(id): Path<String>) -> Response {
         r#"<div class="empty">No workloads</div>"#.to_string()
     } else {
         format!(r#"<table><tr><th>workload</th><th></th></tr>{workloads}</table>"#)
+    };
+
+    let oracle_section = if a.oracles.is_empty() {
+        String::new()
+    } else {
+        let mut rows = String::new();
+        for o in &a.oracles {
+            let cls = match o.status.as_str() {
+                "healthy" => "healthy",
+                "error" => "failed",
+                _ => "idle",
+            };
+            let vanity = o
+                .vanity_url
+                .as_ref()
+                .map(|u| {
+                    format!(
+                        r#"<a href="{url}" target="_blank">open</a>"#,
+                        url = html::escape(u)
+                    )
+                })
+                .unwrap_or_else(|| r#"<span class="dim">none</span>"#.into());
+            rows.push_str(&format!(
+                r#"<tr><td>{title}</td><td><span class="pill {cls}">{status}</span></td><td>{vanity}</td><td class="dim">{path}</td><td class="dim">{last}</td></tr>"#,
+                title = html::escape(&o.title),
+                status = html::escape(&o.status),
+                path = html::escape(&o.path),
+                last = html::escape(o.last_ok.as_deref().unwrap_or("never")),
+            ));
+        }
+        format!(
+            r#"<div class="section">Read-only oracles</div><table><tr><th>oracle</th><th>status</th><th>vanity</th><th>path</th><th>last ok</th></tr>{rows}</table>"#
+        )
     };
 
     let ita_card = {
@@ -1234,6 +1273,7 @@ async fn agent_detail(State(s): State<St>, Path(id): Path<String>) -> Response {
 {disks_table}
 {nets_table}
 {ita_card}
+{oracle_section}
 <div class="section">Workloads</div>{wl_table}
 {extra}"#,
             vm = html::escape(&a.vm_name),
@@ -1248,6 +1288,7 @@ async fn agent_detail(State(s): State<St>, Path(id): Path<String>) -> Response {
             disks_table = disks_table,
             nets_table = nets_table,
             ita_card = ita_card,
+            oracle_section = oracle_section,
         ),
     ))
     .into_response()
