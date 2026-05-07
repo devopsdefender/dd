@@ -1167,11 +1167,11 @@ async fn agent_detail(State(s): State<St>, Path(id): Path<String>) -> Response {
         )
     };
 
-    // `{hostname-base}-block.{tld}` is the ttyd subdomain (CP's own
+    // `{hostname-base}-shell.{tld}` is the dd-shell subdomain (CP's own
     // tunnel publishes it; agents publish it via their register-time
     // `extra_ingress`). Flat shape so Universal SSL covers the cert.
     // Human-gated by CF Access.
-    let term_host = html::escape(&cf::label_hostname(&a.hostname, "block"));
+    let term_host = html::escape(&cf::label_hostname(&a.hostname, "shell"));
     let extra = if is_cp {
         format!(
             r#"<p><a href="https://{term_host}/" target="_blank">Terminal ↗</a> · <a href="/health">health (incl. noise quote)</a> · <a href="/health?verbose=1">health?verbose=1 (incl. ita)</a></p>"#
