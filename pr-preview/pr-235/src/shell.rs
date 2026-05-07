@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path as AxPath, State};
+use axum::extract::{Path as AxPath, Query, State};
 use axum::http::StatusCode;
 use axum::response::{Html, Response};
 use axum::routing::{get, post};
@@ -242,22 +242,28 @@ async fn close_session(State(app): State<App>, AxPath(id): AxPath<String>) -> Re
 async fn attach_session(
     State(app): State<App>,
     AxPath(id): AxPath<String>,
+    Query(query): Query<AttachQuery>,
     ws: WebSocketUpgrade,
 ) -> Result<Response> {
     let Some(session) = app.sessions.read().await.get(&id).cloned() else {
         return Err(Error::NotFound);
     };
     Ok(ws.on_upgrade(move |socket| async move {
-        if let Err(e) = attach(socket, session).await {
+        if let Err(e) = attach(socket, session, query.tail.unwrap_or(true)).await {
             eprintln!("dd-shell: attach ended: {e:#}");
         }
     }))
 }
 
-async fn attach(socket: WebSocket, session: Arc<Session>) -> anyhow::Result<()> {
+#[derive(Debug, Deserialize)]
+struct AttachQuery {
+    tail: Option<bool>,
+}
+
+async fn attach(socket: WebSocket, session: Arc<Session>, tail: bool) -> anyhow::Result<()> {
     let (mut ws_tx, mut ws_rx) = socket.split();
 
-    {
+    if tail {
         let ring = session.ring.lock().await;
         if !ring.is_empty() {
             let bytes: Vec<u8> = ring.iter().copied().collect();
@@ -505,7 +511,6 @@ button.secondary { background:#252a36; color:#d7deea; }
 </div>
 <div class="terminal-wrap">
   <div class="toolbar">
-    <button class="secondary" id="replay">Replay history</button>
     <button class="secondary" id="close">Close session</button>
     <span class="status" id="status">No session</span>
   </div>
@@ -516,6 +521,7 @@ function makeTerminal() {
   let onData = () => {};
   let screen = null;
   let text = "";
+  let input = "";
   const clean = s => String(s)
     .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "")
     .replace(/\x1b\][^\x07]*(\x07|\x1b\\)/g, "");
@@ -529,18 +535,52 @@ function makeTerminal() {
       screen.className = "fallback-term";
       screen.tabIndex = 0;
       parent.appendChild(screen);
+      parent.addEventListener("click", () => screen.focus());
       screen.addEventListener("keydown", ev => {
-        let data = "";
-        if (ev.ctrlKey && ev.key.length === 1) data = String.fromCharCode(ev.key.toUpperCase().charCodeAt(0) - 64);
-        else if (ev.key === "Enter") data = "\r";
-        else if (ev.key === "Backspace") data = "\x7f";
-        else if (ev.key === "Tab") data = "\t";
-        else if (ev.key.length === 1) data = ev.key;
-        if (data) { ev.preventDefault(); onData(data); }
+        if (ev.ctrlKey && ev.key.length === 1) {
+          ev.preventDefault();
+          onData(String.fromCharCode(ev.key.toUpperCase().charCodeAt(0) - 64));
+          return;
+        }
+        if (ev.key === "Enter") {
+          ev.preventDefault();
+          text += "\n";
+          render();
+          onData(input + "\n");
+          input = "";
+          return;
+        }
+        if (ev.key === "Backspace") {
+          ev.preventDefault();
+          if (input.length > 0) {
+            input = input.slice(0, -1);
+            text = text.slice(0, -1);
+            render();
+          }
+          return;
+        }
+        if (ev.key === "Tab") {
+          ev.preventDefault();
+          input += "\t";
+          text += "\t";
+          render();
+          return;
+        }
+        if (ev.key.length === 1) {
+          ev.preventDefault();
+          input += ev.key;
+          text += ev.key;
+          render();
+        }
       });
       screen.addEventListener("paste", ev => {
         const data = ev.clipboardData.getData("text");
-        if (data) { ev.preventDefault(); onData(data); }
+        if (data) {
+          ev.preventDefault();
+          input += data;
+          text += data;
+          render();
+        }
       });
       screen.focus();
     },
@@ -551,7 +591,11 @@ function makeTerminal() {
     },
     clear() {
       text = "";
+      input = "";
       render();
+    },
+    focus() {
+      if (screen) screen.focus();
     },
     onData(fn) {
       onData = fn;
@@ -589,12 +633,17 @@ async function createSession() {
   attach(r.id);
 }
 
-function attach(id) {
+async function attach(id) {
   if (ws) ws.close();
   current = id;
   term.clear();
+  term.focus();
+  document.getElementById("status").textContent = "Loading history";
+  const history = await api(`/api/sessions/${id}/replay`).catch(() => null);
+  if (current !== id) return;
+  if (history) term.write(Uint8Array.from(atob(history.bytes_b64), c => c.charCodeAt(0)));
   document.getElementById("status").textContent = "Attached";
-  ws = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws/sessions/${id}`);
+  ws = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws/sessions/${id}?tail=false`);
   ws.binaryType = "arraybuffer";
   ws.onmessage = ev => {
     if (typeof ev.data === "string") term.write(ev.data);
@@ -602,6 +651,7 @@ function attach(id) {
   };
   ws.onclose = () => document.getElementById("status").textContent = "Detached";
   refresh();
+  setTimeout(() => term.focus(), 0);
 }
 
 term.onData(data => {
@@ -609,12 +659,6 @@ term.onData(data => {
 });
 
 document.getElementById("new-session").onclick = createSession;
-document.getElementById("replay").onclick = async () => {
-  if (!current) return;
-  const r = await api(`/api/sessions/${current}/replay`);
-  term.clear();
-  term.write(Uint8Array.from(atob(r.bytes_b64), c => c.charCodeAt(0)));
-};
 document.getElementById("close").onclick = async () => {
   if (!current) return;
   await api(`/api/sessions/${current}/close`, {method:"POST"});
