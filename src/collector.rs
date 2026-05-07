@@ -27,7 +27,12 @@ use crate::ita;
 use crate::taint::IntegrityState;
 use crate::units::{AgentMode, ManagedUnit};
 
-const DEAD_THRESHOLD_SECS: i64 = 300;
+// Keep this longer than the relaunch-agent CI registration window
+// (10 minutes). Freshly-created Cloudflare hostnames can fail early
+// scrape attempts while DNS/edge state is still converging; deleting
+// the tunnel inside that window makes a slow-but-healthy agent
+// unrecoverable before CI can observe it.
+const DEAD_THRESHOLD_SECS: i64 = 900;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Agent {
