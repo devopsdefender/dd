@@ -20,8 +20,14 @@
 #                      workload onto this agent's /deploy. Same boot
 #                      chain as preview/prod (cloudflared + dd-agent +
 #                      dd-shell + podman). Modest sizing.
+#   dd-local-codex   : CPU-only, registers with production. Durable
+#                      personal development workstation: cloudflared +
+#                      dd-agent + Podman + codex-universal shell.
+#                      Started/upgraded manually; CI never relaunches it.
+#                      Its dd-shell transcript, Codex login, container
+#                      home, and workspace live on the workload disk.
 #
-# All three reuse the existing easyenclave base qcow2 via copy-on-write
+# All local agent profiles reuse the existing easyenclave base qcow2 via copy-on-write
 # overlays; each gets its own config.iso baking in DD_CP_URL +
 # DD_ITA_API_KEY for that target. No GitHub PAT — the agent
 # authenticates to the CP via ITA attestation at /register and picks
@@ -45,15 +51,16 @@
 # Usage:
 #   export DD_ITA_API_KEY="$(cat ~/.secrets/ita_api_key)"
 #   export EE_OWNER="devopsdefender"   # or "alice", "alice/dd-foo", etc.
-#   ./apps/_infra/local-agents.sh <preview> <prod> <bot>
+#   ./apps/_infra/local-agents.sh <preview> <prod> <bot> <codex>
 #
 # Each URL arg is independent — pass "" to skip provisioning that VM:
-#   ./apps/_infra/local-agents.sh "" https://app.devopsdefender.com ""                          # prod only
-#   ./apps/_infra/local-agents.sh https://pr-N.devopsdefender.com "" ""                         # preview only
-#   ./apps/_infra/local-agents.sh "" "" https://app.devopsdefender.com                          # bot only
-#   ./apps/_infra/local-agents.sh "" https://app.devopsdefender.com https://app.devopsdefender.com  # prod + bot
+#   ./apps/_infra/local-agents.sh "" https://app.devopsdefender.com "" ""                          # prod only
+#   ./apps/_infra/local-agents.sh https://pr-N.devopsdefender.com "" "" ""                         # preview only
+#   ./apps/_infra/local-agents.sh "" "" https://app.devopsdefender.com ""                          # bot only
+#   ./apps/_infra/local-agents.sh "" "" "" https://app.devopsdefender.com                          # codex workstation only
+#   ./apps/_infra/local-agents.sh "" https://app.devopsdefender.com "" https://app.devopsdefender.com # prod + codex
 #
-# After: virsh start dd-local-preview && virsh start dd-local-preview-oracle && virsh start dd-local-prod && virsh start dd-local-bot
+# After: virsh start dd-local-preview && virsh start dd-local-preview-oracle && virsh start dd-local-prod && virsh start dd-local-bot && virsh start dd-local-codex
 
 set -euo pipefail
 export LIBVIRT_DEFAULT_URI="${LIBVIRT_DEFAULT_URI:-qemu:///system}"
@@ -61,8 +68,9 @@ export LIBVIRT_DEFAULT_URI="${LIBVIRT_DEFAULT_URI:-qemu:///system}"
 PREVIEW_CP="${1-}"
 PROD_CP="${2-}"
 BOT_CP="${3-}"
-if [ -z "$PREVIEW_CP" ] && [ -z "$PROD_CP" ] && [ -z "$BOT_CP" ]; then
-  echo "usage: $0 <preview-cp-url|\"\"> <prod-cp-url|\"\"> <bot-cp-url|\"\">" >&2
+CODEX_CP="${4-}"
+if [ -z "$PREVIEW_CP" ] && [ -z "$PROD_CP" ] && [ -z "$BOT_CP" ] && [ -z "$CODEX_CP" ]; then
+  echo "usage: $0 <preview-cp-url|\"\"> <prod-cp-url|\"\"> <bot-cp-url|\"\"> <codex-cp-url|\"\">" >&2
   exit 1
 fi
 : "${DD_ITA_API_KEY?set DD_ITA_API_KEY}"
@@ -210,6 +218,16 @@ build_config_iso() {
       preview-oracle)
         bake "$REPO_ROOT/apps/cloudflared/workload.json"
         bake "$REPO_ROOT/apps/human-readonly/workload.json"
+        ;;
+      codex)
+        # Durable personal workstation. Use the codex-universal shell
+        # instead of the generic dd-shell so every read/write session
+        # enters a persistent Podman-backed dev container.
+        bake "$REPO_ROOT/apps/mount-data/workload.json"
+        bake "$REPO_ROOT/apps/podman-static/workload.json"
+        bake "$REPO_ROOT/apps/podman-bootstrap/workload.json"
+        bake "$REPO_ROOT/apps/cloudflared/workload.json"
+        bake "$REPO_ROOT/apps/codex-universal-shell/workload.json"
         ;;
       *)
         # mount-data runs first so `/dev/vdc` is at
@@ -481,7 +499,9 @@ define_agent() {
   # Workload disk (/dev/vdc, ext4, mounted at /var/lib/easyenclave/data
   # by the mount-data boot workload). Sparse qcow2, so only grows with
   # actual writes.
-  build_workload_disk "$name" 160G
+  local workload_disk_size=160G
+  [ "$name" = codex ] && workload_disk_size=512G
+  build_workload_disk "$name" "$workload_disk_size"
   build_config_iso "$name" "$cp" "$env_label"
   local xml
   xml=$(render_domain_xml "$name")
@@ -494,6 +514,7 @@ define_agent() {
 [ -n "$PREVIEW_CP" ] && define_agent preview-oracle "$PREVIEW_CP"
 [ -n "$PROD_CP"    ] && define_agent prod    "$PROD_CP"
 [ -n "$BOT_CP"     ] && define_agent bot     "$BOT_CP"
+[ -n "$CODEX_CP"   ] && define_agent codex   "$CODEX_CP"
 
 echo
 echo "done. start with:"
@@ -501,12 +522,14 @@ echo "done. start with:"
 [ -n "$PREVIEW_CP" ] && echo "  virsh start dd-local-preview-oracle"
 [ -n "$PROD_CP"    ] && echo "  virsh start dd-local-prod"
 [ -n "$BOT_CP"     ] && echo "  virsh start dd-local-bot"
+[ -n "$CODEX_CP"   ] && echo "  virsh start dd-local-codex"
 echo
 echo "watch registration (Ctrl-] to exit):"
 [ -n "$PREVIEW_CP" ] && echo "  virsh console dd-local-preview"
 [ -n "$PREVIEW_CP" ] && echo "  virsh console dd-local-preview-oracle"
 [ -n "$PROD_CP"    ] && echo "  virsh console dd-local-prod"
 [ -n "$BOT_CP"     ] && echo "  virsh console dd-local-bot"
+[ -n "$CODEX_CP"   ] && echo "  virsh console dd-local-codex"
 
 # Explicit 0 — the tail `[ -n "$BOT_CP" ] && …` returns 1 when
 # BOT_CP="" (preview/prod-only), bubbling up as the script exit

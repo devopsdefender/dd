@@ -1,0 +1,15 @@
+{
+  "app_name": "codex-universal-shell",
+  "expose": { "hostname_label": "shell", "port": 7682 },
+  "env": [
+    "DD_MODE=shell",
+    "DD_SHELL_PORT=7682",
+    "DD_SHELL_DIR=/var/lib/easyenclave/data/dd-shell",
+    "DD_SHELL_EE_SOCKET=/var/lib/easyenclave/agent.sock",
+    "SHELL=/var/lib/easyenclave/data/codex-universal/codex-universal-shell"
+  ],
+  "cmd": [
+    "/bin/busybox", "sh", "-c",
+    "set -e\nDATA_DIR=/var/lib/easyenclave/data\nBIN=/var/lib/easyenclave/bin\nuntil [ -x \"$BIN/devopsdefender\" ]; do sleep 1; done\nmkdir -p \"$DATA_DIR/dd-shell\" \"$DATA_DIR/codex-universal/home\" \"$DATA_DIR/codex-universal/workspace\" \"$DATA_DIR/codex-universal/bin\"\ncat > \"$DATA_DIR/codex-universal/codex-universal-shell\" <<'EOF'\n#!/bin/sh\nset -e\nBIN=/var/lib/easyenclave/bin\nDATA_DIR=/var/lib/easyenclave/data\nuntil [ -x \"$BIN/podman\" ]; do echo 'codex-universal-shell: waiting for podman'; sleep 2; done\nmkdir -p \"$DATA_DIR/codex-universal/home\" \"$DATA_DIR/codex-universal/workspace\"\nexec \"$BIN/podman\" run --rm -it \\\n  --name codex-universal-shell-$$ \\\n  --pull=missing \\\n  -e HOME=/root \\\n  -e TERM=xterm-256color \\\n  -e COLORTERM=truecolor \\\n  -e CODEX_ENV_PYTHON_VERSION=3.12 \\\n  -e CODEX_ENV_NODE_VERSION=22 \\\n  -e CODEX_ENV_RUST_VERSION=1.90 \\\n  -e CODEX_ENV_GO_VERSION=1.24.3 \\\n  -e CODEX_ENV_JAVA_VERSION=21 \\\n  -e NPM_CONFIG_PREFIX=/root/.npm-global \\\n  -v \"$DATA_DIR/codex-universal/home:/root\" \\\n  -v \"$DATA_DIR/codex-universal/workspace:/workspace\" \\\n  -w /workspace \\\n  ghcr.io/openai/codex-universal:latest \\\n  bash -lc 'set -e; mkdir -p \"$HOME/.npm-global/bin\" \"$HOME/.config\" \"$HOME/.ssh\"; case \":$PATH:\" in *\":$HOME/.npm-global/bin:\"*) ;; *) printf \"%s\\n\" \"export PATH=\\$HOME/.npm-global/bin:\\$PATH\" >> \"$HOME/.profile\"; export PATH=\"$HOME/.npm-global/bin:$PATH\" ;; esac; if ! command -v codex >/dev/null 2>&1; then npm install -g @openai/codex; fi; cd /workspace; exec bash -l'\nEOF\nchmod +x \"$DATA_DIR/codex-universal/codex-universal-shell\"\ncp \"$BIN/devopsdefender\" \"$DATA_DIR/codex-universal/bin/devopsdefender\"\nchmod +x \"$DATA_DIR/codex-universal/bin/devopsdefender\"\nexec \"$DATA_DIR/codex-universal/bin/devopsdefender\" shell"
+  ]
+}
