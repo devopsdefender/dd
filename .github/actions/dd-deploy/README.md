@@ -24,8 +24,8 @@ The action will:
 
 1. Look up the current hostname for your target agent via the CP's `/api/agents`.
 2. Mint a GitHub Actions OIDC JWT with `audience: dd-agent`.
-3. POST the baked workload JSON to `https://<agent>/deploy` with `Authorization: Bearer <oidc>`.
-4. Poll the agent's `/health` until the deployment appears (or fail after `wait-for-deployment-seconds`).
+3. POST the baked workload JSON to `https://<agent>-agent-api/deploy` with `Authorization: Bearer <oidc>`.
+4. Poll the agent API subdomain's `/health` until the deployment appears (or fail after `wait-for-deployment-seconds`).
 
 ## Inputs
 
@@ -46,7 +46,7 @@ The action will:
 
 ## Trust model
 
-The agent's `/deploy` endpoint is CF-Access-bypassed and gated entirely by an in-code OIDC check:
+The agent API subdomain's `/deploy` endpoint is CF-Access-bypassed and gated entirely by an in-code OIDC check:
 
 - Issuer must be `https://token.actions.githubusercontent.com`
 - Signature must verify against GitHub's live JWKS

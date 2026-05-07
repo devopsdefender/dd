@@ -13,6 +13,8 @@ use crate::config::CfCreds;
 use crate::error::{Error, Result};
 
 const API: &str = "https://api.cloudflare.com/client/v4";
+pub const AGENT_API_LABEL: &str = "agent-api";
+pub const AGENT_API_PORT: u16 = 8081;
 
 pub fn cp_tunnel_name(env: &str) -> String {
     format!("dd-{env}-cp-{}", uuid::Uuid::new_v4())
@@ -25,6 +27,9 @@ pub fn cp_prefix(env: &str) -> String {
 }
 pub fn agent_prefix(env: &str) -> String {
     format!("dd-{env}-agent-")
+}
+pub fn agent_api_hostname(agent_hostname: &str) -> String {
+    label_hostname(agent_hostname, AGENT_API_LABEL)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -702,6 +707,7 @@ pub async fn provision_cp_access(
 ///   - Human: `{agent}.{domain}` — browser dashboard only
 ///   - Human: `<admin-label>.{agent}.{domain}` for labels in
 ///     `ADMIN_LABELS` (ttyd et al) — org members only
+///   - Bypass: `{agent}-agent-api.{domain}` — machine API only
 ///   - Bypass: `{agent}.{domain}/health` — public; carries the Noise
 ///     pre-handshake `{quote_b64, pubkey_hex}` in its response
 ///   - Bypass: `{agent}.{domain}/deploy` — GH-OIDC-gated in code
@@ -890,6 +896,14 @@ mod tests {
         assert_eq!(
             label_hostname("app.devopsdefender.com", "term"),
             "app-term.devopsdefender.com"
+        );
+    }
+
+    #[test]
+    fn agent_api_hostname_uses_reserved_flat_subdomain() {
+        assert_eq!(
+            agent_api_hostname("dd-pr-144-agent-abc.devopsdefender.com"),
+            "dd-pr-144-agent-abc-agent-api.devopsdefender.com"
         );
     }
 
