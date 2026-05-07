@@ -162,19 +162,23 @@ runs:
           # Dropping `2>/dev/null` on tail so "cannot open" / "retrying"
           # diagnostics surface — if the serial log file never appears,
           # we want the reason on-screen, not a silent wait.
+          stream_console_log() {
+            local label="$1" log="$2"
+            ssh -i "$key" -T \
+                -o StrictHostKeyChecking=accept-new \
+                -o ServerAliveInterval=30 \
+                "$SSH_USER@$HOST" \
+                "sudo stdbuf -oL tail -n 0 -F '$log' || true" \
+              2>&1 | stdbuf -oL sed -u "s/^/  [$label console] /" \
+                   | stdbuf -oL tee -a "$mirror" &
+            tail_pid=$!
+          }
           if [ "$KIND" = "preview" ]; then
-            remote_tail='sudo stdbuf -oL tail -n 0 -F /var/log/ee-local-preview.log /var/log/ee-local-preview-oracle.log || true'
+            stream_console_log "dd-local-preview" "/var/log/ee-local-preview.log"
+            stream_console_log "dd-local-preview-oracle" "/var/log/ee-local-preview-oracle.log"
           else
-            remote_tail="sudo stdbuf -oL tail -n 0 -F /var/log/ee-local-$KIND.log || true"
+            stream_console_log "dd-local-$KIND" "/var/log/ee-local-$KIND.log"
           fi
-          ssh -i "$key" -T \
-              -o StrictHostKeyChecking=accept-new \
-              -o ServerAliveInterval=30 \
-              "$SSH_USER@$HOST" \
-              "$remote_tail" \
-            2>&1 | stdbuf -oL sed -u "s/^/  [$vm console] /" \
-                 | stdbuf -oL tee -a "$mirror" &
-          tail_pid=$!
           # Give the tail a moment to attach so its first lines land
           # before the register wait's first status message.
           sleep 1
