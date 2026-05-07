@@ -267,17 +267,23 @@ jobs:
             echo "Orphan agent-hostname sweep..."
 
             live_tunnel_names=$(echo "$tunnels" | jq -r '.result[].name' \
-              | grep -E '^dd-[a-zA-Z0-9-]+-agent-' | sort -u)
-            live_hostnames=$(for t in $live_tunnel_names; do
-              echo "$t.$DD_DOMAIN"
-            done | sort -u)
+              | grep -E '^dd-[a-zA-Z0-9-]+-agent-' | sort -u || true)
+
+            is_live_agent_resource() {
+              local name="$1"
+              local t
+              for t in $live_tunnel_names; do
+                case "$name" in
+                  *"$t"*) return 0 ;;
+                esac
+              done
+              return 1
+            }
 
             orphan_apps=$(echo "$apps" | jq -r \
               '.result[] | select(.name | test("^dd-[a-zA-Z0-9-]+-agent-dd-[a-zA-Z0-9-]+-agent-")) | "\(.id) \(.name)"' \
               | while read -r id name; do
-                  host=$(echo "$name" | grep -oE 'dd-[a-zA-Z0-9-]+-agent-[a-f0-9-]+\.devopsdefender\.com' | head -1)
-                  [ -z "$host" ] && continue
-                  if ! echo "$live_hostnames" | grep -qx "$host"; then
+                  if ! is_live_agent_resource "$name"; then
                     echo "$id $name"
                   fi
               done)
@@ -285,9 +291,7 @@ jobs:
             orphan_dns=$(echo "$dns" | jq -r \
               '.result[] | select(.name | test("dd-[a-zA-Z0-9-]+-agent-[a-f0-9-]+\\.devopsdefender\\.com")) | "\(.id) \(.name)"' \
               | while read -r id name; do
-                  host=$(echo "$name" | grep -oE 'dd-[a-zA-Z0-9-]+-agent-[a-f0-9-]+\.devopsdefender\.com' | head -1)
-                  [ -z "$host" ] && continue
-                  if ! echo "$live_hostnames" | grep -qx "$host"; then
+                  if ! is_live_agent_resource "$name"; then
                     echo "$id $name"
                   fi
               done)
