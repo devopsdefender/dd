@@ -488,19 +488,38 @@ async fn replay_workload(
 }
 
 async fn close_session(State(app): State<App>, AxPath(id): AxPath<String>) -> Result<StatusCode> {
-    let Some(session) = app.sessions.read().await.get(&id).cloned() else {
+    let Some(session) = app.sessions.write().await.remove(&id) else {
         return Err(Error::NotFound);
     };
-    if session.pgid > 0 {
-        unsafe {
-            libc::kill(-session.pgid, libc::SIGHUP);
-        }
-    }
-    let mut child = session.child.lock().await;
-    if let Err(e) = child.kill().await {
-        eprintln!("dd-shell: kill {id}: {e}");
-    }
+    let pgid = session.pgid;
+    mark_session_exited(&app.store, &session, None).await;
+    terminate_process_group(id, pgid);
     Ok(StatusCode::NO_CONTENT)
+}
+
+fn terminate_process_group(id: String, pgid: i32) {
+    if pgid <= 0 {
+        return;
+    }
+    tokio::spawn(async move {
+        for (signal, delay) in [
+            (libc::SIGHUP, Duration::from_millis(250)),
+            (libc::SIGTERM, Duration::from_millis(1500)),
+            (libc::SIGKILL, Duration::ZERO),
+        ] {
+            let rc = unsafe { libc::kill(-pgid, signal) };
+            if rc != 0 {
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() != Some(libc::ESRCH) {
+                    eprintln!("dd-shell: signal {signal} for {id}: {err}");
+                }
+                break;
+            }
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
+        }
+    });
 }
 
 fn workload_log_bytes(logs: &serde_json::Value) -> Vec<u8> {
@@ -642,14 +661,21 @@ fn spawn_waiter(store: TranscriptStore, session: Arc<Session>) {
             let mut child = session.child.lock().await;
             child.wait().await
         };
-        let mut meta = session.meta.write().await;
-        meta.updated_at = unix_ts();
-        meta.status = SessionStatus::Exited;
-        meta.exit_code = status.ok().and_then(|s| s.code());
-        if let Err(e) = store.append_meta(&meta).await {
-            eprintln!("dd-shell: exit meta append failed: {e}");
-        }
+        mark_session_exited(&store, &session, status.ok().and_then(|s| s.code())).await;
     });
+}
+
+async fn mark_session_exited(store: &TranscriptStore, session: &Session, exit_code: Option<i32>) {
+    let mut meta = session.meta.write().await;
+    if matches!(meta.status, SessionStatus::Exited) {
+        return;
+    }
+    meta.updated_at = unix_ts();
+    meta.status = SessionStatus::Exited;
+    meta.exit_code = exit_code;
+    if let Err(e) = store.append_meta(&meta).await {
+        eprintln!("dd-shell: exit meta append failed: {e}");
+    }
 }
 
 async fn push_ring(session: &Session, bytes: &[u8]) {
