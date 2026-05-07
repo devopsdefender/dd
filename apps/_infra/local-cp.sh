@@ -132,7 +132,7 @@ build_config_iso() {
       DD_OWNER_ID="$EE_OWNER_ID" \
       DD_OWNER_KIND="$EE_OWNER_KIND" \
       bake "$REPO_ROOT/apps/dd-management/workload.json.tmpl"
-    bake "$REPO_ROOT/apps/ttyd/workload.json"
+    bake "$REPO_ROOT/apps/dd-shell/workload.json"
   } | jq -cs '.')
 
   {

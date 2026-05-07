@@ -152,7 +152,7 @@ pub async fn run() -> Result<()> {
     // moment CF's edge propagates that change.
     eprintln!("cp: self-provisioning tunnel for {}", cfg.hostname);
     let self_name = cf::cp_tunnel_name(&cfg.common.env_label);
-    let cp_extras: Vec<(String, u16)> = vec![("block".into(), 7681)];
+    let cp_extras: Vec<(String, u16)> = vec![("shell".into(), 7682)];
     let tunnel = match cf::create(&http, &cfg.cf, &self_name, &cfg.hostname, &cp_extras).await {
         Ok(t) => t,
         Err(e) => {
@@ -186,7 +186,7 @@ pub async fn run() -> Result<()> {
     ));
 
     // Stage 4: provision CF Access apps for our own tunnel. Workload
-    // labels (e.g. `block` for ttyd) get the human policy; the
+    // labels (e.g. `shell` for dd-shell) get the human policy; the
     // paths in the bypass list (`/register`, `/api/agents`,
     // `/api/v1/devices/trusted`, `/api/v1/admin/export`, `/noise/ws`,
     // `/health`, …) are CF-bypassed with in-code gating. `/health`

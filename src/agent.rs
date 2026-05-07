@@ -8,9 +8,9 @@
 //! Auth after registration:
 //!   - Browser routes (`/`, `/workload/*`) are behind CF Access with
 //!     the same human policy as the CP dashboard.
-//!   - Terminal is a separate `ttyd` workload published on
-//!     `block.<hostname>` — a plain web shell, not tied to any
-//!     deployment.
+//!   - Terminal access is provided by the `dd-shell` workload on the
+//!     `shell` label. It exposes read-only workload logs and read-write
+//!     PTY sessions as separate capabilities.
 //!   - `/deploy` and `/exec` are CF-Access-bypassed and gated in-code
 //!     by a GitHub Actions OIDC token — any CI workflow whose
 //!     principal matches `DD_OWNER`/`DD_OWNER_ID`/`DD_OWNER_KIND`
