@@ -1,21 +1,21 @@
-//! Integrity taint-reason tracking for a dd-agent node.
+//! Integrity state tracking for a dd-agent node.
 //!
-//! An agent is either pristine (no reasons) or tainted (one or more
-//! reasons). The spec (SATS_FOR_COMPUTE_SPEC.md) defines taint as a
-//! SET of reasons — not a boolean — each tied to a specific mechanism
-//! that let a non-fleet party influence the node. Third-party
-//! verifiers who read `/health` reconstruct the node's trust profile
-//! from the presence/absence of specific reasons:
+//! Internally this module still uses the security term "taint": a set
+//! of concrete mechanisms, not a boolean. User-facing APIs should
+//! present the derived integrity state (`clean` or `controlled`) and
+//! keep `taint_reasons` only as a compatibility/diagnostic field.
+//! Third-party verifiers who read `/health` reconstruct the node's
+//! trust profile from the presence/absence of specific reasons:
 //!
 //! - `customer_workload_deployed + customer_owner_enabled + interactive_shell_enabled`
 //!   → full customer-deploy mode (shared admin, shell access).
 //! - `customer_workload_deployed` only
 //!   → confidential mode (sealed oracle; no exec channels for anyone).
-//! - empty set → pristine.
+//! - empty set → clean.
 //!
-//! v0 scope: taint is INFORMATIONAL. DD doesn't hard-block actions
-//! based on it; the reasons just mirror what the node's boot config +
-//! runtime events actually produced, for honest disclosure.
+//! v0 scope: integrity state is INFORMATIONAL. DD doesn't hard-block
+//! actions based on it; the reasons just mirror what the node's boot
+//! config + runtime events actually produced, for honest disclosure.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -46,6 +46,26 @@ pub enum TaintReason {
     /// `/health` schema is stable when it lands.
     #[allow(dead_code)]
     InteractiveShellEnabled,
+}
+
+/// User-facing integrity label derived from the internal taint set.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IntegrityState {
+    /// No control/influence reasons are known for this scope.
+    Clean,
+    /// A human/customer/operator control path affected this scope.
+    Controlled,
+}
+
+impl IntegrityState {
+    pub fn from_taint_reasons(reasons: &[TaintReason]) -> Self {
+        if reasons.is_empty() {
+            Self::Clean
+        } else {
+            Self::Controlled
+        }
+    }
 }
 
 /// Thread-safe handle over a `HashSet<TaintReason>`. Shared by the
@@ -79,6 +99,15 @@ impl TaintSet {
         let mut v: Vec<_> = self.inner.read().await.iter().copied().collect();
         v.sort();
         v
+    }
+
+    pub async fn integrity_state(&self) -> IntegrityState {
+        let guard = self.inner.read().await;
+        if guard.is_empty() {
+            IntegrityState::Clean
+        } else {
+            IntegrityState::Controlled
+        }
     }
 }
 
@@ -115,5 +144,19 @@ mod tests {
     fn reasons_serialize_as_snake_case() {
         let s = serde_json::to_string(&TaintReason::CustomerOwnerEnabled).unwrap();
         assert_eq!(s, "\"customer_owner_enabled\"");
+    }
+
+    #[test]
+    fn integrity_state_is_derived_from_reasons() {
+        assert_eq!(
+            IntegrityState::from_taint_reasons(&[]),
+            IntegrityState::Clean
+        );
+        assert_eq!(
+            IntegrityState::from_taint_reasons(&[TaintReason::CustomerWorkloadDeployed]),
+            IntegrityState::Controlled
+        );
+        let s = serde_json::to_string(&IntegrityState::Controlled).unwrap();
+        assert_eq!(s, "\"controlled\"");
     }
 }

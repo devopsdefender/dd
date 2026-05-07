@@ -23,6 +23,7 @@ use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use futures_util::{SinkExt, StreamExt};
 use rand::RngCore;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::fs::File as TokioFile;
@@ -35,6 +36,9 @@ use uuid::Uuid;
 use crate::ee::Ee;
 use crate::error::{Error, Result};
 use crate::html;
+use crate::oracle::OracleStatus;
+use crate::taint::IntegrityState;
+use crate::units::{self, AgentMode, ManagedUnit, UnitKind};
 
 const DEFAULT_PORT: u16 = 7681;
 const DEFAULT_DIR: &str = "/var/lib/devopsdefender/shell";
@@ -45,6 +49,8 @@ struct App {
     sessions: Arc<RwLock<HashMap<String, Arc<Session>>>>,
     store: TranscriptStore,
     ee: Arc<Ee>,
+    http: reqwest::Client,
+    agent_api: String,
     default_shell: String,
 }
 
@@ -64,10 +70,19 @@ struct SessionMeta {
     name: String,
     command: String,
     cwd: String,
+    terminal_mode: TerminalMode,
+    integrity_state: IntegrityState,
+    integrity_reason: &'static str,
     created_at: i64,
     updated_at: i64,
     status: SessionStatus,
     exit_code: Option<i32>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum TerminalMode {
+    ReadWrite,
 }
 
 #[derive(Clone, Serialize)]
@@ -115,11 +130,17 @@ struct ReplayResponse {
 }
 
 #[derive(Serialize)]
-struct WorkloadTerminal {
-    id: String,
-    app_name: String,
+struct SystemProbe {
+    ok: bool,
     status: String,
-    terminal_mode: &'static str,
+    detail: Option<String>,
+    data: Option<serde_json::Value>,
+}
+
+#[derive(Serialize)]
+struct SystemStatus {
+    ee: SystemProbe,
+    agent: SystemProbe,
 }
 
 pub async fn run() -> Result<()> {
@@ -131,12 +152,19 @@ pub async fn run() -> Result<()> {
     let default_shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
     let ee_socket = std::env::var("DD_SHELL_EE_SOCKET")
         .unwrap_or_else(|_| "/var/lib/easyenclave/agent.sock".into());
+    let agent_api = std::env::var("DD_SHELL_AGENT_API_URL")
+        .unwrap_or_else(|_| format!("http://127.0.0.1:{}", crate::cf::AGENT_API_PORT));
     let store = TranscriptStore::new(PathBuf::from(dir)).await?;
 
     let app_state = App {
         sessions: Arc::new(RwLock::new(HashMap::new())),
         store,
         ee: Arc::new(Ee::new(ee_socket)),
+        http: reqwest::Client::builder()
+            .timeout(Duration::from_secs(3))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new()),
+        agent_api,
         default_shell,
     };
 
@@ -150,6 +178,8 @@ pub async fn run() -> Result<()> {
         .route("/api/sessions/{id}/replay", get(replay_session))
         .route("/api/sessions/{id}/resize", post(resize_session))
         .route("/api/sessions/{id}/close", post(close_session))
+        .route("/api/system", get(system_status))
+        .route("/api/oracles", get(list_oracles))
         .route("/api/workloads", get(list_workloads))
         .route("/api/workloads/{app}/replay", get(replay_workload))
         .route("/ws/sessions/{id}", get(attach_session))
@@ -230,6 +260,9 @@ async fn create_session(
         name,
         command,
         cwd,
+        terminal_mode: TerminalMode::ReadWrite,
+        integrity_state: IntegrityState::Controlled,
+        integrity_reason: "interactive_pty_control",
         created_at: now,
         updated_at: now,
         status: SessionStatus::Running,
@@ -344,25 +377,175 @@ async fn replay_session(
     }))
 }
 
-async fn list_workloads(State(app): State<App>) -> Result<Json<Vec<WorkloadTerminal>>> {
-    let list = app.ee.list().await?;
-    let mut workloads: Vec<WorkloadTerminal> = list["deployments"]
-        .as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(|d| {
-                    Some(WorkloadTerminal {
-                        id: d["id"].as_str()?.to_string(),
-                        app_name: d["app_name"].as_str()?.to_string(),
+async fn list_workloads(State(app): State<App>) -> Result<Json<Vec<ManagedUnit>>> {
+    if let Ok(units) = agent_get(&app, "/api/units").await {
+        return Ok(Json(units));
+    }
+
+    let oracles = load_oracles(&app).await;
+    let mut oracle_by_app: HashMap<String, OracleStatus> = oracles
+        .into_iter()
+        .map(|oracle| (oracle.app_name.clone(), oracle))
+        .collect();
+    let mut workloads = Vec::new();
+
+    match app.ee.list().await {
+        Ok(list) => {
+            if let Some(deployments) = list["deployments"].as_array() {
+                for d in deployments {
+                    let Some(app_name) = d["app_name"].as_str() else {
+                        continue;
+                    };
+                    let id = d["id"].as_str().unwrap_or(app_name).to_string();
+                    let oracle = oracle_by_app.remove(app_name);
+                    let kind = units::kind_for_app(app_name);
+                    let mut capabilities = units::base_capabilities(kind);
+                    capabilities.push("logs".into());
+                    if oracle.is_some() {
+                        capabilities.push("oracle".into());
+                    }
+                    workloads.push(ManagedUnit {
+                        id: id.clone(),
+                        app_name: app_name.to_string(),
+                        title: units::title_for_app(app_name),
+                        kind,
+                        agent_mode: AgentMode::ReadWrite,
+                        agent_integrity_state: IntegrityState::Controlled,
                         status: d["status"].as_str().unwrap_or("unknown").to_string(),
-                        terminal_mode: "read_only",
-                    })
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+                        image: non_empty_string(&d["image"]),
+                        started_at: non_empty_string(&d["started_at"]),
+                        error_message: non_empty_string(&d["error_message"]),
+                        source: units::source_for_app(app_name),
+                        log_line_count: workload_log_line_count(&app.ee, &id).await,
+                        capabilities,
+                        refs: fallback_refs(app_name, kind, oracle.as_ref()),
+                        oracle,
+                    });
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("dd-shell: ee workload probe unavailable: {e}");
+        }
+    }
+
+    workloads.extend(oracle_by_app.into_values().map(|oracle| ManagedUnit {
+        id: oracle.app_name.clone(),
+        app_name: oracle.app_name.clone(),
+        title: oracle.title.clone(),
+        kind: UnitKind::Workload,
+        agent_mode: AgentMode::ReadWrite,
+        agent_integrity_state: IntegrityState::Controlled,
+        status: oracle.status.clone(),
+        image: None,
+        started_at: None,
+        error_message: oracle.last_error.clone(),
+        source: units::source_for_app(&oracle.app_name),
+        log_line_count: 0,
+        capabilities: vec!["oracle".into()],
+        refs: fallback_refs(&oracle.app_name, UnitKind::Workload, Some(&oracle)),
+        oracle: Some(oracle),
+    }));
     workloads.sort_by(|a, b| a.app_name.cmp(&b.app_name));
     Ok(Json(workloads))
+}
+
+async fn workload_log_line_count(ee: &Ee, id: &str) -> usize {
+    match ee.logs(id).await {
+        Ok(logs) => logs["lines"].as_array().map(|a| a.len()).unwrap_or(0),
+        Err(e) => {
+            eprintln!("dd-shell: workload log probe unavailable for {id}: {e}");
+            0
+        }
+    }
+}
+
+fn fallback_refs(
+    app_name: &str,
+    _kind: UnitKind,
+    oracle: Option<&OracleStatus>,
+) -> Vec<units::UnitRef> {
+    let mut refs = units::source_for_app(app_name)
+        .map(|source| vec![units::ref_item("source", "source", source)])
+        .unwrap_or_default();
+    if let Some(oracle) = oracle {
+        if let Some(url) = &oracle.vanity_url {
+            refs.push(units::ref_item("url", "oracle", url.clone()));
+        }
+        refs.push(units::ref_item(
+            "url",
+            "oracle-local",
+            oracle.local_url.clone(),
+        ));
+    }
+    refs
+}
+
+fn non_empty_string(value: &serde_json::Value) -> Option<String> {
+    value
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+}
+
+async fn list_oracles(State(app): State<App>) -> Json<Vec<OracleStatus>> {
+    Json(load_oracles(&app).await)
+}
+
+async fn load_oracles(app: &App) -> Vec<OracleStatus> {
+    match agent_get(app, "/api/oracles").await {
+        Ok(oracles) => oracles,
+        Err(e) => {
+            eprintln!("dd-shell: agent oracle probe unavailable: {e}");
+            Vec::new()
+        }
+    }
+}
+
+async fn system_status(State(app): State<App>) -> Json<SystemStatus> {
+    let ee = match app.ee.health().await {
+        Ok(data) => SystemProbe {
+            ok: true,
+            status: "healthy".into(),
+            detail: None,
+            data: Some(data),
+        },
+        Err(e) => SystemProbe {
+            ok: false,
+            status: "unavailable".into(),
+            detail: Some(e.to_string()),
+            data: None,
+        },
+    };
+    let agent = match agent_get(&app, "/health").await {
+        Ok(data) => SystemProbe {
+            ok: true,
+            status: "healthy".into(),
+            detail: None,
+            data: Some(data),
+        },
+        Err(e) => SystemProbe {
+            ok: false,
+            status: "unavailable".into(),
+            detail: Some(e.to_string()),
+            data: None,
+        },
+    };
+    Json(SystemStatus { ee, agent })
+}
+
+async fn agent_get<T: DeserializeOwned>(app: &App, path: &str) -> Result<T> {
+    let url = format!("{}{}", app.agent_api.trim_end_matches('/'), path);
+    let resp = app.http.get(url).send().await?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(Error::Upstream(format!(
+            "agent api {path}: HTTP {status}: {body}"
+        )));
+    }
+    Ok(resp.json().await?)
 }
 
 async fn replay_workload(
@@ -388,19 +571,38 @@ async fn replay_workload(
 }
 
 async fn close_session(State(app): State<App>, AxPath(id): AxPath<String>) -> Result<StatusCode> {
-    let Some(session) = app.sessions.read().await.get(&id).cloned() else {
+    let Some(session) = app.sessions.write().await.remove(&id) else {
         return Err(Error::NotFound);
     };
-    if session.pgid > 0 {
-        unsafe {
-            libc::kill(-session.pgid, libc::SIGHUP);
-        }
-    }
-    let mut child = session.child.lock().await;
-    if let Err(e) = child.kill().await {
-        eprintln!("dd-shell: kill {id}: {e}");
-    }
+    let pgid = session.pgid;
+    mark_session_exited(&app.store, &session, None).await;
+    terminate_process_group(id, pgid);
     Ok(StatusCode::NO_CONTENT)
+}
+
+fn terminate_process_group(id: String, pgid: i32) {
+    if pgid <= 0 {
+        return;
+    }
+    tokio::spawn(async move {
+        for (signal, delay) in [
+            (libc::SIGHUP, Duration::from_millis(250)),
+            (libc::SIGTERM, Duration::from_millis(1500)),
+            (libc::SIGKILL, Duration::ZERO),
+        ] {
+            let rc = unsafe { libc::kill(-pgid, signal) };
+            if rc != 0 {
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() != Some(libc::ESRCH) {
+                    eprintln!("dd-shell: signal {signal} for {id}: {err}");
+                }
+                break;
+            }
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
+        }
+    });
 }
 
 fn workload_log_bytes(logs: &serde_json::Value) -> Vec<u8> {
@@ -542,14 +744,21 @@ fn spawn_waiter(store: TranscriptStore, session: Arc<Session>) {
             let mut child = session.child.lock().await;
             child.wait().await
         };
-        let mut meta = session.meta.write().await;
-        meta.updated_at = unix_ts();
-        meta.status = SessionStatus::Exited;
-        meta.exit_code = status.ok().and_then(|s| s.code());
-        if let Err(e) = store.append_meta(&meta).await {
-            eprintln!("dd-shell: exit meta append failed: {e}");
-        }
+        mark_session_exited(&store, &session, status.ok().and_then(|s| s.code())).await;
     });
+}
+
+async fn mark_session_exited(store: &TranscriptStore, session: &Session, exit_code: Option<i32>) {
+    let mut meta = session.meta.write().await;
+    if matches!(meta.status, SessionStatus::Exited) {
+        return;
+    }
+    meta.updated_at = unix_ts();
+    meta.status = SessionStatus::Exited;
+    meta.exit_code = exit_code;
+    if let Err(e) = store.append_meta(&meta).await {
+        eprintln!("dd-shell: exit meta append failed: {e}");
+    }
 }
 
 async fn push_ring(session: &Session, bytes: &[u8]) {
@@ -699,37 +908,63 @@ const SHELL_HTML: &str = r##"
 <style>
 body { background:#0b0d12; color:#d7deea; }
 main { max-width:none; padding:0; height:100vh; display:grid; grid-template-columns:280px 1fr; }
-.sidebar { border-right:1px solid #252a36; padding:16px; background:#111520; overflow:auto; }
+.sidebar { border-right:1px solid #252a36; background:#111520; overflow:auto; min-height:0; }
+.sidebar-top { position:sticky; top:0; z-index:5; background:#111520; padding:16px 16px 12px; border-bottom:1px solid #252a36; }
+.sidebar-scroll { padding:0 16px 16px; }
 .terminal-wrap { height:100vh; display:flex; flex-direction:column; min-width:0; }
 .toolbar { height:48px; border-bottom:1px solid #252a36; display:flex; align-items:center; gap:8px; padding:0 12px; background:#111520; }
 .term { flex:1; min-height:0; background:#05070a; overflow:hidden; padding:8px; }
 .term .xterm { height:100%; }
 .term .xterm-viewport { background:#05070a !important; }
-.groups { display:flex; flex-direction:column; gap:18px; margin-top:14px; }
-.group-title { color:#8791a5; font-size:11px; font-weight:700; letter-spacing:0; text-transform:uppercase; margin-bottom:8px; }
+.groups { display:flex; flex-direction:column; gap:18px; }
+.group-title { position:sticky; top:126px; z-index:4; color:#8791a5; font-size:11px; font-weight:700; letter-spacing:0; text-transform:uppercase; margin:0 -16px 8px; padding:8px 16px; background:#111520; border-bottom:1px solid #202634; }
 .sessions { display:flex; flex-direction:column; gap:8px; }
 .session { text-align:left; color:#d7deea; background:#171c29; border:1px solid #2b3242; border-radius:6px; padding:10px; cursor:pointer; }
 .session.active { border-color:#7aa2f7; }
 .session .name { font-weight:700; font-size:13px; }
 .session .meta { margin:3px 0 0; font-size:11px; color:#8791a5; }
 .session.readonly { background:#131720; border-style:dashed; }
+.badges { display:flex; flex-wrap:wrap; gap:5px; margin-top:7px; }
+.badge { border:1px solid #2b3242; border-radius:999px; padding:1px 6px; color:#8791a5; font-size:10px; }
+.badge.ok { color:#9ece6a; border-color:#334b35; }
+.badge.bad { color:#f7768e; border-color:#57323d; }
+.system { display:flex; flex-direction:column; gap:8px; }
+.probe { color:#d7deea; background:#171c29; border:1px solid #2b3242; border-radius:6px; padding:10px; }
+.probe .row { display:flex; align-items:center; justify-content:space-between; gap:8px; }
+.probe .name { font-weight:700; font-size:13px; }
+.probe .meta { margin-top:3px; color:#8791a5; font-size:11px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.pill { border:1px solid #2b3242; border-radius:999px; padding:2px 7px; color:#8791a5; font-size:11px; }
+.pill.ok { color:#9ece6a; border-color:#334b35; }
+.pill.bad { color:#f7768e; border-color:#57323d; }
 .new { width:100%; }
+.filter { width:100%; margin-top:10px; box-sizing:border-box; background:#0b0d12; color:#d7deea; border:1px solid #2b3242; border-radius:6px; padding:9px 10px; font:inherit; font-size:13px; }
+.filter:focus { outline:1px solid #7aa2f7; border-color:#7aa2f7; }
+.empty-mini { color:#8791a5; font-size:12px; padding:8px 2px; }
 .status { color:#8791a5; font-size:12px; margin-left:auto; }
 button.secondary { background:#252a36; color:#d7deea; }
-@media (max-width:760px) { main { grid-template-columns:1fr; } .sidebar { height:220px; border-right:0; border-bottom:1px solid #252a36; } }
+@media (max-width:760px) { main { grid-template-columns:1fr; grid-template-rows:240px 1fr; } .sidebar { height:240px; border-right:0; border-bottom:1px solid #252a36; } .group-title { top:126px; } .terminal-wrap { height:calc(100vh - 240px); } }
 </style>
 <div class="sidebar">
-  <h1>Shell</h1>
-  <div class="sub">Read-only workload logs and read-write PTYs</div>
-  <button class="new" id="new-session">New session</button>
-  <div class="groups">
-    <div>
-      <div class="group-title">Read-write sessions</div>
-      <div class="sessions" id="sessions"></div>
-    </div>
-    <div>
-      <div class="group-title">Read-only workloads</div>
-      <div class="sessions" id="workloads"></div>
+  <div class="sidebar-top">
+    <h1>Shell</h1>
+    <div class="sub">Observed logs and controlled PTYs</div>
+    <button class="new" id="new-session">New session</button>
+    <input class="filter" id="workload-filter" type="search" placeholder="Filter workloads">
+  </div>
+  <div class="sidebar-scroll">
+    <div class="groups">
+      <div>
+        <div class="group-title">System</div>
+        <div class="system" id="system"></div>
+      </div>
+      <div>
+        <div class="group-title">Read-write sessions</div>
+        <div class="sessions" id="sessions"></div>
+      </div>
+      <div>
+        <div class="group-title">Read-only workloads</div>
+        <div class="sessions" id="workloads"></div>
+      </div>
     </div>
   </div>
 </div>
@@ -777,6 +1012,7 @@ let resizeTimer = null;
 let workloadTimer = null;
 let notifyMode = localStorage.getItem("dd-shell-notify") || "always";
 let oscBuffer = "";
+let cachedWorkloads = [];
 const decoder = new TextDecoder();
 
 async function api(path, opts) {
@@ -787,28 +1023,80 @@ async function api(path, opts) {
 }
 
 async function refresh() {
-  const [sessions, workloads] = await Promise.all([
+  const [system, sessions, workloads] = await Promise.all([
+    api("/api/system").catch(() => null),
     api("/api/sessions").catch(() => []),
     api("/api/workloads").catch(() => [])
   ]);
+  renderSystem(system);
+  cachedWorkloads = workloads;
   const root = document.getElementById("sessions");
   root.innerHTML = "";
   sessions.forEach(s => {
     const el = document.createElement("button");
     el.className = "session" + (currentKind === "session" && s.id === current ? " active" : "");
-    el.innerHTML = `<div class="name">${escapeHtml(s.name)}</div><div class="meta">read-write - ${s.status} - ${new Date(s.updated_at*1000).toLocaleString()}</div>`;
+    el.innerHTML = `<div class="name">${escapeHtml(s.name)}</div><div class="meta">read-write - controlled - ${s.status} - ${new Date(s.updated_at*1000).toLocaleString()}</div>`;
     el.onclick = () => attach(s.id);
     root.appendChild(el);
   });
+  renderWorkloads();
+}
+
+function renderWorkloads() {
   const workloadRoot = document.getElementById("workloads");
+  const query = document.getElementById("workload-filter").value.trim().toLowerCase();
+  const workloads = cachedWorkloads.filter(w => workloadSearchText(w).includes(query));
   workloadRoot.innerHTML = "";
+  if (workloads.length === 0) {
+    workloadRoot.innerHTML = `<div class="empty-mini">${query ? "No matching workloads" : "No workloads"}</div>`;
+    return;
+  }
   workloads.forEach(w => {
     const el = document.createElement("button");
     el.className = "session readonly" + (currentKind === "workload" && w.app_name === current ? " active" : "");
-    el.innerHTML = `<div class="name">${escapeHtml(w.app_name)}</div><div class="meta">read-only - ${escapeHtml(w.status)}</div>`;
+    el.innerHTML = workloadButtonHtml(w);
     el.onclick = () => attachWorkload(w.app_name);
     workloadRoot.appendChild(el);
   });
+}
+
+function workloadSearchText(w) {
+  const caps = Array.isArray(w.capabilities) ? w.capabilities.join(" ") : "";
+  const refs = Array.isArray(w.refs) ? w.refs.map(r => `${r.label} ${r.value}`).join(" ") : "";
+  return `${w.title || ""} ${w.app_name || ""} ${w.kind || ""} ${w.status || ""} ${caps} ${refs}`.toLowerCase();
+}
+
+function renderSystem(system) {
+  const root = document.getElementById("system");
+  if (!system) {
+    root.innerHTML = `<div class="probe"><div class="row"><span class="name">Shell</span><span class="pill bad">unknown</span></div><div class="meta">system probe unavailable</div></div>`;
+    return;
+  }
+  root.innerHTML = [
+    probeHtml("EasyEnclave", system.ee),
+    probeHtml("Agent API", system.agent)
+  ].join("");
+}
+
+function probeHtml(name, probe) {
+  const ok = probe && probe.ok;
+  const status = probe ? probe.status : "unknown";
+  const detail = probeSummary(probe);
+  return `<div class="probe"><div class="row"><span class="name">${escapeHtml(name)}</span><span class="pill ${ok ? "ok" : "bad"}">${escapeHtml(status)}</span></div><div class="meta">${escapeHtml(detail)}</div></div>`;
+}
+
+function probeSummary(probe) {
+  if (!probe) return "no data";
+  if (!probe.ok) return probe.detail || "unavailable";
+  const data = probe.data || {};
+  const count = data.workload_count ?? data.deployment_count ?? (Array.isArray(data.deployments) ? data.deployments.length : null);
+  const oracleCount = data.oracle_count ?? (Array.isArray(data.oracles) ? data.oracles.length : null);
+  const parts = [];
+  if (count !== null) parts.push(`${count} workload(s)`);
+  if (oracleCount !== null) parts.push(`${oracleCount} oracle(s)`);
+  if (data.integrity_state) parts.push(data.integrity_state);
+  if (data.vm_name) parts.push(data.vm_name);
+  return parts.length ? parts.join(" - ") : "reachable";
 }
 
 async function createSession() {
@@ -835,7 +1123,7 @@ async function attach(id) {
   ws = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws/sessions/${id}?tail=false`);
   ws.binaryType = "arraybuffer";
   ws.onopen = () => {
-    document.getElementById("status").textContent = "Attached";
+    document.getElementById("status").textContent = "Controlled PTY";
     fitAndResize();
     term.focus();
   };
@@ -869,12 +1157,19 @@ async function loadWorkload(name) {
   term.reset();
   term.focus();
   document.getElementById("close").disabled = true;
-  document.getElementById("status").textContent = "Loading read-only logs";
-  const history = await api(`/api/workloads/${encodeURIComponent(name)}/replay`).catch(() => null);
+  document.getElementById("status").textContent = "Loading read-only workload";
+  const [workloads, history] = await Promise.all([
+    api("/api/workloads").catch(() => []),
+    api(`/api/workloads/${encodeURIComponent(name)}/replay`).catch(() => null)
+  ]);
   if (currentKind !== "workload" || current !== name) return;
-  if (history) await writeTerminal(base64Bytes(history.bytes_b64));
+  const workload = workloads.find(w => w.app_name === name);
+  if (workload) await writeTerminal(workloadText(workload));
+  const logBytes = history ? base64Bytes(history.bytes_b64) : new Uint8Array();
+  if (logBytes.length) await writeTerminal(logBytes);
+  else await writeTerminal("No logs yet\r\n");
   term.scrollToBottom();
-  document.getElementById("status").textContent = "Read-only";
+  document.getElementById("status").textContent = "Observed read-only";
   refresh();
 }
 
@@ -888,6 +1183,7 @@ term.onData(data => {
 });
 
 document.getElementById("new-session").onclick = createSession;
+document.getElementById("workload-filter").oninput = renderWorkloads;
 document.getElementById("close").onclick = async () => {
   if (!current || currentKind !== "session") return;
   await api(`/api/sessions/${current}/close`, {method:"POST"});
@@ -918,6 +1214,61 @@ function base64Bytes(value) {
 }
 function writeTerminal(data) {
   return new Promise(resolve => term.write(data, resolve));
+}
+
+function workloadButtonHtml(w) {
+  const oracle = w.oracle;
+  const caps = Array.isArray(w.capabilities) ? w.capabilities : [];
+  const badges = caps.map(cap => {
+    const cls = cap === "oracle" && oracle && oracle.status === "healthy" ? " ok" : cap === "oracle" && oracle && oracle.status === "error" ? " bad" : "";
+    return `<span class="badge${cls}">${escapeHtml(cap)}</span>`;
+  }).join("");
+  const status = oracle ? `${w.status} / oracle ${oracle.status}` : w.status;
+  const kind = String(w.kind || "workload").replaceAll("_", " ");
+  const logs = Number.isFinite(w.log_line_count) ? `${w.log_line_count} log line(s)` : "logs unknown";
+  return `<div class="name">${escapeHtml(w.title || w.app_name)}</div><div class="meta">${escapeHtml(kind)} - ${escapeHtml(w.agent_mode || "unknown")} - ${escapeHtml(w.agent_integrity_state || "unknown")} - ${escapeHtml(status)} - ${escapeHtml(logs)}</div><div class="badges">${badges}</div>`;
+}
+
+function workloadText(w) {
+  const lines = [
+    `${w.title || w.app_name}`,
+    `app: ${w.app_name}`,
+    `kind: ${w.kind || "workload"}`,
+    `agent mode: ${w.agent_mode || "unknown"}`,
+    `agent integrity: ${w.agent_integrity_state || "unknown"}`,
+    `status: ${w.status}`,
+    `deployment id: ${w.id || "unknown"}`,
+    `source: ${w.source || "unknown"}`,
+    `image: ${w.image || "none"}`,
+    `started: ${w.started_at || "unknown"}`,
+    `log lines: ${w.log_line_count ?? 0}`
+  ];
+  if (w.error_message) lines.push(`error: ${w.error_message}`);
+  const refs = Array.isArray(w.refs) ? w.refs : [];
+  if (refs.length) {
+    lines.push("", "refs:");
+    refs.forEach(ref => lines.push(`${ref.label}: ${ref.value}`));
+  }
+  const o = w.oracle;
+  if (!o) {
+    lines.push("", "logs:");
+    return lines.join("\r\n") + "\r\n";
+  }
+  lines.push(
+    "",
+    "oracle:",
+    `title: ${o.title || o.app_name}`,
+    `status: ${o.status}`,
+    `last ok: ${o.last_ok || "never"}`,
+    `local: ${o.local_url || "unknown"}`
+  );
+  if (o.vanity_url) lines.push(`vanity: ${o.vanity_url}`);
+  if (o.last_error) lines.push(`error: ${o.last_error}`);
+  if (o.sample !== null && o.sample !== undefined) {
+    lines.push("", "sample:", JSON.stringify(o.sample, null, 2));
+  }
+  lines.push("", "logs:");
+  return lines.join("\r\n") + "\r\n";
 }
 function fitAndResize() {
   try { fitAddon.fit(); } catch (_) {}

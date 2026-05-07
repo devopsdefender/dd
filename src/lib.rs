@@ -11,6 +11,8 @@ pub mod html;
 pub mod ita;
 pub mod metrics;
 pub mod noise_gateway;
+pub mod oracle;
 pub mod shell;
 pub mod stonith;
 pub mod taint;
+pub mod units;

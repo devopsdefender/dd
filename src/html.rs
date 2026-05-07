@@ -18,8 +18,10 @@ h1 { color:#89b4fa; font-size:20px; margin-bottom:4px; }
 .card { background:#181825; border:1px solid #313244; border-radius:8px; padding:16px; }
 .card .label { color:#a6adc8; font-size:11px; text-transform:uppercase; }
 .card .value { font-size:20px; margin-top:4px; }
+.card .value.small { font-size:13px; line-height:1.5; }
 .card .value.green { color:#a6e3a1; } .card .value.blue { color:#89b4fa; }
 .card .value.peach { color:#fab387; } .card .value.mauve { color:#cba6f7; }
+.break { overflow-wrap:anywhere; word-break:break-word; }
 .row { display:flex; justify-content:space-between; padding:8px 0; border-bottom:1px solid #313244; }
 .row:last-child { border-bottom:none; }
 table { border-collapse:collapse; width:100%; }

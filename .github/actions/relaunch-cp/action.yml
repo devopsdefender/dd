@@ -58,6 +58,10 @@ inputs:
   owner:
     description: 'Fleet principal — GitHub login or owner/repo path. Forwarded as EE_OWNER to local-cp.sh on the tdx2 host, which resolves it to id+kind via gh api and bakes all three into agent.env.'
     required: true
+  github-token:
+    description: 'GitHub token forwarded into EasyEnclave as EE_GITHUB_TOKEN for authenticated boot-time release asset fetches.'
+    required: false
+    default: ''
 
 runs:
   using: composite
@@ -77,20 +81,21 @@ runs:
         DD_EE_CHANNEL:          ${{ inputs.ee-channel }}
         DD_EE_TAG:              ${{ inputs.ee-tag }}
         EE_OWNER:               ${{ inputs.owner }}
+        EE_GITHUB_TOKEN:        ${{ inputs.github-token }}
         DD_REPO_ROOT:           ${{ inputs.repo-root }}
       with:
         host: ${{ inputs.host }}
         username: ${{ inputs.ssh-user }}
         key: ${{ inputs.ssh-key }}
-        envs: ENV_LABEL,CP_HOSTNAME,REF,RELEASE_TAG,CLOUDFLARE_API_TOKEN,CLOUDFLARE_ACCOUNT_ID,CLOUDFLARE_ZONE_ID,DD_ACCESS_ADMIN_EMAIL,DD_ITA_API_KEY,DD_EE_CHANNEL,DD_EE_TAG,EE_OWNER,DD_REPO_ROOT
+        envs: ENV_LABEL,CP_HOSTNAME,REF,RELEASE_TAG,CLOUDFLARE_API_TOKEN,CLOUDFLARE_ACCOUNT_ID,CLOUDFLARE_ZONE_ID,DD_ACCESS_ADMIN_EMAIL,DD_ITA_API_KEY,DD_EE_CHANNEL,DD_EE_TAG,EE_OWNER,EE_GITHUB_TOKEN,DD_REPO_ROOT
         script: |
           export ENV_LABEL CP_HOSTNAME REF RELEASE_TAG
           export CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID CLOUDFLARE_ZONE_ID
-          export DD_ACCESS_ADMIN_EMAIL DD_ITA_API_KEY DD_EE_CHANNEL DD_EE_TAG EE_OWNER DD_REPO_ROOT
+          export DD_ACCESS_ADMIN_EMAIL DD_ITA_API_KEY DD_EE_CHANNEL DD_EE_TAG EE_OWNER EE_GITHUB_TOKEN DD_REPO_ROOT
           if [ ! -d "$DD_REPO_ROOT/.git" ]; then
             mkdir -p "$(dirname "$DD_REPO_ROOT")"
             git clone https://github.com/devopsdefender/dd.git "$DD_REPO_ROOT"
           fi
           git -C "$DD_REPO_ROOT" fetch --quiet origin "$REF"
-          git -C "$DD_REPO_ROOT" checkout --quiet "origin/$REF" -- apps/
-          env DD_REPO_ROOT="$DD_REPO_ROOT" CLOUDFLARE_API_TOKEN="$CLOUDFLARE_API_TOKEN" CLOUDFLARE_ACCOUNT_ID="$CLOUDFLARE_ACCOUNT_ID" CLOUDFLARE_ZONE_ID="$CLOUDFLARE_ZONE_ID" DD_ACCESS_ADMIN_EMAIL="$DD_ACCESS_ADMIN_EMAIL" DD_ITA_API_KEY="$DD_ITA_API_KEY" DD_EE_CHANNEL="$DD_EE_CHANNEL" DD_EE_TAG="$DD_EE_TAG" EE_OWNER="$EE_OWNER" "$DD_REPO_ROOT/apps/_infra/dd-relaunch-cp.sh" "$ENV_LABEL" "$CP_HOSTNAME" "$REF" "$RELEASE_TAG"
+          git -C "$DD_REPO_ROOT" checkout --quiet FETCH_HEAD -- apps/
+          env DD_REPO_ROOT="$DD_REPO_ROOT" CLOUDFLARE_API_TOKEN="$CLOUDFLARE_API_TOKEN" CLOUDFLARE_ACCOUNT_ID="$CLOUDFLARE_ACCOUNT_ID" CLOUDFLARE_ZONE_ID="$CLOUDFLARE_ZONE_ID" DD_ACCESS_ADMIN_EMAIL="$DD_ACCESS_ADMIN_EMAIL" DD_ITA_API_KEY="$DD_ITA_API_KEY" DD_EE_CHANNEL="$DD_EE_CHANNEL" DD_EE_TAG="$DD_EE_TAG" EE_OWNER="$EE_OWNER" EE_GITHUB_TOKEN="$EE_GITHUB_TOKEN" "$DD_REPO_ROOT/apps/_infra/dd-relaunch-cp.sh" "$ENV_LABEL" "$CP_HOSTNAME" "$REF" "$RELEASE_TAG"

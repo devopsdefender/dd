@@ -39,8 +39,8 @@ cd "${DD_REPO_ROOT:-/home/tdx2/src/dd}"
 # This script is already in memory, so the refresh takes effect on the
 # *next* invocation.
 git fetch --quiet origin "$REF"
-git checkout --quiet "origin/$REF" -- apps/
-echo "dd-relaunch: refreshed apps/ from origin/$REF"
+git checkout --quiet FETCH_HEAD -- apps/
+echo "dd-relaunch: refreshed apps/ from $REF"
 
 # Keep the libvirt base qcow2 aligned with the easyenclave-mini release
 # channel for this env. `prod` tracks `stable` (v*); `preview` tracks
@@ -56,12 +56,17 @@ esac
 sync_base /var/lib/libvirt/images/easyenclave-local.qcow2
 ensure_base_domain /var/lib/libvirt/images/easyenclave-local.qcow2 easyenclave-local
 
-vm="dd-local-$KIND"
-overlay="/var/lib/libvirt/images/$vm.qcow2"
+vms=("dd-local-$KIND")
+if [ "$KIND" = preview ]; then
+  vms+=("dd-local-preview-oracle")
+fi
 
-virsh destroy "$vm" 2>/dev/null || true
-virsh undefine "$vm" --managed-save --snapshots-metadata 2>/dev/null || true
-rm -f "$overlay"
+for vm in "${vms[@]}"; do
+  overlay="/var/lib/libvirt/images/$vm.qcow2"
+  virsh destroy "$vm" 2>/dev/null || true
+  virsh undefine "$vm" --managed-save --snapshots-metadata 2>/dev/null || true
+  rm -f "$overlay"
+done
 
 # Redefine via local-agents.sh; "" skips the other slot.
 case "$KIND" in
@@ -69,5 +74,7 @@ case "$KIND" in
   preview) ./apps/_infra/local-agents.sh "$CP" "" ;;
 esac
 
-virsh start "$vm"
-echo "relaunched $vm against $CP"
+for vm in "${vms[@]}"; do
+  virsh start "$vm"
+  echo "relaunched $vm against $CP"
+done

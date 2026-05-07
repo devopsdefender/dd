@@ -1,7 +1,14 @@
 {
   "app_name": "oracle-readonly",
+  "requires_agent_mode": "read_only",
+  "expose": { "hostname_label": "oracle", "port": 8082 },
+  "oracle": {
+    "title": "Read-only oracle",
+    "path": "/oracle.json",
+    "interval_secs": 10
+  },
   "cmd": [
     "/bin/busybox", "sh", "-c",
-    "i=0; while true; do i=$((i+1)); echo \"oracle-readonly: tick=$i status=ok\"; sleep 10; done"
+    "set -e\nWEB=/tmp/oracle-readonly-www\nmkdir -p \"$WEB\"\n(\n  cd \"$WEB\"\n  /bin/busybox httpd -f -p 0.0.0.0:8082\n) &\ni=0\nwhile true; do\n  i=$((i+1))\n  printf '{\"ok\":true,\"oracle\":\"oracle-readonly\",\"tick\":%s,\"integrity\":\"read_only\"}\\n' \"$i\" > \"$WEB/oracle.json\"\n  echo \"oracle-readonly: tick=$i status=ok\"\n  sleep 10\ndone"
   ]
 }

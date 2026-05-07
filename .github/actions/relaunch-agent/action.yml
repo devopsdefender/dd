@@ -50,6 +50,10 @@ inputs:
   owner:
     description: 'Fleet principal — GitHub login or owner/repo path. Forwarded as EE_OWNER to local-agents.sh on the tdx2 host, which resolves it to id+kind via gh api and bakes all three into agent.env.'
     required: true
+  github-token:
+    description: 'GitHub token forwarded into EasyEnclave as EE_GITHUB_TOKEN for authenticated boot-time release asset fetches.'
+    required: false
+    default: ''
 
 runs:
   using: composite
@@ -81,22 +85,23 @@ runs:
         DD_EE_CHANNEL: ${{ inputs.ee-channel }}
         DD_EE_TAG: ${{ inputs.ee-tag }}
         EE_OWNER: ${{ inputs.owner }}
+        EE_GITHUB_TOKEN: ${{ inputs.github-token }}
         DD_REPO_ROOT: ${{ inputs.repo-root }}
       with:
         host: ${{ inputs.host }}
         username: ${{ inputs.ssh-user }}
         key: ${{ inputs.ssh-key }}
-        envs: KIND,URL,REF,RELEASE_TAG,DD_ITA_API_KEY,DD_EE_CHANNEL,DD_EE_TAG,EE_OWNER,DD_REPO_ROOT
+        envs: KIND,URL,REF,RELEASE_TAG,DD_ITA_API_KEY,DD_EE_CHANNEL,DD_EE_TAG,EE_OWNER,EE_GITHUB_TOKEN,DD_REPO_ROOT
         script: |
           export KIND URL REF RELEASE_TAG
-          export DD_ITA_API_KEY DD_EE_CHANNEL DD_EE_TAG EE_OWNER DD_REPO_ROOT
+          export DD_ITA_API_KEY DD_EE_CHANNEL DD_EE_TAG EE_OWNER EE_GITHUB_TOKEN DD_REPO_ROOT
           if [ ! -d "$DD_REPO_ROOT/.git" ]; then
             mkdir -p "$(dirname "$DD_REPO_ROOT")"
             git clone https://github.com/devopsdefender/dd.git "$DD_REPO_ROOT"
           fi
           git -C "$DD_REPO_ROOT" fetch --quiet origin "$REF"
-          git -C "$DD_REPO_ROOT" checkout --quiet "origin/$REF" -- apps/
-          env DD_REPO_ROOT="$DD_REPO_ROOT" DD_ITA_API_KEY="$DD_ITA_API_KEY" DD_EE_CHANNEL="$DD_EE_CHANNEL" DD_EE_TAG="$DD_EE_TAG" EE_OWNER="$EE_OWNER" "$DD_REPO_ROOT/apps/_infra/dd-relaunch.sh" "$KIND" "$URL" "$REF" "$RELEASE_TAG"
+          git -C "$DD_REPO_ROOT" checkout --quiet FETCH_HEAD -- apps/
+          env DD_REPO_ROOT="$DD_REPO_ROOT" DD_ITA_API_KEY="$DD_ITA_API_KEY" DD_EE_CHANNEL="$DD_EE_CHANNEL" DD_EE_TAG="$DD_EE_TAG" EE_OWNER="$EE_OWNER" EE_GITHUB_TOKEN="$EE_GITHUB_TOKEN" "$DD_REPO_ROOT/apps/_infra/dd-relaunch.sh" "$KIND" "$URL" "$REF" "$RELEASE_TAG"
 
     # Block until the freshly-booted agent VM registers with the CP.
     # This is the "I can see the local agent deployment worked"
@@ -162,14 +167,23 @@ runs:
           # Dropping `2>/dev/null` on tail so "cannot open" / "retrying"
           # diagnostics surface — if the serial log file never appears,
           # we want the reason on-screen, not a silent wait.
-          ssh -i "$key" -T \
-              -o StrictHostKeyChecking=accept-new \
-              -o ServerAliveInterval=30 \
-              "$SSH_USER@$HOST" \
-              "sudo stdbuf -oL tail -n 0 -F /var/log/ee-local-$KIND.log || true" \
-            2>&1 | stdbuf -oL sed -u "s/^/  [$vm console] /" \
-                 | stdbuf -oL tee -a "$mirror" &
-          tail_pid=$!
+          stream_console_log() {
+            local label="$1" log="$2"
+            ssh -i "$key" -T \
+                -o StrictHostKeyChecking=accept-new \
+                -o ServerAliveInterval=30 \
+                "$SSH_USER@$HOST" \
+                "sudo stdbuf -oL tail -n 0 -F '$log' || true" \
+              2>&1 | stdbuf -oL sed -u "s/^/  [$label console] /" \
+                   | stdbuf -oL tee -a "$mirror" &
+            tail_pid=$!
+          }
+          if [ "$KIND" = "preview" ]; then
+            stream_console_log "dd-local-preview" "/var/log/ee-local-preview.log"
+            stream_console_log "dd-local-preview-oracle" "/var/log/ee-local-preview-oracle.log"
+          else
+            stream_console_log "dd-local-$KIND" "/var/log/ee-local-$KIND.log"
+          fi
           # Give the tail a moment to attach so its first lines land
           # before the register wait's first status message.
           sleep 1
@@ -198,6 +212,11 @@ runs:
         oidc=$(curl -fsSL \
           -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
           "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=dd-agent" | jq -r .value)
+        expected_vms=("dd-local-$KIND")
+        if [ "$KIND" = "preview" ]; then
+          expected_vms+=("dd-local-preview-oracle")
+        fi
+        expected_json=$(printf '%s\n' "${expected_vms[@]}" | jq -R . | jq -cs .)
         last_payload=""
         for i in $(seq 1 60); do
           payload=$(curl -fsS --max-time 10 -H "Authorization: Bearer ${oidc}" \
@@ -205,11 +224,15 @@ runs:
           if [ -n "$payload" ]; then
             last_payload="$payload"
           fi
-          host_found=$(echo "$payload" | jq -r --arg since "$since" --arg vm "$vm" '
-                [.[] | select(.vm_name==$vm and .status=="healthy" and .last_seen > $since)]
-                | sort_by(.last_seen) | reverse | .[0].hostname // empty' 2>/dev/null || true)
-          if [ -n "$host_found" ]; then
-            echo "$vm registered at https://$host_found"
+          ready_count=$(echo "$payload" | jq -r --arg since "$since" --argjson expected "$expected_json" '
+                [.[] | select(.status=="healthy" and .last_seen > $since and (.vm_name as $vm | $expected | index($vm)))]
+                | unique_by(.vm_name)
+                | length' 2>/dev/null || echo 0)
+          if [ "$ready_count" = "${#expected_vms[@]}" ]; then
+            echo "registered agents:"
+            echo "$payload" | jq -r --arg since "$since" --argjson expected "$expected_json" '
+              .[] | select(.status=="healthy" and .last_seen > $since and (.vm_name as $vm | $expected | index($vm)))
+              | "  \(.vm_name) at https://\(.hostname)"' 2>/dev/null || true
             cleanup_tail
             exit 0
           fi
@@ -226,7 +249,7 @@ runs:
             echo "::error::$vm agent exited fatal; not polling /api/agents further"
             exit 1
           fi
-          echo "  waiting for $vm to register with $URL... (${i}/60)"
+          echo "  waiting for ${expected_vms[*]} to register with $URL... (${i}/60)"
           sleep 10
         done
         cleanup_tail

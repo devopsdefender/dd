@@ -24,8 +24,15 @@ use crate::cf;
 use crate::config::CfCreds;
 use crate::ee::Ee;
 use crate::ita;
+use crate::taint::IntegrityState;
+use crate::units::{AgentMode, ManagedUnit};
 
-const DEAD_THRESHOLD_SECS: i64 = 300;
+// Keep this longer than the relaunch-agent CI registration window
+// (10 minutes). Freshly-created Cloudflare hostnames can fail early
+// scrape attempts while DNS/edge state is still converging; deleting
+// the tunnel inside that window makes a slow-but-healthy agent
+// unrecoverable before CI can observe it.
+const DEAD_THRESHOLD_SECS: i64 = 900;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Agent {
@@ -35,8 +42,12 @@ pub struct Agent {
     pub attestation_type: String,
     pub status: String,
     pub last_seen: DateTime<Utc>,
+    pub agent_mode: AgentMode,
+    pub integrity_state: IntegrityState,
     pub deployment_count: usize,
     pub deployment_names: Vec<String>,
+    pub unit_count: usize,
+    pub units: Vec<ManagedUnit>,
     pub cpu_percent: u64,
     pub memory_used_mb: u64,
     pub memory_total_mb: u64,
@@ -60,6 +71,9 @@ pub struct Agent {
     /// recovers this list from the agent's `/health` response.
     #[serde(default)]
     pub extras: Vec<(String, u16)>,
+    /// Read-only oracle scrape status reported by dd-agent health.
+    #[serde(default)]
+    pub oracles: Vec<crate::oracle::OracleStatus>,
 }
 
 pub type Store = Arc<Mutex<HashMap<String, Agent>>>;
@@ -201,6 +215,10 @@ async fn tick(
                     .to_string(),
                 status: "healthy".into(),
                 last_seen: now,
+                agent_mode: serde_json::from_value(h["agent_mode"].clone())
+                    .unwrap_or(AgentMode::ReadWrite),
+                integrity_state: serde_json::from_value(h["integrity_state"].clone())
+                    .unwrap_or(IntegrityState::Controlled),
                 deployment_count: h["deployment_count"].as_u64().unwrap_or(0) as usize,
                 deployment_names: h["deployments"]
                     .as_array()
@@ -210,6 +228,8 @@ async fn tick(
                             .collect()
                     })
                     .unwrap_or_default(),
+                unit_count: h["unit_count"].as_u64().unwrap_or(0) as usize,
+                units: serde_json::from_value(h["units"].clone()).unwrap_or_default(),
                 cpu_percent: h["cpu_percent"].as_u64().unwrap_or(0),
                 memory_used_mb: h["memory_used_mb"].as_u64().unwrap_or(0),
                 memory_total_mb: h["memory_total_mb"].as_u64().unwrap_or(0),
@@ -218,6 +238,7 @@ async fn tick(
                 ita: claims,
                 tunnel_id: tunnel_id.clone(),
                 extras,
+                oracles: serde_json::from_value(h["oracles"].clone()).unwrap_or_default(),
             },
         );
         drop(s);
@@ -333,12 +354,10 @@ async fn mark_stale_or_orphan(
             });
         } else {
             a.status = "stale".into();
-            if age > DEAD_THRESHOLD_SECS {
-                eprintln!(
-                    "cp: collector: preserving {name} despite old scrape failure: {}",
-                    err.as_deref().unwrap_or("unknown error")
-                );
-            }
+            eprintln!(
+                "cp: collector: {name} scrape failed: {}",
+                err.as_deref().unwrap_or("unknown error")
+            );
         }
     } else if let Some(e) = err {
         eprintln!(

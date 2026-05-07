@@ -16,6 +16,9 @@
 # Required env (all from the calling workflow's secrets):
 #   CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID, CLOUDFLARE_ZONE_ID
 #   DD_ACCESS_ADMIN_EMAIL, DD_ITA_API_KEY
+#   EE_GITHUB_TOKEN    optional; forwarded to EasyEnclave so boot-time
+#                      GitHub release asset fetches don't use anonymous
+#                      API rate limits.
 #   EE_OWNER         GitHub login or owner/repo path (no default).
 #                    Resolved at runtime via `gh api` to (id, kind);
 #                    DD_OWNER_ID + DD_OWNER_KIND are derived from it.
@@ -35,6 +38,7 @@ HOSTNAME="${2?hostname required}"
 : "${DD_ITA_API_KEY?}"
 : "${EE_OWNER?set EE_OWNER (GitHub login or owner/repo path; no default)}"
 DD_RELEASE_TAG="${DD_RELEASE_TAG:-latest}"
+EE_GITHUB_TOKEN="${EE_GITHUB_TOKEN:-${GITHUB_TOKEN:-}}"
 
 # Resolve EE_OWNER to (id, kind) via gh api — same idiom as
 # local-agents.sh.
@@ -139,6 +143,9 @@ build_config_iso() {
     echo "EE_OWNER=$EE_OWNER"
     echo "EE_OWNER_ID=$EE_OWNER_ID"
     echo "EE_OWNER_KIND=$EE_OWNER_KIND"
+    if [ -n "$EE_GITHUB_TOKEN" ]; then
+      echo "EE_GITHUB_TOKEN=$EE_GITHUB_TOKEN"
+    fi
     echo "EE_BOOT_WORKLOADS=$workloads"
     echo "EE_CAPTURE_SOCKET=/run/ee/capture.sock"
   } > "$tmp/agent.env"

@@ -239,19 +239,13 @@ impl Verifier {
                 .and_then(|x| x.as_str())
                 .unwrap_or("")
                 .into(),
-            repository_id: raw
-                .get("repository_id")
-                .and_then(|x| x.as_u64())
-                .unwrap_or(0),
+            repository_id: claim_u64(&raw, "repository_id"),
             repository_owner: raw
                 .get("repository_owner")
                 .and_then(|x| x.as_str())
                 .unwrap_or("")
                 .into(),
-            repository_owner_id: raw
-                .get("repository_owner_id")
-                .and_then(|x| x.as_u64())
-                .unwrap_or(0),
+            repository_owner_id: claim_u64(&raw, "repository_owner_id"),
             ref_: raw.get("ref").and_then(|x| x.as_str()).unwrap_or("").into(),
             workflow: raw
                 .get("workflow")
@@ -292,6 +286,15 @@ impl Verifier {
         *self.keys.write().await = map;
         Ok(())
     }
+}
+
+fn claim_u64(raw: &serde_json::Value, key: &str) -> u64 {
+    raw.get(key)
+        .and_then(|x| {
+            x.as_u64()
+                .or_else(|| x.as_str().and_then(|s| s.parse::<u64>().ok()))
+        })
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -528,6 +531,19 @@ FwIDAQAB
         }));
         let claims = verifier(repo()).verify(&token).await.unwrap();
         assert_eq!(claims.repository, "posix4e/dd-hyperliquid-recorder-example");
+    }
+
+    #[tokio::test]
+    async fn accepts_github_id_claims_serialized_as_strings() {
+        let token = mint(json!({
+            "repository": "devopsdefender/anything",
+            "repository_id": "999001",
+            "repository_owner": "devopsdefender",
+            "repository_owner_id": "67890123",
+        }));
+        let claims = verifier(org()).verify(&token).await.unwrap();
+        assert_eq!(claims.repository_id, 999001);
+        assert_eq!(claims.repository_owner_id, 67890123);
     }
 
     // ── squat-defense / shape-mismatch rejections ─────────────────

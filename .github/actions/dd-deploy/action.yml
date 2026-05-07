@@ -82,6 +82,33 @@ runs:
         agent_api_host="${agent_host%%.*}-agent-api.${agent_host#*.}"
         echo "agent-host=$agent_host" >> "$GITHUB_OUTPUT"
 
+        # The agent-api hostname and its CF Access bypass app are created
+        # immediately before preview deploys. DNS can resolve before the
+        # bypass decision is active at every edge, which shows up as transient
+        # 401s on /deploy. Gate the mutating request on the read-only health
+        # endpoint being reachable through the same hostname.
+        echo "waiting for agent API health at $agent_api_host"
+        deadline=$(( $(date +%s) + 120 ))
+        last_health_error=""
+        agent_api_ready=0
+        while [ "$(date +%s)" -lt "$deadline" ]; do
+          if health=$(curl -fsS "https://${agent_api_host}/health" 2>&1); then
+            if echo "$health" | jq -e '.service == "agent" and .ok == true' >/dev/null; then
+              echo "agent API is ready"
+              agent_api_ready=1
+              break
+            fi
+            last_health_error="unexpected health body: ${health:0:400}"
+          else
+            last_health_error="$health"
+          fi
+          sleep 5
+        done
+        if [ "$agent_api_ready" -ne 1 ]; then
+          echo "::error::agent API ${agent_api_host} did not become ready within 120s: ${last_health_error}"
+          exit 1
+        fi
+
         # Compact + inspect the workload spec.
         spec=$(jq -c . "$WORKLOAD")
         app_name=$(echo "$spec" | jq -r '.app_name // empty')

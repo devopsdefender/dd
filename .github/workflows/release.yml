@@ -162,7 +162,7 @@ jobs:
       service_account: 'easyenclave-staging-ci@eestaging.iam.gserviceaccount.com'
       release_tag: ${{ needs.build.outputs.tag }}
       comment_on_pr: true
-      ref: ${{ github.event.pull_request.head.ref }}
+      ref: ${{ github.event.pull_request.head.sha }}
       # Pin preview to the same mini release as prod — one bump, one PR.
       # Latest verified mini release as of 2026-05-05.
       ee_tag: ${{ inputs.ee_tag || 'image-1c6062146153' }}

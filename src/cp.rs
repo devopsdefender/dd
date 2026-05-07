@@ -29,6 +29,8 @@ use crate::ita;
 use crate::metrics;
 use crate::noise_gateway;
 use crate::stonith;
+use crate::taint::IntegrityState;
+use crate::units::{AgentMode, UnitKind};
 
 /// Re-mint interval for the CP's own ITA token. The CP isn't scraped
 /// by its own collector (different tunnel prefix), so a background
@@ -237,8 +239,12 @@ pub async fn run() -> Result<()> {
             attestation_type: "tdx".into(),
             status: "healthy".into(),
             last_seen: chrono::Utc::now(),
+            agent_mode: AgentMode::ReadWrite,
+            integrity_state: IntegrityState::Controlled,
             deployment_count: 0,
             deployment_names: Vec::new(),
+            unit_count: 0,
+            units: Vec::new(),
             cpu_percent: cp_m.cpu_pct,
             memory_used_mb: cp_m.mem_used_mb,
             memory_total_mb: cp_m.mem_total_mb,
@@ -251,6 +257,7 @@ pub async fn run() -> Result<()> {
             // target "control-plane".
             tunnel_id: String::new(),
             extras: Vec::new(),
+            oracles: Vec::new(),
         },
     );
 
@@ -501,6 +508,7 @@ async fn health(
         "uptime_secs": s.started.elapsed().as_secs(),
         "agent_count": agents.len(),
         "healthy_count": agents.values().filter(|a| a.status == "healthy").count(),
+        "oracle_count": agents.values().map(|a| a.oracles.len()).sum::<usize>(),
         // Pre-Noise-handshake bundle — the former `GET /attest`
         // endpoint folded in here so bastion-app bootstraps in one
         // fetch and we drop a CF Access bypass-app per env × per
@@ -621,10 +629,14 @@ async fn register(
                 hostname: tunnel.hostname.clone(),
                 vm_name: req.vm_name.clone(),
                 attestation_type: "tdx".into(),
-                status: "healthy".into(),
+                status: "registering".into(),
                 last_seen: now,
+                agent_mode: AgentMode::ReadWrite,
+                integrity_state: IntegrityState::Controlled,
                 deployment_count: 0,
                 deployment_names: Vec::new(),
+                unit_count: 0,
+                units: Vec::new(),
                 cpu_percent: 0,
                 memory_used_mb: 0,
                 memory_total_mb: 0,
@@ -635,6 +647,7 @@ async fn register(
                 // requests extend this list via /ingress/replace (below).
                 tunnel_id: tunnel.id.clone(),
                 extras: extras.clone(),
+                oracles: Vec::new(),
             },
         );
     }
@@ -781,24 +794,81 @@ async fn fleet(State(s): State<St>) -> Response {
         };
         rows.push_str(&format!(
             r#"<tr><td><a href="/agent/{id}">{vm}</a></td>
-<td><span class="pill {st}">{st}</span></td><td>{att}</td>
-<td>{cpu}%</td><td>{mem}</td><td>{n}</td>
+<td><span class="pill {st_cls}">{st}</span></td><td>{att}</td>
+<td>{mode}</td><td>{integrity}</td>
+<td>{cpu}%</td><td>{mem}</td><td>{n}</td><td>{u}</td><td>{o}</td>
 <td class="dim">{host}</td></tr>"#,
             id = html::escape(&a.agent_id),
             vm = html::escape(&a.vm_name),
+            st_cls = status_class(&a.status),
             st = html::escape(&a.status),
             att = html::escape(&a.attestation_type),
+            mode = html::escape(a.agent_mode.as_str()),
+            integrity = html::escape(&format!("{:?}", a.integrity_state).to_lowercase()),
             cpu = a.cpu_percent,
             n = a.deployment_count,
+            u = a.unit_count,
+            o = a.oracles.len(),
             host = html::escape(&a.hostname),
         ));
+    }
+
+    let mut unit_rows = String::new();
+    for (_, a) in &by_id {
+        for u in &a.units {
+            let refs = if u.refs.is_empty() {
+                r#"<span class="dim">none</span>"#.into()
+            } else {
+                u.refs
+                    .iter()
+                    .take(3)
+                    .map(|r| {
+                        if r.value.starts_with("https://") {
+                            format!(
+                                r#"<a href="{url}" target="_blank">{label}</a>"#,
+                                url = html::escape(&r.value),
+                                label = html::escape(&r.label)
+                            )
+                        } else {
+                            html::escape(&r.label)
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" · ")
+            };
+            unit_rows.push_str(&format!(
+                r#"<tr><td><a href="/agent/{id}">{vm}</a></td><td>{title}<div class="dim">{app}</div></td><td>{kind}</td><td>{mode}</td><td>{integrity}</td><td><span class="pill {cls}">{status}</span></td><td>{logs}</td><td>{refs}</td></tr>"#,
+                id = html::escape(&a.agent_id),
+                vm = html::escape(&a.vm_name),
+                title = html::escape(&u.title),
+                app = html::escape(&u.app_name),
+                kind = html::escape(u.kind.as_str()),
+                mode = html::escape(u.agent_mode.as_str()),
+                integrity = html::escape(&format!("{:?}", u.agent_integrity_state).to_lowercase()),
+                cls = status_class(&u.status),
+                status = html::escape(&u.status),
+                logs = if u.log_line_count == 0 {
+                    r#"<span class="dim">No logs yet</span>"#.into()
+                } else {
+                    format!("{} line(s)", u.log_line_count)
+                },
+                refs = refs,
+            ));
+        }
     }
 
     let table = if by_id.is_empty() {
         r#"<div class="empty">No agents registered</div>"#.to_string()
     } else {
         format!(
-            r#"<table><tr><th>vm</th><th>status</th><th>att</th><th>cpu</th><th>mem</th><th>wl</th><th>host</th></tr>{rows}</table>"#
+            r#"<table><tr><th>vm</th><th>status</th><th>att</th><th>mode</th><th>integrity</th><th>cpu</th><th>mem</th><th>wl</th><th>units</th><th>oracles</th><th>host</th></tr>{rows}</table>"#
+        )
+    };
+    let unit_table = if unit_rows.is_empty() {
+        r#"<div class="empty">No managed units reported yet</div>"#.to_string()
+    } else {
+        format!(
+            r#"<div class="section">Managed units</div><table><tr><th>agent</th><th>unit</th><th>kind</th><th>mode</th><th>integrity</th><th>status</th><th>logs</th><th>refs</th></tr>{unit_rows}</table>"#
         )
     };
 
@@ -806,10 +876,11 @@ async fn fleet(State(s): State<St>) -> Response {
         "DD Fleet",
         &html::nav(&[("Fleet", "/", true)]),
         &format!(
-            r#"<h1>Fleet</h1><div class="sub">{host} · env {env} · {n} agent(s)</div>{table}"#,
+            r#"<h1>Fleet</h1><div class="sub">{host} · env {env} · {n} agent(s)</div>{table}{unit_table}"#,
             host = html::escape(&s.cfg.hostname),
             env = html::escape(&s.cfg.common.env_label),
             n = by_id.len(),
+            unit_table = unit_table,
         ),
     ))
     .into_response()
@@ -1055,7 +1126,14 @@ async fn api_agents(
                     "vm_name": a.vm_name,
                     "hostname": a.hostname,
                     "status": a.status,
+                    "agent_mode": a.agent_mode,
+                    "integrity_state": a.integrity_state,
                     "last_seen": a.last_seen.to_rfc3339(),
+                    "deployment_count": a.deployment_count,
+                    "unit_count": a.unit_count,
+                    "units": a.units,
+                    "oracle_count": a.oracles.len(),
+                    "oracles": a.oracles,
                 })
             })
             .collect(),
@@ -1110,23 +1188,79 @@ async fn agent_detail(State(s): State<St>, Path(id): Path<String>) -> Response {
 
     let is_cp = a.agent_id == "control-plane";
     let mut workloads = String::new();
-    for w in &a.deployment_names {
-        let link = if is_cp {
-            format!(
-                r#"<a href="/agent/{id}/logs/{w}">logs</a>"#,
-                id = html::escape(&a.agent_id),
+    if !a.units.is_empty() {
+        for u in &a.units {
+            let refs = if u.refs.is_empty() {
+                r#"<span class="dim">none</span>"#.into()
+            } else {
+                u.refs
+                    .iter()
+                    .map(|r| {
+                        if r.value.starts_with("https://") {
+                            format!(
+                                r#"<a href="{url}" target="_blank">{label}</a>"#,
+                                url = html::escape(&r.value),
+                                label = html::escape(&r.label)
+                            )
+                        } else {
+                            format!(
+                                r#"<span class="dim">{label}: {value}</span>"#,
+                                label = html::escape(&r.label),
+                                value = html::escape(&r.value)
+                            )
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" · ")
+            };
+            let caps = if u.capabilities.is_empty() {
+                String::new()
+            } else {
+                u.capabilities
+                    .iter()
+                    .map(|c| format!(r#"<span class="pill idle">{}</span>"#, html::escape(c)))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            };
+            workloads.push_str(&format!(
+                r#"<tr><td>{title}<div class="dim">{app}</div></td><td>{kind}</td><td><span class="pill {cls}">{status}</span></td><td>{logs}</td><td>{caps}</td><td>{refs}</td></tr>"#,
+                title = html::escape(&u.title),
+                app = html::escape(&u.app_name),
+                kind = html::escape(u.kind.as_str()),
+                cls = status_class(&u.status),
+                status = html::escape(&u.status),
+                logs = if u.log_line_count == 0 {
+                    r#"<span class="dim">No logs yet</span>"#.into()
+                } else {
+                    format!("{} line(s)", u.log_line_count)
+                },
+                caps = caps,
+                refs = refs,
+            ));
+        }
+    } else {
+        for w in &a.deployment_names {
+            let link = if is_cp {
+                format!(
+                    r#"<a href="/agent/{id}/logs/{w}">logs</a>"#,
+                    id = html::escape(&a.agent_id),
+                    w = html::escape(w)
+                )
+            } else {
+                String::new()
+            };
+            workloads.push_str(&format!(
+                r#"<tr><td>{w}</td><td>{link}</td></tr>"#,
                 w = html::escape(w)
-            )
-        } else {
-            String::new()
-        };
-        workloads.push_str(&format!(
-            r#"<tr><td>{w}</td><td>{link}</td></tr>"#,
-            w = html::escape(w)
-        ));
+            ));
+        }
     }
-    let wl_table = if a.deployment_names.is_empty() {
-        r#"<div class="empty">No workloads</div>"#.to_string()
+    let wl_table = if workloads.is_empty() {
+        r#"<div class="empty">No managed units</div>"#.to_string()
+    } else if !a.units.is_empty() {
+        format!(
+            r#"<table><tr><th>unit</th><th>kind</th><th>status</th><th>logs</th><th>capabilities</th><th>refs</th></tr>{workloads}</table>"#
+        )
     } else {
         format!(r#"<table><tr><th>workload</th><th></th></tr>{workloads}</table>"#)
     };
@@ -1167,18 +1301,25 @@ async fn agent_detail(State(s): State<St>, Path(id): Path<String>) -> Response {
         )
     };
 
-    // `{hostname-base}-shell.{tld}` is the dd-shell subdomain (CP's own
-    // tunnel publishes it; agents publish it via their register-time
-    // `extra_ingress`). Flat shape so Universal SSL covers the cert.
-    // Human-gated by CF Access.
-    let term_host = html::escape(&cf::label_hostname(&a.hostname, "shell"));
+    let has_shell = is_cp || a.units.iter().any(|u| u.kind == UnitKind::Shell);
     let extra = if is_cp {
+        // `{hostname-base}-shell.{tld}` is the dd-shell subdomain (CP's own
+        // tunnel publishes it; agents publish it via their register-time
+        // `extra_ingress`). Flat shape so Universal SSL covers the cert.
+        // Human-gated by CF Access.
+        let term_host = html::escape(&cf::label_hostname(&a.hostname, "shell"));
         format!(
             r#"<p><a href="https://{term_host}/" target="_blank">Terminal ↗</a> · <a href="/health">health (incl. noise quote)</a> · <a href="/health?verbose=1">health?verbose=1 (incl. ita)</a></p>"#
         )
-    } else {
+    } else if has_shell {
+        let term_host = html::escape(&cf::label_hostname(&a.hostname, "shell"));
         format!(
             r#"<p><a href="https://{h}/">open agent dashboard ↗</a> · <a href="https://{term_host}/" target="_blank">Terminal ↗</a></p>"#,
+            h = html::escape(&a.hostname)
+        )
+    } else {
+        format!(
+            r#"<p><a href="https://{h}/">open agent dashboard ↗</a></p>"#,
             h = html::escape(&a.hostname)
         )
     };
@@ -1226,6 +1367,8 @@ async fn agent_detail(State(s): State<St>, Path(id): Path<String>) -> Response {
 <h1>{vm}</h1><div class="sub">{id} · {host}</div>
 <div class="card">
   <div class="row"><span>Status</span><span class="pill {st}">{st}</span></div>
+  <div class="row"><span>Mode</span><span>{mode}</span></div>
+  <div class="row"><span>Integrity</span><span>{integrity}</span></div>
   <div class="row"><span>Attestation</span><span>{att}</span></div>
   <div class="row"><span>Last seen</span><span>{ls}</span></div>
   <div class="row"><span>CPU</span><span>{cpu}%</span></div>
@@ -1234,12 +1377,14 @@ async fn agent_detail(State(s): State<St>, Path(id): Path<String>) -> Response {
 {disks_table}
 {nets_table}
 {ita_card}
-<div class="section">Workloads</div>{wl_table}
+<div class="section">Managed units</div>{wl_table}
 {extra}"#,
             vm = html::escape(&a.vm_name),
             id = html::escape(&a.agent_id),
             host = html::escape(&a.hostname),
             st = html::escape(&a.status),
+            mode = html::escape(a.agent_mode.as_str()),
+            integrity = html::escape(&format!("{:?}", a.integrity_state).to_lowercase()),
             att = html::escape(&a.attestation_type),
             ls = a.last_seen.to_rfc3339(),
             cpu = a.cpu_percent,
@@ -1251,6 +1396,15 @@ async fn agent_detail(State(s): State<St>, Path(id): Path<String>) -> Response {
         ),
     ))
     .into_response()
+}
+
+fn status_class(status: &str) -> &'static str {
+    match status {
+        "healthy" | "running" => "running",
+        "deploying" | "registering" | "unknown" | "stale" => "deploying",
+        "failed" | "exited" | "error" | "dead" => "failed",
+        _ => "idle",
+    }
 }
 
 /// GET /agent/control-plane/logs/{app} — show logs for a CP workload via the

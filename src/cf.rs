@@ -319,24 +319,32 @@ pub async fn delete_by_name(http: &Client, cf: &CfCreds, name: &str) {
 }
 
 pub async fn list(http: &Client, cf: &CfCreds) -> Result<Vec<serde_json::Value>> {
-    // `per_page=200` — CF's default is 20, and every caller here scans
-    // for a name-prefix match. A predecessor CP tunnel sorting off page 1
-    // silently breaks both `stonith::kill_old_tunnels` (leaks the old
-    // tunnel instead of STONITHing it) and `cp::run`'s hydrate gate
-    // (skips hydrate, losing devices + agents on a deploy). 200 is the
-    // same cap `.github/workflows/cleanup.yml` uses.
-    let resp = call(
-        http,
-        cf,
-        Method::GET,
-        &format!(
-            "/accounts/{}/cfd_tunnel?is_deleted=false&per_page=200",
-            cf.account_id
-        ),
-        None,
-    )
-    .await?;
-    Ok(resp["result"].as_array().cloned().unwrap_or_default())
+    let mut out = Vec::new();
+    let per_page = 200u64;
+    let mut page = 1u64;
+    loop {
+        let resp = call(
+            http,
+            cf,
+            Method::GET,
+            &format!(
+                "/accounts/{}/cfd_tunnel?is_deleted=false&per_page={per_page}&page={page}",
+                cf.account_id
+            ),
+            None,
+        )
+        .await?;
+        let items = resp["result"].as_array().cloned().unwrap_or_default();
+        let count = items.len();
+        out.extend(items);
+
+        let total_pages = resp["result_info"]["total_pages"].as_u64().unwrap_or(page);
+        if page >= total_pages || count < per_page as usize {
+            break;
+        }
+        page += 1;
+    }
+    Ok(out)
 }
 
 /// `Some(true)` if present, `Some(false)` if confirmed deleted, `None`

@@ -2,6 +2,6 @@
   "app_name": "mount-data",
   "cmd": [
     "/bin/busybox", "sh", "-c",
-    "set -e; if [ -b /dev/vdc ]; then mkdir -p /data; mount -t ext4 /dev/vdc /data && echo mount-data: mounted /dev/vdc on /data; else echo mount-data: no /dev/vdc, skipping; fi"
+    "set -e\nDATA_DIR=/var/lib/easyenclave/data\nif [ -b /dev/vdc ]; then\n  mkdir -p \"$DATA_DIR\"\n  mount -t ext4 /dev/vdc \"$DATA_DIR\"\n  echo \"mount-data: mounted /dev/vdc on $DATA_DIR\"\nelse\n  echo mount-data: no /dev/vdc, skipping\nfi"
   ]
 }

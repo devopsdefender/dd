@@ -40,7 +40,9 @@ use crate::html::{self, shell};
 use crate::ita;
 use crate::metrics;
 use crate::noise_gateway;
-use crate::taint::{TaintReason, TaintSet};
+use crate::oracle;
+use crate::taint::{IntegrityState, TaintReason, TaintSet};
+use crate::units::{self, AgentMode, ManagedUnit, UnitKind};
 
 /// Re-mint interval. Intel ITA tokens typically expire in a few
 /// minutes; refresh well before so `/health` always serves a live
@@ -94,6 +96,8 @@ struct St {
     /// as events happen (`/owner` → CustomerOwnerEnabled, `/deploy`
     /// ok → CustomerWorkloadDeployed). Mirrored in `/health`.
     taint: TaintSet,
+    /// Read-only oracle scrape state derived from boot workload metadata.
+    oracles: oracle::OracleStore,
 }
 
 pub async fn run() -> Result<()> {
@@ -115,6 +119,8 @@ pub async fn run() -> Result<()> {
     eprintln!("agent: registered as {}", b.hostname);
 
     spawn_cloudflared(b.tunnel_token);
+    let oracle_store = oracle::initial_store(&cfg.oracles, &b.hostname);
+    oracle::spawn_scrapers(cfg.oracles.clone(), oracle_store.clone());
 
     let ita_token = Arc::new(RwLock::new(initial_token));
 
@@ -210,6 +216,7 @@ pub async fn run() -> Result<()> {
         attest: attestor,
         agent_owner: Arc::new(RwLock::new(None)),
         taint,
+        oracles: oracle_store,
     };
     let api_state = state.clone();
     let api_ng_state = ng_state.clone();
@@ -224,6 +231,8 @@ pub async fn run() -> Result<()> {
     let mut app = Router::new()
         .route("/", get(dashboard))
         .route("/health", get(health))
+        .route("/api/oracles", get(api_oracles))
+        .route("/api/units", get(api_units))
         .route("/workload/{id}", get(workload_page))
         .route("/logs/{app}", get(logs));
     if !cfg.confidential {
@@ -247,6 +256,8 @@ pub async fn run() -> Result<()> {
 
     let mut api = Router::new()
         .route("/health", get(health))
+        .route("/api/oracles", get(api_oracles))
+        .route("/api/units", get(api_units))
         .route("/logs/{app}", get(logs));
     if !cfg.confidential {
         api = api
@@ -516,7 +527,11 @@ async fn health(State(s): State<St>) -> Json<serde_json::Value> {
     let m = metrics::collect().await;
     let ita_token = s.ita_token.read().await.clone();
     let agent_owner = s.agent_owner.read().await.clone();
+    let oracles = s.oracles.read().await.clone();
     let taint_reasons = s.taint.snapshot().await;
+    let integrity_state = IntegrityState::from_taint_reasons(&taint_reasons);
+    let agent_mode = AgentMode::from_confidential(s.cfg.confidential);
+    let units = managed_units(&s, &list, &oracles, agent_mode, integrity_state).await;
     let extra_ingress: Vec<serde_json::Value> = s
         .extras
         .read()
@@ -552,14 +567,25 @@ async fn health(State(s): State<St>) -> Json<serde_json::Value> {
         // `confidential_mode`: boot-time flag; true → /deploy + /exec
         // + /owner were NOT registered on this agent. Set from
         // `DD_CONFIDENTIAL`.
-        // `taint_reasons`: current set, sorted for diff-friendliness.
-        // Empty set = pristine. v0: informational — DD doesn't block
-        // actions based on the set.
+        // `integrity_state`: user-facing label derived from the
+        // internal taint set. Empty set = clean; any reason =
+        // controlled. v0: informational — DD doesn't block actions
+        // based on the set.
+        // `integrity_reasons`: current set, sorted for
+        // diff-friendliness. `taint_reasons` is kept as a diagnostic
+        // compatibility alias for existing consumers.
         "confidential_mode": s.cfg.confidential,
+        "agent_mode": agent_mode,
+        "integrity_state": integrity_state,
+        "integrity_reasons": taint_reasons.clone(),
         "taint_reasons": taint_reasons,
         "attestation_type": ee_health["attestation_type"].as_str().unwrap_or("unknown"),
         "deployments": deployments,
         "deployment_count": list["deployments"].as_array().map(|a| a.len()).unwrap_or(0),
+        "oracle_count": oracles.len(),
+        "oracles": oracles,
+        "unit_count": units.len(),
+        "units": units,
         "cpu_percent": m.cpu_pct,
         "memory_used_mb": m.mem_used_mb,
         "memory_total_mb": m.mem_total_mb,
@@ -593,21 +619,132 @@ async fn dashboard(State(s): State<St>) -> Response {
     let list = s.ee.list().await.unwrap_or_default();
     let ee_health = s.ee.health().await.unwrap_or_default();
     let att = ee_health["attestation_type"].as_str().unwrap_or("unknown");
+    let oracles = s.oracles.read().await.clone();
+    let taint_reasons = s.taint.snapshot().await;
+    let integrity_state = IntegrityState::from_taint_reasons(&taint_reasons);
+    let agent_mode = AgentMode::from_confidential(s.cfg.confidential);
+    let units = managed_units(&s, &list, &oracles, agent_mode, integrity_state).await;
 
     let deployments: Vec<&serde_json::Value> = list["deployments"]
         .as_array()
         .map(|a| a.iter().collect())
         .unwrap_or_default();
 
+    if agent_mode == AgentMode::ReadOnly && !oracles.is_empty() {
+        let primary = &oracles[0];
+        let primary_unit = units.iter().find(|u| u.app_name == primary.app_name);
+        let public_view = primary
+            .vanity_url
+            .as_ref()
+            .map(|url| {
+                format!(
+                    r#"<a class="break" href="{url}" target="_blank">{url}</a>"#,
+                    url = html::escape(url)
+                )
+            })
+            .unwrap_or_else(|| r#"<span class="dim">not exposed</span>"#.into());
+        let sample = primary
+            .sample
+            .as_ref()
+            .and_then(|v| serde_json::to_string_pretty(v).ok())
+            .map(|s| html::escape(&s))
+            .unwrap_or_else(|| r#"<span class="dim">No successful scrape yet</span>"#.into());
+        let logs = primary_unit
+            .map(|u| {
+                if u.log_line_count == 0 {
+                    r#"<span class="dim">No logs yet</span>"#.to_string()
+                } else {
+                    format!(
+                        r#"<a href="/workload/{id}">{n} line(s)</a>"#,
+                        id = html::escape(&u.id),
+                        n = u.log_line_count
+                    )
+                }
+            })
+            .unwrap_or_else(|| r#"<span class="dim">not attached</span>"#.into());
+        let recent_logs = match primary_unit {
+            Some(u) => recent_log_lines_html(&s.ee, &u.id, 80).await,
+            None => r#"<span class="dim">No workload log stream attached</span>"#.into(),
+        };
+
+        let mut unit_rows = String::new();
+        for u in &units {
+            let refs = if u.refs.is_empty() {
+                r#"<span class="dim">none</span>"#.to_string()
+            } else {
+                u.refs
+                    .iter()
+                    .map(|r| {
+                        if r.value.starts_with("https://") || r.value.starts_with("http://") {
+                            format!(
+                                r#"<a class="break" href="{url}" target="_blank">{label}</a>"#,
+                                url = html::escape(&r.value),
+                                label = html::escape(&r.label)
+                            )
+                        } else {
+                            format!(
+                                r#"<span class="dim">{label}: {value}</span>"#,
+                                label = html::escape(&r.label),
+                                value = html::escape(&r.value)
+                            )
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" · ")
+            };
+            unit_rows.push_str(&format!(
+                r#"<tr><td>{title}<div class="dim">{app}</div></td><td>{kind}</td><td><span class="pill {cls}">{status}</span></td><td>{refs}</td></tr>"#,
+                title = html::escape(&u.title),
+                app = html::escape(&u.app_name),
+                kind = html::escape(u.kind.as_str()),
+                cls = status_class(&u.status),
+                status = html::escape(&u.status),
+                refs = refs,
+            ));
+        }
+
+        let body = format!(
+            r#"<h1>{title}</h1>
+<div class="sub">{host} · {vm} · {att}</div>
+<div class="meta"><span class="ok">read-only</span> · integrity {integrity} · public oracle view</div>
+<div class="cards">
+  <div class="card"><div class="label">Oracle status</div><div class="value green">{status}</div></div>
+  <div class="card"><div class="label">Public view</div><div class="value small">{public_view}</div></div>
+  <div class="card"><div class="label">Last ok</div><div class="value small">{last_ok}</div></div>
+  <div class="card"><div class="label">Logs</div><div class="value small">{logs}</div></div>
+</div>
+<div class="section">Latest public sample</div>
+<pre style="max-height:42vh">{sample}</pre>
+<div class="section">Recent captured logs</div>
+<pre style="max-height:42vh">{recent_logs}</pre>
+<div class="section">Managed components</div>
+<table><tr><th>component</th><th>kind</th><th>status</th><th>refs</th></tr>{unit_rows}</table>"#,
+            title = html::escape(&primary.title),
+            host = html::escape(&s.hostname),
+            vm = html::escape(&s.cfg.common.vm_name),
+            att = html::escape(att),
+            integrity = html::escape(integrity_label(integrity_state)),
+            status = html::escape(&primary.status),
+            public_view = public_view,
+            last_ok = html::escape(primary.last_ok.as_deref().unwrap_or("never")),
+            logs = logs,
+            sample = sample,
+            recent_logs = recent_logs,
+            unit_rows = unit_rows,
+        );
+
+        return Html(shell(
+            &format!("DD — {}", primary.title),
+            &html::nav(&[("Oracle", "/", true)]),
+            &body,
+        ))
+        .into_response();
+    }
+
     let mut rows = String::new();
     for d in &deployments {
         let status = d["status"].as_str().unwrap_or("idle");
-        let cls = match status {
-            "running" => "running",
-            "deploying" => "deploying",
-            "failed" | "exited" => "failed",
-            _ => "idle",
-        };
+        let cls = status_class(status);
         let id = d["id"].as_str().unwrap_or("");
         let app = d["app_name"].as_str().unwrap_or("unnamed");
         let image = d["image"].as_str().unwrap_or("");
@@ -624,22 +761,63 @@ async fn dashboard(State(s): State<St>) -> Response {
         )
     };
 
-    // `{hostname-base}-shell.{tld}` is the dd-shell subdomain provisioned
-    // at register time. Human-gated by CF Access. Flat shape so
-    // Universal SSL covers the cert.
-    let term_host = html::escape(&crate::cf::label_hostname(&s.hostname, "shell"));
+    let oracle_section = if oracles.is_empty() {
+        String::new()
+    } else {
+        let mut rows = String::new();
+        for o in &oracles {
+            let cls = match o.status.as_str() {
+                "healthy" => "healthy",
+                "error" => "failed",
+                _ => "idle",
+            };
+            let vanity = o
+                .vanity_url
+                .as_ref()
+                .map(|u| {
+                    format!(
+                        r#"<a href="{url}" target="_blank">{label}</a>"#,
+                        url = html::escape(u),
+                        label = html::escape(&o.hostname_label)
+                    )
+                })
+                .unwrap_or_else(|| r#"<span class="dim">none</span>"#.into());
+            rows.push_str(&format!(
+                r#"<tr><td>{title}</td><td><span class="pill {cls}">{status}</span></td><td>{vanity}</td><td class="dim">{path}</td><td class="dim">{last}</td></tr>"#,
+                title = html::escape(&o.title),
+                status = html::escape(&o.status),
+                path = html::escape(&o.path),
+                last = html::escape(o.last_ok.as_deref().unwrap_or("never")),
+            ));
+        }
+        format!(
+            r#"<div class="section">Read-only oracles</div><table><tr><th>oracle</th><th>status</th><th>vanity</th><th>path</th><th>last ok</th></tr>{rows}</table>"#
+        )
+    };
+
+    let terminal_link = if units.iter().any(|u| u.kind == UnitKind::Shell) {
+        // `{hostname-base}-shell.{tld}` is the dd-shell subdomain provisioned
+        // at register time. Human-gated by CF Access. Flat shape so
+        // Universal SSL covers the cert.
+        let term_host = html::escape(&crate::cf::label_hostname(&s.hostname, "shell"));
+        format!(r#" · <a href="https://{term_host}/" target="_blank">Terminal ↗</a>"#)
+    } else {
+        String::new()
+    };
 
     let body = format!(
         r#"<h1>{hostname}</h1>
 <div class="sub">{vm} · {att}</div>
-<div class="meta"><span class="ok">healthy</span> · uptime {up} · {count} workload(s) · <a href="https://{term_host}/" target="_blank">Terminal ↗</a></div>
+<div class="meta"><span class="ok">healthy</span> · uptime {up} · {count} workload(s){terminal_link}</div>
 <div class="cards">
   <div class="card"><div class="label">CPU</div><div class="value green">{cpu}%</div></div>
   <div class="card"><div class="label">Memory</div><div class="value blue">{mu} / {mt}</div></div>
   <div class="card"><div class="label">Load 1m</div><div class="value mauve">{load:.2}</div></div>
 </div>
+{oracle_section}
 <div class="section">Workloads</div>{table}"#,
-        term_host = term_host,
+        terminal_link = terminal_link,
+        oracle_section = oracle_section,
         hostname = html::escape(&s.hostname),
         vm = html::escape(&s.cfg.common.vm_name),
         att = html::escape(att),
@@ -657,6 +835,229 @@ async fn dashboard(State(s): State<St>) -> Response {
         &body,
     ))
     .into_response()
+}
+
+async fn api_oracles(State(s): State<St>) -> Json<Vec<oracle::OracleStatus>> {
+    Json(s.oracles.read().await.clone())
+}
+
+async fn api_units(State(s): State<St>) -> Json<Vec<ManagedUnit>> {
+    let list = s.ee.list().await.unwrap_or_default();
+    let oracles = s.oracles.read().await.clone();
+    let taint_reasons = s.taint.snapshot().await;
+    let integrity_state = IntegrityState::from_taint_reasons(&taint_reasons);
+    let agent_mode = AgentMode::from_confidential(s.cfg.confidential);
+    Json(managed_units(&s, &list, &oracles, agent_mode, integrity_state).await)
+}
+
+async fn managed_units(
+    s: &St,
+    list: &serde_json::Value,
+    oracles: &[oracle::OracleStatus],
+    agent_mode: AgentMode,
+    agent_integrity_state: IntegrityState,
+) -> Vec<ManagedUnit> {
+    let mut oracle_by_app: std::collections::HashMap<String, oracle::OracleStatus> = oracles
+        .iter()
+        .cloned()
+        .map(|oracle| (oracle.app_name.clone(), oracle))
+        .collect();
+    let mut out = Vec::new();
+    if let Some(deployments) = list["deployments"].as_array() {
+        for d in deployments {
+            let Some(app_name) = d["app_name"].as_str() else {
+                continue;
+            };
+            let id = d["id"].as_str().unwrap_or(app_name).to_string();
+            let oracle = oracle_by_app.remove(app_name);
+            let kind = units::kind_for_app(app_name);
+            let log_line_count = workload_log_line_count(&s.ee, &id).await;
+            let mut capabilities = units::base_capabilities(kind);
+            if kind == UnitKind::Agent && agent_mode == AgentMode::ReadWrite {
+                capabilities.extend(["deploy".into(), "exec".into()]);
+            }
+            capabilities.push("logs".into());
+            if oracle.is_some() {
+                capabilities.push("oracle".into());
+            }
+            let refs = unit_refs(s, app_name, kind, oracle.as_ref()).await;
+            let title = oracle
+                .as_ref()
+                .map(|oracle| oracle.title.clone())
+                .unwrap_or_else(|| units::title_for_app(app_name));
+            out.push(ManagedUnit {
+                id,
+                app_name: app_name.to_string(),
+                title,
+                kind,
+                agent_mode,
+                agent_integrity_state,
+                status: d["status"].as_str().unwrap_or("unknown").to_string(),
+                image: non_empty_string(&d["image"]),
+                started_at: non_empty_string(&d["started_at"]),
+                error_message: non_empty_string(&d["error_message"]),
+                source: units::source_for_app(app_name),
+                log_line_count,
+                capabilities,
+                refs,
+                oracle,
+            });
+        }
+    }
+
+    for oracle in oracle_by_app.into_values() {
+        let refs = unit_refs(s, &oracle.app_name, UnitKind::Workload, Some(&oracle)).await;
+        out.push(ManagedUnit {
+            id: oracle.app_name.clone(),
+            app_name: oracle.app_name.clone(),
+            title: oracle.title.clone(),
+            kind: UnitKind::Workload,
+            agent_mode,
+            agent_integrity_state,
+            status: oracle.status.clone(),
+            image: None,
+            started_at: None,
+            error_message: oracle.last_error.clone(),
+            source: units::source_for_app(&oracle.app_name),
+            log_line_count: 0,
+            capabilities: vec!["oracle".into()],
+            refs,
+            oracle: Some(oracle),
+        });
+    }
+    out.sort_by(|a, b| a.app_name.cmp(&b.app_name));
+    out
+}
+
+async fn unit_refs(
+    s: &St,
+    app_name: &str,
+    kind: UnitKind,
+    oracle: Option<&oracle::OracleStatus>,
+) -> Vec<units::UnitRef> {
+    let mut refs = Vec::new();
+    if let Some(source) = units::source_for_app(app_name) {
+        refs.push(units::ref_item("source", "source", source));
+    }
+    match kind {
+        UnitKind::Agent => {
+            refs.push(units::ref_item(
+                "url",
+                "dashboard",
+                format!("https://{}", s.hostname),
+            ));
+            refs.push(units::ref_item(
+                "url",
+                "agent-api",
+                format!("https://{}", crate::cf::agent_api_hostname(&s.hostname)),
+            ));
+        }
+        UnitKind::Shell => refs.push(units::ref_item(
+            "url",
+            "shell",
+            format!(
+                "https://{}",
+                crate::cf::label_hostname(&s.hostname, "shell")
+            ),
+        )),
+        UnitKind::Tunnel => {
+            refs.push(units::ref_item(
+                "url",
+                "dashboard",
+                format!("https://{}", s.hostname),
+            ));
+            refs.push(units::ref_item(
+                "url",
+                "agent-api",
+                format!("https://{}", crate::cf::agent_api_hostname(&s.hostname)),
+            ));
+            for (label, port) in s.extras.read().await.iter() {
+                refs.push(units::ref_item(
+                    "ingress",
+                    label,
+                    format!(
+                        "https://{} -> localhost:{port}",
+                        crate::cf::label_hostname(&s.hostname, label)
+                    ),
+                ));
+            }
+        }
+        UnitKind::Storage | UnitKind::Runtime | UnitKind::Workload => {}
+    }
+    if let Some(oracle) = oracle {
+        if let Some(url) = &oracle.vanity_url {
+            refs.push(units::ref_item("url", "oracle", url.clone()));
+        }
+        refs.push(units::ref_item(
+            "url",
+            "oracle-local",
+            oracle.local_url.clone(),
+        ));
+    }
+    refs
+}
+
+async fn workload_log_line_count(ee: &Ee, id: &str) -> usize {
+    match ee.logs(id).await {
+        Ok(logs) => logs["lines"].as_array().map(|a| a.len()).unwrap_or(0),
+        Err(e) => {
+            eprintln!("agent: log count unavailable for {id}: {e}");
+            0
+        }
+    }
+}
+
+async fn recent_log_lines_html(ee: &Ee, id: &str, limit: usize) -> String {
+    match ee.logs(id).await {
+        Ok(logs) => {
+            let Some(lines) = logs["lines"].as_array() else {
+                return r#"<span class="dim">No logs captured yet</span>"#.into();
+            };
+            let start = lines.len().saturating_sub(limit);
+            let text = lines[start..]
+                .iter()
+                .filter_map(|v| v.as_str())
+                .map(html::escape)
+                .collect::<Vec<_>>()
+                .join("\n");
+            if text.is_empty() {
+                r#"<span class="dim">No logs captured yet</span>"#.into()
+            } else {
+                text
+            }
+        }
+        Err(e) => {
+            eprintln!("agent: recent logs unavailable for {id}: {e}");
+            format!(
+                r#"<span style="color:#f38ba8">Log capture unavailable: {}</span>"#,
+                html::escape(&e.to_string())
+            )
+        }
+    }
+}
+
+fn status_class(status: &str) -> &'static str {
+    match status {
+        "healthy" | "running" => "running",
+        "deploying" | "unknown" | "stale" => "deploying",
+        "error" | "failed" | "exited" | "dead" => "failed",
+        _ => "idle",
+    }
+}
+
+fn integrity_label(integrity_state: IntegrityState) -> &'static str {
+    match integrity_state {
+        IntegrityState::Clean => "clean",
+        IntegrityState::Controlled => "controlled",
+    }
+}
+
+fn non_empty_string(value: &serde_json::Value) -> Option<String> {
+    value
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
 }
 
 async fn workload_page(State(s): State<St>, Path(id): Path<String>) -> Result<Response> {

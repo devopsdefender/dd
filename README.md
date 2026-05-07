@@ -106,7 +106,7 @@ The agent verifies the OIDC token against GitHub's JWKS, checks `repository_owne
 
 ## Terminal access
 
-Each VM runs `dd-shell` as a workload on a `-shell` labelled subdomain (for example `app-shell.devopsdefender.com` or `<agent>-shell.devopsdefender.com`). CF Access gates it behind the same GitHub OAuth + admin-email policy as the dashboards. The shell UI separates read-only workload log terminals from read-write PTY sessions, and read-write sessions keep encrypted transcript history inside the enclave.
+Each VM runs `dd-shell` as a workload on a `-shell` labelled subdomain (for example `app-shell.devopsdefender.com` or `<agent>-shell.devopsdefender.com`). CF Access gates it behind the same GitHub OAuth + admin-email policy as the dashboards. The shell UI separates observed read-only workload logs from controlled read-write PTY sessions. Read-only viewing does not change integrity state because it cannot send input or signals; read-write PTYs are controlled as soon as they exist and keep encrypted transcript history inside the enclave.
 
 ## STONITH
 
