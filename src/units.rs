@@ -85,9 +85,7 @@ pub struct ManagedUnit {
 pub fn kind_for_app(app: &str) -> UnitKind {
     match app {
         "dd-agent" => UnitKind::Agent,
-        "dd-shell" | "confidential-shell" | "codex-podman-shell" | "codex-universal-shell" => {
-            UnitKind::Shell
-        }
+        "dd-shell" | "confidential-shell" | "codex-podman-shell" => UnitKind::Shell,
         "cloudflared" => UnitKind::Tunnel,
         "mount-data" => UnitKind::Storage,
         app if app.starts_with("podman-") => UnitKind::Runtime,
@@ -99,7 +97,6 @@ pub fn title_for_app(app: &str) -> String {
     match app {
         "dd-agent" => "Agent API".into(),
         "dd-shell" => "Shell service".into(),
-        "codex-universal-shell" => "Codex universal workstation".into(),
         "cloudflared" => "Cloudflare tunnel".into(),
         "mount-data" => "Persistent data mount".into(),
         "podman-static" => "Podman release asset".into(),

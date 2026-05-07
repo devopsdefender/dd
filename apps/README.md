@@ -152,16 +152,15 @@ inline in two places so both lifecycle points behave identically:
 
 ## Where each workload runs
 
-| workload | CP VM | agent VM (preview) | agent VM (prod) | durable Codex VM |
-|---|---|---|---|---|
-| `cloudflared` | ✅ | ✅ | ✅ | ✅ |
-| `dd-agent` | | ✅ | ✅ | ✅ |
-| `dd-shell` | | ✅ | ✅ | |
-| `codex-universal-shell` | | | | ✅ |
-| `human-readonly` | | ✅ | | |
-| `dd-management` | ✅ | | | |
-| `podman-static` | | ✅ | ✅ | ✅ |
-| `podman-bootstrap` | | ✅ | ✅ | ✅ |
+| workload | CP VM | agent VM (preview) | agent VM (prod) |
+|---|---|---|---|
+| `cloudflared` | ✅ | ✅ | ✅ |
+| `dd-agent` | | ✅ | ✅ |
+| `dd-shell` | | ✅ | ✅ |
+| `human-readonly` | | ✅ | |
+| `dd-management` | ✅ | | |
+| `podman-static` | | ✅ | ✅ |
+| `podman-bootstrap` | | ✅ | ✅ |
 
 Additional examples:
 
@@ -182,41 +181,11 @@ Additional examples:
   completed interactively from the browser terminal. Use this instead of
   `dd-shell`, not alongside it, unless you give one of them a different
   `hostname_label`.
-- `apps/codex-universal-shell`: durable personal development shell for
-  `dd-local-codex`. It exposes the normal `-shell` label, stores encrypted
-  dd-shell history under `/var/lib/easyenclave/data/dd-shell`, and makes each
-  new PTY enter `ghcr.io/openai/codex-universal:latest` through Podman.
-  Container home and `/workspace` live under
-  `/var/lib/easyenclave/data/codex-universal`, so Codex login, git config,
-  cloned repos, npm/global tools, and workspace state survive reconnects and
-  VM reboots.
 
 CP stays slim: just `cloudflared` + `dd-management`. Preview agent VMs run a
 small read-only oracle plus agent + podman for CI to prove registration,
 scraping, vanity ingress, and dashboards end-to-end. Prod agent VMs use the
 same CPU-only boot shape without demo workloads for now.
-
-## Durable Codex workstation
-
-`dd-local-prod` is the CI-managed production canary. Production releases
-destroy/recreate it, so do not put long-lived development state there.
-
-Use `dd-local-codex` for a real personal Codex workstation registered to
-production:
-
-```bash
-export DD_ITA_API_KEY="$(cat ~/.secrets/ita_api_key)"
-export EE_OWNER="devopsdefender"
-./apps/_infra/local-agents.sh "" "" "" https://app.devopsdefender.com
-virsh start dd-local-codex
-```
-
-The user-facing object is the agent: `dd-local-codex`, a Codex dev
-workstation. Its internal units (`cloudflared`, `dd-agent`, Podman bootstrap,
-and `codex-universal-shell`) are diagnostic inventory for health/logs/refs, not
-separate products. The durable state disk is
-`/var/lib/libvirt/images/dd-local-codex-workload.qcow2`; `local-agents.sh`
-reuses it, and the normal production release relaunch path does not touch it.
 
 ## Ordering
 
