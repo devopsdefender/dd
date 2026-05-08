@@ -3,6 +3,8 @@
 //! Newline-delimited JSON request/response, one exchange per connection.
 //! `attach()` is special — after the JSON ack the socket carries raw PTY bytes.
 
+use std::time::{Duration, Instant};
+
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
@@ -48,6 +50,27 @@ impl Ee {
 
     pub async fn health(&self) -> Result<serde_json::Value> {
         self.call(serde_json::json!({"method": "health"})).await
+    }
+
+    pub async fn wait_ready(&self, timeout: Duration) -> Result<serde_json::Value> {
+        let started = Instant::now();
+        loop {
+            let err = match self.health().await {
+                Ok(v) => return Ok(v),
+                Err(e) => e,
+            };
+
+            if started.elapsed() >= timeout {
+                return Err(Error::Upstream(format!(
+                    "EE socket {} was not ready after {}s: {}",
+                    self.path,
+                    timeout.as_secs(),
+                    err
+                )));
+            }
+
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
     }
 
     pub async fn list(&self) -> Result<serde_json::Value> {

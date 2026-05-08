@@ -225,6 +225,7 @@ build_config_iso() {
         DD_RELEASE_TAG="$DD_RELEASE_TAG" bake "$REPO_ROOT/apps/busybox/workload.json.tmpl"
         bake "$REPO_ROOT/apps/mount-data/workload.json"
         bake "$REPO_ROOT/apps/podman-static/workload.json"
+        DD_RELEASE_TAG="$DD_RELEASE_TAG" bake "$REPO_ROOT/apps/ca-certificates/workload.json.tmpl"
         bake "$REPO_ROOT/apps/podman-bootstrap/workload.json"
         bake "$REPO_ROOT/apps/cloudflared/workload.json"
         bake "$REPO_ROOT/apps/dd-shell/workload.json"

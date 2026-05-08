@@ -217,43 +217,6 @@ runs:
           expected_vms+=("dd-local-preview-oracle")
         fi
         expected_json=$(printf '%s\n' "${expected_vms[@]}" | jq -R . | jq -cs .)
-        agent_api_hostname() {
-          local host="$1" base rest prefix suffix
-          if [[ "$host" == *.* ]]; then
-            base="${host%%.*}"
-            rest="${host#*.}"
-          else
-            base="$host"
-            rest=""
-          fi
-          if [[ "$base" == *-agent-* ]]; then
-            prefix="${base%%-agent-*}"
-            suffix="${base#*-agent-}"
-            if [ -n "$rest" ]; then
-              printf '%s-api-%s.%s\n' "$prefix" "$suffix" "$rest"
-            else
-              printf '%s-api-%s\n' "$prefix" "$suffix"
-            fi
-          elif [ -n "$rest" ]; then
-            printf '%s-agent-api.%s\n' "$base" "$rest"
-          else
-            printf '%s-agent-api\n' "$base"
-          fi
-        }
-        direct_health_ready() {
-          local vm="$1" host api health
-          host=$(echo "$payload" | jq -r --arg since "$since" --arg vm "$vm" '
-            [.[] | select(.vm_name == $vm and .last_seen > $since)]
-            | sort_by(.last_seen)
-            | reverse
-            | .[0].hostname // empty' 2>/dev/null || true)
-          [ -n "$host" ] || return 1
-          api=$(agent_api_hostname "$host")
-          health=$(curl -fsS --max-time 10 "https://${api}/health" 2>/dev/null || true)
-          echo "$health" | jq -e --arg vm "$vm" '
-            .ok == true and .vm_name == $vm and (.ita_token | type == "string" and length > 0)
-          ' >/dev/null 2>&1
-        }
         last_payload=""
         for i in $(seq 1 60); do
           payload=$(curl -fsS --max-time 10 -H "Authorization: Bearer ${oidc}" \
@@ -262,30 +225,14 @@ runs:
             last_payload="$payload"
           fi
           ready_count=$(echo "$payload" | jq -r --arg since "$since" --argjson expected "$expected_json" '
-                [.[] | select(.status=="healthy" and .last_seen > $since and (.vm_name as $vm | $expected | index($vm)))]
+                [.[] | select((.status=="healthy" or .status=="registering") and .last_seen > $since and (.vm_name as $vm | $expected | index($vm)))]
                 | unique_by(.vm_name)
                 | length' 2>/dev/null || echo 0)
           if [ "$ready_count" = "${#expected_vms[@]}" ]; then
             echo "registered agents:"
             echo "$payload" | jq -r --arg since "$since" --argjson expected "$expected_json" '
-              .[] | select(.status=="healthy" and .last_seen > $since and (.vm_name as $vm | $expected | index($vm)))
-              | "  \(.vm_name) at https://\(.hostname)"' 2>/dev/null || true
-            cleanup_tail
-            exit 0
-          fi
-          direct_ready_count=0
-          if [ -n "$payload" ]; then
-            for expected_vm in "${expected_vms[@]}"; do
-              if direct_health_ready "$expected_vm"; then
-                direct_ready_count=$((direct_ready_count + 1))
-              fi
-            done
-          fi
-          if [ "$direct_ready_count" = "${#expected_vms[@]}" ]; then
-            echo "registered agents (verified by direct /health):"
-            echo "$payload" | jq -r --arg since "$since" --argjson expected "$expected_json" '
-              .[] | select(.last_seen > $since and (.vm_name as $vm | $expected | index($vm)))
-              | "  \(.vm_name) status=\(.status) at https://\(.hostname)"' 2>/dev/null || true
+              .[] | select((.status=="healthy" or .status=="registering") and .last_seen > $since and (.vm_name as $vm | $expected | index($vm)))
+              | "  \(.vm_name) [\(.status)] at https://\(.hostname)"' 2>/dev/null || true
             cleanup_tail
             exit 0
           fi

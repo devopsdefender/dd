@@ -53,6 +53,8 @@ const ITA_REFRESH: Duration = Duration::from_secs(180);
 /// Tuned so a revoke propagates within ~30s.
 const DEVICES_POLL: Duration = Duration::from_secs(30);
 
+const EE_READY_TIMEOUT: Duration = Duration::from_secs(90);
+
 #[derive(Clone)]
 struct St {
     cfg: Arc<Cfg>,
@@ -104,7 +106,7 @@ pub async fn run() -> Result<()> {
     let cfg = Arc::new(Cfg::from_env()?);
     let ee = Arc::new(Ee::new(&cfg.ee_socket));
 
-    let h = ee.health().await?;
+    let h = ee.wait_ready(EE_READY_TIMEOUT).await?;
     eprintln!(
         "agent: EE connected (attestation={})",
         h["attestation_type"].as_str().unwrap_or("?")
@@ -674,21 +676,7 @@ async fn dashboard(State(s): State<St>) -> Response {
             } else {
                 u.refs
                     .iter()
-                    .map(|r| {
-                        if r.value.starts_with("https://") || r.value.starts_with("http://") {
-                            format!(
-                                r#"<a class="break" href="{url}" target="_blank">{label}</a>"#,
-                                url = html::escape(&r.value),
-                                label = html::escape(&r.label)
-                            )
-                        } else {
-                            format!(
-                                r#"<span class="dim">{label}: {value}</span>"#,
-                                label = html::escape(&r.label),
-                                value = html::escape(&r.value)
-                            )
-                        }
-                    })
+                    .map(|r| html::unit_ref(&r.label, &r.value))
                     .collect::<Vec<_>>()
                     .join(" · ")
             };

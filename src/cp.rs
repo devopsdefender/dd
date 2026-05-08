@@ -37,6 +37,7 @@ use crate::units::{AgentMode, UnitKind};
 /// task is the only thing keeping the `control-plane` entry's claims
 /// fresh on the dashboard.
 const ITA_REFRESH: Duration = Duration::from_secs(180);
+const EE_READY_TIMEOUT: Duration = Duration::from_secs(90);
 
 #[derive(Clone)]
 struct St {
@@ -67,6 +68,17 @@ pub async fn run() -> Result<()> {
     let ee = Arc::new(Ee::new("/var/lib/easyenclave/agent.sock"));
 
     let http = reqwest::Client::new();
+    let h = match ee.wait_ready(EE_READY_TIMEOUT).await {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("cp: EE socket not ready: {e}");
+            stonith::poweroff();
+        }
+    };
+    eprintln!(
+        "cp: EE connected (attestation={})",
+        h["attestation_type"].as_str().unwrap_or("?")
+    );
 
     // Stage 1: mint + verify our own ITA token before touching CF.
     // We need the token as a Bearer for the hydrate call below; if
@@ -822,17 +834,7 @@ async fn fleet(State(s): State<St>) -> Response {
                 u.refs
                     .iter()
                     .take(3)
-                    .map(|r| {
-                        if r.value.starts_with("https://") {
-                            format!(
-                                r#"<a href="{url}" target="_blank">{label}</a>"#,
-                                url = html::escape(&r.value),
-                                label = html::escape(&r.label)
-                            )
-                        } else {
-                            html::escape(&r.label)
-                        }
-                    })
+                    .map(|r| html::unit_ref(&r.label, &r.value))
                     .collect::<Vec<_>>()
                     .join(" · ")
             };
@@ -1195,21 +1197,7 @@ async fn agent_detail(State(s): State<St>, Path(id): Path<String>) -> Response {
             } else {
                 u.refs
                     .iter()
-                    .map(|r| {
-                        if r.value.starts_with("https://") {
-                            format!(
-                                r#"<a href="{url}" target="_blank">{label}</a>"#,
-                                url = html::escape(&r.value),
-                                label = html::escape(&r.label)
-                            )
-                        } else {
-                            format!(
-                                r#"<span class="dim">{label}: {value}</span>"#,
-                                label = html::escape(&r.label),
-                                value = html::escape(&r.value)
-                            )
-                        }
-                    })
+                    .map(|r| html::unit_ref(&r.label, &r.value))
                     .collect::<Vec<_>>()
                     .join(" · ")
             };

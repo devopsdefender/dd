@@ -67,9 +67,48 @@ pub fn nav(items: &[(&str, &str, bool)]) -> String {
     s
 }
 
+pub fn unit_ref(label: &str, value: &str) -> String {
+    let first = value.split_whitespace().next().unwrap_or("");
+    if first.starts_with("https://") || first.starts_with("http://") {
+        let suffix = value
+            .strip_prefix(first)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| format!(r#" <span class="dim">{}</span>"#, escape(s)))
+            .unwrap_or_default();
+        format!(
+            r#"<a class="break" href="{url}" target="_blank">{label}</a>{suffix}"#,
+            url = escape(first),
+            label = escape(label),
+        )
+    } else {
+        format!(
+            r#"<span class="dim">{label}: {value}</span>"#,
+            label = escape(label),
+            value = escape(value),
+        )
+    }
+}
+
 pub fn escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unit_ref_uses_only_url_token_for_href() {
+        let got = unit_ref(
+            "shell",
+            "https://agent-shell.devopsdefender.com -> localhost:7682",
+        );
+        assert!(got.contains(r#"href="https://agent-shell.devopsdefender.com""#));
+        assert!(!got.contains(r#"href="https://agent-shell.devopsdefender.com -&gt;"#));
+        assert!(got.contains("-&gt; localhost:7682"));
+    }
 }
