@@ -8,7 +8,6 @@
     "interval_secs": 10
   },
   "cmd": [
-    "/bin/busybox", "sh", "-c",
-    "set -e\nWEB=/tmp/oracle-readonly-www\nmkdir -p \"$WEB\"\n(\n  cd \"$WEB\"\n  /bin/busybox httpd -f -p 0.0.0.0:8082\n) &\ni=0\nwhile true; do\n  i=$((i+1))\n  printf '{\"ok\":true,\"oracle\":\"oracle-readonly\",\"tick\":%s,\"integrity\":\"read_only\"}\\n' \"$i\" > \"$WEB/oracle.json\"\n  echo \"oracle-readonly: tick=$i status=ok\"\n  sleep 10\ndone"
+    "devopsdefender", "oracle-readonly"
   ]
 }
