@@ -134,7 +134,7 @@ async fn tick(
     env_label: &str,
     cp_hostname: &str,
 ) {
-    let tunnels: Vec<(String, String, String)> = cf::list(http, cf)
+    let tunnels: Vec<(String, String, String, Option<DateTime<Utc>>)> = cf::list(http, cf)
         .await
         .unwrap_or_default()
         .into_iter()
@@ -145,15 +145,20 @@ async fn tick(
                 return None;
             }
             let hostname = format!("{name}.{}", cf.domain);
-            Some((name.to_string(), id.to_string(), hostname))
+            let created_at = t["created_at"]
+                .as_str()
+                .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                .map(|dt| dt.with_timezone(&Utc));
+            Some((name.to_string(), id.to_string(), hostname, created_at))
         })
         .collect();
 
-    let scrapes = tunnels.iter().map(|(name, tunnel_id, host)| {
+    let scrapes = tunnels.iter().map(|(name, tunnel_id, host, created_at)| {
         let http = http.clone();
         let name = name.clone();
         let tunnel_id = tunnel_id.clone();
         let host = host.clone();
+        let created_at = *created_at;
         async move {
             let health_host = cf::agent_api_hostname(&host);
             let r = http
@@ -163,16 +168,24 @@ async fn tick(
             match r {
                 Ok(resp) if resp.status().is_success() => {
                     let body = resp.json::<serde_json::Value>().await.ok();
-                    (name, tunnel_id, host, body, None)
+                    (name, tunnel_id, host, created_at, body, None)
                 }
                 Ok(resp) => (
                     name,
                     tunnel_id,
                     host,
+                    created_at,
                     None,
                     Some(format!("status {}", resp.status())),
                 ),
-                Err(e) => (name, tunnel_id, host, None, Some(format!("{e:?}"))),
+                Err(e) => (
+                    name,
+                    tunnel_id,
+                    host,
+                    created_at,
+                    None,
+                    Some(format!("{e:?}")),
+                ),
             }
         }
     });
@@ -182,9 +195,9 @@ async fn tick(
     let mut orphans: Vec<Orphan> = Vec::new();
     let mut verified = 0usize;
 
-    for (name, tunnel_id, host, body, err) in &results {
+    for (name, tunnel_id, host, created_at, body, err) in &results {
         let Some(h) = body else {
-            mark_stale_or_orphan(store, host, name, err, now, &mut orphans).await;
+            mark_stale_or_orphan(store, host, name, *created_at, err, now, &mut orphans).await;
             continue;
         };
         let Some(token) = h["ita_token"].as_str() else {
@@ -337,6 +350,7 @@ async fn mark_stale_or_orphan(
     store: &Store,
     host: &str,
     name: &str,
+    created_at: Option<DateTime<Utc>>,
     err: &Option<String>,
     now: DateTime<Utc>,
     orphans: &mut Vec<Orphan>,
@@ -359,11 +373,33 @@ async fn mark_stale_or_orphan(
                 err.as_deref().unwrap_or("unknown error")
             );
         }
+    } else if unknown_tunnel_is_gc_candidate(created_at, err, now) {
+        eprintln!(
+            "cp: collector: {name} unknown stale tunnel failed scrape; GC'ing: {}",
+            err.as_deref().unwrap_or("unknown error")
+        );
+        orphans.push(Orphan {
+            name: name.to_string(),
+            host: host.to_string(),
+            extras: Vec::new(),
+        });
     } else if let Some(e) = err {
         eprintln!(
             "cp: collector: {name} not in store yet; preserving tunnel after scrape error: {e}"
         );
     }
+}
+
+fn unknown_tunnel_is_gc_candidate(
+    created_at: Option<DateTime<Utc>>,
+    err: &Option<String>,
+    now: DateTime<Utc>,
+) -> bool {
+    let Some(created_at) = created_at else {
+        return false;
+    };
+    now.signed_duration_since(created_at).num_seconds() > DEAD_THRESHOLD_SECS
+        && scrape_failure_is_dead_signal(err)
 }
 
 fn scrape_failure_is_dead_signal(err: &Option<String>) -> bool {
@@ -384,7 +420,11 @@ fn scrape_failure_is_dead_signal(err: &Option<String>) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_extra_ingress, scrape_failure_is_dead_signal};
+    use chrono::{Duration, Utc};
+
+    use super::{
+        parse_extra_ingress, scrape_failure_is_dead_signal, unknown_tunnel_is_gc_candidate,
+    };
 
     #[test]
     fn missing_extra_ingress_preserves_existing_state() {
@@ -443,5 +483,35 @@ mod tests {
         ] {
             assert!(scrape_failure_is_dead_signal(&err));
         }
+    }
+
+    #[test]
+    fn unknown_tunnels_gc_only_after_grace_window() {
+        let now = Utc::now();
+        let err = Some("error sending request".to_string());
+
+        assert!(!unknown_tunnel_is_gc_candidate(None, &err, now));
+        assert!(!unknown_tunnel_is_gc_candidate(
+            Some(now - Duration::seconds(60)),
+            &err,
+            now
+        ));
+        assert!(unknown_tunnel_is_gc_candidate(
+            Some(now - Duration::seconds(1200)),
+            &err,
+            now
+        ));
+    }
+
+    #[test]
+    fn unknown_tunnels_keep_access_policy_failures() {
+        let now = Utc::now();
+        let err = Some("status 403 Forbidden".to_string());
+
+        assert!(!unknown_tunnel_is_gc_candidate(
+            Some(now - Duration::seconds(1200)),
+            &err,
+            now
+        ));
     }
 }
