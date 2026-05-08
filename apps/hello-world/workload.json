@@ -4,6 +4,7 @@
     "podman",
     "run",
     "--rm",
+    "--pull=always",
     "--name",
     "hello-world",
     "docker.io/library/busybox",
