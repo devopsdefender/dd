@@ -44,6 +44,88 @@ use crate::units::{self, AgentMode, ManagedUnit, UnitKind};
 const DEFAULT_PORT: u16 = 7681;
 const DEFAULT_DIR: &str = "/var/lib/devopsdefender/shell";
 const RING_LIMIT: usize = 256 * 1024;
+const CODEX_PODMAN_RECIPE: &str = r#"#!/var/lib/easyenclave/bin/busybox sh
+set -eu
+BB=/var/lib/easyenclave/bin/busybox
+BIN=/var/lib/easyenclave/bin
+PODMAN=$BIN/podman
+SESSION_ID=${DD_SESSION_ID:-manual-$$}
+SESSION_DIR=${DD_SESSION_DIR:-/var/lib/easyenclave/data/dd-shell/sessions/$SESSION_ID}
+WORKSPACE=${DD_WORKSPACE:-$SESSION_DIR/workspace}
+HOME_DIR=${DD_HOME:-$SESSION_DIR/home}
+CACHE_DIR=${DD_CACHE:-$SESSION_DIR/cache}
+TMP_DIR=${TMPDIR:-$SESSION_DIR/tmp}
+until [ -x "$PODMAN" ]; do echo "codex-podman: waiting for podman"; $BB sleep 2; done
+$BB mkdir -p "$HOME_DIR" "$WORKSPACE" "$CACHE_DIR" "$TMP_DIR"
+SAFE_SESSION=$(printf '%s' "$SESSION_ID" | $BB tr -c 'A-Za-z0-9_.-' '-')
+exec "$PODMAN" run --rm --replace -it --pull=missing \
+  --name "codex-shell-$SAFE_SESSION" \
+  -e HOME=/root \
+  -e TERM=xterm-256color \
+  -e COLORTERM=truecolor \
+  -e NPM_CONFIG_PREFIX=/root/.npm-global \
+  -v "$HOME_DIR:/root" \
+  -v "$WORKSPACE:/workspace" \
+  -v "$CACHE_DIR:/root/.cache" \
+  -v "$TMP_DIR:/tmp" \
+  -w /workspace \
+  docker.io/library/node:22-bookworm \
+  sh -lc 'set -e; mkdir -p "$HOME/.npm-global/bin"; export PATH="$HOME/.npm-global/bin:$PATH"; if ! command -v codex >/dev/null 2>&1; then npm install -g @openai/codex; fi; exec bash -l'
+"#;
+const PODMAN_UBUNTU_RECIPE: &str = r#"#!/var/lib/easyenclave/bin/busybox sh
+set -eu
+BB=/var/lib/easyenclave/bin/busybox
+BIN=/var/lib/easyenclave/bin
+PODMAN=$BIN/podman
+SESSION_ID=${DD_SESSION_ID:-manual-$$}
+SESSION_DIR=${DD_SESSION_DIR:-/var/lib/easyenclave/data/dd-shell/sessions/$SESSION_ID}
+WORKSPACE=${DD_WORKSPACE:-$SESSION_DIR/workspace}
+HOME_DIR=${DD_HOME:-$SESSION_DIR/home}
+CACHE_DIR=${DD_CACHE:-$SESSION_DIR/cache}
+TMP_DIR=${TMPDIR:-$SESSION_DIR/tmp}
+until [ -x "$PODMAN" ]; do echo "podman-ubuntu: waiting for podman"; $BB sleep 2; done
+$BB mkdir -p "$HOME_DIR" "$WORKSPACE" "$CACHE_DIR" "$TMP_DIR"
+SAFE_SESSION=$(printf '%s' "$SESSION_ID" | $BB tr -c 'A-Za-z0-9_.-' '-')
+exec "$PODMAN" run --rm --replace -it --pull=missing \
+  --name "ubuntu-shell-$SAFE_SESSION" \
+  -e HOME=/root \
+  -e TERM=xterm-256color \
+  -e COLORTERM=truecolor \
+  -v "$HOME_DIR:/root" \
+  -v "$WORKSPACE:/workspace" \
+  -v "$CACHE_DIR:/root/.cache" \
+  -v "$TMP_DIR:/tmp" \
+  -w /workspace \
+  docker.io/library/ubuntu:24.04 \
+  bash -l
+"#;
+const PODMAN_ALPINE_RECIPE: &str = r#"#!/var/lib/easyenclave/bin/busybox sh
+set -eu
+BB=/var/lib/easyenclave/bin/busybox
+BIN=/var/lib/easyenclave/bin
+PODMAN=$BIN/podman
+SESSION_ID=${DD_SESSION_ID:-manual-$$}
+SESSION_DIR=${DD_SESSION_DIR:-/var/lib/easyenclave/data/dd-shell/sessions/$SESSION_ID}
+WORKSPACE=${DD_WORKSPACE:-$SESSION_DIR/workspace}
+HOME_DIR=${DD_HOME:-$SESSION_DIR/home}
+CACHE_DIR=${DD_CACHE:-$SESSION_DIR/cache}
+TMP_DIR=${TMPDIR:-$SESSION_DIR/tmp}
+until [ -x "$PODMAN" ]; do echo "podman-alpine: waiting for podman"; $BB sleep 2; done
+$BB mkdir -p "$HOME_DIR" "$WORKSPACE" "$CACHE_DIR" "$TMP_DIR"
+SAFE_SESSION=$(printf '%s' "$SESSION_ID" | $BB tr -c 'A-Za-z0-9_.-' '-')
+exec "$PODMAN" run --rm --replace -it --pull=missing \
+  --name "alpine-shell-$SAFE_SESSION" \
+  -e HOME=/root \
+  -e TERM=xterm-256color \
+  -e COLORTERM=truecolor \
+  -v "$HOME_DIR:/root" \
+  -v "$WORKSPACE:/workspace" \
+  -v "$CACHE_DIR:/root/.cache" \
+  -v "$TMP_DIR:/tmp" \
+  -w /workspace \
+  docker.io/library/alpine:3.20 \
+  /bin/sh
+"#;
 
 #[derive(Clone)]
 struct App {
@@ -107,6 +189,14 @@ struct Recipe {
     command: String,
     cwd: String,
     workspace_policy: WorkspacePolicy,
+}
+
+struct RecipeSeed {
+    id: &'static str,
+    title: &'static str,
+    description: &'static str,
+    script_name: &'static str,
+    script: &'static str,
 }
 
 #[derive(Clone, Serialize)]
@@ -181,10 +271,13 @@ pub async fn run() -> Result<()> {
         .unwrap_or_else(|_| "/var/lib/easyenclave/agent.sock".into());
     let agent_api = std::env::var("DD_SHELL_AGENT_API_URL")
         .unwrap_or_else(|_| format!("http://127.0.0.1:{}", crate::cf::AGENT_API_PORT));
-    let store = TranscriptStore::new(PathBuf::from(dir)).await?;
+    let shell_dir = PathBuf::from(&dir);
+    let store = TranscriptStore::new(shell_dir.clone()).await?;
     tokio::fs::create_dir_all(&scratch_root).await?;
     set_private_dir_permissions(&scratch_root).await?;
-    let recipes = Arc::new(load_recipes(&default_shell));
+    let recipe_dir = shell_dir.join("recipes");
+    let recipe_scripts = install_builtin_recipe_scripts(&recipe_dir).await?;
+    let recipes = Arc::new(load_recipes(&default_shell, recipe_scripts));
 
     let app_state = App {
         sessions: Arc::new(RwLock::new(HashMap::new())),
@@ -358,7 +451,28 @@ fn select_recipe(app: &App, recipe_id: Option<&str>, command: Option<String>) ->
         .ok_or_else(|| Error::BadRequest(format!("unknown recipe: {id}")))
 }
 
-fn load_recipes(default_shell: &str) -> Vec<Recipe> {
+async fn install_builtin_recipe_scripts(dir: &Path) -> Result<Vec<Recipe>> {
+    tokio::fs::create_dir_all(dir).await?;
+    set_private_dir_permissions(dir).await?;
+
+    let mut recipes = Vec::new();
+    for seed in builtin_recipe_seeds() {
+        let path = dir.join(seed.script_name);
+        tokio::fs::write(&path, seed.script).await?;
+        set_private_file_permissions(&path).await?;
+        recipes.push(Recipe {
+            id: seed.id.into(),
+            title: seed.title.into(),
+            description: seed.description.into(),
+            command: path.display().to_string(),
+            cwd: "/".into(),
+            workspace_policy: WorkspacePolicy::EphemeralScratch,
+        });
+    }
+    Ok(recipes)
+}
+
+fn load_recipes(default_shell: &str, mut builtin_recipes: Vec<Recipe>) -> Vec<Recipe> {
     let mut recipes = vec![Recipe {
         id: "shell".into(),
         title: "Shell".into(),
@@ -367,22 +481,60 @@ fn load_recipes(default_shell: &str) -> Vec<Recipe> {
         cwd: "/".into(),
         workspace_policy: WorkspacePolicy::EphemeralScratch,
     }];
+    recipes.append(&mut builtin_recipes);
 
     if let Ok(command) = std::env::var("DD_SHELL_CODEX_COMMAND") {
         let command = command.trim();
         if !command.is_empty() {
-            recipes.push(Recipe {
-                id: "codex-podman".into(),
-                title: "Codex".into(),
-                description: "Podman-backed Codex development session".into(),
-                command: command.into(),
-                cwd: "/".into(),
-                workspace_policy: WorkspacePolicy::EphemeralScratch,
-            });
+            upsert_recipe(
+                &mut recipes,
+                Recipe {
+                    id: "codex-podman".into(),
+                    title: "Codex".into(),
+                    description: "Podman-backed Codex development session".into(),
+                    command: command.into(),
+                    cwd: "/".into(),
+                    workspace_policy: WorkspacePolicy::EphemeralScratch,
+                },
+            );
         }
     }
 
     recipes
+}
+
+fn upsert_recipe(recipes: &mut Vec<Recipe>, recipe: Recipe) {
+    if let Some(existing) = recipes.iter_mut().find(|r| r.id == recipe.id) {
+        *existing = recipe;
+    } else {
+        recipes.push(recipe);
+    }
+}
+
+fn builtin_recipe_seeds() -> Vec<RecipeSeed> {
+    vec![
+        RecipeSeed {
+            id: "codex-podman",
+            title: "Codex",
+            description: "Podman-backed Codex development session",
+            script_name: "codex-podman",
+            script: CODEX_PODMAN_RECIPE,
+        },
+        RecipeSeed {
+            id: "podman-ubuntu",
+            title: "Ubuntu",
+            description: "Podman Ubuntu 24.04 shell",
+            script_name: "podman-ubuntu",
+            script: PODMAN_UBUNTU_RECIPE,
+        },
+        RecipeSeed {
+            id: "podman-alpine",
+            title: "Alpine",
+            description: "Podman Alpine shell",
+            script_name: "podman-alpine",
+            script: PODMAN_ALPINE_RECIPE,
+        },
+    ]
 }
 
 async fn prepare_scratch_dir(
@@ -406,6 +558,12 @@ async fn prepare_scratch_dir(
 }
 
 async fn set_private_dir_permissions(path: &Path) -> Result<()> {
+    let permissions = std::fs::Permissions::from_mode(0o700);
+    tokio::fs::set_permissions(path, permissions).await?;
+    Ok(())
+}
+
+async fn set_private_file_permissions(path: &Path) -> Result<()> {
     let permissions = std::fs::Permissions::from_mode(0o700);
     tokio::fs::set_permissions(path, permissions).await?;
     Ok(())
