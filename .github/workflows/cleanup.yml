@@ -65,7 +65,8 @@ jobs:
       CF_ZONE_ID:        ${{ secrets.DD_CP_CF_ZONE_ID }}
       DD_DOMAIN:         ${{ vars.DD_CF_DOMAIN || 'devopsdefender.com' }}
       GH_TOKEN:          ${{ github.token }}
-      DD_LOCAL_HOST:     ${{ secrets.DD_LOCAL_HOST }}
+      DD_LOCAL_HOST:     ${{ vars.BAREMETAL_STAGING_HOST || secrets.DD_LOCAL_HOST }}
+      DD_LOCAL_SSH_USER: ${{ vars.BAREMETAL_STAGING_USER || 'tdx2' }}
       DD_LOCAL_SSH_KEY:  ${{ secrets.DD_LOCAL_SSH_KEY }}
       EVENT_NAME:        ${{ github.event_name }}
       DELETED_REF:       ${{ github.event.ref }}
@@ -114,16 +115,17 @@ jobs:
                 -o StrictHostKeyChecking=accept-new \
                 -o ServerAliveInterval=30 \
                 -o ConnectTimeout=15 \
-                tdx2@"$DD_LOCAL_HOST" bash -s -- "$env" <<'EOSSH' || true
+                "$DD_LOCAL_SSH_USER@$DD_LOCAL_HOST" bash -s -- "$env" <<'EOSSH' || true
           set -euo pipefail
           env="$1"
           prefix="dd-local-$env"
-          domains=$(virsh list --all --name | grep -E "^${prefix}($|-)" || true)
+          domains=$(sudo -n virsh list --all --name)
+          domains=$(printf '%s\n' "$domains" | grep -E "^${prefix}($|-)" || true)
           for vm in $domains; do
-            virsh destroy "$vm" 2>/dev/null || true
-            virsh undefine "$vm" --managed-save --snapshots-metadata --nvram 2>/dev/null \
-              || virsh undefine "$vm" --managed-save --snapshots-metadata 2>/dev/null \
-              || virsh undefine "$vm" 2>/dev/null \
+            sudo -n virsh destroy "$vm" 2>/dev/null || true
+            sudo -n virsh undefine "$vm" --managed-save --snapshots-metadata --nvram 2>/dev/null \
+              || sudo -n virsh undefine "$vm" --managed-save --snapshots-metadata 2>/dev/null \
+              || sudo -n virsh undefine "$vm" 2>/dev/null \
               || true
             echo "  - libvirt $vm"
           done
@@ -216,9 +218,9 @@ jobs:
                 -o StrictHostKeyChecking=accept-new \
                 -o ServerAliveInterval=30 \
                 -o ConnectTimeout=15 \
-                tdx2@"$DD_LOCAL_HOST" \
-                "virsh list --all --name | grep -oE '^dd-local-pr-[0-9]+' | sed 's/^dd-local-//' | sort -u" \
-                2>/dev/null || true)
+                "$DD_LOCAL_SSH_USER@$DD_LOCAL_HOST" \
+                "sudo -n virsh list --all --name | grep -oE '^dd-local-pr-[0-9]+' | sed 's/^dd-local-//' | sort -u" \
+                || true)
             vm_envs=$(gcloud compute instances list \
               --project="$GCP_PROJECT_ID" \
               --filter='labels.devopsdefender=managed AND labels.dd_env~"^pr-" AND status=RUNNING' \
