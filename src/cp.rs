@@ -798,6 +798,17 @@ async fn fleet(State(s): State<St>) -> Response {
     let mut rows = String::new();
     let mut by_id: Vec<_> = agents.into_iter().collect();
     by_id.sort_by(|a, b| a.0.cmp(&b.0));
+    let healthy = by_id.iter().filter(|(_, a)| a.status == "healthy").count();
+    let read_only = by_id
+        .iter()
+        .filter(|(_, a)| a.agent_mode == AgentMode::ReadOnly)
+        .count();
+    let read_write = by_id
+        .iter()
+        .filter(|(_, a)| a.agent_mode == AgentMode::ReadWrite)
+        .count();
+    let unit_total: usize = by_id.iter().map(|(_, a)| a.units.len()).sum();
+    let oracle_total: usize = by_id.iter().map(|(_, a)| a.oracles.len()).sum();
     for (_, a) in &by_id {
         let mem = if a.memory_total_mb > 0 {
             format!("{}/{} MB", a.memory_used_mb, a.memory_total_mb)
@@ -809,7 +820,7 @@ async fn fleet(State(s): State<St>) -> Response {
 <td><span class="pill {st_cls}">{st}</span></td><td>{att}</td>
 <td>{mode}</td><td>{integrity}</td>
 <td>{cpu}%</td><td>{mem}</td><td>{n}</td><td>{u}</td><td>{o}</td>
-<td class="dim">{host}</td></tr>"#,
+<td>{actions}</td><td class="dim">{host}</td></tr>"#,
             id = html::escape(&a.agent_id),
             vm = html::escape(&a.vm_name),
             st_cls = status_class(&a.status),
@@ -821,6 +832,7 @@ async fn fleet(State(s): State<St>) -> Response {
             n = a.deployment_count,
             u = a.unit_count,
             o = a.oracles.len(),
+            actions = agent_actions(a),
             host = html::escape(&a.hostname),
         ));
     }
@@ -838,8 +850,9 @@ async fn fleet(State(s): State<St>) -> Response {
                     .collect::<Vec<_>>()
                     .join(" · ")
             };
+            let actions = unit_actions(a, u);
             unit_rows.push_str(&format!(
-                r#"<tr><td><a href="/agent/{id}">{vm}</a></td><td>{title}<div class="dim">{app}</div></td><td>{kind}</td><td>{mode}</td><td>{integrity}</td><td><span class="pill {cls}">{status}</span></td><td>{logs}</td><td>{refs}</td></tr>"#,
+                r#"<tr><td><a href="/agent/{id}">{vm}</a></td><td>{title}<div class="dim">{app}</div></td><td>{kind}</td><td>{mode}</td><td>{integrity}</td><td><span class="pill {cls}">{status}</span></td><td>{logs}</td><td>{actions}</td><td>{refs}</td></tr>"#,
                 id = html::escape(&a.agent_id),
                 vm = html::escape(&a.vm_name),
                 title = html::escape(&u.title),
@@ -854,6 +867,7 @@ async fn fleet(State(s): State<St>) -> Response {
                 } else {
                     format!("{} line(s)", u.log_line_count)
                 },
+                actions = actions,
                 refs = refs,
             ));
         }
@@ -863,14 +877,14 @@ async fn fleet(State(s): State<St>) -> Response {
         r#"<div class="empty">No agents registered</div>"#.to_string()
     } else {
         format!(
-            r#"<table><tr><th>vm</th><th>status</th><th>att</th><th>mode</th><th>integrity</th><th>cpu</th><th>mem</th><th>wl</th><th>units</th><th>oracles</th><th>host</th></tr>{rows}</table>"#
+            r#"<table><tr><th>vm</th><th>status</th><th>att</th><th>mode</th><th>integrity</th><th>cpu</th><th>mem</th><th>wl</th><th>units</th><th>oracles</th><th>actions</th><th>host</th></tr>{rows}</table>"#
         )
     };
     let unit_table = if unit_rows.is_empty() {
         r#"<div class="empty">No managed units reported yet</div>"#.to_string()
     } else {
         format!(
-            r#"<div class="section">Managed units</div><table><tr><th>agent</th><th>unit</th><th>kind</th><th>mode</th><th>integrity</th><th>status</th><th>logs</th><th>refs</th></tr>{unit_rows}</table>"#
+            r#"<div class="section">Managed units</div><table><tr><th>agent</th><th>unit</th><th>kind</th><th>mode</th><th>integrity</th><th>status</th><th>logs</th><th>actions</th><th>refs</th></tr>{unit_rows}</table>"#
         )
     };
 
@@ -878,10 +892,23 @@ async fn fleet(State(s): State<St>) -> Response {
         "DD Fleet",
         &html::nav(&[("Fleet", "/", true)]),
         &format!(
-            r#"<h1>Fleet</h1><div class="sub">{host} · env {env} · {n} agent(s)</div>{table}{unit_table}"#,
+            r#"<h1>Fleet</h1><div class="sub">{host} · env {env} · {n} agent(s)</div>
+<div class="cards">
+  <div class="card"><div class="label">Healthy</div><div class="value green">{healthy}/{n}</div></div>
+  <div class="card"><div class="label">Read/write</div><div class="value blue">{read_write}</div></div>
+  <div class="card"><div class="label">Read-only</div><div class="value mauve">{read_only}</div></div>
+  <div class="card"><div class="label">Units</div><div class="value peach">{unit_total}</div></div>
+  <div class="card"><div class="label">Oracles</div><div class="value green">{oracle_total}</div></div>
+</div>
+{table}{unit_table}"#,
             host = html::escape(&s.cfg.hostname),
             env = html::escape(&s.cfg.common.env_label),
             n = by_id.len(),
+            healthy = healthy,
+            read_write = read_write,
+            read_only = read_only,
+            unit_total = unit_total,
+            oracle_total = oracle_total,
             unit_table = unit_table,
         ),
     ))
@@ -1392,6 +1419,77 @@ fn status_class(status: &str) -> &'static str {
         "deploying" | "registering" | "unknown" | "stale" => "deploying",
         "failed" | "exited" | "error" | "dead" => "failed",
         _ => "idle",
+    }
+}
+
+fn action_link(label: &str, href: &str) -> String {
+    format!(
+        r#"<a href="{href}" target="_blank">{label}</a>"#,
+        href = html::escape(href),
+        label = html::escape(label),
+    )
+}
+
+fn has_shell(a: &collector::Agent) -> bool {
+    a.agent_id == "control-plane" || a.units.iter().any(|u| u.kind == UnitKind::Shell)
+}
+
+fn agent_actions(a: &collector::Agent) -> String {
+    let mut links = Vec::new();
+    links.push(action_link("details", &format!("/agent/{}", a.agent_id)));
+    if a.agent_id != "control-plane" {
+        links.push(action_link(
+            "dashboard",
+            &format!("https://{}/", a.hostname),
+        ));
+        links.push(action_link(
+            "api",
+            &format!("https://{}/health", cf::agent_api_hostname(&a.hostname)),
+        ));
+    } else {
+        links.push(action_link("health", "/health"));
+    }
+    if has_shell(a) {
+        links.push(action_link(
+            "shell",
+            &format!("https://{}/", cf::label_hostname(&a.hostname, "shell")),
+        ));
+    }
+    for oracle in &a.oracles {
+        if let Some(url) = &oracle.vanity_url {
+            links.push(action_link(&oracle.hostname_label, url));
+        }
+    }
+    if links.is_empty() {
+        r#"<span class="dim">none</span>"#.into()
+    } else {
+        links.join(" · ")
+    }
+}
+
+fn unit_actions(a: &collector::Agent, u: &crate::units::ManagedUnit) -> String {
+    let mut links = Vec::new();
+    if u.kind == UnitKind::Shell {
+        links.push(action_link(
+            "shell",
+            &format!("https://{}/", cf::label_hostname(&a.hostname, "shell")),
+        ));
+    }
+    if let Some(oracle) = &u.oracle {
+        if let Some(url) = &oracle.vanity_url {
+            links.push(action_link("oracle", url));
+        }
+    }
+    if a.agent_id == "control-plane" && u.log_line_count > 0 {
+        links.push(action_link(
+            "logs",
+            &format!("/agent/control-plane/logs/{}", u.app_name),
+        ));
+    }
+    if links.is_empty() {
+        r#"<span class="dim">none</span>"#.into()
+    } else {
+        links.join(" · ")
     }
 }
 
