@@ -160,12 +160,28 @@ build_config_iso() {
 
 build_overlay() {
   local overlay="$IMG_DIR/$VM.qcow2"
+  local marker="$overlay.base"
+  local base_fingerprint
+  if [ -r "$BASE.tag" ]; then
+    base_fingerprint="tag:$(cat "$BASE.tag")"
+  else
+    base_fingerprint="stat:$(stat -c '%s:%Y' "$BASE")"
+  fi
+
   if [ -f "$overlay" ]; then
-    echo "  overlay $overlay already exists (reusing)"
-    return
+    local existing_fingerprint=""
+    [ -r "$marker" ] && existing_fingerprint="$(cat "$marker")"
+    if [ "$existing_fingerprint" != "$base_fingerprint" ]; then
+      echo "  overlay $overlay was built from ${existing_fingerprint:-unknown base}; recreating for $base_fingerprint"
+      rm -f "$overlay" "$marker"
+    else
+      echo "  overlay $overlay already exists (reusing)"
+      return
+    fi
   fi
   # 160 GB — general shape from the DD capacity rule. Sparse qcow2.
   qemu-img create -q -F qcow2 -b "$BASE" -f qcow2 "$overlay" 160G
+  printf '%s\n' "$base_fingerprint" > "$marker"
   echo "  wrote $overlay (160G, backing $BASE)"
 }
 
@@ -286,13 +302,13 @@ undefine_domain() {
 }
 
 echo "== $VM → https://$HOSTNAME (env=$ENV_LABEL) =="
+# Destroy any previous instance before deciding whether its root overlay
+# can be reused. Root overlays are tied to the exact EE base image, while
+# workload/data disks are separate and may persist across base updates.
+undefine_domain "$VM"
+sudo rm -f "/var/log/ee-local-$NAME.log" 2>/dev/null || true
 build_overlay
 build_config_iso
 xml=$(render_domain_xml)
-# Destroy any previous instance. rm on /var/log needs sudo (root-owned
-# by libvirt); || true so a missing file or permission denial doesn't
-# fail the deploy — libvirt will overwrite on domain start anyway.
-undefine_domain "$VM"
-sudo rm -f "/var/log/ee-local-$NAME.log" 2>/dev/null || true
 echo "$xml" | virsh define /dev/stdin >/dev/null
 echo "  defined $VM"
