@@ -16,4 +16,3 @@ pub mod shell;
 pub mod stonith;
 pub mod taint;
 pub mod units;
-pub mod workload_helpers;

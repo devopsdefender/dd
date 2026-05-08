@@ -28,7 +28,7 @@ A **workload** is a JSON object consumed by easyenclave's `DeployRequest` (see
 ```json
 {
   "app_name": "myapp",
-  "cmd": ["/bin/busybox", "sh", "-c", "echo hello; sleep inf"]
+  "cmd": ["myapp"]
 }
 ```
 
@@ -46,6 +46,24 @@ and is spawned by `cmd`:
   }
 }
 ```
+
+EE does not ship a rootfs shell. If a workload wants shell scripting, fetch a
+shell/toolbox as an explicit workload asset first and run that asset:
+
+```json
+{
+  "app_name": "busybox",
+  "github_release": {
+    "repo": "devopsdefender/dd",
+    "asset": "busybox",
+    "tag": "${DD_RELEASE_TAG}"
+  }
+}
+```
+
+Then dependent recipes can use `"cmd": ["busybox", "sh", "-c", "..."]`.
+That keeps EE shell-less while letting workload bundles bring their own
+userspace when they need scripting.
 
 Add `env` to inject config:
 
@@ -154,6 +172,7 @@ inline in two places so both lifecycle points behave identically:
 
 | workload | CP VM | agent VM (preview) | agent VM (prod) |
 |---|---|---|---|
+| `busybox` | | ✅ | ✅ |
 | `cloudflared` | ✅ | ✅ | ✅ |
 | `dd-agent` | | ✅ | ✅ |
 | `dd-shell` | | ✅ | ✅ |
@@ -166,7 +185,8 @@ Additional examples:
 
 - `apps/human-readonly`: tiny preview-only read-only oracle. It emits logs for
   dd-shell's read-only terminal, serves `/oracle.json` on port 8082, gets a
-  vanity `oracle.<agent-hostname>` address, and appears in the dashboards.
+  vanity `oracle.<agent-hostname>` address, and appears in the dashboards. It
+  is a shell workload recipe, not a `devopsdefender` binary subcommand.
 - `apps/oracle-readonly`: standalone oracle example with the same scraper and
   vanity-address metadata; copy this shape into real oracle app repos.
 - `apps/confidential-shell`: runs dd-shell with
@@ -193,10 +213,10 @@ same CPU-only boot shape without demo workloads for now.
 
 EasyEnclave spawns boot workloads concurrently — there's no declared
 dependency graph. Dependents self-sequence by polling for their prerequisites.
-Worked examples from this tree:
-
-- `podman-bootstrap` waits for `podman-static`'s tarball
-  (`until [ -x $SRC/usr/local/bin/podman ]; do sleep 1; done`).
+- `podman-bootstrap` waits for `podman-static`'s tarball, then stages
+  `podman`, `conmon`, `crun`, config, and the `podman` wrapper script.
+- Shell-based recipes wait for `busybox` by depending on the fetch-only
+  `busybox` workload in the boot set.
 
 Costs seconds of wasted polling at boot; easy to reason about; no
 workload-runner changes needed.

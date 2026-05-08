@@ -8,7 +8,7 @@
     "DD_SHELL_EE_SOCKET=/var/lib/easyenclave/agent.sock"
   ],
   "cmd": [
-    "/bin/busybox", "sh", "-c",
-    "set -e; until [ -x /var/lib/easyenclave/bin/devopsdefender ]; do sleep 1; done; mkdir -p /var/lib/easyenclave/data/dd-shell /tmp/dd-shell-bin-dir; cp /var/lib/easyenclave/bin/devopsdefender /tmp/dd-shell-bin-dir/devopsdefender; chmod +x /tmp/dd-shell-bin-dir/devopsdefender; exec /tmp/dd-shell-bin-dir/devopsdefender shell"
+    "busybox", "sh", "-c",
+    "set -e; BB=/var/lib/easyenclave/bin/busybox; until [ -x /var/lib/easyenclave/bin/devopsdefender ]; do $BB sleep 1; done; $BB mkdir -p /var/lib/easyenclave/data/dd-shell /tmp/dd-shell-bin-dir; $BB cp /var/lib/easyenclave/bin/devopsdefender /tmp/dd-shell-bin-dir/devopsdefender; $BB chmod +x /tmp/dd-shell-bin-dir/devopsdefender; exec /tmp/dd-shell-bin-dir/devopsdefender shell"
   ]
 }

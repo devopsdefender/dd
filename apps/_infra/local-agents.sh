@@ -201,6 +201,7 @@ build_config_iso() {
 
   # Boot workload chain (EE spawns concurrently; dependents self-sequence
   # via `until` loops):
+  #   busybox        — fetch an explicit workload-owned shell/toolbox asset
   #   podman-static  — fetch the podman tarball into /var/lib/easyenclave/bin
   #   podman-bootstrap — stage binaries, install /var/lib/easyenclave/bin/podman
   #                    wrapper + containers.conf + policy.json
@@ -212,14 +213,16 @@ build_config_iso() {
   bare_workloads=$({
     case "$name" in
       preview-oracle)
+        DD_RELEASE_TAG="$DD_RELEASE_TAG" bake "$REPO_ROOT/apps/busybox/workload.json.tmpl"
         bake "$REPO_ROOT/apps/cloudflared/workload.json"
         bake "$REPO_ROOT/apps/human-readonly/workload.json"
         ;;
       *)
-        # mount-data runs first so `/dev/vdc` is at
-        # `/var/lib/easyenclave/data` by the time podman-bootstrap reaches
-        # its `mountpoint -q` wait (both spawn concurrently but EE's
-        # pre-fetch serializes binary downloads before boot-loop).
+        # mount-data gets `/dev/vdc` to `/var/lib/easyenclave/data`;
+        # podman-bootstrap waits on /proc/mounts before configuring
+        # storage. EE spawns boot workloads concurrently, so each
+        # dependent workload self-sequences.
+        DD_RELEASE_TAG="$DD_RELEASE_TAG" bake "$REPO_ROOT/apps/busybox/workload.json.tmpl"
         bake "$REPO_ROOT/apps/mount-data/workload.json"
         bake "$REPO_ROOT/apps/podman-static/workload.json"
         bake "$REPO_ROOT/apps/podman-bootstrap/workload.json"
