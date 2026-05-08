@@ -174,11 +174,13 @@ Additional examples:
   transcript history survives on the workload disk.
 - `apps/codex-podman-shell`: alternative read-write shell workload. It exposes
   the normal `-shell` label, stores encrypted dd-shell history under
-  `/var/lib/easyenclave/data/dd-shell`, and makes each new PTY enter a
-  Podman-backed Node container.
-  The container installs `@openai/codex` on first use and persists login/config
-  under `/var/lib/easyenclave/data/codex/home`, so `codex login` can be
-  completed interactively from the browser terminal. Use this instead of
+  `/var/lib/easyenclave/data/dd-shell`, and advertises a Codex recipe in the
+  shell UI. The normal shell recipe remains available. Launching Codex starts a
+  Podman-backed Node container with per-session home, workspace, cache, and tmp
+  directories supplied by dd-shell. The container installs `@openai/codex` on
+  first use, so `codex login` can be completed interactively from the browser
+  terminal. Session scratch is intentionally ephemeral in this first slice; the
+  encrypted transcript remains under `DD_SHELL_DIR`. Use this instead of
   `dd-shell`, not alongside it, unless you give one of them a different
   `hostname_label`.
 

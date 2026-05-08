@@ -97,7 +97,7 @@ pub async fn run(
 ) -> ! {
     let prefix = cf::agent_prefix(&env_label);
     let http = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(20))
         .build()
         .unwrap_or_else(|_| reqwest::Client::new());
 
@@ -172,7 +172,7 @@ async fn tick(
                     None,
                     Some(format!("status {}", resp.status())),
                 ),
-                Err(e) => (name, tunnel_id, host, None, Some(e.to_string())),
+                Err(e) => (name, tunnel_id, host, None, Some(format!("{e:?}"))),
             }
         }
     });
