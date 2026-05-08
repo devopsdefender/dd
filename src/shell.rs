@@ -59,6 +59,7 @@ until [ -x "$PODMAN" ]; do echo "codex-podman: waiting for podman"; $BB sleep 2;
 $BB mkdir -p "$HOME_DIR" "$WORKSPACE" "$CACHE_DIR" "$TMP_DIR"
 SAFE_SESSION=$(printf '%s' "$SESSION_ID" | $BB tr -c 'A-Za-z0-9_.-' '-')
 exec "$PODMAN" run --rm --replace -it --pull=missing \
+  --network=host \
   --name "codex-shell-$SAFE_SESSION" \
   -e HOME=/root \
   -e TERM=xterm-256color \
@@ -87,6 +88,7 @@ until [ -x "$PODMAN" ]; do echo "podman-ubuntu: waiting for podman"; $BB sleep 2
 $BB mkdir -p "$HOME_DIR" "$WORKSPACE" "$CACHE_DIR" "$TMP_DIR"
 SAFE_SESSION=$(printf '%s' "$SESSION_ID" | $BB tr -c 'A-Za-z0-9_.-' '-')
 exec "$PODMAN" run --rm --replace -it --pull=missing \
+  --network=host \
   --name "ubuntu-shell-$SAFE_SESSION" \
   -e HOME=/root \
   -e TERM=xterm-256color \
@@ -114,6 +116,7 @@ until [ -x "$PODMAN" ]; do echo "podman-alpine: waiting for podman"; $BB sleep 2
 $BB mkdir -p "$HOME_DIR" "$WORKSPACE" "$CACHE_DIR" "$TMP_DIR"
 SAFE_SESSION=$(printf '%s' "$SESSION_ID" | $BB tr -c 'A-Za-z0-9_.-' '-')
 exec "$PODMAN" run --rm --replace -it --pull=missing \
+  --network=host \
   --name "alpine-shell-$SAFE_SESSION" \
   -e HOME=/root \
   -e TERM=xterm-256color \

@@ -5,6 +5,7 @@
     "run",
     "--rm",
     "--pull=always",
+    "--network=host",
     "--name",
     "hello-world",
     "docker.io/library/busybox",
