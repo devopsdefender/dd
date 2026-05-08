@@ -1,7 +1,9 @@
 {
   "app_name": "mount-data",
   "cmd": [
-    "/bin/busybox", "sh", "-c",
-    "set -e\nDATA_DIR=/var/lib/easyenclave/data\nif [ -b /dev/vdc ]; then\n  mkdir -p \"$DATA_DIR\"\n  mount -t ext4 /dev/vdc \"$DATA_DIR\"\n  echo \"mount-data: mounted /dev/vdc on $DATA_DIR\"\nelse\n  echo mount-data: no /dev/vdc, skipping\nfi"
+    "busybox",
+    "sh",
+    "-c",
+    "set -eu\nBB=/var/lib/easyenclave/bin/busybox\nDATA=/var/lib/easyenclave/data\nif [ ! -e /dev/vdc ]; then echo 'mount-data: no /dev/vdc, skipping'; exit 0; fi\n$BB mkdir -p \"$DATA\"\nif ! $BB grep -q \" $DATA \" /proc/mounts; then $BB mount -t ext4 /dev/vdc \"$DATA\"; fi\necho \"mount-data: mounted /dev/vdc on $DATA\""
   ]
 }

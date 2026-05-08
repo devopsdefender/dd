@@ -8,7 +8,9 @@
     "interval_secs": 10
   },
   "cmd": [
-    "/bin/busybox", "sh", "-c",
-    "set -e\nWEB=/tmp/oracle-readonly-www\nmkdir -p \"$WEB\"\n(\n  cd \"$WEB\"\n  /bin/busybox httpd -f -p 0.0.0.0:8082\n) &\ni=0\nwhile true; do\n  i=$((i+1))\n  printf '{\"ok\":true,\"oracle\":\"oracle-readonly\",\"tick\":%s,\"integrity\":\"read_only\"}\\n' \"$i\" > \"$WEB/oracle.json\"\n  echo \"oracle-readonly: tick=$i status=ok\"\n  sleep 10\ndone"
+    "busybox",
+    "sh",
+    "-c",
+    "set -eu\nBB=/var/lib/easyenclave/bin/busybox\nROOT=/tmp/oracle-readonly\n$BB mkdir -p \"$ROOT\"\n$BB httpd -f -p 0.0.0.0:8082 -h \"$ROOT\" &\ntick=0\nwhile :; do tick=$((tick + 1)); ts=$($BB date -u +%Y-%m-%dT%H:%M:%SZ); printf '{\"ok\":true,\"oracle\":\"oracle-readonly\",\"recommendation\":\"ok\",\"integrity\":\"read_only\",\"tick\":%s,\"ts\":\"%s\"}\\n' \"$tick\" \"$ts\" > \"$ROOT/oracle.json\"; echo \"oracle-readonly: tick=$tick ts=$ts status=ok\"; $BB sleep 10; done"
   ]
 }

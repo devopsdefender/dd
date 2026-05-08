@@ -201,6 +201,7 @@ build_config_iso() {
 
   # Boot workload chain (EE spawns concurrently; dependents self-sequence
   # via `until` loops):
+  #   busybox        — fetch an explicit workload-owned shell/toolbox asset
   #   podman-static  — fetch the podman tarball into /var/lib/easyenclave/bin
   #   podman-bootstrap — stage binaries, install /var/lib/easyenclave/bin/podman
   #                    wrapper + containers.conf + policy.json
@@ -212,14 +213,16 @@ build_config_iso() {
   bare_workloads=$({
     case "$name" in
       preview-oracle)
+        DD_RELEASE_TAG="$DD_RELEASE_TAG" bake "$REPO_ROOT/apps/busybox/workload.json.tmpl"
         bake "$REPO_ROOT/apps/cloudflared/workload.json"
         bake "$REPO_ROOT/apps/human-readonly/workload.json"
         ;;
       *)
-        # mount-data runs first so `/dev/vdc` is at
-        # `/var/lib/easyenclave/data` by the time podman-bootstrap reaches
-        # its `mountpoint -q` wait (both spawn concurrently but EE's
-        # pre-fetch serializes binary downloads before boot-loop).
+        # mount-data gets `/dev/vdc` to `/var/lib/easyenclave/data`;
+        # podman-bootstrap waits on /proc/mounts before configuring
+        # storage. EE spawns boot workloads concurrently, so each
+        # dependent workload self-sequences.
+        DD_RELEASE_TAG="$DD_RELEASE_TAG" bake "$REPO_ROOT/apps/busybox/workload.json.tmpl"
         bake "$REPO_ROOT/apps/mount-data/workload.json"
         bake "$REPO_ROOT/apps/podman-static/workload.json"
         bake "$REPO_ROOT/apps/podman-bootstrap/workload.json"
@@ -286,11 +289,27 @@ build_overlay() {
   # sized per the DD capacity rule — see `build_workload_disk`.
   local name="$1"
   local overlay="$IMG_DIR/dd-local-$name.qcow2"
+  local marker="$overlay.base"
+  local base_fingerprint
+  if [ -r "$BASE.tag" ]; then
+    base_fingerprint="tag:$(cat "$BASE.tag")"
+  else
+    base_fingerprint="stat:$(stat -c '%s:%Y' "$BASE")"
+  fi
+
   if [ -f "$overlay" ]; then
-    echo "  overlay $overlay already exists (reusing)"
-    return
+    local existing_fingerprint=""
+    [ -r "$marker" ] && existing_fingerprint="$(cat "$marker")"
+    if [ "$existing_fingerprint" != "$base_fingerprint" ]; then
+      echo "  overlay $overlay was built from ${existing_fingerprint:-unknown base}; recreating for $base_fingerprint"
+      rm -f "$overlay" "$marker"
+    else
+      echo "  overlay $overlay already exists (reusing)"
+      return
+    fi
   fi
   qemu-img create -q -F qcow2 -b "$BASE" -f qcow2 "$overlay" 20G
+  printf '%s\n' "$base_fingerprint" > "$marker"
   echo "  wrote $overlay (20G sparse, backing $BASE)"
 }
 
@@ -484,6 +503,10 @@ define_agent() {
   env_label=$(env_from_url "$cp")
 
   echo "== dd-local-$name → $cp (env=$env_label) =="
+  # Destroy any previous instance before deciding whether its root overlay
+  # can be reused. Root overlays are tied to the exact EE base image; the
+  # separate workload disk remains persistent across base updates.
+  undefine_domain "dd-local-$name"
   build_overlay "$name"
   # Workload disk (/dev/vdc, ext4, mounted at /var/lib/easyenclave/data
   # by the mount-data boot workload). Sparse qcow2, so only grows with
@@ -492,7 +515,6 @@ define_agent() {
   build_config_iso "$name" "$cp" "$env_label"
   local xml
   xml=$(render_domain_xml "$name")
-  undefine_domain "dd-local-$name"
   virsh define "$xml" >/dev/null
   echo "  defined dd-local-$name (xml at $xml)"
 }

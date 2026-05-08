@@ -30,7 +30,7 @@ on:
         required: false
         default: 'latest'
       ee_tag:
-        description: 'Pin the libvirt base qcow2 to a specific easyenclave-mini release (e.g. image-1c6062146153 or mini-image-abc123456) for pre-flight testing a candidate EE Mini. Empty = workflow default.'
+        description: 'Pin the libvirt base qcow2 to a specific easyenclave-mini release (e.g. mini-image-139b2c96ebfd or mini-image-abc123456) for pre-flight testing a candidate EE Mini. Empty = workflow default.'
         required: false
         default: ''
 
@@ -57,8 +57,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install musl tools
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools busybox-static
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -83,6 +83,9 @@ jobs:
       - name: Build static binaries
         run: |
           cargo build --release -p devopsdefender --target x86_64-unknown-linux-musl
+          mkdir -p target/workload-assets
+          cp /bin/busybox target/workload-assets/busybox
+          chmod 0755 target/workload-assets/busybox
 
       - name: Resolve release tag
         id: meta
@@ -122,6 +125,7 @@ jobs:
           PRERELEASE: ${{ steps.meta.outputs.prerelease }}
         run: |
           DD_BINARY=target/x86_64-unknown-linux-musl/release/devopsdefender
+          BUSYBOX_BINARY=target/workload-assets/busybox
           # Rolling tags (latest, pr-*) get recreated each run. Versioned
           # v* tags are immutable.
           if [[ "$TAG" == "latest" || "$TAG" == pr-* ]]; then
@@ -130,7 +134,8 @@ jobs:
           gh release create "$TAG" $PRERELEASE \
             --title "$TAG" \
             --notes "Built from ${GITHUB_SHA}" \
-            "$DD_BINARY"
+            "$DD_BINARY" \
+            "$BUSYBOX_BINARY"
 
       - name: Rotate old PR pre-releases
         if: github.event_name == 'pull_request'
@@ -164,8 +169,8 @@ jobs:
       comment_on_pr: true
       ref: ${{ github.event.pull_request.head.sha }}
       # Pin preview to the same mini release as prod — one bump, one PR.
-      # Latest verified mini release as of 2026-05-05.
-      ee_tag: ${{ inputs.ee_tag || 'image-1c6062146153' }}
+      # Latest verified mini release as of 2026-05-08.
+      ee_tag: ${{ inputs.ee_tag || 'mini-image-139b2c96ebfd' }}
       owner: devopsdefender
     secrets: inherit
 
@@ -198,6 +203,6 @@ jobs:
       # when we want prod to move to a newer mini release. Static
       # pinning is the whole point — prod should never silently pick
       # up whatever mini shipped most recently.
-      ee_tag: ${{ inputs.ee_tag || 'image-1c6062146153' }}
+      ee_tag: ${{ inputs.ee_tag || 'mini-image-139b2c96ebfd' }}
       owner: devopsdefender
     secrets: inherit
