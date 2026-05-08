@@ -30,7 +30,7 @@ on:
         required: false
         default: 'latest'
       ee_tag:
-        description: 'Pin the libvirt base qcow2 to a specific easyenclave-mini release (e.g. image-1c6062146153 or mini-image-abc123456) for pre-flight testing a candidate EE Mini. Empty = workflow default.'
+        description: 'Pin the libvirt base qcow2 to a specific easyenclave-mini release (e.g. mini-image-139b2c96ebfd or mini-image-abc123456) for pre-flight testing a candidate EE Mini. Empty = workflow default.'
         required: false
         default: ''
 
@@ -164,8 +164,8 @@ jobs:
       comment_on_pr: true
       ref: ${{ github.event.pull_request.head.sha }}
       # Pin preview to the same mini release as prod — one bump, one PR.
-      # Latest verified mini release as of 2026-05-05.
-      ee_tag: ${{ inputs.ee_tag || 'image-1c6062146153' }}
+      # Latest verified mini release as of 2026-05-08.
+      ee_tag: ${{ inputs.ee_tag || 'mini-image-139b2c96ebfd' }}
       owner: devopsdefender
     secrets: inherit
 
@@ -198,6 +198,6 @@ jobs:
       # when we want prod to move to a newer mini release. Static
       # pinning is the whole point — prod should never silently pick
       # up whatever mini shipped most recently.
-      ee_tag: ${{ inputs.ee_tag || 'image-1c6062146153' }}
+      ee_tag: ${{ inputs.ee_tag || 'mini-image-139b2c96ebfd' }}
       owner: devopsdefender
     secrets: inherit
