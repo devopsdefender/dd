@@ -225,14 +225,14 @@ runs:
             last_payload="$payload"
           fi
           ready_count=$(echo "$payload" | jq -r --arg since "$since" --argjson expected "$expected_json" '
-                [.[] | select(.status=="healthy" and .last_seen > $since and (.vm_name as $vm | $expected | index($vm)))]
+                [.[] | select((.status=="healthy" or .status=="registering") and .last_seen > $since and (.vm_name as $vm | $expected | index($vm)))]
                 | unique_by(.vm_name)
                 | length' 2>/dev/null || echo 0)
           if [ "$ready_count" = "${#expected_vms[@]}" ]; then
             echo "registered agents:"
             echo "$payload" | jq -r --arg since "$since" --argjson expected "$expected_json" '
-              .[] | select(.status=="healthy" and .last_seen > $since and (.vm_name as $vm | $expected | index($vm)))
-              | "  \(.vm_name) at https://\(.hostname)"' 2>/dev/null || true
+              .[] | select((.status=="healthy" or .status=="registering") and .last_seen > $since and (.vm_name as $vm | $expected | index($vm)))
+              | "  \(.vm_name) [\(.status)] at https://\(.hostname)"' 2>/dev/null || true
             cleanup_tail
             exit 0
           fi

@@ -266,7 +266,7 @@ pub async fn run() -> Result<()> {
         .and_then(|s| s.parse::<u16>().ok())
         .unwrap_or(DEFAULT_PORT);
     let dir = std::env::var("DD_SHELL_DIR").unwrap_or_else(|_| DEFAULT_DIR.into());
-    let default_shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+    let requested_shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
     let scratch_root = std::env::var("DD_SHELL_SCRATCH_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from(&dir).join("sessions"));
@@ -279,6 +279,7 @@ pub async fn run() -> Result<()> {
     tokio::fs::create_dir_all(&scratch_root).await?;
     set_private_dir_permissions(&scratch_root).await?;
     let recipe_dir = shell_dir.join("recipes");
+    let default_shell = install_default_shell_command(&recipe_dir, &requested_shell).await?;
     let recipe_scripts = install_builtin_recipe_scripts(&recipe_dir).await?;
     let recipes = Arc::new(load_recipes(&default_shell, recipe_scripts));
 
@@ -452,6 +453,35 @@ fn select_recipe(app: &App, recipe_id: Option<&str>, command: Option<String>) ->
         .find(|recipe| recipe.id == id)
         .cloned()
         .ok_or_else(|| Error::BadRequest(format!("unknown recipe: {id}")))
+}
+
+async fn install_default_shell_command(dir: &Path, requested_shell: &str) -> Result<String> {
+    if executable_exists(requested_shell).await {
+        return Ok(requested_shell.into());
+    }
+    if executable_exists("/bin/sh").await {
+        return Ok("/bin/sh".into());
+    }
+    if executable_exists("/var/lib/easyenclave/bin/busybox").await {
+        tokio::fs::create_dir_all(dir).await?;
+        set_private_dir_permissions(dir).await?;
+        let path = dir.join("plain-shell");
+        tokio::fs::write(
+            &path,
+            "#!/var/lib/easyenclave/bin/busybox sh\nexec /var/lib/easyenclave/bin/busybox sh\n",
+        )
+        .await?;
+        set_private_file_permissions(&path).await?;
+        return Ok(path.display().to_string());
+    }
+    Ok(requested_shell.into())
+}
+
+async fn executable_exists(path: &str) -> bool {
+    match tokio::fs::metadata(path).await {
+        Ok(meta) => meta.is_file() && meta.permissions().mode() & 0o111 != 0,
+        Err(_) => false,
+    }
 }
 
 async fn install_builtin_recipe_scripts(dir: &Path) -> Result<Vec<Recipe>> {

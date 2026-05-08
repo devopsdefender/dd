@@ -118,6 +118,7 @@ build_config_iso() {
 
   local workloads
   workloads=$({
+    DD_RELEASE_TAG="$DD_RELEASE_TAG" bake "$REPO_ROOT/apps/busybox/workload.json.tmpl"
     bake "$REPO_ROOT/apps/cloudflared/workload.json"
     DD_RELEASE_TAG="$DD_RELEASE_TAG" \
       CLOUDFLARE_API_TOKEN="$CLOUDFLARE_API_TOKEN" \
