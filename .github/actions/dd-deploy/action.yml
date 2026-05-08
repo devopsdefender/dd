@@ -67,8 +67,10 @@ runs:
         # Registration is already ITA-gated by the CP. Do not block on
         # the CP collector marking it healthy here: freshly-created
         # Cloudflare DNS can be visible to the GitHub runner before it
-        # is visible inside the just-booted CP VM. The next gate probes
-        # the agent API hostname directly before POSTing /deploy.
+        # is visible inside the just-booted CP VM. The collector may
+        # briefly mark that agent stale for the same reason. The next
+        # gate probes the agent API hostname directly before POSTing
+        # /deploy, so direct reachability remains authoritative.
         echo "waiting for registered agent vm_name=$VM_NAME on $CP_URL"
         deadline=$(( $(date +%s) + 120 ))
         agent_host=""
@@ -81,7 +83,7 @@ runs:
           if [ -n "$agents" ]; then
             last_agents="$agents"
             agent_host=$(echo "$agents" | jq -r --arg vm "$VM_NAME" '
-                [.[] | select(.vm_name == $vm and (.status == "healthy" or .status == "registering"))]
+                [.[] | select(.vm_name == $vm and (.status == "healthy" or .status == "registering" or .status == "stale"))]
                 | sort_by(.last_seen) | reverse | .[0].hostname // empty')
             [ -n "$agent_host" ] && break
           fi
