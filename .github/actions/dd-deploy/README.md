@@ -24,7 +24,7 @@ The action will:
 
 1. Look up the current hostname for your target agent via the CP's `/api/agents`.
 2. Mint a GitHub Actions OIDC JWT with `audience: dd-agent`.
-3. POST the baked workload JSON to `https://<agent>-agent-api/deploy` with `Authorization: Bearer <oidc>`.
+3. POST the baked workload JSON to the agent API hostname with `Authorization: Bearer <oidc>`.
 4. Poll the agent API subdomain's `/health` until the deployment appears (or fail after `wait-for-deployment-seconds`).
 
 ## Inputs

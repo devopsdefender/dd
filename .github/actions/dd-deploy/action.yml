@@ -79,10 +79,17 @@ runs:
           echo "::error::no healthy agent with vm_name=$VM_NAME"
           exit 1
         fi
-        agent_api_host="${agent_host%%.*}-agent-api.${agent_host#*.}"
+        agent_label="${agent_host%%.*}"
+        agent_domain="${agent_host#*.}"
+        if [[ "$agent_label" == *-agent-* ]]; then
+          agent_api_label="${agent_label/-agent-/-api-}"
+        else
+          agent_api_label="${agent_label}-agent-api"
+        fi
+        agent_api_host="${agent_api_label}.${agent_domain}"
         echo "agent-host=$agent_host" >> "$GITHUB_OUTPUT"
 
-        # The agent-api hostname and its CF Access bypass app are created
+        # The agent API hostname and its CF Access bypass app are created
         # immediately before preview deploys. DNS can resolve before the
         # bypass decision is active at every edge, which shows up as transient
         # 401s on /deploy. Gate the mutating request on the read-only health
