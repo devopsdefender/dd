@@ -29,7 +29,24 @@ pub fn agent_prefix(env: &str) -> String {
     format!("dd-{env}-agent-")
 }
 pub fn agent_api_hostname(agent_hostname: &str) -> String {
-    label_hostname(agent_hostname, AGENT_API_LABEL)
+    match agent_hostname.split_once('.') {
+        Some((base, rest)) => {
+            if let Some((prefix, suffix)) = base.split_once("-agent-") {
+                format!("{prefix}-api-{suffix}.{rest}")
+            } else {
+                format!("{base}-{AGENT_API_LABEL}.{rest}")
+            }
+        }
+        None => format!("{agent_hostname}-{AGENT_API_LABEL}"),
+    }
+}
+
+pub fn extra_hostname(agent_hostname: &str, label: &str) -> String {
+    if label == AGENT_API_LABEL {
+        agent_api_hostname(agent_hostname)
+    } else {
+        label_hostname(agent_hostname, label)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -182,7 +199,7 @@ async fn apply_ingress(
         .iter()
         .map(|(label, port)| {
             serde_json::json!({
-                "hostname": label_hostname(hostname, label),
+                "hostname": extra_hostname(hostname, label),
                 "service": format!("http://localhost:{port}"),
             })
         })
@@ -208,7 +225,7 @@ async fn apply_ingress(
     upsert_cname(http, cf, tunnel_id, hostname).await?;
     let mut extra_hostnames = Vec::with_capacity(extras.len());
     for (label, _) in extras {
-        let extra = label_hostname(hostname, label);
+        let extra = extra_hostname(hostname, label);
         upsert_cname(http, cf, tunnel_id, &extra).await?;
         extra_hostnames.push(extra);
     }
@@ -708,7 +725,7 @@ pub async fn provision_cp_access(
 ///   - Human: `{agent}.{domain}` — browser dashboard only
 ///   - Human: `<admin-label>.{agent}.{domain}` for labels in
 ///     `ADMIN_LABELS` — org members only
-///   - Bypass: `{agent}-agent-api.{domain}` — machine API only
+///   - Bypass: `dd-{env}-api-{uuid}.{domain}` — machine API only
 ///   - Bypass: `{agent}.{domain}/health` — public; carries the Noise
 ///     pre-handshake `{quote_b64, pubkey_hex}` in its response
 ///   - Bypass: `{agent}.{domain}/deploy` — GH-OIDC-gated in code
@@ -768,10 +785,10 @@ pub async fn provision_agent_access(
 
     let desired: std::collections::HashSet<String> = workload_labels
         .iter()
-        .map(|l| label_hostname(agent_hostname, l))
+        .map(|l| extra_hostname(agent_hostname, l))
         .collect();
     for label in workload_labels {
-        let domain = label_hostname(agent_hostname, label);
+        let domain = extra_hostname(agent_hostname, label);
         if is_admin_label(label) {
             ensure_app(
                 http,
@@ -797,6 +814,7 @@ pub async fn provision_agent_access(
         .unwrap_or((agent_hostname, ""));
     let prefix = format!("{base}-");
     let suffix_tld = format!(".{tld}");
+    let agent_api_domain = agent_api_hostname(agent_hostname);
     let resp = call(
         http,
         cf,
@@ -810,7 +828,9 @@ pub async fn provision_agent_access(
             let Some(domain) = app["domain"].as_str() else {
                 continue;
             };
-            if !(domain.starts_with(&prefix) && domain.ends_with(&suffix_tld)) {
+            if domain != agent_api_domain
+                && !(domain.starts_with(&prefix) && domain.ends_with(&suffix_tld))
+            {
                 continue;
             }
             if desired.contains(domain) {
@@ -854,6 +874,7 @@ pub async fn delete_access_apps_for(http: &Client, cf: &CfCreds, agent_hostname:
         .unwrap_or((agent_hostname, ""));
     let prefix = format!("{base}-");
     let suffix_tld = format!(".{tld}");
+    let agent_api_domain = agent_api_hostname(agent_hostname);
     for app in items {
         let Some(domain) = app["domain"].as_str() else {
             continue;
@@ -863,6 +884,7 @@ pub async fn delete_access_apps_for(http: &Client, cf: &CfCreds, agent_hostname:
         // `{base}-*.{tld}`.
         let matches_agent = domain == agent_hostname
             || domain.starts_with(&format!("{agent_hostname}/"))
+            || domain == agent_api_domain
             || (domain.starts_with(&prefix) && domain.ends_with(&suffix_tld));
         if !matches_agent {
             continue;
@@ -904,7 +926,13 @@ mod tests {
     fn agent_api_hostname_uses_reserved_flat_subdomain() {
         assert_eq!(
             agent_api_hostname("dd-pr-144-agent-abc.devopsdefender.com"),
-            "dd-pr-144-agent-abc-agent-api.devopsdefender.com"
+            "dd-pr-144-api-abc.devopsdefender.com"
+        );
+        assert_eq!(
+            agent_api_hostname(
+                "dd-production-agent-73744f46-0a97-4628-ad8b-dd37a07b1e10.devopsdefender.com"
+            ),
+            "dd-production-api-73744f46-0a97-4628-ad8b-dd37a07b1e10.devopsdefender.com"
         );
     }
 

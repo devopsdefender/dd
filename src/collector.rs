@@ -6,7 +6,7 @@
 //! or mis-signed don't enter the store. One tick:
 //!
 //!   1. List CF tunnels whose name starts with `dd-{env}-agent-`.
-//!   2. Scrape `https://{tunnel-name}-agent-api.{domain}/health` in parallel.
+//!   2. Scrape `https://dd-{env}-api-{uuid}.{domain}/health` in parallel.
 //!   3. Verify the `ita_token` field from each /health body.
 //!   4. Insert on success, including tunnel id and reported ingress.
 //!   5. Mark dead / GC tunnel on repeated scrape failures.
@@ -264,7 +264,7 @@ async fn tick(
             let _ = cf::delete_cname(http, cf, &orphan.host).await;
             let _ = cf::delete_cname(http, cf, &cf::agent_api_hostname(&orphan.host)).await;
             for (label, _) in &orphan.extras {
-                let _ = cf::delete_cname(http, cf, &cf::label_hostname(&orphan.host, label)).await;
+                let _ = cf::delete_cname(http, cf, &cf::extra_hostname(&orphan.host, label)).await;
             }
             // Sweep the agent's CF Access apps — its human dashboard
             // app and every workload-URL bypass under this hostname.
