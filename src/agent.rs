@@ -53,6 +53,8 @@ const ITA_REFRESH: Duration = Duration::from_secs(180);
 /// Tuned so a revoke propagates within ~30s.
 const DEVICES_POLL: Duration = Duration::from_secs(30);
 
+const EE_READY_TIMEOUT: Duration = Duration::from_secs(90);
+
 #[derive(Clone)]
 struct St {
     cfg: Arc<Cfg>,
@@ -104,7 +106,7 @@ pub async fn run() -> Result<()> {
     let cfg = Arc::new(Cfg::from_env()?);
     let ee = Arc::new(Ee::new(&cfg.ee_socket));
 
-    let h = ee.health().await?;
+    let h = ee.wait_ready(EE_READY_TIMEOUT).await?;
     eprintln!(
         "agent: EE connected (attestation={})",
         h["attestation_type"].as_str().unwrap_or("?")
