@@ -17,6 +17,9 @@ name: Cleanup
 # Per-env teardown covers, in order:
 #   1. `dd-local-{env}*` libvirt domains + qcow2/config/workload
 #      disks + serial logs on tdx2 (via SSH — target=ssh VMs).
+#      PR sweeps also reap shared preview domains
+#      (`dd-local-preview`, `dd-local-preview-oracle`) only when their
+#      baked config/logs still point at that PR env.
 #   2. CF Access apps named `dd-{env}-…`.
 #   3. CF tunnels named `dd-{env}-…` (connections drained first —
 #      delete is 400 otherwise).
@@ -119,8 +122,55 @@ jobs:
           set -euo pipefail
           env="$1"
           prefix="dd-local-$env"
-          domains=$(sudo -n virsh list --all --name)
-          domains=$(printf '%s\n' "$domains" | grep -E "^${prefix}($|-)" || true)
+          all_domains=$(sudo -n virsh list --all --name)
+          domains=$(printf '%s\n' "$all_domains" | grep -E "^${prefix}($|-)" || true)
+
+          vm_matches_env() {
+            vm="$1"
+            config="/var/lib/libvirt/images/$vm-config.iso"
+            log="/var/log/ee-local-${vm#dd-local-}.log"
+            if [ -f "$config" ]; then
+              sudo -n grep -aFq "DD_ENV=$env" "$config" 2>/dev/null && return 0
+              sudo -n grep -aFq "https://$env." "$config" 2>/dev/null && return 0
+            fi
+            if [ -f "$log" ]; then
+              sudo -n grep -aFq "DD_ENV=$env" "$log" 2>/dev/null && return 0
+              sudo -n grep -aFq "https://$env." "$log" 2>/dev/null && return 0
+            fi
+            return 1
+          }
+
+          # Preview agents are shared libvirt names, not `dd-local-pr-N`.
+          # Reap them only when their current config/logs prove they belong
+          # to the PR env being torn down; otherwise an old branch-delete
+          # could kill a different open PR's active preview.
+          case "$env" in
+            pr-*)
+              for vm in dd-local-preview dd-local-preview-oracle; do
+                if printf '%s\n' "$all_domains" | grep -Fxq "$vm"; then
+                  if vm_matches_env "$vm"; then
+                    domains="$domains $vm"
+                  else
+                    echo "  - keep $vm (not bound to $env)"
+                  fi
+                fi
+              done
+              ;;
+          esac
+
+          delete_vm_files() {
+            vm="$1"
+            sudo find /var/lib/libvirt/images -maxdepth 1 -type f \( \
+                -name "$vm.qcow2" \
+                -o -name "$vm.qcow2.base" \
+                -o -name "$vm-config.iso" \
+                -o -name "$vm-workload.qcow2" \
+              \) -print -delete 2>/dev/null | sed 's/^/  - file /' || true
+            sudo find /var/log -maxdepth 1 -type f \
+                -name "ee-local-${vm#dd-local-}.log" \
+                -print -delete 2>/dev/null | sed 's/^/  - file /' || true
+          }
+
           for vm in $domains; do
             sudo -n virsh destroy "$vm" 2>/dev/null || true
             sudo -n virsh undefine "$vm" --managed-save --snapshots-metadata --nvram 2>/dev/null \
@@ -128,10 +178,13 @@ jobs:
               || sudo -n virsh undefine "$vm" 2>/dev/null \
               || true
             echo "  - libvirt $vm"
+            delete_vm_files "$vm"
           done
           sudo find /var/lib/libvirt/images -maxdepth 1 -type f \( \
               -name "$prefix.qcow2" \
+              -o -name "$prefix.qcow2.base" \
               -o -name "$prefix-*.qcow2" \
+              -o -name "$prefix-*.qcow2.base" \
               -o -name "$prefix-config.iso" \
               -o -name "$prefix-*-config.iso" \
             \) -print -delete 2>/dev/null | sed 's/^/  - file /' || true
