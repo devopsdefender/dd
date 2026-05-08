@@ -76,21 +76,6 @@ DD_RELEASE_TAG="${DD_RELEASE_TAG:-latest}"
 # rate limits during cold boots.
 EE_GITHUB_TOKEN="${EE_GITHUB_TOKEN:-${GITHUB_TOKEN:-}}"
 
-find_host_ca_bundle() {
-  local candidate
-  for candidate in \
-    /etc/ssl/certs/ca-certificates.crt \
-    /etc/pki/tls/certs/ca-bundle.crt \
-    /etc/ssl/ca-bundle.pem
-  do
-    if [ -r "$candidate" ]; then
-      printf '%s\n' "$candidate"
-      return 0
-    fi
-  done
-  return 1
-}
-
 # Resolve EE_OWNER to (id, kind) once via `gh api`. Hard-fails if the
 # login or repo doesn't exist — better than baking a typo into a
 # config.iso whose agent then 401s every deploy with no signal.
@@ -210,15 +195,6 @@ build_config_iso() {
   local out="$IMG_DIR/dd-local-$name-config.iso"
   local confidential=""
   [ "$name" = preview-oracle ] && confidential=true
-  local ca_bundle_b64=""
-  local ca_bundle=""
-  if [ "$name" != preview-oracle ]; then
-    if ca_bundle=$(find_host_ca_bundle); then
-      ca_bundle_b64=$(base64 "$ca_bundle" | tr -d '\n')
-    else
-      echo "  warning: no host CA bundle found; podman registry pulls may fail TLS verification" >&2
-    fi
-  fi
   local tmp
   tmp=$(mktemp -d)
   trap "rm -rf $tmp" RETURN
@@ -249,6 +225,7 @@ build_config_iso() {
         DD_RELEASE_TAG="$DD_RELEASE_TAG" bake "$REPO_ROOT/apps/busybox/workload.json.tmpl"
         bake "$REPO_ROOT/apps/mount-data/workload.json"
         bake "$REPO_ROOT/apps/podman-static/workload.json"
+        DD_RELEASE_TAG="$DD_RELEASE_TAG" bake "$REPO_ROOT/apps/ca-certificates/workload.json.tmpl"
         bake "$REPO_ROOT/apps/podman-bootstrap/workload.json"
         bake "$REPO_ROOT/apps/cloudflared/workload.json"
         bake "$REPO_ROOT/apps/dd-shell/workload.json"
@@ -285,9 +262,6 @@ build_config_iso() {
     echo "EE_OWNER_KIND=$EE_OWNER_KIND"
     if [ -n "$EE_GITHUB_TOKEN" ]; then
       echo "EE_GITHUB_TOKEN=$EE_GITHUB_TOKEN"
-    fi
-    if [ -n "$ca_bundle_b64" ]; then
-      echo "EE_PODMAN_CA_BUNDLE_B64=$ca_bundle_b64"
     fi
     echo "EE_BOOT_WORKLOADS=$workloads"
     # EE capture-socket tee target. Kept for forward compatibility: a

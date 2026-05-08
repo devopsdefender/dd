@@ -179,6 +179,7 @@ inline in two places so both lifecycle points behave identically:
 | `human-readonly` | | ✅ | |
 | `dd-management` | ✅ | | |
 | `podman-static` | | ✅ | ✅ |
+| `ca-certificates` | | ✅ | ✅ |
 | `podman-bootstrap` | | ✅ | ✅ |
 
 Additional examples:
@@ -213,7 +214,8 @@ same CPU-only boot shape without demo workloads for now.
 
 EasyEnclave spawns boot workloads concurrently — there's no declared
 dependency graph. Dependents self-sequence by polling for their prerequisites.
-- `podman-bootstrap` waits for `podman-static`'s tarball, then stages
+- `podman-bootstrap` waits for `podman-static`'s tarball, copies the
+  `ca-certificates` release asset into Podman's persistent config, then stages
   `podman`, `conmon`, `crun`, config, and the `podman` wrapper script.
 - Shell-based recipes wait for `busybox` by depending on the fetch-only
   `busybox` workload in the boot set.
