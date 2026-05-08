@@ -63,20 +63,35 @@ runs:
           -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
           "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${AUDIENCE}" | jq -r .value)
 
-        # Discover the agent hostname on the CP. Curl's native --retry
-        # absorbs the transient 5xx (notably CF 530 "origin
-        # unreachable") that reliably hits right after an agent
-        # relaunch — the edge is momentarily between routes. ~30 s
-        # of retries, no bash loop.
-        agent_host=$(curl -fsS \
-          --retry 6 --retry-delay 5 --retry-all-errors \
-          -H "Authorization: Bearer ${oidc}" \
-          "${CP_URL}/api/agents" \
-          | jq -r --arg vm "$VM_NAME" '
-              [.[] | select(.vm_name == $vm and .status == "healthy")]
-              | sort_by(.last_seen) | reverse | .[0].hostname // empty')
+        # Discover the agent hostname from the CP's source of truth. A
+        # freshly relaunched agent registers before the collector has
+        # scraped and marked it healthy, so poll on that state instead
+        # of racing the next action against the collector interval.
+        echo "waiting for healthy agent vm_name=$VM_NAME on $CP_URL"
+        deadline=$(( $(date +%s) + 120 ))
+        agent_host=""
+        last_agents=""
+        while [ "$(date +%s)" -lt "$deadline" ]; do
+          agents=$(curl -fsS \
+            --retry 2 --retry-delay 5 --retry-all-errors \
+            -H "Authorization: Bearer ${oidc}" \
+            "${CP_URL}/api/agents" 2>/dev/null || true)
+          if [ -n "$agents" ]; then
+            last_agents="$agents"
+            agent_host=$(echo "$agents" | jq -r --arg vm "$VM_NAME" '
+                [.[] | select(.vm_name == $vm and .status == "healthy")]
+                | sort_by(.last_seen) | reverse | .[0].hostname // empty')
+            [ -n "$agent_host" ] && break
+          fi
+          sleep 5
+        done
         if [ -z "$agent_host" ]; then
-          echo "::error::no healthy agent with vm_name=$VM_NAME"
+          echo "::error::no healthy agent with vm_name=$VM_NAME within 120s"
+          if [ -n "$last_agents" ]; then
+            echo "$last_agents" | jq -r --arg vm "$VM_NAME" '
+              .[] | select(.vm_name == $vm)
+              | "  \(.vm_name) status=\(.status) last_seen=\(.last_seen) host=https://\(.hostname)"'
+          fi
           exit 1
         fi
         agent_label="${agent_host%%.*}"
