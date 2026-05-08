@@ -822,17 +822,7 @@ async fn fleet(State(s): State<St>) -> Response {
                 u.refs
                     .iter()
                     .take(3)
-                    .map(|r| {
-                        if r.value.starts_with("https://") {
-                            format!(
-                                r#"<a href="{url}" target="_blank">{label}</a>"#,
-                                url = html::escape(&r.value),
-                                label = html::escape(&r.label)
-                            )
-                        } else {
-                            html::escape(&r.label)
-                        }
-                    })
+                    .map(|r| html::unit_ref(&r.label, &r.value))
                     .collect::<Vec<_>>()
                     .join(" · ")
             };
@@ -1195,21 +1185,7 @@ async fn agent_detail(State(s): State<St>, Path(id): Path<String>) -> Response {
             } else {
                 u.refs
                     .iter()
-                    .map(|r| {
-                        if r.value.starts_with("https://") {
-                            format!(
-                                r#"<a href="{url}" target="_blank">{label}</a>"#,
-                                url = html::escape(&r.value),
-                                label = html::escape(&r.label)
-                            )
-                        } else {
-                            format!(
-                                r#"<span class="dim">{label}: {value}</span>"#,
-                                label = html::escape(&r.label),
-                                value = html::escape(&r.value)
-                            )
-                        }
-                    })
+                    .map(|r| html::unit_ref(&r.label, &r.value))
                     .collect::<Vec<_>>()
                     .join(" · ")
             };

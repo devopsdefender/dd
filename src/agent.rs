@@ -674,21 +674,7 @@ async fn dashboard(State(s): State<St>) -> Response {
             } else {
                 u.refs
                     .iter()
-                    .map(|r| {
-                        if r.value.starts_with("https://") || r.value.starts_with("http://") {
-                            format!(
-                                r#"<a class="break" href="{url}" target="_blank">{label}</a>"#,
-                                url = html::escape(&r.value),
-                                label = html::escape(&r.label)
-                            )
-                        } else {
-                            format!(
-                                r#"<span class="dim">{label}: {value}</span>"#,
-                                label = html::escape(&r.label),
-                                value = html::escape(&r.value)
-                            )
-                        }
-                    })
+                    .map(|r| html::unit_ref(&r.label, &r.value))
                     .collect::<Vec<_>>()
                     .join(" · ")
             };
