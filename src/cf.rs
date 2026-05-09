@@ -408,23 +408,41 @@ async fn list_access_apps(http: &Client, cf: &CfCreds) -> Result<Vec<serde_json:
 }
 
 fn access_app_matches_domain(app: &serde_json::Value, domain: &str) -> bool {
-    if app["domain"].as_str() == Some(domain) {
+    if access_domain_matches(app["domain"].as_str(), domain) {
         return true;
     }
     if app["destinations"].as_array().is_some_and(|items| {
-        items
-            .iter()
-            .any(|d| d["type"].as_str() == Some("public") && d["uri"].as_str() == Some(domain))
+        items.iter().any(|d| {
+            d["type"].as_str() == Some("public") && access_domain_matches(d["uri"].as_str(), domain)
+        })
     }) {
         return true;
     }
     app["self_hosted_domains"].as_array().is_some_and(|items| {
         items.iter().any(|d| {
-            d.as_str() == Some(domain)
-                || d["domain"].as_str() == Some(domain)
-                || d["uri"].as_str() == Some(domain)
+            access_domain_matches(d.as_str(), domain)
+                || access_domain_matches(d["domain"].as_str(), domain)
+                || access_domain_matches(d["uri"].as_str(), domain)
         })
     })
+}
+
+fn access_domain_matches(app_domain: Option<&str>, target: &str) -> bool {
+    let Some(app_domain) = app_domain else {
+        return false;
+    };
+    if app_domain == target {
+        return true;
+    }
+    let app_host = app_domain.split('/').next().unwrap_or(app_domain);
+    let target_host = target.split('/').next().unwrap_or(target);
+    if app_host == target_host {
+        return true;
+    }
+    if let Some(suffix) = app_host.strip_prefix("*.") {
+        return target_host != suffix && target_host.ends_with(&format!(".{suffix}"));
+    }
+    false
 }
 
 async fn delete_access_apps_for_domains(
@@ -626,7 +644,7 @@ mod tests {
             "type": "self_hosted",
         });
         assert!(access_app_matches_domain(&app, "agent.example.com/health"));
-        assert!(!access_app_matches_domain(&app, "agent.example.com/deploy"));
+        assert!(access_app_matches_domain(&app, "agent.example.com/deploy"));
     }
 
     #[test]
@@ -639,6 +657,24 @@ mod tests {
             ],
         });
         assert!(access_app_matches_domain(&app, "agent.example.com/health"));
-        assert!(!access_app_matches_domain(&app, "agent.example.com/deploy"));
+        assert!(access_app_matches_domain(&app, "agent.example.com/deploy"));
+    }
+
+    #[test]
+    fn access_app_matches_wildcard_domain() {
+        let app = serde_json::json!({
+            "domain": "*.devopsdefender.com",
+            "type": "self_hosted",
+        });
+        assert!(access_app_matches_domain(
+            &app,
+            "pr-253.devopsdefender.com/health"
+        ));
+        assert!(access_app_matches_domain(
+            &app,
+            "dd-pr-253-api-abc.devopsdefender.com"
+        ));
+        assert!(!access_app_matches_domain(&app, "devopsdefender.com"));
+        assert!(!access_app_matches_domain(&app, "example.com"));
     }
 }
