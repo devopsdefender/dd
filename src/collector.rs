@@ -451,6 +451,13 @@ async fn mark_stale_or_orphan(
     let mut s = store.lock().await;
     if let Some(a) = s.values_mut().find(|a| a.hostname == *host) {
         let age = now.signed_duration_since(a.last_seen).num_seconds();
+        if a.status == "registering" && age < UNKNOWN_TUNNEL_SCRAPE_DELAY_SECS {
+            eprintln!(
+                "cp: collector: {name} scrape failed during registration grace: {}",
+                err.as_deref().unwrap_or("unknown error")
+            );
+            return;
+        }
         if age > DEAD_THRESHOLD_SECS && scrape_failure_is_dead_signal(err) {
             let extras = a.extras.clone();
             a.status = "dead".into();
@@ -559,6 +566,7 @@ mod tests {
     use super::{
         parse_extra_ingress, rendezvous_shard, scrape_failure_is_dead_signal, should_scrape_key,
         unknown_tunnel_is_gc_candidate, unknown_tunnel_should_wait_for_registration,
+        UNKNOWN_TUNNEL_SCRAPE_DELAY_SECS,
     };
 
     #[test]
@@ -663,6 +671,20 @@ mod tests {
             now
         ));
         assert!(!unknown_tunnel_should_wait_for_registration(None, now));
+    }
+
+    #[test]
+    fn registration_grace_matches_unknown_tunnel_delay() {
+        let now = Utc::now();
+
+        assert!(unknown_tunnel_should_wait_for_registration(
+            Some(now - Duration::seconds(UNKNOWN_TUNNEL_SCRAPE_DELAY_SECS - 1)),
+            now
+        ));
+        assert!(!unknown_tunnel_should_wait_for_registration(
+            Some(now - Duration::seconds(UNKNOWN_TUNNEL_SCRAPE_DELAY_SECS + 1)),
+            now
+        ));
     }
 
     #[test]
