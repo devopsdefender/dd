@@ -164,6 +164,9 @@ pub struct Cp {
     pub auth: crate::auth::AuthConfig,
     pub hostname: String,
     pub scrape_interval_secs: u64,
+    pub discovery_interval_secs: u64,
+    pub scraper_shard_index: u64,
+    pub scraper_shard_total: u64,
     pub ita: Ita,
     /// Source-of-truth file for the device registry (JSON). Survives
     /// CP restart; mutations fsync through to disk.
@@ -183,7 +186,27 @@ impl Cp {
         let scrape_interval_secs = std::env::var("DD_SCRAPE_INTERVAL")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(30);
+            .unwrap_or(5)
+            .max(1);
+        let discovery_interval_secs = std::env::var("DD_DISCOVERY_INTERVAL")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(30)
+            .max(scrape_interval_secs);
+        let scraper_shard_total = std::env::var("DD_SCRAPER_SHARD_TOTAL")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1)
+            .max(1);
+        let scraper_shard_index = std::env::var("DD_SCRAPER_SHARD_INDEX")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        if scraper_shard_index >= scraper_shard_total {
+            return Err(Error::Internal(format!(
+                "DD_SCRAPER_SHARD_INDEX ({scraper_shard_index}) must be less than DD_SCRAPER_SHARD_TOTAL ({scraper_shard_total})"
+            )));
+        }
         // `/tmp/` (tmpfs) is the only universally-writable path in the
         // EE workload sandbox — the root FS is RO, and `/var/lib/` +
         // `/data/` are both unavailable on the CP VM (no mount-data
@@ -205,6 +228,9 @@ impl Cp {
             auth,
             hostname,
             scrape_interval_secs,
+            discovery_interval_secs,
+            scraper_shard_index,
+            scraper_shard_total,
             ita,
             devices_path,
             noise_key_path,

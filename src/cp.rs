@@ -18,7 +18,7 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, Notify, RwLock};
 
 use crate::cf;
 use crate::collector::{self, Store};
@@ -46,6 +46,7 @@ struct St {
     cfg: Arc<Cfg>,
     ee: Arc<Ee>,
     store: Store,
+    collector_wake: Arc<Notify>,
     started: Instant,
     verifier: Arc<ita::Verifier>,
     /// The CP's own ITA token. Refreshed by a background task.
@@ -318,6 +319,7 @@ pub async fn run() -> Result<()> {
     // Start the collector with the verifier. It re-verifies each
     // scraped agent's ita_token, so expired / revoked / unsigned
     // agents drop off the dashboard automatically.
+    let collector_wake = Arc::new(Notify::new());
     tokio::spawn(collector::run(
         store.clone(),
         cfg.cf.clone(),
@@ -325,7 +327,11 @@ pub async fn run() -> Result<()> {
         cfg.hostname.clone(),
         ee.clone(),
         verifier.clone(),
+        collector_wake.clone(),
         Duration::from_secs(cfg.scrape_interval_secs),
+        Duration::from_secs(cfg.discovery_interval_secs),
+        cfg.scraper_shard_index,
+        cfg.scraper_shard_total,
     ));
 
     let gh = crate::gh_oidc::Verifier::new(cfg.common.owner.clone(), "dd-agent".into());
@@ -353,6 +359,7 @@ pub async fn run() -> Result<()> {
         cfg: cfg.clone(),
         ee,
         store,
+        collector_wake,
         started: Instant::now(),
         verifier,
         cp_ita_token,
@@ -660,6 +667,7 @@ async fn register(
     }
 
     eprintln!("cp: registered {} as {}", req.vm_name, agent_hostname);
+    s.collector_wake.notify_one();
 
     Ok(Json(serde_json::json!({
         "tunnel_token": tunnel.token,
@@ -751,6 +759,7 @@ async fn ingress_replace(
     }
 
     eprintln!("cp: ingress/replace {} → {:?}", req.agent_id, hostnames);
+    s.collector_wake.notify_one();
     Ok(Json(serde_json::json!({
         "agent_id": req.agent_id,
         "extra_hostnames": hostnames,
