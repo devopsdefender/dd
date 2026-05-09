@@ -413,12 +413,12 @@ async fn find_app_by_domain(
     Ok(resp["result"].as_array().and_then(|items| {
         items
             .iter()
-            .find(|a| access_app_matches_domain(a, domain))
+            .find(|a| routing_app_matches_domain(a, domain))
             .cloned()
     }))
 }
 
-fn access_app_matches_domain(app: &serde_json::Value, domain: &str) -> bool {
+fn routing_app_matches_domain(app: &serde_json::Value, domain: &str) -> bool {
     if app["domain"].as_str() == Some(domain) {
         return true;
     }
@@ -449,7 +449,7 @@ fn bypass_policy() -> serde_json::Value {
 /// Idempotently upsert a Cloudflare self-hosted app at `domain` with the
 /// provided policy list. Matches on exact `domain`; updates in place
 /// if present, creates otherwise.
-async fn ensure_app(
+async fn ensure_routing_app(
     http: &Client,
     cf: &CfCreds,
     name: &str,
@@ -496,12 +496,17 @@ async fn ensure_app(
         .ok_or_else(|| Error::Upstream(format!("Cloudflare app create missing id for {domain}")))
 }
 
-/// Idempotently upsert a path-scoped bypass routing app. Anyone can
+/// Idempotently upsert a path-scoped public routing app. Anyone can
 /// reach `domain/path` without authentication; used for /health,
 /// /register (which is authenticated by ITA in-app), and every
 /// workload-exposed URL.
-async fn ensure_bypass_app(http: &Client, cf: &CfCreds, name: &str, domain: &str) -> Result<()> {
-    ensure_app(http, cf, name, domain, vec![bypass_policy()]).await?;
+async fn ensure_public_route_app(
+    http: &Client,
+    cf: &CfCreds,
+    name: &str,
+    domain: &str,
+) -> Result<()> {
+    ensure_routing_app(http, cf, name, domain, vec![bypass_policy()]).await?;
     Ok(())
 }
 
@@ -512,25 +517,25 @@ fn is_admin_label(label: &str) -> bool {
     ADMIN_LABELS.contains(&label)
 }
 
-/// Provision the CP's Access/routing apps at startup.
+/// Provision the CP's Cloudflare routing apps at startup.
 ///
-/// Apps created:
-///   - Bypass: `{hostname}` — dashboard, app-layer GitHub auth
-///   - Bypass: `{hostname}-shell` — dd-shell, app-layer GitHub auth
-///   - Bypass: `{hostname}/health` — public (read-only fleet health;
+/// Routes created:
+///   - `{hostname}` — dashboard, app-layer GitHub auth
+///   - `{hostname}-shell` — dd-shell, app-layer GitHub auth
+///   - `{hostname}/health` — public (read-only fleet health;
 ///     also carries the Noise pre-handshake `{quote_b64, pubkey_hex}`)
-///   - Bypass: `{hostname}/api/agents` — read-only agent list
-///   - Bypass: `{hostname}/noise/ws` — Noise_IK-gated in code
-///   - Bypass: `{hostname}/register` — ITA-gated in code
-///   - Bypass: `{hostname}/ingress/replace` — ITA-gated in code
-pub async fn provision_cp_access(
+///   - `{hostname}/api/agents` — read-only agent list
+///   - `{hostname}/noise/ws` — Noise_IK-gated in code
+///   - `{hostname}/register` — ITA-gated in code
+///   - `{hostname}/ingress/replace` — ITA-gated in code
+pub async fn provision_cp_routing(
     http: &Client,
     cf: &CfCreds,
     env: &str,
     hostname: &str,
     workload_labels: &[String],
 ) -> Result<()> {
-    ensure_app(
+    ensure_routing_app(
         http,
         cf,
         &format!("dd-{env}-cp"),
@@ -539,8 +544,8 @@ pub async fn provision_cp_access(
     )
     .await?;
 
-    // One Cloudflare self-hosted app per CP-exposed workload label.
-    // Admin labels are still bypass apps: DD checks browser sessions
+    // One Cloudflare routing app per CP-exposed workload label.
+    // Admin labels still use bypass policies: DD checks browser sessions
     // in-code, and non-admin workload URLs remain public by default.
     let desired: std::collections::HashSet<String> = workload_labels
         .iter()
@@ -549,7 +554,7 @@ pub async fn provision_cp_access(
     for label in workload_labels {
         let domain = label_hostname(hostname, label);
         if is_admin_label(label) {
-            ensure_app(
+            ensure_routing_app(
                 http,
                 cf,
                 &format!("dd-{env}-cp-{label}"),
@@ -558,7 +563,7 @@ pub async fn provision_cp_access(
             )
             .await?;
         } else {
-            ensure_bypass_app(http, cf, &format!("dd-{env}-cp-{label}"), &domain).await?;
+            ensure_public_route_app(http, cf, &format!("dd-{env}-cp-{label}"), &domain).await?;
         }
     }
 
@@ -603,9 +608,9 @@ pub async fn provision_cp_access(
         }
     }
     // One-shot reap: any prior deploy left behind a
-    // `dd-{env}-cp-noise-attest` bypass app fronting `{hostname}/attest`.
-    // The attest route is gone, so the bypass has no job. The workload
-    // sweep above is subdomain-scoped and won't catch path-bypass apps,
+    // `dd-{env}-cp-noise-attest` route fronting `{hostname}/attest`.
+    // The attest route is gone, so the route has no job. The workload
+    // sweep above is subdomain-scoped and won't catch path-scoped routes,
     // so delete it explicitly here. Lookup-by-domain is idempotent;
     // no-op once the app is gone.
     if let Ok(Some(stale)) = find_app_by_domain(http, cf, &format!("{hostname}/attest")).await {
@@ -633,7 +638,7 @@ pub async fn provision_cp_access(
         ("/register", "register"),
         ("/ingress/replace", "ingress"),
     ] {
-        ensure_bypass_app(
+        ensure_public_route_app(
             http,
             cf,
             &format!("dd-{env}-cp-{label}"),
@@ -646,32 +651,32 @@ pub async fn provision_cp_access(
 
 /// Provision routing apps for one agent. Called at /register and again
 /// at /ingress/replace so newly-exposed workload labels get their
-/// bypass apps and labels that disappeared get cleaned up.
+/// public routes and labels that disappeared get cleaned up.
 ///
-///   - Bypass: `{agent}.{domain}` — browser dashboard, app-layer auth
-///   - Bypass: `<admin-label>.{agent}.{domain}` for labels in
+///   - `{agent}.{domain}` — browser dashboard, app-layer auth
+///   - `<admin-label>.{agent}.{domain}` for labels in
 ///     `ADMIN_LABELS` — app-layer auth
-///   - Bypass: `dd-{env}-api-{uuid}.{domain}` — machine API only
-///   - Bypass: `{agent}.{domain}/health` — public; carries the Noise
+///   - `dd-{env}-api-{uuid}.{domain}` — machine API only
+///   - `{agent}.{domain}/health` — public; carries the Noise
 ///     pre-handshake `{quote_b64, pubkey_hex}` in its response
-///   - Bypass: `{agent}.{domain}/deploy` — GH-OIDC-gated in code
-///   - Bypass: `{agent}.{domain}/exec` — GH-OIDC-gated in code
-///   - Bypass: `{agent}.{domain}/owner` — fleet-GH-OIDC-gated in code
-///   - Bypass: `{agent}.{domain}/logs/*` — GH-OIDC-gated in code
-///   - Bypass: `{agent}.{domain}/noise/ws` — Noise_IK-gated in code
+///   - `{agent}.{domain}/deploy` — GH-OIDC-gated in code
+///   - `{agent}.{domain}/exec` — GH-OIDC-gated in code
+///   - `{agent}.{domain}/owner` — fleet-GH-OIDC-gated in code
+///   - `{agent}.{domain}/logs/*` — GH-OIDC-gated in code
+///   - `{agent}.{domain}/noise/ws` — Noise_IK-gated in code
 ///     against the CP-trusted paired device pubkey set
-///   - Bypass: `{label}.{agent}.{domain}` for other labels — workload
+///   - `{label}.{agent}.{domain}` for other labels — workload
 ///     URLs are public by default.
 ///   - Any existing `*.{agent}.{domain}` app whose label is no longer
 ///     in `workload_labels` is deleted.
-pub async fn provision_agent_access(
+pub async fn provision_agent_routing(
     http: &Client,
     cf: &CfCreds,
     env: &str,
     agent_hostname: &str,
     workload_labels: &[String],
 ) -> Result<()> {
-    ensure_app(
+    ensure_routing_app(
         http,
         cf,
         &format!("dd-{env}-agent-{agent_hostname}"),
@@ -695,7 +700,7 @@ pub async fn provision_agent_access(
         // paired device pubkey set is the gate.
         ("/noise/ws", "noise-ws"),
     ] {
-        ensure_bypass_app(
+        ensure_public_route_app(
             http,
             cf,
             &format!("dd-{env}-agent-{agent_hostname}-{label}"),
@@ -711,7 +716,7 @@ pub async fn provision_agent_access(
     for label in workload_labels {
         let domain = extra_hostname(agent_hostname, label);
         if is_admin_label(label) {
-            ensure_app(
+            ensure_routing_app(
                 http,
                 cf,
                 &format!("dd-{env}-workload-{domain}"),
@@ -720,7 +725,8 @@ pub async fn provision_agent_access(
             )
             .await?;
         } else {
-            ensure_bypass_app(http, cf, &format!("dd-{env}-workload-{domain}"), &domain).await?;
+            ensure_public_route_app(http, cf, &format!("dd-{env}-workload-{domain}"), &domain)
+                .await?;
         }
     }
 
@@ -775,7 +781,7 @@ pub async fn provision_agent_access(
 /// Cleanup hook invoked by the collector's orphan-GC path and by any
 /// explicit reap: delete the agent's dashboard route, its /health
 /// route, and every `*.{agent_hostname}` workload route in one sweep.
-pub async fn delete_access_apps_for(http: &Client, cf: &CfCreds, agent_hostname: &str) {
+pub async fn delete_routing_apps_for(http: &Client, cf: &CfCreds, agent_hostname: &str) {
     let Ok(resp) = call(
         http,
         cf,
@@ -863,17 +869,20 @@ mod tests {
     }
 
     #[test]
-    fn access_app_matches_primary_domain() {
+    fn routing_app_matches_primary_domain() {
         let app = serde_json::json!({
             "domain": "agent.example.com/health",
             "type": "self_hosted",
         });
-        assert!(access_app_matches_domain(&app, "agent.example.com/health"));
-        assert!(!access_app_matches_domain(&app, "agent.example.com/deploy"));
+        assert!(routing_app_matches_domain(&app, "agent.example.com/health"));
+        assert!(!routing_app_matches_domain(
+            &app,
+            "agent.example.com/deploy"
+        ));
     }
 
     #[test]
-    fn access_app_matches_public_destination() {
+    fn routing_app_matches_public_destination() {
         let app = serde_json::json!({
             "domain": "agent.example.com",
             "destinations": [
@@ -881,7 +890,10 @@ mod tests {
                 { "type": "private", "hostname": "agent.internal" }
             ],
         });
-        assert!(access_app_matches_domain(&app, "agent.example.com/health"));
-        assert!(!access_app_matches_domain(&app, "agent.example.com/deploy"));
+        assert!(routing_app_matches_domain(&app, "agent.example.com/health"));
+        assert!(!routing_app_matches_domain(
+            &app,
+            "agent.example.com/deploy"
+        ));
     }
 }
