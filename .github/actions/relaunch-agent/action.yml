@@ -32,6 +32,15 @@ inputs:
   ita-api-key:
     description: 'Intel Trust Authority API key for attestation'
     required: true
+  auth-broker-url:
+    description: 'DD browser auth broker origin (normally https://app.<domain>)'
+    required: true
+  auth-cookie-domain:
+    description: 'Domain scope for DD browser session cookies'
+    required: true
+  auth-cookie-secret:
+    description: 'Shared DD browser session signing secret'
+    required: true
   release-tag:
     description: 'devopsdefender release tag the local agent should download (e.g. pr-abc123, latest)'
     required: true
@@ -60,7 +69,7 @@ runs:
   steps:
     # curl's native --retry handles the CP-healthy wait. On PR pushes
     # we race with Release's deploy-preview standing up the pr-N CP;
-    # /health is CF-bypassed. 60 attempts × 10s = 10 min budget.
+    # /health is public. 60 attempts × 10s = 10 min budget.
     - name: Wait for CP to be healthy
       shell: bash
       env:
@@ -82,6 +91,9 @@ runs:
         REF: ${{ inputs.ref }}
         RELEASE_TAG: ${{ inputs.release-tag }}
         DD_ITA_API_KEY: ${{ inputs.ita-api-key }}
+        DD_AUTH_BROKER_URL: ${{ inputs.auth-broker-url }}
+        DD_AUTH_COOKIE_DOMAIN: ${{ inputs.auth-cookie-domain }}
+        DD_AUTH_COOKIE_SECRET: ${{ inputs.auth-cookie-secret }}
         DD_EE_CHANNEL: ${{ inputs.ee-channel }}
         DD_EE_TAG: ${{ inputs.ee-tag }}
         EE_OWNER: ${{ inputs.owner }}
@@ -91,17 +103,17 @@ runs:
         host: ${{ inputs.host }}
         username: ${{ inputs.ssh-user }}
         key: ${{ inputs.ssh-key }}
-        envs: KIND,URL,REF,RELEASE_TAG,DD_ITA_API_KEY,DD_EE_CHANNEL,DD_EE_TAG,EE_OWNER,EE_GITHUB_TOKEN,DD_REPO_ROOT
+        envs: KIND,URL,REF,RELEASE_TAG,DD_ITA_API_KEY,DD_AUTH_BROKER_URL,DD_AUTH_COOKIE_DOMAIN,DD_AUTH_COOKIE_SECRET,DD_EE_CHANNEL,DD_EE_TAG,EE_OWNER,EE_GITHUB_TOKEN,DD_REPO_ROOT
         script: |
           export KIND URL REF RELEASE_TAG
-          export DD_ITA_API_KEY DD_EE_CHANNEL DD_EE_TAG EE_OWNER EE_GITHUB_TOKEN DD_REPO_ROOT
+          export DD_ITA_API_KEY DD_AUTH_BROKER_URL DD_AUTH_COOKIE_DOMAIN DD_AUTH_COOKIE_SECRET DD_EE_CHANNEL DD_EE_TAG EE_OWNER EE_GITHUB_TOKEN DD_REPO_ROOT
           if [ ! -d "$DD_REPO_ROOT/.git" ]; then
             mkdir -p "$(dirname "$DD_REPO_ROOT")"
             git clone https://github.com/devopsdefender/dd.git "$DD_REPO_ROOT"
           fi
           git -C "$DD_REPO_ROOT" fetch --quiet origin "$REF"
           git -C "$DD_REPO_ROOT" checkout --quiet FETCH_HEAD -- apps/
-          env DD_REPO_ROOT="$DD_REPO_ROOT" DD_ITA_API_KEY="$DD_ITA_API_KEY" DD_EE_CHANNEL="$DD_EE_CHANNEL" DD_EE_TAG="$DD_EE_TAG" EE_OWNER="$EE_OWNER" EE_GITHUB_TOKEN="$EE_GITHUB_TOKEN" "$DD_REPO_ROOT/apps/_infra/dd-relaunch.sh" "$KIND" "$URL" "$REF" "$RELEASE_TAG"
+          env DD_REPO_ROOT="$DD_REPO_ROOT" DD_ITA_API_KEY="$DD_ITA_API_KEY" DD_AUTH_BROKER_URL="$DD_AUTH_BROKER_URL" DD_AUTH_COOKIE_DOMAIN="$DD_AUTH_COOKIE_DOMAIN" DD_AUTH_COOKIE_SECRET="$DD_AUTH_COOKIE_SECRET" DD_EE_CHANNEL="$DD_EE_CHANNEL" DD_EE_TAG="$DD_EE_TAG" EE_OWNER="$EE_OWNER" EE_GITHUB_TOKEN="$EE_GITHUB_TOKEN" "$DD_REPO_ROOT/apps/_infra/dd-relaunch.sh" "$KIND" "$URL" "$REF" "$RELEASE_TAG"
 
     # Block until the freshly-booted agent VM registers with the CP.
     # This is the "I can see the local agent deployment worked"

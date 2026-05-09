@@ -12,8 +12,7 @@
 #
 # DD_ITA_API_KEY must be set in the environment. No GitHub PAT — the
 # agent authenticates to the CP via ITA attestation at /register and
-# uses a CF Access service token (received in the register response)
-# for subsequent machine-to-machine calls.
+# uses in-code auth for subsequent machine-to-machine calls.
 
 set -euo pipefail
 export LIBVIRT_DEFAULT_URI="${LIBVIRT_DEFAULT_URI:-qemu:///system}"

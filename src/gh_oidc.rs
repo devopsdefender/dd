@@ -12,15 +12,13 @@
 //!     matches via [`Principal::matches`]
 //!
 //! A "principal" is one of three kinds — a GitHub user, a GitHub
-//! organization, or a specific repository. User and org are
-//! textually identical at the token layer (both produce the same
-//! `repository_owner` claim); the kind is carried alongside only so
-//! `cf.rs::human_policy` can decide whether to install a
-//! `github-organization` CF Access include rule. A repo principal
-//! gates on `repository` instead. All three flavors require the
-//! corresponding numeric ID claim (`repository_owner_id` or
-//! `repository_id`) to match too — name-only matching would let a
-//! re-registered deleted login produce accepted tokens.
+//! organization, or a specific repository. User and org are textually
+//! identical at the token layer (both produce the same
+//! `repository_owner` claim); a repo principal gates on `repository`
+//! instead. All three flavors require the corresponding numeric ID
+//! claim (`repository_owner_id` or `repository_id`) to match too —
+//! name-only matching would let a re-registered deleted login produce
+//! accepted tokens.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -45,7 +43,7 @@ const ALLOWED_ALGS: &[Algorithm] = &[
     Algorithm::PS512,
 ];
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PrincipalKind {
     User,

@@ -15,9 +15,9 @@ Source layout (all under `src/`, flat module tree):
 
 | Module | Responsibility |
 |---|---|
-| `cp.rs` | CP HTTP: fleet dashboard, `/register` for agents, `/api/agents` public read, `/cp/attest`. Runs the collector + per-agent CF Access app + STONITH. |
+| `cp.rs` | CP HTTP: fleet dashboard, `/register` for agents, `/api/agents` public read, `/cp/attest`. Runs the collector + per-agent Cloudflare routing app + STONITH. |
 | `agent.rs` | Agent HTTP: per-VM dashboard, `/deploy` + `/exec` + `/logs/{app}` + `/ingress/replace`, GitHub-OIDC and ITA verification. |
-| `cf.rs` | Cloudflare API: tunnel CRUD, DNS CNAME, Access app provisioning, flat `label_hostname`, orphan reaping. |
+| `cf.rs` | Cloudflare API: tunnel CRUD, DNS CNAME, self-hosted app provisioning, flat `label_hostname`, orphan reaping. |
 | `ee.rs` | Thin client for [EasyEnclave Mini](https://github.com/easyenclave/easyenclave-mini)'s unix socket — `Deploy`, `List`, `Logs`. |
 | `ita.rs` | Mint + verify Intel Trust Authority tokens (quote-v4 MRTD extraction). |
 | `gh_oidc.rs` | Verify GitHub Actions OIDC JWTs against GitHub's JWKS (`repository_owner == DD_OWNER`). |
@@ -31,7 +31,7 @@ The sealed enclave runtime is [EasyEnclave Mini](https://github.com/easyenclave/
 
 ## Public website
 
-[**devopsdefender.com**](https://devopsdefender.com) is a static site served from this repo's [`gh-pages` branch](https://github.com/devopsdefender/dd/tree/gh-pages) (CNAME pinned there). It's the **only** place public-facing marketing copy lives — the CP binary serves operator dashboards behind CF Access and is never the right home for public prose.
+[**devopsdefender.com**](https://devopsdefender.com) is a static site served from this repo's [`gh-pages` branch](https://github.com/devopsdefender/dd/tree/gh-pages) (CNAME pinned there). It's the **only** place public-facing marketing copy lives — the CP binary serves operator dashboards behind DD's GitHub App auth and is never the right home for public prose.
 
 To change the website: PR against `gh-pages` (not `main`). The branch's own `.github/workflows/website-preview.yml` auto-deploys each PR to `devopsdefender.com/pr-preview/<N>/` via [`rossjrw/pr-preview-action`](https://github.com/rossjrw/pr-preview-action); merging to `gh-pages` publishes to root.
 
@@ -55,32 +55,32 @@ manual dispatch → redeploy any existing tag to production (rollback tool)
 
 Every path lives in `.github/workflows/release.yml`: one `build` job, then either `deploy-preview` (PR) or `deploy-production` (main / dispatch), both calling the reusable `deploy-cp.yml` with env-specific inputs. Each cascades into a relaunch of the matching `dd-local-{env}` VM on the tdx2 host — the Release run only goes green when that agent re-registers with the freshly-deployed CP. Verifications along the way:
 
-1. `/health` via the Cloudflare tunnel (CF Access bypass; public)
-2. `/cp/attest` returning a real TDX MRTD (CF Access bypass; the quote is self-authenticating — old VMs don't have the endpoint and return 404)
-3. Dashboard `/` returning a CF Access redirect (HTTP 302) to the Cloudflare login flow
+1. `/health` via the Cloudflare tunnel (public)
+2. `/cp/attest` returning a real TDX MRTD (the quote is self-authenticating — old VMs don't have the endpoint and return 404)
+3. Dashboard `/` returning a DD GitHub App auth redirect (HTTP 302) to the broker
 4. No other `dd-{env}-*` VM is RUNNING after deploy (STONITH must have halted the previous instance)
 5. `dd-local-{env}` re-registers with the new CP within 5 min
 
 ## Auth
 
-Zero shared secrets. Every CP and agent URL is fronted by [Cloudflare Access](https://developers.cloudflare.com/cloudflare-one/applications/); everything else is gated by signed tokens validated in code.
+Zero shared secrets. Cloudflare handles tunnel/DNS routing only; DD owns auth in-process with signed browser sessions, ITA tokens, GitHub Actions OIDC tokens, and Noise device keys.
 
 | Caller | Endpoint | Auth |
 | --- | --- | --- |
-| Human browser | CP `/`, agent `/`, dd-shell terminal | CF Access → GitHub OAuth → `github-organization:DD_OWNER` or `emails:DD_ACCESS_ADMIN_EMAIL` |
-| Agent → CP | `/register`, `/ingress/replace` | CF Access bypass + Intel ITA token verified in-code |
-| CI → agent | `/deploy`, `/exec`, `/logs/{app}` | CF Access bypass + GitHub Actions OIDC JWT verified in-code (`repository_owner == DD_OWNER`) |
-| Anyone | `/health`, `/cp/attest`, `/api/agents`, workload URLs | CF Access bypass; read-only or self-authenticating content |
+| Human browser | CP `/`, agent `/`, dd-shell terminal | DD GitHub App OAuth broker + signed DD session cookie |
+| Agent → CP | `/register`, `/ingress/replace` | Intel ITA token verified in-code |
+| CI → agent | `/deploy`, `/exec`, `/logs/{app}` | GitHub Actions OIDC JWT verified in-code (`repository_owner == DD_OWNER`) |
+| Anyone | `/health`, `/cp/attest`, `/api/agents`, workload URLs | Public read-only or self-authenticating content |
 
-No PATs. No CF Access service tokens. No Worker. Agents ship with nothing but an ITA API key; CI ships with nothing but its per-job GitHub OIDC token.
+No PATs. No Cloudflare service tokens. No Worker. Agents ship with nothing but an ITA API key; CI ships with nothing but its per-job GitHub OIDC token.
 
-CF Access apps are provisioned programmatically by the CP at boot — one application per hostname (CP, agent, each admin-gated workload label like `-shell`). Orphan apps from torn-down preview VMs are reaped on the next CP boot.
+Cloudflare self-hosted apps are provisioned programmatically by the CP at boot as bypass routing objects — one application per hostname (CP, agent, each routed workload label like `-shell`). Orphan apps from torn-down preview VMs are reaped on the next CP boot.
 
-First-time setup on a fresh Cloudflare account:
-1. Zero Trust → Settings → Authentication → Login methods → add GitHub (`read:user` scope only).
-2. Extend `DD_CF_API_TOKEN` with **Access: Apps and Policies: Edit** and **Access: Identity Providers: Read**.
-3. Set repo var/secret `DD_ACCESS_ADMIN_EMAIL` (break-glass human login).
-4. Deploy. No per-deploy bootstrap step.
+First-time setup:
+1. Create the staging and production GitHub Apps with callback URL `https://app.devopsdefender.com/auth/github/callback`.
+2. Store the app client ids/secrets and `DD_AUTH_COOKIE_SECRET` in GitHub repo vars/secrets.
+3. Ensure `DD_CF_API_TOKEN` can manage Cloudflare tunnels, DNS, and self-hosted apps.
+4. Deploy. No per-deploy OAuth callback setup.
 
 ## Deploy a workload from GitHub Actions
 
@@ -106,7 +106,7 @@ The agent verifies the OIDC token against GitHub's JWKS, checks `repository_owne
 
 ## Terminal access
 
-Each VM runs `dd-shell` as a workload on a `-shell` labelled subdomain (for example `app-shell.devopsdefender.com` or `<agent>-shell.devopsdefender.com`). CF Access gates it behind the same GitHub OAuth + admin-email policy as the dashboards. The shell UI separates observed read-only workload logs from controlled read-write PTY sessions. Read-only viewing does not change integrity state because it cannot send input or signals; read-write PTYs are controlled as soon as they exist and keep encrypted transcript history inside the enclave.
+Each VM runs `dd-shell` as a workload on a `-shell` labelled subdomain (for example `app-shell.devopsdefender.com` or `<agent>-shell.devopsdefender.com`). DD gates it behind the same GitHub App broker session as the dashboards. The shell UI separates observed read-only workload logs from controlled read-write PTY sessions. Read-only viewing does not change integrity state because it cannot send input or signals; read-write PTYs are controlled as soon as they exist and keep encrypted transcript history inside the enclave.
 
 ## STONITH
 

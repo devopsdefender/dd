@@ -20,7 +20,7 @@ name: Cleanup
 #      PR sweeps also reap shared preview domains
 #      (`dd-local-preview`, `dd-local-preview-oracle`) only when their
 #      baked config/logs still point at that PR env.
-#   2. CF Access apps named `dd-{env}-…`.
+#   2. Cloudflare self-hosted apps named `dd-{env}-…`.
 #   3. CF tunnels named `dd-{env}-…` (connections drained first —
 #      delete is 400 otherwise).
 #   4. CF DNS CNAMEs matching `{env}.`, `{env}-`, or `dd-{env}-`.
@@ -196,7 +196,7 @@ jobs:
             \) -print -delete 2>/dev/null | sed 's/^/  - file /' || true
           EOSSH
 
-            # 2. CF Access apps named dd-{env}-…
+            # 2. Cloudflare self-hosted apps named dd-{env}-…
             echo "$apps" | jq -r --arg p "dd-$env-" \
               '.result[] | select(.name | startswith($p)) | "\(.id) \(.name)"' \
               | while read -r id name; do
@@ -311,7 +311,7 @@ jobs:
           # Orphan agent-hostname sweep — scheduled runs only. Agent
           # tunnels are `dd-{env}-agent-{uuid}`; every agent relaunch
           # mints a fresh UUID, STONITH kills the old tunnel, but the
-          # old tunnel's Access apps and DNS records linger. The
+          # old tunnel's Cloudflare self-hosted apps and DNS records linger. The
           # per-env pass above matches by `dd-{env}-` prefix so it
           # catches these for CLOSED envs; this catch-up pass covers
           # them for OPEN envs (where the env-level sweep intentionally

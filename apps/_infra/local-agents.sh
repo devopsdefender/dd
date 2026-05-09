@@ -24,10 +24,9 @@
 # All three reuse the existing easyenclave base qcow2 via copy-on-write
 # overlays; each gets its own config.iso baking in DD_CP_URL +
 # DD_ITA_API_KEY for that target. No GitHub PAT — the agent
-# authenticates to the CP via ITA attestation at /register and picks
-# up a CF Access service token from the register response for all
-# subsequent machine-to-machine calls. Libvirt XML is rendered from
-# the existing `easyenclave-local` domain.
+# authenticates to the CP via ITA attestation at /register and uses
+# in-code auth for subsequent machine-to-machine calls. Libvirt XML is
+# rendered from the existing `easyenclave-local` domain.
 #
 # `EE_OWNER` (required) is the principal authorized to deploy to the
 # baked agents — one of:
@@ -39,8 +38,8 @@
 #                  Strictly tighter than the bare-login form.
 # Both DD_OWNER_ID and DD_OWNER_KIND are derived from the resolved
 # answer and baked alongside DD_OWNER. There is no default — pick a
-# principal explicitly. CF Access dashboard membership only works
-# for kind=org; user/repo fall back to admin-email-only.
+# principal explicitly. Browser dashboard access is checked by DD's
+# GitHub App OAuth flow.
 #
 # Usage:
 #   export DD_ITA_API_KEY="$(cat ~/.secrets/ita_api_key)"
@@ -75,6 +74,9 @@ DD_RELEASE_TAG="${DD_RELEASE_TAG:-latest}"
 # asset fetches. CI forwards github.token here to avoid anonymous API
 # rate limits during cold boots.
 EE_GITHUB_TOKEN="${EE_GITHUB_TOKEN:-${GITHUB_TOKEN:-}}"
+DD_AUTH_BROKER_URL="${DD_AUTH_BROKER_URL:-https://app.devopsdefender.com}"
+DD_AUTH_COOKIE_DOMAIN="${DD_AUTH_COOKIE_DOMAIN:-.devopsdefender.com}"
+: "${DD_AUTH_COOKIE_SECRET?set DD_AUTH_COOKIE_SECRET}"
 
 # Resolve EE_OWNER to (id, kind) once via `gh api`. Hard-fails if the
 # login or repo doesn't exist — better than baking a typo into a
@@ -182,6 +184,12 @@ env_from_url() {
   esac
 }
 
+domain_from_url() {
+  local h
+  h=$(echo "$1" | sed -E 's#https?://##;s#/.*##')
+  echo "${h#*.}"
+}
+
 build_config_iso() {
   # $1=name, $2=cp_url, $3=env_label
   local name="$1" cp="$2" env="$3"
@@ -193,6 +201,8 @@ build_config_iso() {
     esac
   fi
   local out="$IMG_DIR/dd-local-$name-config.iso"
+  local domain
+  domain=$(domain_from_url "$cp")
   local confidential=""
   [ "$name" = preview-oracle ] && confidential=true
   local tmp
@@ -228,7 +238,16 @@ build_config_iso() {
         DD_RELEASE_TAG="$DD_RELEASE_TAG" bake "$REPO_ROOT/apps/ca-certificates/workload.json.tmpl"
         bake "$REPO_ROOT/apps/podman-bootstrap/workload.json"
         bake "$REPO_ROOT/apps/cloudflared/workload.json"
-        bake "$REPO_ROOT/apps/dd-shell/workload.json"
+        DD_DOMAIN="$domain" \
+          DD_HOSTNAME="dd-local-$name" \
+          DD_ENV="$env" \
+          DD_OWNER="$EE_OWNER" \
+          DD_OWNER_ID="$EE_OWNER_ID" \
+          DD_OWNER_KIND="$EE_OWNER_KIND" \
+          DD_AUTH_BROKER_URL="$DD_AUTH_BROKER_URL" \
+          DD_AUTH_COOKIE_DOMAIN="$DD_AUTH_COOKIE_DOMAIN" \
+          DD_AUTH_COOKIE_SECRET="$DD_AUTH_COOKIE_SECRET" \
+          bake "$REPO_ROOT/apps/dd-shell/workload.json.tmpl"
         ;;
     esac
   })
@@ -253,6 +272,11 @@ build_config_iso() {
       DD_OWNER="$EE_OWNER" \
       DD_OWNER_ID="$EE_OWNER_ID" \
       DD_OWNER_KIND="$EE_OWNER_KIND" \
+      DD_DOMAIN="$domain" \
+      DD_HOSTNAME="dd-local-$name" \
+      DD_AUTH_BROKER_URL="$DD_AUTH_BROKER_URL" \
+      DD_AUTH_COOKIE_DOMAIN="$DD_AUTH_COOKIE_DOMAIN" \
+      DD_AUTH_COOKIE_SECRET="$DD_AUTH_COOKIE_SECRET" \
       bake "$REPO_ROOT/apps/dd-agent/workload.json.tmpl"
   } | jq -cs '.')
 

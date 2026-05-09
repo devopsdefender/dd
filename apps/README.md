@@ -236,7 +236,7 @@ workload-runner changes needed.
    - **Agent VM**: add the same call to `apps/_infra/local-agents.sh` in
      `build_config_iso()`.
    - **Ad-hoc, runtime-only**: POST the baked JSON to `/deploy` on a running
-     agent. The endpoint is CF-Access-bypassed and gated in-code by a
+     agent. The endpoint is gated in-code by a
      GitHub Actions OIDC JWT. From inside a GitHub Actions workflow
      running in the `DD_OWNER` org:
      ```
