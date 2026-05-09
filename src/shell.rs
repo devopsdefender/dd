@@ -316,6 +316,9 @@ pub async fn run() -> Result<()> {
     let app = Router::new()
         .route("/", get(index))
         .route("/favicon.ico", get(favicon))
+        .route("/manifest.webmanifest", get(manifest))
+        .route("/sw.js", get(service_worker))
+        .route("/icon.svg", get(icon_svg))
         .route("/assets/xterm/xterm.css", get(xterm_css))
         .route("/assets/xterm/xterm.js", get(xterm_js))
         .route("/assets/xterm/addon-fit.js", get(xterm_fit_js))
@@ -372,6 +375,82 @@ async fn index(State(app): State<App>, headers: HeaderMap, uri: Uri) -> Response
 
 async fn favicon() -> StatusCode {
     StatusCode::NO_CONTENT
+}
+
+async fn manifest() -> impl IntoResponse {
+    (
+        [
+            ("content-type", "application/manifest+json; charset=utf-8"),
+            ("cache-control", "no-cache"),
+        ],
+        r##"{
+  "name": "DD Shell",
+  "short_name": "DD Shell",
+  "description": "DevOps Defender confidential shell",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#05070a",
+  "theme_color": "#111520",
+  "icons": [
+    {"src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable"}
+  ]
+}"##,
+    )
+}
+
+async fn service_worker() -> impl IntoResponse {
+    (
+        [
+            ("content-type", "application/javascript; charset=utf-8"),
+            ("cache-control", "no-cache"),
+        ],
+        r#"self.addEventListener("install", event => {
+  event.waitUntil(self.skipWaiting());
+});
+self.addEventListener("activate", event => {
+  event.waitUntil(self.clients.claim());
+});
+self.addEventListener("notificationclick", event => {
+  event.notification.close();
+  event.waitUntil((async () => {
+    const allClients = await self.clients.matchAll({type: "window", includeUncontrolled: true});
+    if (allClients.length) {
+      await allClients[0].focus();
+      return;
+    }
+    await self.clients.openWindow("/");
+  })());
+});
+self.addEventListener("message", event => {
+  const data = event.data || {};
+  if (data.type !== "notify") return;
+  const title = data.title || "DD Shell";
+  const body = data.body || "";
+  event.waitUntil(self.registration.showNotification(title, {
+    body,
+    tag: data.tag || "dd-shell",
+    renotify: true,
+    icon: "/icon.svg",
+    badge: "/icon.svg"
+  }));
+});
+"#,
+    )
+}
+
+async fn icon_svg() -> impl IntoResponse {
+    (
+        [
+            ("content-type", "image/svg+xml; charset=utf-8"),
+            ("cache-control", "public, max-age=31536000, immutable"),
+        ],
+        r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
+  <rect width="128" height="128" rx="24" fill="#05070a"/>
+  <path fill="#7aa2f7" d="M25 28h37c25 0 42 14 42 36S87 100 62 100H25V28Zm20 18v36h17c14 0 22-7 22-18s-8-18-22-18H45Z"/>
+  <path fill="#9ece6a" d="M38 55h23v18H38z"/>
+</svg>"##,
+    )
 }
 
 async fn xterm_css() -> impl IntoResponse {
@@ -1526,6 +1605,9 @@ let activePanel = "system";
 let notifications = loadNotificationHistory();
 let unreadNotifications = 0;
 const decoder = new TextDecoder();
+let serviceWorkerReady = null;
+installPwaMetadata();
+registerServiceWorker();
 
 async function api(path, opts) {
   const res = await fetch(path, opts);
@@ -1652,7 +1734,8 @@ function notificationHtml() {
   const supported = "Notification" in window;
   const permission = supported ? Notification.permission : "unavailable";
   const enabled = supported && permission === "granted" && notifyMode !== "off";
-  const detail = supported ? `native ${permission}; in-app history on` : "in-app history on; native unavailable";
+  const sw = "serviceWorker" in navigator ? "service worker ready" : "service worker unavailable";
+  const detail = supported ? `native ${permission}; ${sw}; in-app history on` : `in-app history on; native unavailable; ${sw}`;
   return `<div class="probe"><div class="row"><span class="name">Notifications</span><span class="pill ${enabled ? "ok" : "bad"}">${enabled ? "native" : "in-app"}</span></div><div class="meta">${escapeHtml(detail)}</div></div>`;
 }
 
@@ -1803,6 +1886,7 @@ document.getElementById("close").onclick = async () => {
   await refresh();
 };
 document.getElementById("notify").onclick = async () => {
+  await registerServiceWorker();
   if (!("Notification" in window)) {
     document.getElementById("status").textContent = "Notifications unavailable";
     return;
@@ -1950,17 +2034,40 @@ function notify(title, body) {
   if (activePanel !== "system") unreadNotifications++;
   renderNotificationFeed();
   showToast(item);
+  deliverNativeNotification(item);
+}
+function registerServiceWorker() {
+  if (!("serviceWorker" in navigator) || !window.isSecureContext) return Promise.resolve(null);
+  if (!serviceWorkerReady) {
+    serviceWorkerReady = navigator.serviceWorker.register("/sw.js")
+      .then(() => navigator.serviceWorker.ready)
+      .catch(() => null);
+  }
+  return serviceWorkerReady;
+}
+async function deliverNativeNotification(item) {
   if (!("Notification" in window) || Notification.permission !== "granted") return;
   if (notifyMode !== "always" && document.hasFocus()) return;
-  const n = new Notification(title || "Shell", {
-    body: body || "",
-    tag: current ? `dd-shell-${current}` : "dd-shell"
-  });
-  n.onclick = () => {
-    window.focus();
-    term.focus();
-    n.close();
-  };
+  const title = item.title || "DD Shell";
+  const body = item.body || "";
+  const tag = current ? `dd-shell-${current}` : "dd-shell";
+  const registration = await registerServiceWorker();
+  if (registration && "showNotification" in registration) {
+    await registration.showNotification(title, {body, tag, renotify: true, icon: "/icon.svg", badge: "/icon.svg"});
+    return;
+  }
+  const n = new Notification(title, {body, tag});
+  n.onclick = () => { window.focus(); term.focus(); n.close(); };
+}
+function installPwaMetadata() {
+  const manifest = document.createElement("link");
+  manifest.rel = "manifest";
+  manifest.href = "/manifest.webmanifest";
+  document.head.appendChild(manifest);
+  const theme = document.createElement("meta");
+  theme.name = "theme-color";
+  theme.content = "#111520";
+  document.head.appendChild(theme);
 }
 function loadNotificationHistory() {
   try {

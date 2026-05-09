@@ -61,6 +61,11 @@ Every path lives in `.github/workflows/release.yml`: one `build` job, then eithe
 4. No other `dd-{env}-*` VM is RUNNING after deploy (STONITH must have halted the previous instance)
 5. `dd-local-{env}` re-registers with the new CP within 5 min
 
+`dd-local-dogfood` is the exception: it is a manually managed production
+development agent for real Codex/Podman work. Release deploys never recreate
+it. Launch or refresh it explicitly with `apps/_infra/dd-dogfood.sh`; it keeps
+its workload disk and reconnects to production across CP redeploys.
+
 ## Auth
 
 Zero shared secrets. Cloudflare handles tunnel/DNS routing only; DD owns auth in-process with signed browser sessions, ITA tokens, GitHub Actions OIDC tokens, and Noise device keys.
@@ -107,6 +112,11 @@ The agent verifies the OIDC token against GitHub's JWKS, checks `repository_owne
 ## Terminal access
 
 Each VM runs `dd-shell` as a workload on a `-shell` labelled subdomain (for example `app-shell.devopsdefender.com` or `<agent>-shell.devopsdefender.com`). DD gates it behind the same GitHub App broker session as the dashboards. The shell UI separates observed read-only workload logs from controlled read-write PTY sessions. Read-only viewing does not change integrity state because it cannot send input or signals; read-write PTYs are controlled as soon as they exist and keep encrypted transcript history inside the enclave.
+
+The shell is installable as a small PWA. Browser notifications are always
+delivered by default when permission is granted; on mobile, install the shell
+from the browser so the service worker can present notifications through the
+platform notification surface while the shell is active.
 
 ## STONITH
 

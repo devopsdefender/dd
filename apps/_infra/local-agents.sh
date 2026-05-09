@@ -20,8 +20,13 @@
 #                      workload onto this agent's /deploy. Same boot
 #                      chain as preview/prod (cloudflared + dd-agent +
 #                      dd-shell + podman). Modest sizing.
+#   dd-local-dogfood : CPU-only, registers with production. Dedicated
+#                      manually-managed development agent for real Codex /
+#                      Podman work. CI never reprovisions it; production
+#                      deploys can roll the CP while this VM keeps trying to
+#                      reconnect with its persistent workload disk intact.
 #
-# All three reuse the existing easyenclave base qcow2 via copy-on-write
+# All agents reuse the existing easyenclave base qcow2 via copy-on-write
 # overlays; each gets its own config.iso baking in DD_CP_URL +
 # DD_ITA_API_KEY for that target. No GitHub PAT — the agent
 # authenticates to the CP via ITA attestation at /register and uses
@@ -44,15 +49,16 @@
 # Usage:
 #   export DD_ITA_API_KEY="$(cat ~/.secrets/ita_api_key)"
 #   export EE_OWNER="devopsdefender"   # or "alice", "alice/dd-foo", etc.
-#   ./apps/_infra/local-agents.sh <preview> <prod> <bot>
+#   ./apps/_infra/local-agents.sh <preview> <prod> <bot> <dogfood>
 #
 # Each URL arg is independent — pass "" to skip provisioning that VM:
-#   ./apps/_infra/local-agents.sh "" https://app.devopsdefender.com ""                          # prod only
-#   ./apps/_infra/local-agents.sh https://pr-N.devopsdefender.com "" ""                         # preview only
-#   ./apps/_infra/local-agents.sh "" "" https://app.devopsdefender.com                          # bot only
-#   ./apps/_infra/local-agents.sh "" https://app.devopsdefender.com https://app.devopsdefender.com  # prod + bot
+#   ./apps/_infra/local-agents.sh "" https://app.devopsdefender.com "" ""                         # prod only
+#   ./apps/_infra/local-agents.sh https://pr-N.devopsdefender.com "" "" ""                        # preview only
+#   ./apps/_infra/local-agents.sh "" "" https://app.devopsdefender.com ""                         # bot only
+#   ./apps/_infra/local-agents.sh "" "" "" https://app.devopsdefender.com                         # dogfood only
+#   ./apps/_infra/local-agents.sh "" https://app.devopsdefender.com https://app.devopsdefender.com ""  # prod + bot
 #
-# After: virsh start dd-local-preview && virsh start dd-local-preview-oracle && virsh start dd-local-prod && virsh start dd-local-bot
+# After: virsh start dd-local-preview && virsh start dd-local-preview-oracle && virsh start dd-local-prod && virsh start dd-local-bot && virsh start dd-local-dogfood
 
 set -euo pipefail
 export LIBVIRT_DEFAULT_URI="${LIBVIRT_DEFAULT_URI:-qemu:///system}"
@@ -60,8 +66,9 @@ export LIBVIRT_DEFAULT_URI="${LIBVIRT_DEFAULT_URI:-qemu:///system}"
 PREVIEW_CP="${1-}"
 PROD_CP="${2-}"
 BOT_CP="${3-}"
-if [ -z "$PREVIEW_CP" ] && [ -z "$PROD_CP" ] && [ -z "$BOT_CP" ]; then
-  echo "usage: $0 <preview-cp-url|\"\"> <prod-cp-url|\"\"> <bot-cp-url|\"\">" >&2
+DOGFOOD_CP="${4-}"
+if [ -z "$PREVIEW_CP" ] && [ -z "$PROD_CP" ] && [ -z "$BOT_CP" ] && [ -z "$DOGFOOD_CP" ]; then
+  echo "usage: $0 <preview-cp-url|\"\"> <prod-cp-url|\"\"> <bot-cp-url|\"\"> <dogfood-cp-url|\"\">" >&2
   exit 1
 fi
 : "${DD_ITA_API_KEY?set DD_ITA_API_KEY}"
@@ -338,6 +345,14 @@ build_overlay() {
   echo "  wrote $overlay (20G sparse, backing $BASE)"
 }
 
+workload_disk_size() {
+  # $1=name
+  case "$1" in
+    dogfood) echo "${DD_DOGFOOD_DISK_SIZE:-512G}" ;;
+    *)       echo "160G" ;;
+  esac
+}
+
 build_workload_disk() {
   # $1=name   $2=size-spec (e.g. 160G, 1920G)
   #
@@ -459,9 +474,14 @@ with open(p, "w") as f: f.write(x)
 PY
   fi
 
-  # CPU-only agent sizing.
+  # CPU-only agent sizing. Dogfood is meant for real interactive
+  # development, so give it enough room for Codex + nested containers.
   local mem_kib=16777216    # 16 GiB
   local vcpus=4
+  if [ "$name" = dogfood ]; then
+    mem_kib="${DD_DOGFOOD_MEM_KIB:-33554432}" # 32 GiB
+    vcpus="${DD_DOGFOOD_VCPUS:-8}"
+  fi
   sed -i -E "s|<memory unit='KiB'>[0-9]+</memory>|<memory unit='KiB'>$mem_kib</memory>|" "$out"
   sed -i -E "s|<currentMemory unit='KiB'>[0-9]+</currentMemory>|<currentMemory unit='KiB'>$mem_kib</currentMemory>|" "$out"
   sed -i -E "s|<vcpu placement='static'>[0-9]+</vcpu>|<vcpu placement='static'>$vcpus</vcpu>|" "$out"
@@ -536,7 +556,7 @@ define_agent() {
   # Workload disk (/dev/vdc, ext4, mounted at /var/lib/easyenclave/data
   # by the mount-data boot workload). Sparse qcow2, so only grows with
   # actual writes.
-  build_workload_disk "$name" 160G
+  build_workload_disk "$name" "$(workload_disk_size "$name")"
   build_config_iso "$name" "$cp" "$env_label"
   local xml
   xml=$(render_domain_xml "$name")
@@ -548,6 +568,7 @@ define_agent() {
 [ -n "$PREVIEW_CP" ] && define_agent preview-oracle "$PREVIEW_CP"
 [ -n "$PROD_CP"    ] && define_agent prod    "$PROD_CP"
 [ -n "$BOT_CP"     ] && define_agent bot     "$BOT_CP"
+[ -n "$DOGFOOD_CP" ] && define_agent dogfood "$DOGFOOD_CP"
 
 echo
 echo "done. start with:"
@@ -555,14 +576,16 @@ echo "done. start with:"
 [ -n "$PREVIEW_CP" ] && echo "  virsh start dd-local-preview-oracle"
 [ -n "$PROD_CP"    ] && echo "  virsh start dd-local-prod"
 [ -n "$BOT_CP"     ] && echo "  virsh start dd-local-bot"
+[ -n "$DOGFOOD_CP" ] && echo "  virsh start dd-local-dogfood"
 echo
 echo "watch registration (Ctrl-] to exit):"
 [ -n "$PREVIEW_CP" ] && echo "  virsh console dd-local-preview"
 [ -n "$PREVIEW_CP" ] && echo "  virsh console dd-local-preview-oracle"
 [ -n "$PROD_CP"    ] && echo "  virsh console dd-local-prod"
 [ -n "$BOT_CP"     ] && echo "  virsh console dd-local-bot"
+[ -n "$DOGFOOD_CP" ] && echo "  virsh console dd-local-dogfood"
 
 # Explicit 0 — the tail `[ -n "$BOT_CP" ] && …` returns 1 when
-# BOT_CP="" (preview/prod-only), bubbling up as the script exit
+# BOT_CP/DOGFOOD_CP="" (preview/prod-only), bubbling up as the script exit
 # status and tripping set -e in dd-relaunch.sh. Force success.
 exit 0
