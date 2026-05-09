@@ -112,11 +112,8 @@ pub async fn run() -> Result<()> {
     );
     eprintln!("agent: ITA mode={:?}", cfg.ita.mode);
 
-    let initial_token = mint_ita(&cfg, &ee).await?;
-    eprintln!("agent: ITA token minted");
-
     eprintln!("agent: registering with {}", cfg.cp_url);
-    let b = register(&cfg, &initial_token).await?;
+    let (initial_token, b) = register(&cfg, &ee).await?;
     eprintln!("agent: registered as {}", b.hostname);
 
     spawn_cloudflared(b.tunnel_token);
@@ -396,7 +393,12 @@ struct Bootstrap {
     agent_id: String,
 }
 
-async fn register(cfg: &Cfg, ita_token: &str) -> Result<Bootstrap> {
+enum RegisterAttempt {
+    Retry(Error),
+    Fatal(Error),
+}
+
+async fn register(cfg: &Cfg, ee: &Ee) -> Result<(String, Bootstrap)> {
     let http = reqwest::Client::builder()
         .timeout(Duration::from_secs(60))
         .build()
@@ -407,53 +409,95 @@ async fn register(cfg: &Cfg, ita_token: &str) -> Result<Bootstrap> {
         .iter()
         .map(|(label, port)| serde_json::json!({"hostname_label": label, "port": port}))
         .collect();
+
+    // /register is authenticated by a fresh ITA attestation token. The
+    // CP and its Cloudflare route are allowed to disappear during a
+    // deploy; a long-lived local dev agent should keep trying instead
+    // of becoming permanently dead. Client errors other than rate
+    // limiting are still fatal because they usually mean bad config
+    // or failed attestation.
+    let mut attempt = 1u64;
+    loop {
+        let ita_token = match mint_ita(cfg, ee).await {
+            Ok(token) => {
+                eprintln!("agent: ITA token minted for register attempt {attempt}");
+                token
+            }
+            Err(e) => {
+                let delay = register_backoff(attempt);
+                eprintln!(
+                    "agent: register attempt {attempt} could not mint ITA token ({e}) — backing off {}s",
+                    delay.as_secs()
+                );
+                tokio::time::sleep(delay).await;
+                attempt = attempt.saturating_add(1);
+                continue;
+            }
+        };
+
+        match register_once(&http, cfg, &url, &extra_ingress, &ita_token).await {
+            Ok(bootstrap) => return Ok((ita_token, bootstrap)),
+            Err(RegisterAttempt::Fatal(e)) => return Err(e),
+            Err(RegisterAttempt::Retry(e)) => {
+                let delay = register_backoff(attempt);
+                eprintln!(
+                    "agent: register attempt {attempt} failed ({e}) — backing off {}s",
+                    delay.as_secs()
+                );
+                tokio::time::sleep(delay).await;
+                attempt = attempt.saturating_add(1);
+            }
+        }
+    }
+}
+
+async fn register_once(
+    http: &reqwest::Client,
+    cfg: &Cfg,
+    url: &str,
+    extra_ingress: &[serde_json::Value],
+    ita_token: &str,
+) -> std::result::Result<Bootstrap, RegisterAttempt> {
     let body = serde_json::json!({
         "vm_name": cfg.common.vm_name,
         "ita_token": ita_token,
         "extra_ingress": extra_ingress,
     });
 
-    // /register is authenticated by ITA attestation. The transport
-    // layer is retried — the agent VM often boots
-    // faster than CF edge propagation for a just-flipped CP CNAME
-    // or a just-reconnected cloudflared tunnel, and the first POST
-    // tends to fail with "error sending request" / 502 / 530.
-    // Exponential-ish backoff, ~90s total.
-    let mut last_err: Option<Error> = None;
-    for attempt in 1..=6u32 {
-        match http.post(&url).json(&body).send().await {
-            Ok(resp) if resp.status().is_success() => {
-                return Ok(resp.json().await?);
-            }
-            Ok(resp) => {
-                let s = resp.status();
-                // 4xx from the CP is almost always a real config
-                // error (ITA invalid, etc.) — no point retrying.
-                if s.is_client_error() && s != reqwest::StatusCode::TOO_MANY_REQUESTS {
-                    let b = resp.text().await.unwrap_or_default();
-                    return Err(Error::Upstream(format!("register {url} → {s}: {b}")));
-                }
-                let b = resp.text().await.unwrap_or_default();
-                last_err = Some(Error::Upstream(format!("register {url} → {s}: {b}")));
-            }
-            Err(e) => {
-                // Print `{:?}` so the reqwest error chain (TLS,
-                // DNS, connect details) lands in the agent log
-                // instead of just the wrapper message.
-                last_err = Some(Error::Upstream(format!("register {url}: {e:?}")));
+    match http.post(url).json(&body).send().await {
+        Ok(resp) if resp.status().is_success() => resp
+            .json()
+            .await
+            .map_err(Error::from)
+            .map_err(RegisterAttempt::Retry),
+        Ok(resp) => {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            let err = Error::Upstream(format!("register {url} → {status}: {body}"));
+            if status.is_client_error() && status != reqwest::StatusCode::TOO_MANY_REQUESTS {
+                Err(RegisterAttempt::Fatal(err))
+            } else {
+                Err(RegisterAttempt::Retry(err))
             }
         }
-        eprintln!(
-            "agent: register attempt {attempt}/6 failed ({}) — backing off",
-            last_err.as_ref().map(|e| e.to_string()).unwrap_or_default()
-        );
-        tokio::time::sleep(Duration::from_secs(5 * attempt as u64)).await;
+        Err(e) => {
+            // Print `{:?}` so the reqwest error chain (TLS, DNS,
+            // connect details) lands in the agent log instead of just
+            // the wrapper message.
+            Err(RegisterAttempt::Retry(Error::Upstream(format!(
+                "register {url}: {e:?}"
+            ))))
+        }
     }
-    Err(last_err.unwrap_or_else(|| Error::Upstream("register: exhausted retries".into())))
 }
 
-/// Mint an Intel-signed TDX attestation JWT. Fatal on any failure —
-/// the agent refuses to start without a valid token.
+fn register_backoff(attempt: u64) -> Duration {
+    Duration::from_secs((attempt.saturating_mul(5)).clamp(5, 60))
+}
+
+/// Mint an Intel-signed TDX attestation JWT. Registration retries mint
+/// failures because a long-lived local agent may boot while ITA or the
+/// CP path is temporarily unavailable.
 async fn mint_ita(cfg: &Cfg, ee: &Ee) -> Result<String> {
     if cfg.ita.mode == ItaMode::Local {
         return ita::mint_local(&cfg.ita.issuer, &cfg.ita.api_key, &cfg.common.vm_name);
