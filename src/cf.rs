@@ -684,6 +684,14 @@ pub async fn provision_agent_routing(
         vec![bypass_policy()],
     )
     .await?;
+    let agent_api_domain = agent_api_hostname(agent_hostname);
+    ensure_public_route_app(
+        http,
+        cf,
+        &format!("dd-{env}-agent-api-{agent_hostname}"),
+        &agent_api_domain,
+    )
+    .await?;
     for (suffix, label) in [
         ("/health", "health"),
         ("/deploy", "deploy"),
@@ -709,10 +717,11 @@ pub async fn provision_agent_routing(
         .await?;
     }
 
-    let desired: std::collections::HashSet<String> = workload_labels
+    let mut desired: std::collections::HashSet<String> = workload_labels
         .iter()
         .map(|l| extra_hostname(agent_hostname, l))
         .collect();
+    desired.insert(agent_api_domain.clone());
     for label in workload_labels {
         let domain = extra_hostname(agent_hostname, label);
         if is_admin_label(label) {
@@ -741,7 +750,6 @@ pub async fn provision_agent_routing(
         .unwrap_or((agent_hostname, ""));
     let prefix = format!("{base}-");
     let suffix_tld = format!(".{tld}");
-    let agent_api_domain = agent_api_hostname(agent_hostname);
     let resp = call(
         http,
         cf,
