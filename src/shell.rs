@@ -1387,6 +1387,18 @@ main { max-width:none; padding:0; height:100dvh; display:grid; grid-template-col
 .pill { border:1px solid #2b3242; border-radius:999px; padding:2px 7px; color:#8791a5; font-size:11px; }
 .pill.ok { color:#9ece6a; border-color:#334b35; }
 .pill.bad { color:#f7768e; border-color:#57323d; }
+.notify-feed { display:flex; flex-direction:column; gap:8px; margin-top:8px; }
+.notify-item { background:#171c29; border:1px solid #2b3242; border-radius:6px; padding:9px 10px; min-width:0; }
+.notify-item .notify-title { display:flex; align-items:center; justify-content:space-between; gap:8px; font-size:12px; font-weight:700; }
+.notify-item .notify-time { color:#8791a5; font-size:10px; font-weight:400; white-space:nowrap; }
+.notify-item .notify-body { margin-top:3px; color:#8791a5; font-size:11px; line-height:1.4; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.notify-badge { display:none; min-width:18px; height:18px; border-radius:999px; background:#7aa2f7; color:#05070a; font-size:11px; font-weight:800; align-items:center; justify-content:center; padding:0 5px; }
+.notify-badge.active { display:inline-flex; }
+.toast-stack { position:fixed; top:60px; right:14px; z-index:50; display:flex; flex-direction:column; gap:8px; width:min(340px, calc(100vw - 28px)); pointer-events:none; }
+.toast { background:#171c29; border:1px solid #3a4256; box-shadow:0 12px 30px #0008; border-radius:7px; padding:10px 12px; opacity:0; transform:translateY(-8px); transition:opacity .14s ease, transform .14s ease; }
+.toast.show { opacity:1; transform:translateY(0); }
+.toast .notify-title { font-size:12px; font-weight:800; }
+.toast .notify-body { margin-top:3px; color:#d7deea; font-size:12px; line-height:1.35; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .filter { width:100%; margin-top:10px; box-sizing:border-box; background:#0b0d12; color:#d7deea; border:1px solid #2b3242; border-radius:6px; padding:9px 10px; font:inherit; font-size:13px; }
 .filter:focus { outline:1px solid #7aa2f7; border-color:#7aa2f7; }
 .empty-mini { color:#8791a5; font-size:12px; padding:8px 2px; }
@@ -1414,6 +1426,7 @@ button.secondary { background:#252a36; color:#d7deea; }
   .mobile-tabs { position:fixed; left:0; right:0; bottom:0; z-index:30; display:grid; grid-template-columns:repeat(4,1fr); height:52px; padding-bottom:env(safe-area-inset-bottom); background:#111520; border-top:1px solid #252a36; }
   .mobile-tabs button { border:0; border-right:1px solid #252a36; border-radius:0; background:#111520; color:#8791a5; font-size:12px; padding:8px 4px; }
   .mobile-tabs button.active { color:#d7deea; background:#171c29; }
+  .toast-stack { top:52px; right:8px; width:calc(100vw - 16px); }
 }
 </style>
 <div class="sidebar">
@@ -1428,6 +1441,8 @@ button.secondary { background:#252a36; color:#d7deea; }
       <div class="panel active" data-panel="system">
         <div class="group-title">System</div>
         <div class="system" id="system"></div>
+        <div class="group-title">Notifications</div>
+        <div class="notify-feed" id="notify-feed"></div>
       </div>
       <div class="panel" data-panel="recipes">
         <div class="group-title">New session</div>
@@ -1454,10 +1469,12 @@ button.secondary { background:#252a36; color:#d7deea; }
     <button class="secondary" id="close">Close session</button>
     <button class="secondary" id="notify" title="Enable notifications">Notify</button>
     <button class="secondary" id="notify-test" title="Send a test notification">Test</button>
+    <span class="notify-badge" id="notify-badge">0</span>
     <span class="status" id="status">No session</span>
   </div>
   <div class="term" id="terminal"></div>
 </div>
+<div class="toast-stack" id="toast-stack"></div>
 <div class="mobile-tabs" id="mobile-tabs">
   <button data-panel="system" class="active">System</button>
   <button data-panel="recipes">New</button>
@@ -1503,6 +1520,8 @@ let oscBuffer = "";
 let cachedRecipes = [];
 let cachedWorkloads = [];
 let activePanel = "system";
+let notifications = loadNotificationHistory();
+let unreadNotifications = 0;
 const decoder = new TextDecoder();
 
 async function api(path, opts) {
@@ -1520,6 +1539,7 @@ async function refresh() {
     api("/api/workloads").catch(() => [])
   ]);
   renderSystem(system);
+  renderNotificationFeed();
   cachedRecipes = recipes;
   renderRecipes();
   cachedWorkloads = workloads;
@@ -1629,8 +1649,26 @@ function notificationHtml() {
   const supported = "Notification" in window;
   const permission = supported ? Notification.permission : "unavailable";
   const enabled = supported && permission === "granted" && notifyMode !== "off";
-  const detail = supported ? `${permission}, mode ${notifyMode}` : "browser does not expose Notification API";
-  return `<div class="probe"><div class="row"><span class="name">Notifications</span><span class="pill ${enabled ? "ok" : "bad"}">${enabled ? "enabled" : "off"}</span></div><div class="meta">${escapeHtml(detail)}</div></div>`;
+  const detail = supported ? `native ${permission}; in-app history on` : "in-app history on; native unavailable";
+  return `<div class="probe"><div class="row"><span class="name">Notifications</span><span class="pill ${enabled ? "ok" : "bad"}">${enabled ? "native" : "in-app"}</span></div><div class="meta">${escapeHtml(detail)}</div></div>`;
+}
+
+function renderNotificationFeed() {
+  const root = document.getElementById("notify-feed");
+  const badge = document.getElementById("notify-badge");
+  if (!root || !badge) return;
+  badge.textContent = unreadNotifications > 99 ? "99+" : String(unreadNotifications);
+  badge.classList.toggle("active", unreadNotifications > 0);
+  if (!notifications.length) {
+    root.innerHTML = `<div class="empty-mini">No notifications yet</div>`;
+    return;
+  }
+  root.innerHTML = notifications.slice(0, 12).map(n => `
+    <div class="notify-item">
+      <div class="notify-title"><span>${escapeHtml(n.title || "Shell")}</span><span class="notify-time">${escapeHtml(formatClock(n.ts))}</span></div>
+      <div class="notify-body">${escapeHtml(n.body || "")}</div>
+    </div>
+  `).join("");
 }
 
 function probeHtml(name, probe) {
@@ -1780,11 +1818,7 @@ document.getElementById("notify").onclick = async () => {
   }
 };
 document.getElementById("notify-test").onclick = async () => {
-  if (!("Notification" in window)) {
-    document.getElementById("status").textContent = "Notifications unavailable";
-    return;
-  }
-  if (Notification.permission !== "granted") {
+  if ("Notification" in window && Notification.permission !== "granted") {
     await document.getElementById("notify").onclick();
   }
   notify("DD Shell", "notification test");
@@ -1794,6 +1828,10 @@ function setPanel(panel) {
   activePanel = panel || "system";
   document.querySelectorAll(".panel").forEach(el => el.classList.toggle("active", el.dataset.panel === activePanel));
   document.querySelectorAll("#mobile-tabs button").forEach(el => el.classList.toggle("active", el.dataset.panel === activePanel));
+  if (activePanel === "system") {
+    unreadNotifications = 0;
+    renderNotificationFeed();
+  }
 }
 
 function openPanels(panel) {
@@ -1898,6 +1936,17 @@ function scanNotifications(data) {
   if (oscBuffer.length > 8192) oscBuffer = oscBuffer.slice(-1024);
 }
 function notify(title, body) {
+  const item = {
+    title: title || "Shell",
+    body: body || "",
+    ts: Date.now()
+  };
+  notifications.unshift(item);
+  notifications = notifications.slice(0, 50);
+  saveNotificationHistory();
+  if (activePanel !== "system") unreadNotifications++;
+  renderNotificationFeed();
+  showToast(item);
   if (!("Notification" in window) || Notification.permission !== "granted") return;
   if (notifyMode !== "always" && document.hasFocus()) return;
   const n = new Notification(title || "Shell", {
@@ -1909,6 +1958,37 @@ function notify(title, body) {
     term.focus();
     n.close();
   };
+}
+function loadNotificationHistory() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem("dd-shell-notifications") || "[]");
+    return Array.isArray(parsed) ? parsed.slice(0, 50) : [];
+  } catch (_) {
+    return [];
+  }
+}
+function saveNotificationHistory() {
+  localStorage.setItem("dd-shell-notifications", JSON.stringify(notifications.slice(0, 50)));
+}
+function showToast(item) {
+  const stack = document.getElementById("toast-stack");
+  if (!stack) return;
+  const el = document.createElement("div");
+  el.className = "toast";
+  el.innerHTML = `<div class="notify-title">${escapeHtml(item.title || "Shell")}</div><div class="notify-body">${escapeHtml(item.body || "")}</div>`;
+  stack.prepend(el);
+  requestAnimationFrame(() => el.classList.add("show"));
+  setTimeout(() => {
+    el.classList.remove("show");
+    setTimeout(() => el.remove(), 180);
+  }, 4200);
+}
+function formatClock(ts) {
+  try {
+    return new Date(ts).toLocaleTimeString([], {hour:"2-digit", minute:"2-digit"});
+  } catch (_) {
+    return "";
+  }
 }
 function formatBytes(value) {
   const n = Number(value || 0);
