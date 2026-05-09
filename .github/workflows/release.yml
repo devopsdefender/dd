@@ -151,9 +151,9 @@ jobs:
             | tail -n +12 \
             | xargs -rI{} gh release delete {} --yes --cleanup-tag
 
-  # Per-PR ephemeral preview at pr-{N}.{domain}. Browser auth is CF
-  # Access GitHub OAuth (public org membership) across all envs; there
-  # is no longer a preview-vs-prod auth difference. Cascades into
+  # Per-PR ephemeral preview at pr-{N}.{domain}. Browser auth is DD's
+  # GitHub App broker (public org membership) across all envs; there is
+  # no longer a preview-vs-prod auth difference. Cascades into
   # dd-local-preview relaunch.
   deploy-preview:
     if: github.event_name == 'pull_request'

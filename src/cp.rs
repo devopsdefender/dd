@@ -206,9 +206,9 @@ pub async fn run() -> Result<()> {
     // `/health` also carries the Noise pre-handshake quote + pubkey
     // (the former `/attest`, now inlined to save a bootstrap round-trip).
     let cp_labels: Vec<String> = cp_extras.iter().map(|(l, _)| l.clone()).collect();
-    let mut access_ready = false;
+    let mut routing_ready = false;
     for attempt in 1..=5 {
-        match cf::provision_cp_access(
+        match cf::provision_cp_routing(
             &http,
             &cfg.cf,
             &cfg.common.env_label,
@@ -218,7 +218,7 @@ pub async fn run() -> Result<()> {
         .await
         {
             Ok(()) => {
-                access_ready = true;
+                routing_ready = true;
                 break;
             }
             Err(e) => {
@@ -227,7 +227,7 @@ pub async fn run() -> Result<()> {
             }
         }
     }
-    if !access_ready {
+    if !routing_ready {
         eprintln!("cp: Cloudflare app provisioning failed after retries");
         stonith::poweroff();
     }
@@ -601,7 +601,7 @@ async fn register(
     }
 
     let labels: Vec<String> = tunnel_extras.iter().map(|(l, _)| l.clone()).collect();
-    if let Err(e) = cf::provision_agent_access(
+    if let Err(e) = cf::provision_agent_routing(
         &http,
         &s.cfg.cf,
         &s.cfg.common.env_label,
@@ -610,7 +610,7 @@ async fn register(
     )
     .await
     {
-        eprintln!("cp: provision_agent_access {agent_hostname} failed: {e}");
+        eprintln!("cp: provision_agent_routing {agent_hostname} failed: {e}");
     }
 
     // Seed the store so the dashboard shows the agent before the first
@@ -733,7 +733,7 @@ async fn ingress_replace(
         cf::update_ingress(&http, &s.cfg.cf, &tunnel_id, &hostname, &tunnel_extras).await?;
 
     let labels: Vec<String> = tunnel_extras.iter().map(|(l, _)| l.clone()).collect();
-    if let Err(e) = cf::provision_agent_access(
+    if let Err(e) = cf::provision_agent_routing(
         &http,
         &s.cfg.cf,
         &s.cfg.common.env_label,
@@ -742,7 +742,7 @@ async fn ingress_replace(
     )
     .await
     {
-        eprintln!("cp: provision_agent_access on /ingress/replace failed: {e}");
+        eprintln!("cp: provision_agent_routing on /ingress/replace failed: {e}");
     }
 
     {

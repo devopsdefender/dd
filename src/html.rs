@@ -60,9 +60,8 @@ pub fn nav(items: &[(&str, &str, bool)]) -> String {
         let class = if *active { r#" class="active""# } else { "" };
         s.push_str(&format!(r#"<a href="{href}"{class}>{label}</a>"#));
     }
-    // Log out is handled by clearing DD's browser session cookie.
-    // (https://<domain>/cdn-cgi/access/logout). We don't own auth, so
-    // we don't render a log-out button in the nav.
+    // Log out is handled by clearing DD's browser session cookie. We
+    // do not render a log-out button in the shared nav yet.
     s.push_str(r#"<span class="spacer"></span></nav>"#);
     s
 }

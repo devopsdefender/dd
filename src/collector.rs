@@ -296,11 +296,11 @@ async fn tick(
             for (label, _) in &orphan.extras {
                 let _ = cf::delete_cname(http, cf, &cf::extra_hostname(&orphan.host, label)).await;
             }
-            // Sweep the agent's Cloudflare self-hosted apps: its
+            // Sweep the agent's Cloudflare routing apps: its
             // dashboard route and every workload URL under this hostname.
             // Without this the account accumulates dead apps every
             // STONITH cycle.
-            cf::delete_access_apps_for(http, cf, &orphan.host).await;
+            cf::delete_routing_apps_for(http, cf, &orphan.host).await;
         }
     }
 
@@ -491,7 +491,7 @@ mod tests {
     }
 
     #[test]
-    fn access_policy_scrape_failures_are_not_dead_signals() {
+    fn auth_gate_scrape_failures_are_not_dead_signals() {
         for err in [
             None,
             Some("status 302 Found".to_string()),
@@ -531,7 +531,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_tunnels_keep_access_policy_failures() {
+    fn unknown_tunnels_keep_auth_gate_failures() {
         let now = Utc::now();
         let err = Some("status 403 Forbidden".to_string());
 
