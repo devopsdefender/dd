@@ -170,7 +170,7 @@ inline in two places so both lifecycle points behave identically:
 
 ## Where each workload runs
 
-| workload | CP VM | agent VM (preview) | agent VM (prod) |
+| workload | CP VM | agent VM (preview) | agent VM (prod / dogfood) |
 |---|---|---|---|
 | `busybox` | | ✅ | ✅ |
 | `cloudflared` | ✅ | ✅ | ✅ |
@@ -208,7 +208,36 @@ Additional examples:
 CP stays slim: just `cloudflared` + `dd-management`. Preview agent VMs run a
 small read-only oracle plus agent + podman for CI to prove registration,
 scraping, vanity ingress, and dashboards end-to-end. Prod agent VMs use the
-same CPU-only boot shape without demo workloads for now.
+same CPU-only boot shape without demo workloads for now. `dd-local-dogfood`
+uses that same prod boot chain but is manually managed, sized larger by
+default, and not relaunched by CI.
+
+## Production dogfood agent
+
+Use `apps/_infra/dd-dogfood.sh` when you want a real, long-lived local VM
+registered to production for Codex/Podman development:
+
+```bash
+export DD_ITA_API_KEY="$(cat ~/.secrets/ita_api_key)"
+export DD_AUTH_COOKIE_SECRET="$(cat ~/.secrets/dd_auth_cookie_secret)"
+export EE_OWNER="posix4e" # or an org/repo principal
+./apps/_infra/dd-dogfood.sh
+```
+
+The script defines and starts `dd-local-dogfood` against
+`https://app.devopsdefender.com`. It follows the production stable EE image and
+the `latest` DD release by default. It preserves
+`/var/lib/libvirt/images/dd-local-dogfood-workload.qcow2` across runs, so
+Podman images, shell transcript storage, and Codex login state survive explicit
+operator refreshes. Production deploys do not call this script and do not
+destroy the dogfood VM.
+
+Optional sizing knobs:
+
+```bash
+DD_DOGFOOD_DISK_SIZE=1024G DD_DOGFOOD_MEM_KIB=67108864 DD_DOGFOOD_VCPUS=12 \
+  ./apps/_infra/dd-dogfood.sh
+```
 
 ## Ordering
 

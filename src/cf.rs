@@ -12,6 +12,12 @@ use serde::{Deserialize, Serialize};
 use crate::config::CfCreds;
 use crate::error::{Error, Result};
 
+/// Cloudflare control-plane API client. Keep this on reqwest's system
+/// resolver path even when scrape clients enable Hickory DNS.
+pub fn http_client() -> Client {
+    crate::system_http_client()
+}
+
 const API: &str = "https://api.cloudflare.com/client/v4";
 pub const AGENT_API_LABEL: &str = "agent-api";
 pub const AGENT_API_PORT: u16 = 8081;

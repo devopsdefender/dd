@@ -237,13 +237,24 @@ runs:
             last_payload="$payload"
           fi
           ready_count=$(echo "$payload" | jq -r --arg since "$since" --argjson expected "$expected_json" '
-                [.[] | select((.status=="healthy" or .status=="registering") and .last_seen > $since and (.vm_name as $vm | $expected | index($vm)))]
+                [.[] | select(.status=="healthy" and .last_seen > $since and (.vm_name as $vm | $expected | index($vm)))]
                 | unique_by(.vm_name)
                 | length' 2>/dev/null || echo 0)
           if [ "$ready_count" = "${#expected_vms[@]}" ]; then
+            if [ "$KIND" = "preview" ]; then
+              cp_health=$(curl -fsS --max-time 10 "$URL/health" 2>/dev/null || true)
+              healthy_count=$(echo "$cp_health" | jq -r '.healthy_count // 0' 2>/dev/null || echo 0)
+              agent_count=$(echo "$cp_health" | jq -r '.agent_count // 0' 2>/dev/null || echo 0)
+              if [ "$healthy_count" -lt 3 ] || [ "$agent_count" -lt 3 ]; then
+                last_payload="$payload"
+                echo "  CP /api/agents has preview agents healthy, but /health reports agent_count=$agent_count healthy_count=$healthy_count; waiting for collector/store convergence... (${i}/60)"
+                sleep 10
+                continue
+              fi
+            fi
             echo "registered agents:"
             echo "$payload" | jq -r --arg since "$since" --argjson expected "$expected_json" '
-              .[] | select((.status=="healthy" or .status=="registering") and .last_seen > $since and (.vm_name as $vm | $expected | index($vm)))
+              .[] | select(.status=="healthy" and .last_seen > $since and (.vm_name as $vm | $expected | index($vm)))
               | "  \(.vm_name) [\(.status)] at https://\(.hostname)"' 2>/dev/null || true
             cleanup_tail
             exit 0

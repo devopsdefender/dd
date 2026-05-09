@@ -80,8 +80,9 @@ pub async fn self_watchdog(
 ) -> ! {
     let http = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
+        .no_hickory_dns()
         .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
+        .unwrap_or_else(|_| crate::system_http_client());
 
     let initial = rand::thread_rng().gen_range(INITIAL_MIN_SECS..=INITIAL_MAX_SECS);
     tokio::time::sleep(Duration::from_secs(initial)).await;
