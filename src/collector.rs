@@ -16,11 +16,16 @@
 
 use std::collections::HashMap;
 use std::error::Error as StdError;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use reqwest::StatusCode;
+use hickory_resolver::config::{LookupIpStrategy, ResolveHosts, ResolverConfig};
+use hickory_resolver::name_server::TokioConnectionProvider;
+use hickory_resolver::TokioResolver;
+use reqwest::dns::{Addrs, Name, Resolve, Resolving};
+use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, Notify};
 use tokio::time::MissedTickBehavior;
@@ -114,6 +119,44 @@ struct ScrapeFailure {
     message: String,
 }
 
+#[derive(Clone)]
+struct ScrapeDnsResolver {
+    inner: TokioResolver,
+}
+
+impl ScrapeDnsResolver {
+    fn cloudflare() -> Self {
+        let mut builder = TokioResolver::builder_with_config(
+            ResolverConfig::cloudflare(),
+            TokioConnectionProvider::default(),
+        );
+        let opts = builder.options_mut();
+        opts.timeout = Duration::from_secs(3);
+        opts.attempts = 2;
+        opts.cache_size = 0;
+        opts.negative_max_ttl = Some(Duration::from_secs(0));
+        opts.use_hosts_file = ResolveHosts::Never;
+        opts.ip_strategy = LookupIpStrategy::Ipv4AndIpv6;
+        opts.try_tcp_on_error = true;
+        Self {
+            inner: builder.build(),
+        }
+    }
+}
+
+impl Resolve for ScrapeDnsResolver {
+    fn resolve(&self, name: Name) -> Resolving {
+        let resolver = self.inner.clone();
+        let name = name.as_str().to_string();
+        Box::pin(async move {
+            let lookup = resolver.lookup_ip(name).await?;
+            let addrs: Vec<SocketAddr> = lookup.iter().map(|ip| SocketAddr::new(ip, 0)).collect();
+            let addrs: Addrs = Box::new(addrs.into_iter());
+            Ok(addrs)
+        })
+    }
+}
+
 impl ScrapeFailure {
     fn status(status: StatusCode) -> Self {
         Self {
@@ -168,6 +211,14 @@ impl ScrapeFailure {
     }
 }
 
+fn collector_scrape_client() -> Client {
+    Client::builder()
+        .timeout(Duration::from_secs(20))
+        .dns_resolver(Arc::new(ScrapeDnsResolver::cloudflare()))
+        .build()
+        .expect("build collector scrape HTTP client")
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     store: Store,
@@ -188,11 +239,7 @@ pub async fn run(
         .no_hickory_dns()
         .build()
         .unwrap_or_else(|_| crate::system_http_client());
-    let scrape_http = reqwest::Client::builder()
-        .timeout(Duration::from_secs(20))
-        .hickory_dns(true)
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
+    let scrape_http = collector_scrape_client();
 
     eprintln!(
         "cp: collector starting (prefix={prefix}*, scrape={}s, discovery={}s, shard={}/{})",
