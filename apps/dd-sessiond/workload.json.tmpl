@@ -1,0 +1,13 @@
+{
+  "app_name": "dd-sessiond",
+  "env": [
+    "DD_MODE=sessiond",
+    "DD_SESSIOND_HTTP_ADDR=127.0.0.1:7683",
+    "DD_SESSIOND_ATTACH_ADDR=127.0.0.1:7684",
+    "DD_SESSIOND_DIR=/var/lib/easyenclave/data/dd-shell",
+    "DD_SESSIOND_SCRATCH_DIR=/var/lib/easyenclave/data/dd-shell/sessions"
+  ],
+  "cmd": [
+    "devopsdefender", "sessiond"
+  ]
+}

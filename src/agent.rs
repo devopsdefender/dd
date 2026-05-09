@@ -21,13 +21,18 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use axum::extract::{Path, State};
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, Uri};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::Engine as _;
+use futures_util::{SinkExt, StreamExt};
+use serde::de::DeserializeOwned;
 use serde::Deserialize;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 use tokio::sync::RwLock;
 
 use crate::config::Agent as Cfg;
@@ -99,6 +104,12 @@ struct St {
     taint: TaintSet,
     /// Read-only oracle scrape state derived from boot workload metadata.
     oracles: oracle::OracleStore,
+    /// Local session supervisor control endpoint. Public callers reach this
+    /// through dd-agent; dd-sessiond itself stays loopback-local.
+    sessiond_http_url: String,
+    /// Local raw attach socket used to proxy PTY bytes over WebSocket.
+    sessiond_attach_addr: String,
+    http: reqwest::Client,
 }
 
 pub async fn run() -> Result<()> {
@@ -192,6 +203,10 @@ pub async fn run() -> Result<()> {
     };
 
     let gh = gh_oidc::Verifier::new(cfg.common.owner.clone(), "dd-agent".into());
+    let sessiond_http_url =
+        std::env::var("DD_SESSIOND_HTTP_URL").unwrap_or_else(|_| "http://127.0.0.1:7683".into());
+    let sessiond_attach_addr =
+        std::env::var("DD_SESSIOND_ATTACH_ADDR").unwrap_or_else(|_| "127.0.0.1:7684".into());
 
     // Seed taint set. Boot-time facts go in now; runtime events
     // (CustomerOwnerEnabled, CustomerWorkloadDeployed) are appended
@@ -215,6 +230,9 @@ pub async fn run() -> Result<()> {
         agent_owner: Arc::new(RwLock::new(None)),
         taint,
         oracles: oracle_store,
+        sessiond_http_url,
+        sessiond_attach_addr,
+        http: crate::system_http_client(),
     };
     let api_state = state.clone();
     let api_ng_state = ng_state.clone();
@@ -231,6 +249,11 @@ pub async fn run() -> Result<()> {
         .route("/health", get(health))
         .route("/api/oracles", get(api_oracles))
         .route("/api/units", get(api_units))
+        .route("/api/sessions", get(api_sessions).post(create_session))
+        .route("/api/sessions/{id}/replay", get(replay_session))
+        .route("/api/sessions/{id}/resize", post(resize_session))
+        .route("/api/sessions/{id}/close", post(close_session))
+        .route("/api/sessions/{id}/attach", get(attach_session))
         .route("/workload/{id}", get(workload_page))
         .route("/logs/{app}", get(logs));
     if !cfg.confidential {
@@ -256,6 +279,11 @@ pub async fn run() -> Result<()> {
         .route("/health", get(health))
         .route("/api/oracles", get(api_oracles))
         .route("/api/units", get(api_units))
+        .route("/api/sessions", get(api_sessions).post(create_session))
+        .route("/api/sessions/{id}/replay", get(replay_session))
+        .route("/api/sessions/{id}/resize", post(resize_session))
+        .route("/api/sessions/{id}/close", post(close_session))
+        .route("/api/sessions/{id}/attach", get(attach_session))
         .route("/logs/{app}", get(logs));
     if !cfg.confidential {
         api = api
@@ -891,6 +919,194 @@ async fn dashboard(State(s): State<St>, headers: HeaderMap, uri: Uri) -> Respons
         &body,
     ))
     .into_response()
+}
+
+async fn api_sessions(
+    State(s): State<St>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Result<Json<Vec<crate::sessiond::SessionMeta>>> {
+    ensure_browser_auth(&s, &headers, &uri)?;
+    sessiond_get(&s, "/api/sessions").await.map(Json)
+}
+
+async fn create_session(
+    State(s): State<St>,
+    headers: HeaderMap,
+    uri: Uri,
+    Json(req): Json<crate::sessiond::CreateSession>,
+) -> Result<Json<crate::sessiond::CreateSessionResponse>> {
+    ensure_browser_auth(&s, &headers, &uri)?;
+    sessiond_post(&s, "/api/sessions", &req).await.map(Json)
+}
+
+async fn replay_session(
+    State(s): State<St>,
+    headers: HeaderMap,
+    uri: Uri,
+    Path(id): Path<String>,
+) -> Result<Json<crate::sessiond::ReplayResponse>> {
+    ensure_browser_auth(&s, &headers, &uri)?;
+    sessiond_get(&s, &format!("/api/sessions/{id}/replay"))
+        .await
+        .map(Json)
+}
+
+async fn resize_session(
+    State(s): State<St>,
+    headers: HeaderMap,
+    uri: Uri,
+    Path(id): Path<String>,
+    Json(req): Json<crate::sessiond::ResizeSession>,
+) -> Result<axum::http::StatusCode> {
+    ensure_browser_auth(&s, &headers, &uri)?;
+    sessiond_post_empty_json(&s, &format!("/api/sessions/{id}/resize"), &req).await
+}
+
+async fn close_session(
+    State(s): State<St>,
+    headers: HeaderMap,
+    uri: Uri,
+    Path(id): Path<String>,
+) -> Result<axum::http::StatusCode> {
+    ensure_browser_auth(&s, &headers, &uri)?;
+    sessiond_post_empty(&s, &format!("/api/sessions/{id}/close")).await
+}
+
+async fn attach_session(
+    State(s): State<St>,
+    headers: HeaderMap,
+    uri: Uri,
+    Path(id): Path<String>,
+    Query(query): Query<AttachQuery>,
+    ws: WebSocketUpgrade,
+) -> Result<Response> {
+    ensure_browser_auth(&s, &headers, &uri)?;
+    let attach_addr = s.sessiond_attach_addr.clone();
+    Ok(ws.on_upgrade(move |socket| async move {
+        if let Err(e) =
+            attach_to_sessiond(socket, attach_addr, id, query.tail.unwrap_or(true)).await
+        {
+            eprintln!("agent: session attach ended: {e:#}");
+        }
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+struct AttachQuery {
+    tail: Option<bool>,
+}
+
+fn ensure_browser_auth(s: &St, headers: &HeaderMap, uri: &Uri) -> Result<()> {
+    if require_browser_auth(s, headers, uri).is_some() {
+        Err(Error::Unauthorized)
+    } else {
+        Ok(())
+    }
+}
+
+async fn attach_to_sessiond(
+    socket: WebSocket,
+    attach_addr: String,
+    id: String,
+    tail: bool,
+) -> anyhow::Result<()> {
+    let mut stream = TcpStream::connect(&attach_addr).await?;
+    let tail_arg = if tail { "tail" } else { "notail" };
+    stream
+        .write_all(format!("{id} {tail_arg}\n").as_bytes())
+        .await?;
+    let (mut tcp_rx, mut tcp_tx) = stream.into_split();
+    let (mut ws_tx, mut ws_rx) = socket.split();
+
+    let output = tokio::spawn(async move {
+        let mut buf = [0u8; 4096];
+        loop {
+            let n = match tcp_rx.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(_) => break,
+            };
+            if ws_tx
+                .send(Message::Binary(buf[..n].to_vec().into()))
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+
+    while let Some(msg) = ws_rx.next().await {
+        match msg? {
+            Message::Binary(bytes) => tcp_tx.write_all(&bytes).await?,
+            Message::Text(text) => tcp_tx.write_all(text.as_bytes()).await?,
+            Message::Close(_) => break,
+            Message::Ping(_) | Message::Pong(_) => {}
+        }
+    }
+    output.abort();
+    Ok(())
+}
+
+async fn sessiond_get<T: DeserializeOwned>(s: &St, path: &str) -> Result<T> {
+    let url = format!("{}{}", s.sessiond_http_url.trim_end_matches('/'), path);
+    let resp = s.http.get(url).send().await?;
+    decode_sessiond_response(path, resp).await
+}
+
+async fn sessiond_post<T: DeserializeOwned, B: serde::Serialize>(
+    s: &St,
+    path: &str,
+    body: &B,
+) -> Result<T> {
+    let url = format!("{}{}", s.sessiond_http_url.trim_end_matches('/'), path);
+    let resp = s.http.post(url).json(body).send().await?;
+    decode_sessiond_response(path, resp).await
+}
+
+async fn sessiond_post_empty(s: &St, path: &str) -> Result<axum::http::StatusCode> {
+    let url = format!("{}{}", s.sessiond_http_url.trim_end_matches('/'), path);
+    let resp = s.http.post(url).send().await?;
+    decode_sessiond_empty(path, resp).await
+}
+
+async fn sessiond_post_empty_json<B: serde::Serialize>(
+    s: &St,
+    path: &str,
+    body: &B,
+) -> Result<axum::http::StatusCode> {
+    let url = format!("{}{}", s.sessiond_http_url.trim_end_matches('/'), path);
+    let resp = s.http.post(url).json(body).send().await?;
+    decode_sessiond_empty(path, resp).await
+}
+
+async fn decode_sessiond_response<T: DeserializeOwned>(
+    path: &str,
+    resp: reqwest::Response,
+) -> Result<T> {
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(Error::Upstream(format!(
+            "sessiond {path}: HTTP {status}: {body}"
+        )));
+    }
+    Ok(resp.json().await?)
+}
+
+async fn decode_sessiond_empty(
+    path: &str,
+    resp: reqwest::Response,
+) -> Result<axum::http::StatusCode> {
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(Error::Upstream(format!(
+            "sessiond {path}: HTTP {status}: {body}"
+        )));
+    }
+    Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
 async fn api_oracles(State(s): State<St>) -> Json<Vec<oracle::OracleStatus>> {

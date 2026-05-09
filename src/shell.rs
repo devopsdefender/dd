@@ -2,6 +2,7 @@
 //!
 //! One process per VM, multiple reconnectable PTY sessions, read-only workload
 //! terminals, and encrypted append-only transcripts on disk.
+#![allow(dead_code, unused_imports)]
 
 use std::cmp::Reverse;
 use std::collections::{HashMap, VecDeque};
@@ -30,6 +31,7 @@ use sha2::{Digest, Sha256};
 use tokio::fs::File as TokioFile;
 use tokio::fs::OpenOptions;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 use tokio::process::{Child, Command};
 use tokio::sync::{broadcast, Mutex, RwLock};
 use uuid::Uuid;
@@ -143,6 +145,8 @@ struct App {
     ee: Arc<Ee>,
     http: reqwest::Client,
     agent_api: String,
+    sessiond_http_url: String,
+    sessiond_attach_addr: String,
     owner: crate::gh_oidc::Principal,
     auth: crate::auth::AuthConfig,
     hostname: String,
@@ -217,7 +221,7 @@ enum WorkspacePolicy {
     EphemeralScratch,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct CreateSession {
     name: Option<String>,
     recipe_id: Option<String>,
@@ -230,7 +234,7 @@ struct CreateSessionResponse {
     id: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct ResizeSession {
     cols: u16,
     rows: u16,
@@ -291,6 +295,10 @@ pub async fn run() -> Result<()> {
         .unwrap_or_else(|_| "/var/lib/easyenclave/agent.sock".into());
     let agent_api = std::env::var("DD_SHELL_AGENT_API_URL")
         .unwrap_or_else(|_| format!("http://127.0.0.1:{}", crate::cf::AGENT_API_PORT));
+    let sessiond_http_url =
+        std::env::var("DD_SESSIOND_HTTP_URL").unwrap_or_else(|_| "http://127.0.0.1:7683".into());
+    let sessiond_attach_addr =
+        std::env::var("DD_SESSIOND_ATTACH_ADDR").unwrap_or_else(|_| "127.0.0.1:7684".into());
     let shell_dir = PathBuf::from(&dir);
     let store = TranscriptStore::new(shell_dir.clone()).await?;
     tokio::fs::create_dir_all(&scratch_root).await?;
@@ -310,6 +318,8 @@ pub async fn run() -> Result<()> {
             .build()
             .unwrap_or_else(|_| crate::system_http_client()),
         agent_api,
+        sessiond_http_url,
+        sessiond_attach_addr,
         owner: common.owner,
         auth,
         hostname,
@@ -491,24 +501,18 @@ async fn list_recipes(
     State(app): State<App>,
     headers: HeaderMap,
     uri: Uri,
-) -> Result<Json<Vec<Recipe>>> {
+) -> Result<Json<Vec<crate::sessiond::Recipe>>> {
     ensure_shell_auth(&app, &headers, &uri)?;
-    Ok(Json((*app.recipes).clone()))
+    sessiond_get(&app, "/api/recipes").await.map(Json)
 }
 
 async fn list_sessions(
     State(app): State<App>,
     headers: HeaderMap,
     uri: Uri,
-) -> Result<Json<Vec<SessionMeta>>> {
+) -> Result<Json<Vec<crate::sessiond::SessionMeta>>> {
     ensure_shell_auth(&app, &headers, &uri)?;
-    let sessions: Vec<Arc<Session>> = app.sessions.read().await.values().cloned().collect();
-    let mut out = Vec::with_capacity(sessions.len());
-    for s in sessions {
-        out.push(s.meta.read().await.clone());
-    }
-    out.sort_by_key(|s| Reverse(s.updated_at));
-    Ok(Json(out))
+    sessiond_get(&app, "/api/sessions").await.map(Json)
 }
 
 async fn create_session(
@@ -516,59 +520,9 @@ async fn create_session(
     headers: HeaderMap,
     uri: Uri,
     Json(req): Json<CreateSession>,
-) -> Result<Json<CreateSessionResponse>> {
+) -> Result<Json<crate::sessiond::CreateSessionResponse>> {
     ensure_shell_auth(&app, &headers, &uri)?;
-    let id = Uuid::new_v4().to_string();
-    let recipe = select_recipe(&app, req.recipe_id.as_deref(), req.command)?;
-    let command = recipe.command.clone();
-    let cwd = req.cwd.unwrap_or_else(|| recipe.cwd.clone());
-    let name = req.name.unwrap_or_else(|| session_name(&recipe, &id));
-    let now = unix_ts();
-    let scratch_dir = prepare_scratch_dir(&app, &id, &recipe.workspace_policy).await?;
-    let env = session_env(&id, scratch_dir.as_deref());
-
-    let (child, output, input, pgid) = spawn_pty(&command, &cwd, &env)?;
-    let master_fd = input.as_raw_fd();
-    let (tx, _) = broadcast::channel(512);
-
-    let meta = SessionMeta {
-        id: id.clone(),
-        name,
-        recipe_id: recipe.id,
-        recipe_title: recipe.title,
-        workspace_policy: recipe.workspace_policy,
-        command,
-        cwd,
-        terminal_mode: TerminalMode::ReadWrite,
-        integrity_state: IntegrityState::Controlled,
-        integrity_reason: "interactive_pty_control",
-        created_at: now,
-        updated_at: now,
-        status: SessionStatus::Running,
-        exit_code: None,
-    };
-    app.store.append_meta(&meta).await?;
-
-    let session = Arc::new(Session {
-        meta: RwLock::new(meta),
-        input: Mutex::new(input),
-        master_fd,
-        child: Mutex::new(child),
-        pgid,
-        tx,
-        ring: Mutex::new(VecDeque::with_capacity(RING_LIMIT)),
-        scratch_dir,
-        cleanup_scratch_on_exit: true,
-    });
-
-    app.sessions
-        .write()
-        .await
-        .insert(id.clone(), session.clone());
-    spawn_reader(app.store.clone(), session.clone(), output, "pty");
-    spawn_waiter(app.store.clone(), session.clone());
-
-    Ok(Json(CreateSessionResponse { id }))
+    sessiond_post(&app, "/api/sessions", &req).await.map(Json)
 }
 
 fn select_recipe(app: &App, recipe_id: Option<&str>, command: Option<String>) -> Result<Recipe> {
@@ -853,13 +807,11 @@ async fn replay_session(
     headers: HeaderMap,
     uri: Uri,
     AxPath(id): AxPath<String>,
-) -> Result<Json<ReplayResponse>> {
+) -> Result<Json<crate::sessiond::ReplayResponse>> {
     ensure_shell_auth(&app, &headers, &uri)?;
-    let bytes = app.store.replay(&id).await?;
-    Ok(Json(ReplayResponse {
-        id,
-        bytes_b64: base64::engine::general_purpose::STANDARD.encode(bytes),
-    }))
+    sessiond_get(&app, &format!("/api/sessions/{id}/replay"))
+        .await
+        .map(Json)
 }
 
 async fn list_workloads(
@@ -1048,6 +1000,63 @@ async fn agent_get<T: DeserializeOwned>(app: &App, path: &str) -> Result<T> {
     Ok(resp.json().await?)
 }
 
+async fn sessiond_get<T: DeserializeOwned>(app: &App, path: &str) -> Result<T> {
+    let url = format!("{}{}", app.sessiond_http_url.trim_end_matches('/'), path);
+    let resp = app.http.get(url).send().await?;
+    decode_sessiond_response(path, resp).await
+}
+
+async fn sessiond_post<T: DeserializeOwned, B: Serialize>(
+    app: &App,
+    path: &str,
+    body: &B,
+) -> Result<T> {
+    let url = format!("{}{}", app.sessiond_http_url.trim_end_matches('/'), path);
+    let resp = app.http.post(url).json(body).send().await?;
+    decode_sessiond_response(path, resp).await
+}
+
+async fn sessiond_post_empty(app: &App, path: &str) -> Result<StatusCode> {
+    let url = format!("{}{}", app.sessiond_http_url.trim_end_matches('/'), path);
+    let resp = app.http.post(url).send().await?;
+    decode_sessiond_empty(path, resp).await
+}
+
+async fn sessiond_post_empty_json<B: Serialize>(
+    app: &App,
+    path: &str,
+    body: &B,
+) -> Result<StatusCode> {
+    let url = format!("{}{}", app.sessiond_http_url.trim_end_matches('/'), path);
+    let resp = app.http.post(url).json(body).send().await?;
+    decode_sessiond_empty(path, resp).await
+}
+
+async fn decode_sessiond_response<T: DeserializeOwned>(
+    path: &str,
+    resp: reqwest::Response,
+) -> Result<T> {
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(Error::Upstream(format!(
+            "sessiond {path}: HTTP {status}: {body}"
+        )));
+    }
+    Ok(resp.json().await?)
+}
+
+async fn decode_sessiond_empty(path: &str, resp: reqwest::Response) -> Result<StatusCode> {
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(Error::Upstream(format!(
+            "sessiond {path}: HTTP {status}: {body}"
+        )));
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn replay_workload(
     State(app): State<App>,
     headers: HeaderMap,
@@ -1080,13 +1089,7 @@ async fn close_session(
     AxPath(id): AxPath<String>,
 ) -> Result<StatusCode> {
     ensure_shell_auth(&app, &headers, &uri)?;
-    let Some(session) = app.sessions.write().await.remove(&id) else {
-        return Err(Error::NotFound);
-    };
-    let pgid = session.pgid;
-    mark_session_exited(&app.store, &session, None).await;
-    terminate_process_group(id, pgid);
-    Ok(StatusCode::NO_CONTENT)
+    sessiond_post_empty(&app, &format!("/api/sessions/{id}/close")).await
 }
 
 fn terminate_process_group(id: String, pgid: i32) {
@@ -1133,31 +1136,7 @@ async fn resize_session(
     Json(req): Json<ResizeSession>,
 ) -> Result<StatusCode> {
     ensure_shell_auth(&app, &headers, &uri)?;
-    if req.cols == 0 || req.rows == 0 {
-        return Err(Error::BadRequest("terminal size must be non-zero".into()));
-    }
-    let Some(session) = app.sessions.read().await.get(&id).cloned() else {
-        return Err(Error::NotFound);
-    };
-    let winsize = libc::winsize {
-        ws_row: req.rows,
-        ws_col: req.cols,
-        ws_xpixel: 0,
-        ws_ypixel: 0,
-    };
-    let rc = unsafe { libc::ioctl(session.master_fd, libc::TIOCSWINSZ, &winsize) };
-    if rc != 0 {
-        return Err(Error::Internal(format!(
-            "resize pty: {}",
-            std::io::Error::last_os_error()
-        )));
-    }
-    if session.pgid > 0 {
-        unsafe {
-            libc::kill(-session.pgid, libc::SIGWINCH);
-        }
-    }
-    Ok(StatusCode::NO_CONTENT)
+    sessiond_post_empty_json(&app, &format!("/api/sessions/{id}/resize"), &req).await
 }
 
 async fn attach_session(
@@ -1169,11 +1148,9 @@ async fn attach_session(
     ws: WebSocketUpgrade,
 ) -> Result<Response> {
     ensure_shell_auth(&app, &headers, &uri)?;
-    let Some(session) = app.sessions.read().await.get(&id).cloned() else {
-        return Err(Error::NotFound);
-    };
+    let attach_addr = app.sessiond_attach_addr.clone();
     Ok(ws.on_upgrade(move |socket| async move {
-        if let Err(e) = attach(socket, session, query.tail.unwrap_or(true)).await {
+        if let Err(e) = attach(socket, attach_addr, id, query.tail.unwrap_or(true)).await {
             eprintln!("dd-shell: attach ended: {e:#}");
         }
     }))
@@ -1184,21 +1161,33 @@ struct AttachQuery {
     tail: Option<bool>,
 }
 
-async fn attach(socket: WebSocket, session: Arc<Session>, tail: bool) -> anyhow::Result<()> {
+async fn attach(
+    socket: WebSocket,
+    attach_addr: String,
+    id: String,
+    tail: bool,
+) -> anyhow::Result<()> {
+    let mut stream = TcpStream::connect(&attach_addr).await?;
+    let tail_arg = if tail { "tail" } else { "notail" };
+    stream
+        .write_all(format!("{id} {tail_arg}\n").as_bytes())
+        .await?;
+    let (mut tcp_rx, mut tcp_tx) = stream.into_split();
     let (mut ws_tx, mut ws_rx) = socket.split();
 
-    if tail {
-        let ring = session.ring.lock().await;
-        if !ring.is_empty() {
-            let bytes: Vec<u8> = ring.iter().copied().collect();
-            ws_tx.send(Message::Binary(bytes.into())).await?;
-        }
-    }
-
-    let mut output_rx = session.tx.subscribe();
     let output = tokio::spawn(async move {
-        while let Ok(bytes) = output_rx.recv().await {
-            if ws_tx.send(Message::Binary(bytes.into())).await.is_err() {
+        let mut buf = [0u8; 4096];
+        loop {
+            let n = match tcp_rx.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(_) => break,
+            };
+            if ws_tx
+                .send(Message::Binary(buf[..n].to_vec().into()))
+                .await
+                .is_err()
+            {
                 break;
             }
         }
@@ -1207,15 +1196,10 @@ async fn attach(socket: WebSocket, session: Arc<Session>, tail: bool) -> anyhow:
     while let Some(msg) = ws_rx.next().await {
         match msg? {
             Message::Binary(bytes) => {
-                session.input.lock().await.write_all(&bytes).await?;
+                tcp_tx.write_all(&bytes).await?;
             }
             Message::Text(text) => {
-                session
-                    .input
-                    .lock()
-                    .await
-                    .write_all(text.as_bytes())
-                    .await?;
+                tcp_tx.write_all(text.as_bytes()).await?;
             }
             Message::Close(_) => break,
             Message::Ping(_) | Message::Pong(_) => {}
@@ -1721,11 +1705,16 @@ function metricsHtml(data) {
   const uptime = data.system_uptime_secs ?? data.uptime_secs;
   const load = data.load_1m;
   const disks = Array.isArray(data.disks) ? data.disks : [];
+  const nets = Array.isArray(data.nets) ? data.nets : [];
   const disk = disks.find(d => d.mount === "/var/lib/easyenclave/data") || disks.find(d => d.mount === "/") || disks[0];
+  const netRx = nets.reduce((sum, n) => sum + Number(n.rx_bytes || 0), 0);
+  const netTx = nets.reduce((sum, n) => sum + Number(n.tx_bytes || 0), 0);
+  const netNames = nets.map(n => n.iface).filter(Boolean).join(", ");
   return `<div class="metrics">
     ${metricHtml("CPU", cpu === undefined ? "unknown" : `${cpu}%`, load === undefined ? "load unknown" : `load ${Number(load).toFixed(2)}`)}
     ${metricHtml("Memory", memUsed === undefined || memTotal === undefined ? "unknown" : `${memUsed}/${memTotal} MB`, memTotal ? `${Math.round((memUsed / memTotal) * 100)}% used` : "")}
     ${metricHtml("Disk", disk ? `${formatBytes(disk.used_bytes)} / ${formatBytes(disk.total_bytes)}` : "unknown", disk ? disk.mount : "no disk data")}
+    ${metricHtml("Network", nets.length ? `${formatBytes(netRx)} / ${formatBytes(netTx)}` : "unknown", nets.length ? `rx / tx ${netNames}` : "no net data")}
     ${metricHtml("Uptime", uptime === undefined ? "unknown" : formatDuration(uptime), data.vm_name || "agent")}
   </div>`;
 }

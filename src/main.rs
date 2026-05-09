@@ -2,11 +2,12 @@
 //!
 //!   DD_MODE=cp      devopsdefender    # control-plane
 //!   DD_MODE=agent   devopsdefender    # in-VM agent
-//!   DD_MODE=shell   devopsdefender    # multi-session shell service
+//!   DD_MODE=shell   devopsdefender    # shell web service
+//!   DD_MODE=sessiond devopsdefender   # local session supervisor
 //!
 //! (Also accepts `devopsdefender cp` / `devopsdefender agent` for local dev.)
 
-use devopsdefender::{agent, cp, shell};
+use devopsdefender::{agent, cp, sessiond, shell};
 
 #[tokio::main]
 async fn main() {
@@ -18,8 +19,9 @@ async fn main() {
         Some("cp") | Some("management") => cp::run().await.map_err(Into::into),
         Some("agent") => agent::run().await.map_err(Into::into),
         Some("shell") => shell::run().await.map_err(Into::into),
+        Some("sessiond") => sessiond::run().await.map_err(Into::into),
         _ => {
-            eprintln!("usage: devopsdefender <cp|agent|shell>");
+            eprintln!("usage: devopsdefender <cp|agent|shell|sessiond>");
             eprintln!("   or: DD_MODE=<mode> devopsdefender");
             std::process::exit(2);
         }
