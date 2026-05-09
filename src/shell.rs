@@ -57,6 +57,7 @@ CACHE_DIR=${DD_CACHE:-$SESSION_DIR/cache}
 TMP_DIR=${TMPDIR:-$SESSION_DIR/tmp}
 until [ -x "$PODMAN" ]; do echo "codex-podman: waiting for podman"; $BB sleep 2; done
 $BB mkdir -p "$HOME_DIR" "$WORKSPACE" "$CACHE_DIR" "$TMP_DIR"
+$BB chmod 1777 "$TMP_DIR"
 SAFE_SESSION=$(printf '%s' "$SESSION_ID" | $BB tr -c 'A-Za-z0-9_.-' '-')
 exec "$PODMAN" run --rm --replace -it --pull=missing \
   --network=host \
@@ -86,6 +87,7 @@ CACHE_DIR=${DD_CACHE:-$SESSION_DIR/cache}
 TMP_DIR=${TMPDIR:-$SESSION_DIR/tmp}
 until [ -x "$PODMAN" ]; do echo "podman-ubuntu: waiting for podman"; $BB sleep 2; done
 $BB mkdir -p "$HOME_DIR" "$WORKSPACE" "$CACHE_DIR" "$TMP_DIR"
+$BB chmod 1777 "$TMP_DIR"
 SAFE_SESSION=$(printf '%s' "$SESSION_ID" | $BB tr -c 'A-Za-z0-9_.-' '-')
 exec "$PODMAN" run --rm --replace -it --pull=missing \
   --network=host \
@@ -114,6 +116,7 @@ CACHE_DIR=${DD_CACHE:-$SESSION_DIR/cache}
 TMP_DIR=${TMPDIR:-$SESSION_DIR/tmp}
 until [ -x "$PODMAN" ]; do echo "podman-alpine: waiting for podman"; $BB sleep 2; done
 $BB mkdir -p "$HOME_DIR" "$WORKSPACE" "$CACHE_DIR" "$TMP_DIR"
+$BB chmod 1777 "$TMP_DIR"
 SAFE_SESSION=$(printf '%s' "$SESSION_ID" | $BB tr -c 'A-Za-z0-9_.-' '-')
 exec "$PODMAN" run --rm --replace -it --pull=missing \
   --network=host \
