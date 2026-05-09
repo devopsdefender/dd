@@ -31,9 +31,9 @@ The sealed enclave runtime is [EasyEnclave Mini](https://github.com/easyenclave/
 
 ## Public website
 
-[**devopsdefender.com**](https://devopsdefender.com) is a static site served from this repo's [`gh-pages` branch](https://github.com/devopsdefender/dd/tree/gh-pages) (CNAME pinned there). It's the **only** place public-facing marketing copy lives — the CP binary serves operator dashboards behind DD's GitHub App auth and is never the right home for public prose.
+[**devopsdefender.com**](https://devopsdefender.com) is a static site that lives in its own repo: [`devopsdefender/devopsdefender.com`](https://github.com/devopsdefender/devopsdefender.com). It's the **only** place public-facing marketing copy lives — the CP binary serves operator dashboards behind DD's GitHub App auth and is never the right home for public prose.
 
-To change the website: PR against `gh-pages` (not `main`). The branch's own `.github/workflows/website-preview.yml` auto-deploys each PR to `devopsdefender.com/pr-preview/<N>/` via [`rossjrw/pr-preview-action`](https://github.com/rossjrw/pr-preview-action); merging to `gh-pages` publishes to root.
+To change the website: PR against the [`devopsdefender.com`](https://github.com/devopsdefender/devopsdefender.com) repo, not this one.
 
 ## Deployment
 
