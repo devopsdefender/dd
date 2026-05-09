@@ -256,7 +256,9 @@ jobs:
           EE_BOOT_WORKLOADS=$({
             bake apps/cloudflared/workload.json
             bake apps/dd-management/workload.json.tmpl
-            bake apps/dd-sessiond/workload.json.tmpl
+            DD_SESSIOND_DIR=/tmp/dd-shell \
+              DD_SESSIOND_SCRATCH_DIR=/tmp/dd-shell/sessions \
+              bake apps/dd-sessiond/workload.json.tmpl
             DD_DOMAIN="$DD_DOMAIN" \
               DD_HOSTNAME="$DD_HOSTNAME" \
               DD_ENV="$DD_ENV" \

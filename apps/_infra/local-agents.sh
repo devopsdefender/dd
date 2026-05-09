@@ -245,7 +245,9 @@ build_config_iso() {
         DD_RELEASE_TAG="$DD_RELEASE_TAG" bake "$REPO_ROOT/apps/ca-certificates/workload.json.tmpl"
         bake "$REPO_ROOT/apps/podman-bootstrap/workload.json"
         bake "$REPO_ROOT/apps/cloudflared/workload.json"
-        bake "$REPO_ROOT/apps/dd-sessiond/workload.json.tmpl"
+        DD_SESSIOND_DIR=/var/lib/easyenclave/data/dd-shell \
+          DD_SESSIOND_SCRATCH_DIR=/var/lib/easyenclave/data/dd-shell/sessions \
+          bake "$REPO_ROOT/apps/dd-sessiond/workload.json.tmpl"
         DD_DOMAIN="$domain" \
           DD_HOSTNAME="dd-local-$name" \
           DD_ENV="$env" \
