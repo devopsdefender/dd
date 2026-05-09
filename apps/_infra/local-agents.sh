@@ -264,9 +264,8 @@ build_config_iso() {
   local oracles_b64
   oracles_b64=$(echo "$bare_workloads" | extract_oracles)
 
-  local workloads
-  workloads=$({
-    echo "$bare_workloads"
+  local agent_workload
+  agent_workload=$(
     DD_CP_URL="$cp" \
       DD_ITA_MODE="$ita_mode" \
       DD_ITA_API_KEY="$DD_ITA_API_KEY" \
@@ -285,7 +284,28 @@ build_config_iso() {
       DD_AUTH_COOKIE_DOMAIN="$DD_AUTH_COOKIE_DOMAIN" \
       DD_AUTH_COOKIE_SECRET="$DD_AUTH_COOKIE_SECRET" \
       bake "$REPO_ROOT/apps/dd-agent/workload.json.tmpl"
-  } | jq -cs '.')
+  )
+
+  local workloads
+  if [ "$name" = dogfood ]; then
+    # Dogfood boots both dd-agent and dd-shell from the same devopsdefender
+    # release asset. Fetch it once up front, then run both workloads from the
+    # prefetched binary so concurrent startup does not try to overwrite an
+    # executable that another workload already has mapped.
+    local devopsdefender_fetch agent_runtime_workload
+    devopsdefender_fetch=$(echo "$agent_workload" | jq -c '{app_name:"devopsdefender", github_release:.github_release}')
+    agent_runtime_workload=$(echo "$agent_workload" | jq -c 'del(.github_release)')
+    workloads=$({
+      echo "$devopsdefender_fetch"
+      echo "$agent_runtime_workload"
+      echo "$bare_workloads"
+    } | jq -cs '.')
+  else
+    workloads=$({
+      echo "$bare_workloads"
+      echo "$agent_workload"
+    } | jq -cs '.')
+  fi
 
   {
     echo "EE_OWNER=$EE_OWNER"

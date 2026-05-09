@@ -60,6 +60,7 @@ $BB mkdir -p "$HOME_DIR" "$WORKSPACE" "$CACHE_DIR" "$TMP_DIR"
 $BB chmod 1777 "$TMP_DIR"
 SAFE_SESSION=$(printf '%s' "$SESSION_ID" | $BB tr -c 'A-Za-z0-9_.-' '-')
 exec "$PODMAN" run --rm --replace -it --pull=missing \
+  --cgroups=disabled \
   --network=host \
   --name "codex-shell-$SAFE_SESSION" \
   -e HOME=/root \
@@ -72,7 +73,7 @@ exec "$PODMAN" run --rm --replace -it --pull=missing \
   -v "$TMP_DIR:/tmp" \
   -w /workspace \
   docker.io/library/node:22-bookworm \
-  sh -lc 'set -e; mkdir -p "$HOME/.npm-global/bin"; export PATH="$HOME/.npm-global/bin:$PATH"; if ! command -v codex >/dev/null 2>&1; then npm install -g @openai/codex; fi; exec bash -l'
+  sh -lc 'set -e; mkdir -p "$HOME/.npm-global/bin" "$HOME/.local/bin"; printf "%s\n" "export NPM_CONFIG_PREFIX=\${NPM_CONFIG_PREFIX:-\$HOME/.npm-global}" "export PATH=\"\$HOME/.npm-global/bin:\$HOME/.local/bin:\$PATH\"" > "$HOME/.bashrc"; printf "%s\n" "[ -r \"\$HOME/.bashrc\" ] && . \"\$HOME/.bashrc\"" > "$HOME/.bash_profile"; export PATH="$HOME/.npm-global/bin:$HOME/.local/bin:$PATH"; if ! command -v codex >/dev/null 2>&1; then npm install -g @openai/codex; fi; exec bash -l'
 "#;
 const PODMAN_UBUNTU_RECIPE: &str = r#"#!/var/lib/easyenclave/bin/busybox sh
 set -eu
@@ -90,6 +91,7 @@ $BB mkdir -p "$HOME_DIR" "$WORKSPACE" "$CACHE_DIR" "$TMP_DIR"
 $BB chmod 1777 "$TMP_DIR"
 SAFE_SESSION=$(printf '%s' "$SESSION_ID" | $BB tr -c 'A-Za-z0-9_.-' '-')
 exec "$PODMAN" run --rm --replace -it --pull=missing \
+  --cgroups=disabled \
   --network=host \
   --name "ubuntu-shell-$SAFE_SESSION" \
   -e HOME=/root \
@@ -119,6 +121,7 @@ $BB mkdir -p "$HOME_DIR" "$WORKSPACE" "$CACHE_DIR" "$TMP_DIR"
 $BB chmod 1777 "$TMP_DIR"
 SAFE_SESSION=$(printf '%s' "$SESSION_ID" | $BB tr -c 'A-Za-z0-9_.-' '-')
 exec "$PODMAN" run --rm --replace -it --pull=missing \
+  --cgroups=disabled \
   --network=host \
   --name "alpine-shell-$SAFE_SESSION" \
   -e HOME=/root \
