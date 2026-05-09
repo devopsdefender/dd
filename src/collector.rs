@@ -296,11 +296,10 @@ async fn tick(
             for (label, _) in &orphan.extras {
                 let _ = cf::delete_cname(http, cf, &cf::extra_hostname(&orphan.host, label)).await;
             }
-            // Sweep the agent's Cloudflare routing apps: its
-            // dashboard route and every workload URL under this hostname.
-            // Without this the account accumulates dead apps every
-            // STONITH cycle.
-            cf::delete_routing_apps_for(http, cf, &orphan.host).await;
+            // Sweep legacy Cloudflare Access apps for this agent so
+            // stale exact host/path apps cannot intercept future
+            // DNS+tunnel routes.
+            cf::delete_access_apps_for_agent(http, cf, &orphan.host).await;
         }
     }
 
