@@ -245,6 +245,9 @@ build_config_iso() {
         DD_RELEASE_TAG="$DD_RELEASE_TAG" bake "$REPO_ROOT/apps/ca-certificates/workload.json.tmpl"
         bake "$REPO_ROOT/apps/podman-bootstrap/workload.json"
         bake "$REPO_ROOT/apps/cloudflared/workload.json"
+        DD_SESSIOND_DIR=/var/lib/easyenclave/data/dd-shell \
+          DD_SESSIOND_SCRATCH_DIR=/var/lib/easyenclave/data/dd-shell/sessions \
+          bake "$REPO_ROOT/apps/dd-sessiond/workload.json.tmpl"
         DD_DOMAIN="$domain" \
           DD_HOSTNAME="dd-local-$name" \
           DD_ENV="$env" \
@@ -288,7 +291,7 @@ build_config_iso() {
 
   local workloads
   if [ "$name" = dogfood ]; then
-    # Dogfood boots both dd-agent and dd-shell from the same devopsdefender
+    # Dogfood boots dd-agent, dd-sessiond, and dd-shell from the same devopsdefender
     # release asset. Fetch it once up front, then run both workloads from the
     # prefetched binary so concurrent startup does not try to overwrite an
     # executable that another workload already has mapped.
