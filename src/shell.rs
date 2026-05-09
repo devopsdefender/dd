@@ -1349,29 +1349,37 @@ const XTERM_FIT_JS: &str = include_str!("../assets/xterm/addon-fit.js");
 const SHELL_HTML: &str = r##"
 <link rel="stylesheet" href="/assets/xterm/xterm.css">
 <style>
-body { background:#0b0d12; color:#d7deea; }
-main { max-width:none; padding:0; height:100vh; display:grid; grid-template-columns:280px 1fr; }
+body { background:#0b0d12; color:#d7deea; overflow:hidden; }
+main { max-width:none; padding:0; height:100dvh; display:grid; grid-template-columns:320px 1fr; }
 .sidebar { border-right:1px solid #252a36; background:#111520; overflow:auto; min-height:0; }
 .sidebar-top { position:sticky; top:0; z-index:5; background:#111520; padding:16px 16px 12px; border-bottom:1px solid #252a36; }
 .sidebar-scroll { padding:0 16px 16px; }
-.terminal-wrap { height:100vh; display:flex; flex-direction:column; min-width:0; }
+.terminal-wrap { height:100dvh; display:flex; flex-direction:column; min-width:0; }
 .toolbar { height:48px; border-bottom:1px solid #252a36; display:flex; align-items:center; gap:8px; padding:0 12px; background:#111520; }
 .term { flex:1; min-height:0; background:#05070a; overflow:hidden; padding:8px; }
 .term .xterm { height:100%; }
 .term .xterm-viewport { background:#05070a !important; }
 .groups { display:flex; flex-direction:column; gap:18px; }
 .group-title { position:sticky; top:126px; z-index:4; color:#8791a5; font-size:11px; font-weight:700; letter-spacing:0; text-transform:uppercase; margin:0 -16px 8px; padding:8px 16px; background:#111520; border-bottom:1px solid #202634; }
-.sessions, .recipes { display:flex; flex-direction:column; gap:8px; }
-.session, .recipe { text-align:left; color:#d7deea; background:#171c29; border:1px solid #2b3242; border-radius:6px; padding:10px; cursor:pointer; }
+.sessions { display:flex; flex-direction:column; gap:8px; }
+.session { text-align:left; color:#d7deea; background:#171c29; border:1px solid #2b3242; border-radius:6px; padding:10px; cursor:pointer; }
 .session.active { border-color:#7aa2f7; }
-.session .name, .recipe .name { font-weight:700; font-size:13px; }
-.session .meta, .recipe .meta { margin:3px 0 0; font-size:11px; color:#8791a5; }
+.session .name { font-weight:700; font-size:13px; }
+.session .meta { margin:3px 0 0; font-size:11px; color:#8791a5; }
 .session.readonly { background:#131720; border-style:dashed; }
+.recipe-launcher { display:grid; grid-template-columns:1fr auto; gap:8px; }
+.recipe-select { min-width:0; background:#0b0d12; color:#d7deea; border:1px solid #2b3242; border-radius:6px; padding:9px 10px; font:inherit; font-size:13px; }
+.recipe-summary { margin-top:8px; color:#8791a5; font-size:11px; line-height:1.4; }
 .badges { display:flex; flex-wrap:wrap; gap:5px; margin-top:7px; }
 .badge { border:1px solid #2b3242; border-radius:999px; padding:1px 6px; color:#8791a5; font-size:10px; }
 .badge.ok { color:#9ece6a; border-color:#334b35; }
 .badge.bad { color:#f7768e; border-color:#57323d; }
 .system { display:flex; flex-direction:column; gap:8px; }
+.metrics { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+.metric { background:#171c29; border:1px solid #2b3242; border-radius:6px; padding:10px; min-width:0; }
+.metric .label { color:#8791a5; font-size:10px; text-transform:uppercase; }
+.metric .value { margin-top:3px; font-size:16px; font-weight:700; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.metric .subvalue { margin-top:2px; color:#8791a5; font-size:11px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .probe { color:#d7deea; background:#171c29; border:1px solid #2b3242; border-radius:6px; padding:10px; }
 .probe .row { display:flex; align-items:center; justify-content:space-between; gap:8px; }
 .probe .name { font-weight:700; font-size:13px; }
@@ -1384,29 +1392,56 @@ main { max-width:none; padding:0; height:100vh; display:grid; grid-template-colu
 .empty-mini { color:#8791a5; font-size:12px; padding:8px 2px; }
 .status { color:#8791a5; font-size:12px; margin-left:auto; }
 button.secondary { background:#252a36; color:#d7deea; }
-@media (max-width:760px) { main { grid-template-columns:1fr; grid-template-rows:240px 1fr; } .sidebar { height:240px; border-right:0; border-bottom:1px solid #252a36; } .group-title { top:126px; } .terminal-wrap { height:calc(100vh - 240px); } }
+.mobile-tabs { display:none; }
+.panel { display:block; }
+.panel-close { display:none; }
+@media (max-width:860px) {
+  main { display:block; height:100dvh; }
+  .terminal-wrap { height:calc(100dvh - 52px); padding-bottom:env(safe-area-inset-bottom); }
+  .toolbar { height:44px; padding:0 8px; gap:6px; }
+  .toolbar button { padding:8px 10px; font-size:12px; }
+  .status { font-size:11px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .term { padding:4px; }
+  .sidebar { position:fixed; left:0; right:0; bottom:52px; z-index:20; height:min(64dvh,520px); border-right:0; border-top:1px solid #252a36; border-radius:10px 10px 0 0; transform:translateY(105%); transition:transform .16s ease; box-shadow:0 -16px 40px #0008; }
+  .sidebar.open { transform:translateY(0); }
+  .sidebar-top { padding:12px 14px; }
+  .sidebar-scroll { padding:0 14px 14px; }
+  .groups { gap:0; }
+  .panel { display:none; }
+  .panel.active { display:block; }
+  .group-title { position:static; margin:0 -14px 10px; padding:10px 14px; }
+  .panel-close { display:inline-flex; position:absolute; top:10px; right:12px; padding:7px 10px; }
+  .mobile-tabs { position:fixed; left:0; right:0; bottom:0; z-index:30; display:grid; grid-template-columns:repeat(4,1fr); height:52px; padding-bottom:env(safe-area-inset-bottom); background:#111520; border-top:1px solid #252a36; }
+  .mobile-tabs button { border:0; border-right:1px solid #252a36; border-radius:0; background:#111520; color:#8791a5; font-size:12px; padding:8px 4px; }
+  .mobile-tabs button.active { color:#d7deea; background:#171c29; }
+}
 </style>
 <div class="sidebar">
   <div class="sidebar-top">
     <h1>Shell</h1>
     <div class="sub">Observed logs and controlled PTYs</div>
+    <button class="secondary panel-close" id="panel-close">Done</button>
     <input class="filter" id="workload-filter" type="search" placeholder="Filter workloads">
   </div>
   <div class="sidebar-scroll">
     <div class="groups">
-      <div>
+      <div class="panel active" data-panel="system">
         <div class="group-title">System</div>
         <div class="system" id="system"></div>
       </div>
-      <div>
-        <div class="group-title">Recipes</div>
-        <div class="recipes" id="recipes"></div>
+      <div class="panel" data-panel="recipes">
+        <div class="group-title">New session</div>
+        <div class="recipe-launcher">
+          <select class="recipe-select" id="recipe-select"></select>
+          <button class="secondary" id="launch-recipe">Start</button>
+        </div>
+        <div class="recipe-summary" id="recipe-summary"></div>
       </div>
-      <div>
+      <div class="panel" data-panel="sessions">
         <div class="group-title">Read-write sessions</div>
         <div class="sessions" id="sessions"></div>
       </div>
-      <div>
+      <div class="panel" data-panel="workloads">
         <div class="group-title">Read-only workloads</div>
         <div class="sessions" id="workloads"></div>
       </div>
@@ -1415,11 +1450,19 @@ button.secondary { background:#252a36; color:#d7deea; }
 </div>
 <div class="terminal-wrap">
   <div class="toolbar">
+    <button class="secondary" id="panels">Panels</button>
     <button class="secondary" id="close">Close session</button>
-    <button class="secondary" id="notify" title="Enable desktop notifications">Notify</button>
+    <button class="secondary" id="notify" title="Enable notifications">Notify</button>
+    <button class="secondary" id="notify-test" title="Send a test notification">Test</button>
     <span class="status" id="status">No session</span>
   </div>
   <div class="term" id="terminal"></div>
+</div>
+<div class="mobile-tabs" id="mobile-tabs">
+  <button data-panel="system" class="active">System</button>
+  <button data-panel="recipes">New</button>
+  <button data-panel="sessions">Sessions</button>
+  <button data-panel="workloads">Logs</button>
 </div>
 <script src="/assets/xterm/xterm.js"></script>
 <script src="/assets/xterm/addon-fit.js"></script>
@@ -1459,6 +1502,7 @@ let notifyMode = localStorage.getItem("dd-shell-notify") || "always";
 let oscBuffer = "";
 let cachedRecipes = [];
 let cachedWorkloads = [];
+let activePanel = "system";
 const decoder = new TextDecoder();
 
 async function api(path, opts) {
@@ -1493,19 +1537,33 @@ async function refresh() {
 }
 
 function renderRecipes() {
-  const root = document.getElementById("recipes");
-  root.innerHTML = "";
+  const select = document.getElementById("recipe-select");
+  const summary = document.getElementById("recipe-summary");
+  const selected = select.value;
+  select.innerHTML = "";
   if (!cachedRecipes.length) {
-    root.innerHTML = `<div class="empty-mini">No recipes</div>`;
+    select.innerHTML = `<option value="">No recipes</option>`;
+    select.disabled = true;
+    document.getElementById("launch-recipe").disabled = true;
+    summary.textContent = "";
     return;
   }
+  select.disabled = false;
+  document.getElementById("launch-recipe").disabled = false;
   cachedRecipes.forEach(recipe => {
-    const el = document.createElement("button");
-    el.className = "recipe";
-    el.innerHTML = `<div class="name">${escapeHtml(recipe.title || recipe.id)}</div><div class="meta">${escapeHtml(recipe.description || recipe.command || "")}</div>`;
-    el.onclick = () => createSession(recipe.id);
-    root.appendChild(el);
+    const option = document.createElement("option");
+    option.value = recipe.id;
+    option.textContent = recipe.title || recipe.id;
+    select.appendChild(option);
   });
+  if (selected && cachedRecipes.some(r => r.id === selected)) select.value = selected;
+  renderRecipeSummary();
+}
+
+function renderRecipeSummary() {
+  const select = document.getElementById("recipe-select");
+  const recipe = cachedRecipes.find(r => r.id === select.value);
+  document.getElementById("recipe-summary").textContent = recipe ? (recipe.description || recipe.command || recipe.id) : "";
 }
 
 function renderWorkloads() {
@@ -1539,9 +1597,40 @@ function renderSystem(system) {
     return;
   }
   root.innerHTML = [
+    metricsHtml(system.agent && system.agent.data),
+    notificationHtml(),
     probeHtml("EasyEnclave", system.ee),
     probeHtml("Agent API", system.agent)
   ].join("");
+}
+
+function metricsHtml(data) {
+  if (!data) return "";
+  const cpu = data.cpu_percent ?? data.cpu_pct;
+  const memUsed = data.memory_used_mb ?? data.mem_used_mb;
+  const memTotal = data.memory_total_mb ?? data.mem_total_mb;
+  const uptime = data.system_uptime_secs ?? data.uptime_secs;
+  const load = data.load_1m;
+  const disks = Array.isArray(data.disks) ? data.disks : [];
+  const disk = disks.find(d => d.mount === "/var/lib/easyenclave/data") || disks.find(d => d.mount === "/") || disks[0];
+  return `<div class="metrics">
+    ${metricHtml("CPU", cpu === undefined ? "unknown" : `${cpu}%`, load === undefined ? "load unknown" : `load ${Number(load).toFixed(2)}`)}
+    ${metricHtml("Memory", memUsed === undefined || memTotal === undefined ? "unknown" : `${memUsed}/${memTotal} MB`, memTotal ? `${Math.round((memUsed / memTotal) * 100)}% used` : "")}
+    ${metricHtml("Disk", disk ? `${formatBytes(disk.used_bytes)} / ${formatBytes(disk.total_bytes)}` : "unknown", disk ? disk.mount : "no disk data")}
+    ${metricHtml("Uptime", uptime === undefined ? "unknown" : formatDuration(uptime), data.vm_name || "agent")}
+  </div>`;
+}
+
+function metricHtml(label, value, subvalue) {
+  return `<div class="metric"><div class="label">${escapeHtml(label)}</div><div class="value">${escapeHtml(value)}</div><div class="subvalue">${escapeHtml(subvalue || "")}</div></div>`;
+}
+
+function notificationHtml() {
+  const supported = "Notification" in window;
+  const permission = supported ? Notification.permission : "unavailable";
+  const enabled = supported && permission === "granted" && notifyMode !== "off";
+  const detail = supported ? `${permission}, mode ${notifyMode}` : "browser does not expose Notification API";
+  return `<div class="probe"><div class="row"><span class="name">Notifications</span><span class="pill ${enabled ? "ok" : "bad"}">${enabled ? "enabled" : "off"}</span></div><div class="meta">${escapeHtml(detail)}</div></div>`;
 }
 
 function probeHtml(name, probe) {
@@ -1569,6 +1658,7 @@ async function createSession(recipeId) {
   const body = recipeId ? {recipe_id: recipeId} : {};
   const r = await api("/api/sessions", {method:"POST", headers:{"content-type":"application/json"}, body:JSON.stringify(body)});
   await refresh();
+  closePanels();
   attach(r.id);
 }
 
@@ -1606,6 +1696,7 @@ async function attach(id) {
   };
   ws.onclose = () => document.getElementById("status").textContent = "Detached";
   refresh();
+  closePanels();
   setTimeout(() => term.focus(), 0);
 }
 
@@ -1616,6 +1707,7 @@ async function attachWorkload(name) {
   current = name;
   currentKind = "workload";
   await loadWorkload(name);
+  closePanels();
   workloadTimer = setInterval(() => loadWorkload(name), 2000);
 }
 
@@ -1650,6 +1742,19 @@ term.onData(data => {
 });
 
 document.getElementById("workload-filter").oninput = renderWorkloads;
+document.getElementById("recipe-select").onchange = renderRecipeSummary;
+document.getElementById("launch-recipe").onclick = () => {
+  const id = document.getElementById("recipe-select").value;
+  if (id) createSession(id);
+};
+document.getElementById("panels").onclick = () => openPanels(activePanel);
+document.getElementById("panel-close").onclick = closePanels;
+document.querySelectorAll("#mobile-tabs button").forEach(btn => {
+  btn.onclick = () => {
+    setPanel(btn.dataset.panel);
+    openPanels(btn.dataset.panel);
+  };
+});
 document.getElementById("close").onclick = async () => {
   if (!current || currentKind !== "session") return;
   await api(`/api/sessions/${current}/close`, {method:"POST"});
@@ -1666,12 +1771,40 @@ document.getElementById("notify").onclick = async () => {
     notifyMode = "always";
     localStorage.setItem("dd-shell-notify", notifyMode);
     document.getElementById("status").textContent = "Notifications enabled";
+    renderSystem(await api("/api/system").catch(() => null));
   } else {
     notifyMode = "off";
     localStorage.setItem("dd-shell-notify", notifyMode);
     document.getElementById("status").textContent = "Notifications blocked";
+    renderSystem(await api("/api/system").catch(() => null));
   }
 };
+document.getElementById("notify-test").onclick = async () => {
+  if (!("Notification" in window)) {
+    document.getElementById("status").textContent = "Notifications unavailable";
+    return;
+  }
+  if (Notification.permission !== "granted") {
+    await document.getElementById("notify").onclick();
+  }
+  notify("DD Shell", "notification test");
+};
+
+function setPanel(panel) {
+  activePanel = panel || "system";
+  document.querySelectorAll(".panel").forEach(el => el.classList.toggle("active", el.dataset.panel === activePanel));
+  document.querySelectorAll("#mobile-tabs button").forEach(el => el.classList.toggle("active", el.dataset.panel === activePanel));
+}
+
+function openPanels(panel) {
+  setPanel(panel || activePanel);
+  document.querySelector(".sidebar").classList.add("open");
+}
+
+function closePanels() {
+  document.querySelector(".sidebar").classList.remove("open");
+}
+
 function base64Bytes(value) {
   const raw = atob(value);
   const bytes = new Uint8Array(raw.length);
@@ -1777,12 +1910,31 @@ function notify(title, body) {
     n.close();
   };
 }
+function formatBytes(value) {
+  const n = Number(value || 0);
+  if (n < 1024) return `${n} B`;
+  const units = ["KB", "MB", "GB", "TB"];
+  let v = n / 1024;
+  let i = 0;
+  while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+  return `${v >= 10 ? v.toFixed(0) : v.toFixed(1)} ${units[i]}`;
+}
+function formatDuration(value) {
+  let s = Number(value || 0);
+  const d = Math.floor(s / 86400); s %= 86400;
+  const h = Math.floor(s / 3600); s %= 3600;
+  const m = Math.floor(s / 60);
+  if (d) return `${d}d ${h}h`;
+  if (h) return `${h}h ${m}m`;
+  return `${m}m`;
+}
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
 window.addEventListener("resize", fitAndResize);
 new ResizeObserver(fitAndResize).observe(terminalEl);
 refresh();
+setPanel("system");
 fitAndResize();
 term.focus();
 </script>
