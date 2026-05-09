@@ -47,16 +47,12 @@ impl Common {
         //   kind=user|org → DD_OWNER is a GitHub login (no '/'). The
         //                   verifier matches tokens whose
         //                   repository_owner == DD_OWNER and
-        //                   repository_owner_id == DD_OWNER_ID. The
-        //                   two kinds differ only at CF Access:
-        //                   kind=org maps to a github-organization
-        //                   include rule; kind=user falls back to
-        //                   admin_email-only for the dashboard.
+        //                   repository_owner_id == DD_OWNER_ID.
         //   kind=repo     → DD_OWNER is "<owner>/<repo>" (one '/'),
         //                   verifier matches repository == DD_OWNER
         //                   and repository_id == DD_OWNER_ID.
-        //                   Dashboard CF Access falls back to
-        //                   admin_email-only.
+        //                   Dashboard browser auth is handled by
+        //                   DD's GitHub App OAuth flow.
         //
         // DD_OWNER_ID defeats login-squat — a deleted/transferred
         // account whose login is later re-registered will produce
@@ -161,38 +157,11 @@ impl Ita {
     }
 }
 
-/// CF Access configuration — one email that's always allowed in
-/// alongside GitHub org members. Required so the operator has a
-/// break-glass login path if org membership checks break.
-#[derive(Clone)]
-pub struct CfAccess {
-    pub admin_email: String,
-}
-
-impl CfAccess {
-    pub fn from_env() -> Result<Self> {
-        let admin_email = std::env::var("DD_ACCESS_ADMIN_EMAIL")
-            .map_err(|_| {
-                Error::Internal(
-                    "DD_ACCESS_ADMIN_EMAIL required (break-glass human login for CF Access)".into(),
-                )
-            })?
-            .trim()
-            .to_string();
-        if admin_email.is_empty() || !admin_email.contains('@') {
-            return Err(Error::Internal(
-                "DD_ACCESS_ADMIN_EMAIL must be a valid email address".into(),
-            ));
-        }
-        Ok(Self { admin_email })
-    }
-}
-
 /// Control-plane-mode config.
 pub struct Cp {
     pub common: Common,
     pub cf: CfCreds,
-    pub access: CfAccess,
+    pub auth: crate::auth::AuthConfig,
     pub hostname: String,
     pub scrape_interval_secs: u64,
     pub ita: Ita,
@@ -208,9 +177,9 @@ impl Cp {
     pub fn from_env() -> Result<Self> {
         let common = Common::from_env()?;
         let cf = CfCreds::from_env()?;
-        let access = CfAccess::from_env()?;
         let hostname = std::env::var("DD_HOSTNAME")
             .map_err(|_| Error::Internal("DD_HOSTNAME required in CP mode".into()))?;
+        let auth = crate::auth::AuthConfig::from_env(&hostname, &cf.domain)?;
         let scrape_interval_secs = std::env::var("DD_SCRAPE_INTERVAL")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -233,7 +202,7 @@ impl Cp {
         Ok(Self {
             common,
             cf,
-            access,
+            auth,
             hostname,
             scrape_interval_secs,
             ita,
@@ -244,8 +213,8 @@ impl Cp {
 }
 
 /// Agent-mode config. No PAT — the agent authenticates to the CP with
-/// ITA attestation at /register and the CF Access service token
-/// (received in the register response) on subsequent calls.
+/// ITA attestation at /register and uses in-code auth for subsequent
+/// machine-to-machine calls.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct OracleSpec {
     pub app_name: String,
@@ -273,6 +242,7 @@ pub struct Agent {
     pub cp_url: String,
     pub ee_socket: String,
     pub ita: Ita,
+    pub auth: crate::auth::AuthConfig,
     /// Extra cloudflared ingress rules requested at register time,
     /// parsed from `DD_EXTRA_INGRESS` (a comma-separated list of
     /// `label:port` pairs, e.g. `api:8081,web:9000`). The boot-workload
@@ -300,6 +270,13 @@ pub struct Agent {
 impl Agent {
     pub fn from_env() -> Result<Self> {
         let common = Common::from_env()?;
+        let domain = std::env::var("DD_CF_DOMAIN")
+            .map_err(|_| Error::Internal("DD_CF_DOMAIN required in agent mode".into()))?;
+        let hostname = std::env::var("DD_HOSTNAME")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| common.vm_name.clone());
+        let auth = crate::auth::AuthConfig::from_env(&hostname, &domain)?;
         let cp_url = std::env::var("DD_CP_URL").map_err(|_| {
             Error::Internal("DD_CP_URL required (e.g. https://app.devopsdefender.com)".into())
         })?;
@@ -314,6 +291,7 @@ impl Agent {
             cp_url,
             ee_socket,
             ita,
+            auth,
             extra_ingress,
             confidential,
             oracles,

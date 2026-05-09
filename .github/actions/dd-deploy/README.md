@@ -46,7 +46,7 @@ The action will:
 
 ## Trust model
 
-The agent API subdomain's `/deploy` endpoint is CF-Access-bypassed and gated entirely by an in-code OIDC check:
+The agent API subdomain's `/deploy` endpoint is gated entirely by an in-code OIDC check:
 
 - Issuer must be `https://token.actions.githubusercontent.com`
 - Signature must verify against GitHub's live JWKS

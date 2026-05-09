@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod auth;
 pub mod cf;
 pub mod collector;
 pub mod config;

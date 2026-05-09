@@ -97,6 +97,15 @@ jobs:
       DD_HOSTNAME: ${{ inputs.hostname }}
       DD_BOOT_GITHUB_TOKEN: ${{ github.token }}
       GCP_ZONE: us-central1-c
+      DD_AUTH_BROKER_URL: https://app.${{ vars.DD_CF_DOMAIN || 'devopsdefender.com' }}
+      DD_AUTH_COOKIE_DOMAIN: .${{ vars.DD_CF_DOMAIN || 'devopsdefender.com' }}
+      DD_AUTH_COOKIE_SECRET: ${{ secrets.DD_AUTH_COOKIE_SECRET }}
+      DD_GITHUB_CLIENT_ID: ${{ inputs.env == 'production' && vars.DD_PRODUCTION_GITHUB_CLIENT_ID || vars.DD_STAGING_GITHUB_CLIENT_ID }}
+      DD_GITHUB_CLIENT_SECRET: ${{ inputs.env == 'production' && secrets.DD_PRODUCTION_GITHUB_CLIENT_SECRET || secrets.DD_STAGING_GITHUB_CLIENT_SECRET }}
+      DD_STAGING_GITHUB_CLIENT_ID: ${{ vars.DD_STAGING_GITHUB_CLIENT_ID }}
+      DD_STAGING_GITHUB_CLIENT_SECRET: ${{ secrets.DD_STAGING_GITHUB_CLIENT_SECRET }}
+      DD_PRODUCTION_GITHUB_CLIENT_ID: ${{ vars.DD_PRODUCTION_GITHUB_CLIENT_ID }}
+      DD_PRODUCTION_GITHUB_CLIENT_SECRET: ${{ secrets.DD_PRODUCTION_GITHUB_CLIENT_SECRET }}
     steps:
       - uses: actions/checkout@v4
 
@@ -147,8 +156,16 @@ jobs:
           cf-api-token:  ${{ secrets.DD_CP_CF_API_TOKEN }}
           cf-account-id: ${{ secrets.DD_CP_CF_ACCOUNT_ID }}
           cf-zone-id:    ${{ secrets.DD_CP_CF_ZONE_ID }}
-          admin-email:   ${{ vars.DD_ACCESS_ADMIN_EMAIL || secrets.DD_ACCESS_ADMIN_EMAIL }}
           ita-api-key:   ${{ secrets.DD_ITA_API_KEY }}
+          auth-broker-url: ${{ env.DD_AUTH_BROKER_URL }}
+          auth-cookie-domain: ${{ env.DD_AUTH_COOKIE_DOMAIN }}
+          auth-cookie-secret: ${{ secrets.DD_AUTH_COOKIE_SECRET }}
+          github-client-id: ${{ env.DD_GITHUB_CLIENT_ID }}
+          github-client-secret: ${{ env.DD_GITHUB_CLIENT_SECRET }}
+          staging-github-client-id: ${{ vars.DD_STAGING_GITHUB_CLIENT_ID }}
+          staging-github-client-secret: ${{ secrets.DD_STAGING_GITHUB_CLIENT_SECRET }}
+          production-github-client-id: ${{ vars.DD_PRODUCTION_GITHUB_CLIENT_ID }}
+          production-github-client-secret: ${{ secrets.DD_PRODUCTION_GITHUB_CLIENT_SECRET }}
           release-tag:   ${{ inputs.release_tag }}
           ee-channel:    ${{ steps.ee.outputs.channel }}
           ee-tag:        ${{ inputs.ee_tag }}
@@ -163,7 +180,15 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.DD_CP_CF_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.DD_CP_CF_ACCOUNT_ID }}
           CLOUDFLARE_ZONE_ID: ${{ secrets.DD_CP_CF_ZONE_ID }}
-          DD_ACCESS_ADMIN_EMAIL: ${{ vars.DD_ACCESS_ADMIN_EMAIL || secrets.DD_ACCESS_ADMIN_EMAIL }}
+          DD_AUTH_BROKER_URL: ${{ env.DD_AUTH_BROKER_URL }}
+          DD_AUTH_COOKIE_DOMAIN: ${{ env.DD_AUTH_COOKIE_DOMAIN }}
+          DD_AUTH_COOKIE_SECRET: ${{ secrets.DD_AUTH_COOKIE_SECRET }}
+          DD_GITHUB_CLIENT_ID: ${{ env.DD_GITHUB_CLIENT_ID }}
+          DD_GITHUB_CLIENT_SECRET: ${{ env.DD_GITHUB_CLIENT_SECRET }}
+          DD_STAGING_GITHUB_CLIENT_ID: ${{ vars.DD_STAGING_GITHUB_CLIENT_ID }}
+          DD_STAGING_GITHUB_CLIENT_SECRET: ${{ secrets.DD_STAGING_GITHUB_CLIENT_SECRET }}
+          DD_PRODUCTION_GITHUB_CLIENT_ID: ${{ vars.DD_PRODUCTION_GITHUB_CLIENT_ID }}
+          DD_PRODUCTION_GITHUB_CLIENT_SECRET: ${{ secrets.DD_PRODUCTION_GITHUB_CLIENT_SECRET }}
           DD_ITA_API_KEY: ${{ secrets.DD_ITA_API_KEY }}
           DD_RELEASE_TAG: ${{ inputs.release_tag }}
           EE_OWNER: ${{ inputs.owner }}
@@ -180,7 +205,6 @@ jobs:
 
           VM_NAME="dd-${DD_ENV}-$(date +%s)"
           : "${DD_ITA_API_KEY:?set DD_ITA_API_KEY via secrets.DD_ITA_API_KEY}"
-          : "${DD_ACCESS_ADMIN_EMAIL:?set DD_ACCESS_ADMIN_EMAIL via vars or secrets.DD_ACCESS_ADMIN_EMAIL}"
           : "${EE_OWNER:?set inputs.owner from the calling workflow}"
 
           # Resolve EE_OWNER → numeric id + kind via gh api. Same idiom
@@ -232,7 +256,16 @@ jobs:
           EE_BOOT_WORKLOADS=$({
             bake apps/cloudflared/workload.json
             bake apps/dd-management/workload.json.tmpl
-            bake apps/dd-shell/workload.json
+            DD_DOMAIN="$DD_DOMAIN" \
+              DD_HOSTNAME="$DD_HOSTNAME" \
+              DD_ENV="$DD_ENV" \
+              DD_OWNER="$EE_OWNER" \
+              DD_OWNER_ID="$EE_OWNER_ID" \
+              DD_OWNER_KIND="$EE_OWNER_KIND" \
+              DD_AUTH_BROKER_URL="$DD_AUTH_BROKER_URL" \
+              DD_AUTH_COOKIE_DOMAIN="$DD_AUTH_COOKIE_DOMAIN" \
+              DD_AUTH_COOKIE_SECRET="$DD_AUTH_COOKIE_SECRET" \
+              bake apps/dd-shell/workload.json.tmpl
             bake apps/ee-proxy/workload.json.tmpl
           } | jq -cs '.')
 
@@ -439,33 +472,31 @@ jobs:
           echo "::error::/health never returned a valid .noise.quote_b64 — stale tunnel or new VM never came up"
           exit 1
 
-      - name: Verify dashboard is fronted by CF Access
+      - name: Verify dashboard requires DD GitHub auth
         env:
           AGENT_URL: https://${{ inputs.hostname }}
+          DD_AUTH_BROKER_URL: ${{ env.DD_AUTH_BROKER_URL }}
         run: |
-          # The root is now behind a CF Access self-hosted app. An
-          # unauthenticated browserless curl should see either:
-          #   - 302 with Location: *.cloudflareaccess.com (login redirect)
-          #   - 401 (API-style reject)
-          # A 200 means the app layer is serving the dashboard without
-          # CF gating, which we want to catch.
+          # The root is routed through Cloudflare, but DD owns browser
+          # auth in-app. An unauthenticated browserless curl should
+          # redirect to the DD auth broker, not serve the dashboard.
           set +e
           for attempt in $(seq 1 12); do
             out=$(curl -s -o /dev/null -w '%{http_code}|%{redirect_url}' "${AGENT_URL}/")
             code=${out%%|*}
             location=${out#*|}
-            if [[ "$code" =~ ^30[12]$ ]] && [[ "$location" == *cloudflareaccess.com* ]]; then
-              echo "Dashboard gated by CF Access (HTTP ${code} → ${location}, attempt ${attempt})"
+            if [[ "$code" =~ ^30[1278]$ ]] && [[ "$location" == "$DD_AUTH_BROKER_URL/auth/github/start"* ]]; then
+              echo "Dashboard gated by DD GitHub auth (HTTP ${code} → ${location}, attempt ${attempt})"
               exit 0
             fi
             if [ "$code" = "401" ]; then
-              echo "Dashboard gated by CF Access (HTTP 401, attempt ${attempt})"
+              echo "Dashboard gated by DD GitHub auth (HTTP 401, attempt ${attempt})"
               exit 0
             fi
             echo "  dashboard returned HTTP ${code} (location=${location:-none}), retrying... (${attempt}/12)"
             sleep 5
           done
-          echo "::error::dashboard / never returned a CF Access gate response"
+          echo "::error::dashboard / never returned a DD auth gate response"
           exit 1
 
       - name: Comment preview URL on PR
@@ -479,17 +510,17 @@ jobs:
               ``,
               `**URL:** ${url}`,
               ``,
-              `Browser login: visit ${url} — Cloudflare Access routes you`,
-              `through GitHub OAuth. Membership (public) in the DD GitHub`,
-              `org grants access; the \`DD_ACCESS_ADMIN_EMAIL\` is the`,
-              `break-glass fallback.`,
+              `Browser login: visit ${url} — Cloudflare routes you`,
+              `to DD's GitHub App auth broker. A DD session cookie scoped`,
+              `to \`.devopsdefender.com\` lets the preview, fleet, and`,
+              `shell hosts share the same login.`,
               ``,
               `Machine-to-machine: GitHub Actions workflows in the`,
               `DD_OWNER org pass their per-job OIDC JWT as`,
               `\`Authorization: Bearer …\` (audience \`dd-agent\`).`,
               ``,
               `Register endpoint for a local agent: \`${url}/register\``,
-              `(CF-Access-bypassed; authenticated by ITA attestation).`,
+              `(authenticated by ITA attestation).`,
             ].join('\n');
             const { data: comments } = await github.rest.issues.listComments({
               owner: context.repo.owner,
@@ -531,6 +562,9 @@ jobs:
           repo-root: ${{ format('/home/{0}/src/dd', inputs.env == 'production' && vars.BAREMETAL_PRODUCTION_USER || vars.BAREMETAL_STAGING_USER) }}
           ssh-key: ${{ secrets.DD_LOCAL_SSH_KEY }}
           ita-api-key: ${{ secrets.DD_ITA_API_KEY }}
+          auth-broker-url: ${{ env.DD_AUTH_BROKER_URL }}
+          auth-cookie-domain: ${{ env.DD_AUTH_COOKIE_DOMAIN }}
+          auth-cookie-secret: ${{ secrets.DD_AUTH_COOKIE_SECRET }}
           release-tag: ${{ inputs.release_tag }}
           ee-channel: ${{ steps.ee.outputs.channel }}
           ee-tag: ${{ inputs.ee_tag }}

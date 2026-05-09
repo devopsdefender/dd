@@ -11,7 +11,6 @@
 #
 # Required env (SSH'd-in from CI secrets):
 #   CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID, CLOUDFLARE_ZONE_ID
-#   DD_ACCESS_ADMIN_EMAIL
 #   DD_ITA_API_KEY
 #
 # DD_RELEASE_TAG (optional) — passed positionally as $4.
@@ -27,7 +26,6 @@ export DD_RELEASE_TAG="${4:-${DD_RELEASE_TAG:-latest}}"
 : "${CLOUDFLARE_API_TOKEN?}"
 : "${CLOUDFLARE_ACCOUNT_ID?}"
 : "${CLOUDFLARE_ZONE_ID?}"
-: "${DD_ACCESS_ADMIN_EMAIL?}"
 : "${DD_ITA_API_KEY?}"
 
 cd "${DD_REPO_ROOT:-/home/tdx2/src/dd}"

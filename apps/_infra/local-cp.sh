@@ -15,7 +15,7 @@
 #
 # Required env (all from the calling workflow's secrets):
 #   CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID, CLOUDFLARE_ZONE_ID
-#   DD_ACCESS_ADMIN_EMAIL, DD_ITA_API_KEY
+#   DD_ITA_API_KEY
 #   EE_GITHUB_TOKEN    optional; forwarded to EasyEnclave so boot-time
 #                      GitHub release asset fetches don't use anonymous
 #                      API rate limits.
@@ -34,7 +34,6 @@ HOSTNAME="${2?hostname required}"
 : "${CLOUDFLARE_API_TOKEN?}"
 : "${CLOUDFLARE_ACCOUNT_ID?}"
 : "${CLOUDFLARE_ZONE_ID?}"
-: "${DD_ACCESS_ADMIN_EMAIL?}"
 : "${DD_ITA_API_KEY?}"
 : "${EE_OWNER?set EE_OWNER (GitHub login or owner/repo path; no default)}"
 DD_RELEASE_TAG="${DD_RELEASE_TAG:-latest}"
@@ -63,6 +62,15 @@ fi
 unset _gh_type
 echo "  EE_OWNER=$EE_OWNER (kind=$EE_OWNER_KIND, id=$EE_OWNER_ID)"
 DD_DOMAIN="${DD_DOMAIN:-devopsdefender.com}"
+DD_AUTH_BROKER_URL="${DD_AUTH_BROKER_URL:-https://app.$DD_DOMAIN}"
+DD_AUTH_COOKIE_DOMAIN="${DD_AUTH_COOKIE_DOMAIN:-.$DD_DOMAIN}"
+: "${DD_AUTH_COOKIE_SECRET?set DD_AUTH_COOKIE_SECRET}"
+DD_GITHUB_CLIENT_ID="${DD_GITHUB_CLIENT_ID:-}"
+DD_GITHUB_CLIENT_SECRET="${DD_GITHUB_CLIENT_SECRET:-}"
+DD_STAGING_GITHUB_CLIENT_ID="${DD_STAGING_GITHUB_CLIENT_ID:-}"
+DD_STAGING_GITHUB_CLIENT_SECRET="${DD_STAGING_GITHUB_CLIENT_SECRET:-}"
+DD_PRODUCTION_GITHUB_CLIENT_ID="${DD_PRODUCTION_GITHUB_CLIENT_ID:-}"
+DD_PRODUCTION_GITHUB_CLIENT_SECRET="${DD_PRODUCTION_GITHUB_CLIENT_SECRET:-}"
 DD_ITA_BASE_URL="${DD_ITA_BASE_URL:-https://api.trustauthority.intel.com}"
 DD_ITA_JWKS_URL="${DD_ITA_JWKS_URL:-https://portal.trustauthority.intel.com/certs}"
 DD_ITA_ISSUER="${DD_ITA_ISSUER:-https://portal.trustauthority.intel.com}"
@@ -127,7 +135,15 @@ build_config_iso() {
       DD_DOMAIN="$DD_DOMAIN" \
       DD_HOSTNAME="$HOSTNAME" \
       DD_ENV="$ENV_LABEL" \
-      DD_ACCESS_ADMIN_EMAIL="$DD_ACCESS_ADMIN_EMAIL" \
+      DD_AUTH_BROKER_URL="$DD_AUTH_BROKER_URL" \
+      DD_AUTH_COOKIE_DOMAIN="$DD_AUTH_COOKIE_DOMAIN" \
+      DD_AUTH_COOKIE_SECRET="$DD_AUTH_COOKIE_SECRET" \
+      DD_GITHUB_CLIENT_ID="$DD_GITHUB_CLIENT_ID" \
+      DD_GITHUB_CLIENT_SECRET="$DD_GITHUB_CLIENT_SECRET" \
+      DD_STAGING_GITHUB_CLIENT_ID="$DD_STAGING_GITHUB_CLIENT_ID" \
+      DD_STAGING_GITHUB_CLIENT_SECRET="$DD_STAGING_GITHUB_CLIENT_SECRET" \
+      DD_PRODUCTION_GITHUB_CLIENT_ID="$DD_PRODUCTION_GITHUB_CLIENT_ID" \
+      DD_PRODUCTION_GITHUB_CLIENT_SECRET="$DD_PRODUCTION_GITHUB_CLIENT_SECRET" \
       DD_ITA_MODE="$DD_ITA_MODE" \
       DD_ITA_API_KEY="$DD_ITA_API_KEY" \
       DD_ITA_BASE_URL="$DD_ITA_BASE_URL" \
@@ -137,7 +153,16 @@ build_config_iso() {
       DD_OWNER_ID="$EE_OWNER_ID" \
       DD_OWNER_KIND="$EE_OWNER_KIND" \
       bake "$REPO_ROOT/apps/dd-management/workload.json.tmpl"
-    bake "$REPO_ROOT/apps/dd-shell/workload.json"
+    DD_DOMAIN="$DD_DOMAIN" \
+      DD_HOSTNAME="$HOSTNAME" \
+      DD_ENV="$ENV_LABEL" \
+      DD_OWNER="$EE_OWNER" \
+      DD_OWNER_ID="$EE_OWNER_ID" \
+      DD_OWNER_KIND="$EE_OWNER_KIND" \
+      DD_AUTH_BROKER_URL="$DD_AUTH_BROKER_URL" \
+      DD_AUTH_COOKIE_DOMAIN="$DD_AUTH_COOKIE_DOMAIN" \
+      DD_AUTH_COOKIE_SECRET="$DD_AUTH_COOKIE_SECRET" \
+      bake "$REPO_ROOT/apps/dd-shell/workload.json.tmpl"
   } | jq -cs '.')
 
   {

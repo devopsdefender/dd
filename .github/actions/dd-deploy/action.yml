@@ -108,10 +108,10 @@ runs:
         agent_api_host="${agent_api_label}.${agent_domain}"
         echo "agent-host=$agent_host" >> "$GITHUB_OUTPUT"
 
-        # The agent API hostname and its CF Access bypass app are created
+        # The agent API hostname and its Cloudflare routing app are created
         # immediately before preview deploys. DNS can resolve before the
-        # bypass decision is active at every edge, which shows up as transient
-        # 401s on /deploy. Gate the mutating request on the read-only health
+        # route is active at every edge, which shows up as transient
+        # failures on /deploy. Gate the mutating request on the read-only health
         # endpoint being reachable through the same hostname.
         echo "waiting for agent API health at $agent_api_host"
         deadline=$(( $(date +%s) + 600 ))

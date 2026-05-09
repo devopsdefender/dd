@@ -33,6 +33,7 @@ use crate::units::{AgentMode, ManagedUnit};
 // the tunnel inside that window makes a slow-but-healthy agent
 // unrecoverable before CI can observe it.
 const DEAD_THRESHOLD_SECS: i64 = 900;
+const UNKNOWN_TUNNEL_SCRAPE_DELAY_SECS: i64 = 120;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Agent {
@@ -153,13 +154,30 @@ async fn tick(
         })
         .collect();
 
+    let known_hosts: std::collections::HashSet<String> = {
+        let s = store.lock().await;
+        s.values().map(|a| a.hostname.clone()).collect()
+    };
+
+    let now = Utc::now();
     let scrapes = tunnels.iter().map(|(name, tunnel_id, host, created_at)| {
         let http = http.clone();
         let name = name.clone();
         let tunnel_id = tunnel_id.clone();
         let host = host.clone();
         let created_at = *created_at;
+        let known = known_hosts.contains(&host);
         async move {
+            if !known && unknown_tunnel_should_wait_for_registration(created_at, now) {
+                return (
+                    name,
+                    tunnel_id,
+                    host,
+                    created_at,
+                    None,
+                    Some("fresh unknown tunnel pending registration".into()),
+                );
+            }
             let health_host = cf::agent_api_hostname(&host);
             let r = http
                 .get(format!("https://{health_host}/health"))
@@ -191,7 +209,6 @@ async fn tick(
     });
     let results = futures_util::future::join_all(scrapes).await;
 
-    let now = Utc::now();
     let mut orphans: Vec<Orphan> = Vec::new();
     let mut verified = 0usize;
 
@@ -279,8 +296,8 @@ async fn tick(
             for (label, _) in &orphan.extras {
                 let _ = cf::delete_cname(http, cf, &cf::extra_hostname(&orphan.host, label)).await;
             }
-            // Sweep the agent's CF Access apps — its human dashboard
-            // app and every workload-URL bypass under this hostname.
+            // Sweep the agent's Cloudflare self-hosted apps: its
+            // dashboard route and every workload URL under this hostname.
             // Without this the account accumulates dead apps every
             // STONITH cycle.
             cf::delete_access_apps_for(http, cf, &orphan.host).await;
@@ -402,6 +419,15 @@ fn unknown_tunnel_is_gc_candidate(
         && scrape_failure_is_dead_signal(err)
 }
 
+fn unknown_tunnel_should_wait_for_registration(
+    created_at: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> bool {
+    created_at.is_some_and(|created_at| {
+        now.signed_duration_since(created_at).num_seconds() < UNKNOWN_TUNNEL_SCRAPE_DELAY_SECS
+    })
+}
+
 fn scrape_failure_is_dead_signal(err: &Option<String>) -> bool {
     let Some(err) = err.as_deref() else {
         return false;
@@ -424,6 +450,7 @@ mod tests {
 
     use super::{
         parse_extra_ingress, scrape_failure_is_dead_signal, unknown_tunnel_is_gc_candidate,
+        unknown_tunnel_should_wait_for_registration,
     };
 
     #[test]
@@ -513,5 +540,20 @@ mod tests {
             &err,
             now
         ));
+    }
+
+    #[test]
+    fn fresh_unknown_tunnels_are_not_scraped_immediately() {
+        let now = Utc::now();
+
+        assert!(unknown_tunnel_should_wait_for_registration(
+            Some(now - Duration::seconds(30)),
+            now
+        ));
+        assert!(!unknown_tunnel_should_wait_for_registration(
+            Some(now - Duration::seconds(180)),
+            now
+        ));
+        assert!(!unknown_tunnel_should_wait_for_registration(None, now));
     }
 }

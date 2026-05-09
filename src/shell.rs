@@ -15,7 +15,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path as AxPath, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode, Uri};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -137,6 +137,9 @@ struct App {
     ee: Arc<Ee>,
     http: reqwest::Client,
     agent_api: String,
+    owner: crate::gh_oidc::Principal,
+    auth: crate::auth::AuthConfig,
+    hostname: String,
     recipes: Arc<Vec<Recipe>>,
     scratch_root: PathBuf,
 }
@@ -261,6 +264,14 @@ struct SystemStatus {
 }
 
 pub async fn run() -> Result<()> {
+    let common = crate::config::Common::from_env()?;
+    let domain = std::env::var("DD_CF_DOMAIN")
+        .map_err(|_| Error::Internal("DD_CF_DOMAIN required in shell mode".into()))?;
+    let hostname = std::env::var("DD_HOSTNAME")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| common.vm_name.clone());
+    let auth = crate::auth::AuthConfig::from_env(&hostname, &domain)?;
     let port = std::env::var("DD_SHELL_PORT")
         .ok()
         .and_then(|s| s.parse::<u16>().ok())
@@ -292,6 +303,9 @@ pub async fn run() -> Result<()> {
             .build()
             .unwrap_or_else(|_| reqwest::Client::new()),
         agent_api,
+        owner: common.owner,
+        auth,
+        hostname,
         recipes,
         scratch_root,
     };
@@ -322,8 +336,35 @@ pub async fn run() -> Result<()> {
         .map_err(|e| Error::Internal(e.to_string()))
 }
 
-async fn index() -> Html<String> {
-    Html(html::shell("DD Shell", "", SHELL_HTML))
+fn shell_path_and_query(uri: &Uri) -> &str {
+    uri.path_and_query().map(|p| p.as_str()).unwrap_or("/")
+}
+
+fn require_shell_auth(app: &App, headers: &HeaderMap, uri: &Uri) -> Option<Response> {
+    if app.auth.verify_session(&app.owner, headers).is_some() {
+        None
+    } else {
+        let return_to =
+            crate::auth::absolute_url(headers, &app.hostname, shell_path_and_query(uri));
+        Some(crate::auth::unauthorized_or_redirect(
+            &app.auth, headers, &return_to,
+        ))
+    }
+}
+
+fn ensure_shell_auth(app: &App, headers: &HeaderMap, uri: &Uri) -> Result<()> {
+    if require_shell_auth(app, headers, uri).is_some() {
+        Err(Error::Unauthorized)
+    } else {
+        Ok(())
+    }
+}
+
+async fn index(State(app): State<App>, headers: HeaderMap, uri: Uri) -> Response {
+    if let Some(resp) = require_shell_auth(&app, &headers, &uri) {
+        return resp;
+    }
+    Html(html::shell("DD Shell", "", SHELL_HTML)).into_response()
 }
 
 async fn favicon() -> StatusCode {
@@ -360,24 +401,37 @@ async fn xterm_fit_js() -> impl IntoResponse {
     )
 }
 
-async fn list_recipes(State(app): State<App>) -> Json<Vec<Recipe>> {
-    Json((*app.recipes).clone())
+async fn list_recipes(
+    State(app): State<App>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Result<Json<Vec<Recipe>>> {
+    ensure_shell_auth(&app, &headers, &uri)?;
+    Ok(Json((*app.recipes).clone()))
 }
 
-async fn list_sessions(State(app): State<App>) -> Json<Vec<SessionMeta>> {
+async fn list_sessions(
+    State(app): State<App>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Result<Json<Vec<SessionMeta>>> {
+    ensure_shell_auth(&app, &headers, &uri)?;
     let sessions: Vec<Arc<Session>> = app.sessions.read().await.values().cloned().collect();
     let mut out = Vec::with_capacity(sessions.len());
     for s in sessions {
         out.push(s.meta.read().await.clone());
     }
     out.sort_by_key(|s| Reverse(s.updated_at));
-    Json(out)
+    Ok(Json(out))
 }
 
 async fn create_session(
     State(app): State<App>,
+    headers: HeaderMap,
+    uri: Uri,
     Json(req): Json<CreateSession>,
 ) -> Result<Json<CreateSessionResponse>> {
+    ensure_shell_auth(&app, &headers, &uri)?;
     let id = Uuid::new_v4().to_string();
     let recipe = select_recipe(&app, req.recipe_id.as_deref(), req.command)?;
     let command = recipe.command.clone();
@@ -710,8 +764,11 @@ fn spawn_pty(
 
 async fn replay_session(
     State(app): State<App>,
+    headers: HeaderMap,
+    uri: Uri,
     AxPath(id): AxPath<String>,
 ) -> Result<Json<ReplayResponse>> {
+    ensure_shell_auth(&app, &headers, &uri)?;
     let bytes = app.store.replay(&id).await?;
     Ok(Json(ReplayResponse {
         id,
@@ -719,7 +776,12 @@ async fn replay_session(
     }))
 }
 
-async fn list_workloads(State(app): State<App>) -> Result<Json<Vec<ManagedUnit>>> {
+async fn list_workloads(
+    State(app): State<App>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Result<Json<Vec<ManagedUnit>>> {
+    ensure_shell_auth(&app, &headers, &uri)?;
     if let Ok(units) = agent_get(&app, "/api/units").await {
         return Ok(Json(units));
     }
@@ -831,8 +893,13 @@ fn non_empty_string(value: &serde_json::Value) -> Option<String> {
         .map(String::from)
 }
 
-async fn list_oracles(State(app): State<App>) -> Json<Vec<OracleStatus>> {
-    Json(load_oracles(&app).await)
+async fn list_oracles(
+    State(app): State<App>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Result<Json<Vec<OracleStatus>>> {
+    ensure_shell_auth(&app, &headers, &uri)?;
+    Ok(Json(load_oracles(&app).await))
 }
 
 async fn load_oracles(app: &App) -> Vec<OracleStatus> {
@@ -845,7 +912,12 @@ async fn load_oracles(app: &App) -> Vec<OracleStatus> {
     }
 }
 
-async fn system_status(State(app): State<App>) -> Json<SystemStatus> {
+async fn system_status(
+    State(app): State<App>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Result<Json<SystemStatus>> {
+    ensure_shell_auth(&app, &headers, &uri)?;
     let ee = match app.ee.health().await {
         Ok(data) => SystemProbe {
             ok: true,
@@ -874,7 +946,7 @@ async fn system_status(State(app): State<App>) -> Json<SystemStatus> {
             data: None,
         },
     };
-    Json(SystemStatus { ee, agent })
+    Ok(Json(SystemStatus { ee, agent }))
 }
 
 async fn agent_get<T: DeserializeOwned>(app: &App, path: &str) -> Result<T> {
@@ -892,8 +964,11 @@ async fn agent_get<T: DeserializeOwned>(app: &App, path: &str) -> Result<T> {
 
 async fn replay_workload(
     State(app): State<App>,
+    headers: HeaderMap,
+    uri: Uri,
     AxPath(name): AxPath<String>,
 ) -> Result<Json<ReplayResponse>> {
+    ensure_shell_auth(&app, &headers, &uri)?;
     let list = app.ee.list().await?;
     let id = list["deployments"]
         .as_array()
@@ -912,7 +987,13 @@ async fn replay_workload(
     }))
 }
 
-async fn close_session(State(app): State<App>, AxPath(id): AxPath<String>) -> Result<StatusCode> {
+async fn close_session(
+    State(app): State<App>,
+    headers: HeaderMap,
+    uri: Uri,
+    AxPath(id): AxPath<String>,
+) -> Result<StatusCode> {
+    ensure_shell_auth(&app, &headers, &uri)?;
     let Some(session) = app.sessions.write().await.remove(&id) else {
         return Err(Error::NotFound);
     };
@@ -960,9 +1041,12 @@ fn workload_log_bytes(logs: &serde_json::Value) -> Vec<u8> {
 
 async fn resize_session(
     State(app): State<App>,
+    headers: HeaderMap,
+    uri: Uri,
     AxPath(id): AxPath<String>,
     Json(req): Json<ResizeSession>,
 ) -> Result<StatusCode> {
+    ensure_shell_auth(&app, &headers, &uri)?;
     if req.cols == 0 || req.rows == 0 {
         return Err(Error::BadRequest("terminal size must be non-zero".into()));
     }
@@ -992,10 +1076,13 @@ async fn resize_session(
 
 async fn attach_session(
     State(app): State<App>,
+    headers: HeaderMap,
+    uri: Uri,
     AxPath(id): AxPath<String>,
     Query(query): Query<AttachQuery>,
     ws: WebSocketUpgrade,
 ) -> Result<Response> {
+    ensure_shell_auth(&app, &headers, &uri)?;
     let Some(session) = app.sessions.read().await.get(&id).cloned() else {
         return Err(Error::NotFound);
     };

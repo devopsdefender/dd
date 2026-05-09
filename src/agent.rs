@@ -1,18 +1,17 @@
 //! Agent mode — runs inside an easyenclave TDX VM.
 //!
 //! On startup: POST `{vm_name, env_label, owner, ita_token}` to
-//! `$DD_CP_URL/register` (no auth — ITA attestation is the gate;
-//! the path is exempt from CF Access via a bypass app). The CP
+//! `$DD_CP_URL/register` (ITA attestation is the gate). The CP
 //! responds with `{tunnel_token, hostname, agent_id, cp_hostname}`.
 //!
 //! Auth after registration:
-//!   - Browser routes (`/`, `/workload/*`) are behind CF Access with
-//!     the same human policy as the CP dashboard.
+//!   - Browser routes (`/`, `/workload/*`) require a DD-signed
+//!     GitHub App session cookie. Cloudflare only routes traffic.
 //!   - Terminal access is provided by the `dd-shell` workload on the
 //!     `shell` label. It exposes read-only workload logs and read-write
 //!     PTY sessions as separate capabilities.
-//!   - `/deploy` and `/exec` are CF-Access-bypassed and gated in-code
-//!     by a GitHub Actions OIDC token — any CI workflow whose
+//!   - `/deploy` and `/exec` are gated in-code by a GitHub Actions
+//!     OIDC token — any CI workflow whose
 //!     principal matches `DD_OWNER`/`DD_OWNER_ID`/`DD_OWNER_KIND`
 //!     (see [`gh_oidc::Principal::matches`]) can call them by
 //!     presenting its per-job OIDC JWT as `Authorization: Bearer …`.
@@ -23,7 +22,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::extract::{Path, State};
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, Uri};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -355,9 +354,8 @@ async fn sync_trusted_devices(
     ita_token: &Arc<RwLock<String>>,
     trust: &noise_gateway::TrustHandle,
 ) -> Result<()> {
-    // `/api/v1/devices/trusted` is CF-Access-bypassed (see
-    // `cf::provision_cp_access`) so cross-VM agents can reach it over
-    // the public tunnel. Auth is in-code: loopback / GH-OIDC / ITA,
+    // `/api/v1/devices/trusted` is reachable over the public tunnel.
+    // Auth is in-code: loopback / GH-OIDC / ITA,
     // same three-way policy as `/api/agents`.
     let url = format!("{}/api/v1/devices/trusted", cp_url.trim_end_matches('/'));
     let token = ita_token.read().await.clone();
@@ -415,8 +413,8 @@ async fn register(cfg: &Cfg, ita_token: &str) -> Result<Bootstrap> {
         "extra_ingress": extra_ingress,
     });
 
-    // /register is CF-Access-bypassed; ITA attestation is the gate.
-    // The transport layer is retried — the agent VM often boots
+    // /register is authenticated by ITA attestation. The transport
+    // layer is retried — the agent VM often boots
     // faster than CF edge propagation for a just-flipped CP CNAME
     // or a just-reconnected cloudflared tunnel, and the first POST
     // tends to fail with "error sending request" / 502 / 530.
@@ -604,8 +602,8 @@ async fn health(State(s): State<St>) -> Json<serde_json::Value> {
         "extra_ingress": extra_ingress,
         // Pre-Noise-handshake bundle — stable per boot. Used to be a
         // standalone `GET /attest` endpoint. Keeping it here lets a
-        // bastion-app bootstrap with one fetch and drops a CF Access
-        // bypass-app per env × per service. `quote_b64` binds the
+        // bastion-app bootstrap with one fetch and keeps Cloudflare
+        // routing app count lower. `quote_b64` binds the
         // raw Noise pubkey into its TDX `report_data`; clients verify
         // the Intel signature and pin the pubkey from the quote — no
         // TOFU needed.
@@ -616,7 +614,32 @@ async fn health(State(s): State<St>) -> Json<serde_json::Value> {
     }))
 }
 
-async fn dashboard(State(s): State<St>) -> Response {
+fn agent_path_and_query(uri: &Uri) -> &str {
+    uri.path_and_query().map(|p| p.as_str()).unwrap_or("/")
+}
+
+fn require_browser_auth(s: &St, headers: &HeaderMap, uri: &Uri) -> Option<Response> {
+    if s.cfg
+        .auth
+        .verify_session(&s.cfg.common.owner, headers)
+        .is_some()
+    {
+        None
+    } else {
+        let return_to =
+            crate::auth::absolute_url(headers, &s.cfg.common.vm_name, agent_path_and_query(uri));
+        Some(crate::auth::unauthorized_or_redirect(
+            &s.cfg.auth,
+            headers,
+            &return_to,
+        ))
+    }
+}
+
+async fn dashboard(State(s): State<St>, headers: HeaderMap, uri: Uri) -> Response {
+    if let Some(resp) = require_browser_auth(&s, &headers, &uri) {
+        return resp;
+    }
     let m = metrics::collect().await;
     let list = s.ee.list().await.unwrap_or_default();
     let ee_health = s.ee.health().await.unwrap_or_default();
@@ -785,7 +808,7 @@ async fn dashboard(State(s): State<St>) -> Response {
 
     let terminal_link = if units.iter().any(|u| u.kind == UnitKind::Shell) {
         // `{hostname-base}-shell.{tld}` is the dd-shell subdomain provisioned
-        // at register time. Human-gated by CF Access. Flat shape so
+        // at register time. Human-gated by DD browser auth. Flat shape so
         // Universal SSL covers the cert.
         let term_host = html::escape(&crate::cf::label_hostname(&s.hostname, "shell"));
         format!(r#" · <a href="https://{term_host}/" target="_blank">Terminal ↗</a>"#)
@@ -1048,7 +1071,15 @@ fn non_empty_string(value: &serde_json::Value) -> Option<String> {
         .map(String::from)
 }
 
-async fn workload_page(State(s): State<St>, Path(id): Path<String>) -> Result<Response> {
+async fn workload_page(
+    State(s): State<St>,
+    headers: HeaderMap,
+    uri: Uri,
+    Path(id): Path<String>,
+) -> Result<Response> {
+    if let Some(resp) = require_browser_auth(&s, &headers, &uri) {
+        return Ok(resp);
+    }
     let list = s.ee.list().await?;
     let deployments: Vec<&serde_json::Value> = list["deployments"]
         .as_array()
@@ -1164,8 +1195,8 @@ async fn deploy(
     headers: HeaderMap,
     Json(spec): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>> {
-    // Log entry *before* auth so we can tell CF-Access-intercepts
-    // (no handler entry at all) from OIDC failures (entry + reject).
+    // Log entry before auth so OIDC failures show up with agent-side
+    // context instead of just a caller-side HTTP reject.
     eprintln!(
         "agent: /deploy entered (has_auth={}, app={})",
         headers.contains_key(axum::http::header::AUTHORIZATION),

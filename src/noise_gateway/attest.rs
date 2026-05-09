@@ -12,7 +12,7 @@
 //!
 //! There used to be a dedicated `GET /attest` route here. It was
 //! collapsed into `/health` so a bastion-app bootstrap does one
-//! request instead of two, and so the CF Access bypass list shrinks
+//! request instead of two, and so the Cloudflare routing list shrinks
 //! by one app per env × per service. The Noise quote is stable per
 //! boot — just an `Arc<Attestor>` clone on each `/health` hit.
 

@@ -3,15 +3,17 @@
 //! One HTTP port (`$DD_PORT`, default 8080) behind the CP's own CF tunnel.
 //! On startup we: self-provision a CF tunnel at `$DD_HOSTNAME`, spawn
 //! cloudflared, STONITH any older CP (by `dd-{env}-cp-*` name prefix),
-//! provision CF Access apps + a shared service token, start the
-//! self-watchdog and collector, then serve the router. No app-layer
-//! auth — CF Access validates every request at the edge.
+//! provision routing entries, start the self-watchdog and collector,
+//! then serve the router. Browser auth is in-app GitHub App OAuth via
+//! a shared DD session cookie; machine auth remains ITA / GitHub
+//! Actions OIDC.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::extract::{Path, Query, State};
+use axum::http::{HeaderMap, Uri};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -199,13 +201,10 @@ pub async fn run() -> Result<()> {
         shutdown_tx.clone(),
     ));
 
-    // Stage 4: provision CF Access apps for our own tunnel. Workload
-    // labels (e.g. `shell` for dd-shell) get the human policy; the
-    // paths in the bypass list (`/register`, `/api/agents`,
-    // `/api/v1/devices/trusted`, `/api/v1/admin/export`, `/noise/ws`,
-    // `/health`, …) are CF-bypassed with in-code gating. `/health`
-    // also carries the Noise pre-handshake quote + pubkey (the former
-    // `/attest` — now inlined to save a bootstrap round-trip).
+    // Stage 4: provision Cloudflare self-hosted apps as bypass routing
+    // objects for our tunnel. DD owns browser and machine auth in-code.
+    // `/health` also carries the Noise pre-handshake quote + pubkey
+    // (the former `/attest`, now inlined to save a bootstrap round-trip).
     let cp_labels: Vec<String> = cp_extras.iter().map(|(l, _)| l.clone()).collect();
     let mut access_ready = false;
     for attempt in 1..=5 {
@@ -214,8 +213,6 @@ pub async fn run() -> Result<()> {
             &cfg.cf,
             &cfg.common.env_label,
             &cfg.hostname,
-            &cfg.common.owner,
-            &cfg.access.admin_email,
             &cp_labels,
         )
         .await
@@ -225,16 +222,16 @@ pub async fn run() -> Result<()> {
                 break;
             }
             Err(e) => {
-                eprintln!("cp: CF Access provisioning attempt {attempt}/5 failed: {e}");
+                eprintln!("cp: Cloudflare app provisioning attempt {attempt}/5 failed: {e}");
                 tokio::time::sleep(Duration::from_secs(5 * attempt)).await;
             }
         }
     }
     if !access_ready {
-        eprintln!("cp: CF Access provisioning failed after retries");
+        eprintln!("cp: Cloudflare app provisioning failed after retries");
         stonith::poweroff();
     }
-    eprintln!("cp: CF Access ready");
+    eprintln!("cp: Cloudflare routing apps ready");
     let cp_ita_token = Arc::new(RwLock::new(initial_token));
 
     // Seed the CP into the store before the collector starts ticking.
@@ -367,6 +364,8 @@ pub async fn run() -> Result<()> {
 
     let app = Router::new()
         .route("/", get(fleet))
+        .route("/auth/github/start", get(auth_start))
+        .route("/auth/github/callback", get(auth_callback))
         .route("/health", get(health))
         .route("/register", post(register))
         .route("/ingress/replace", post(ingress_replace))
@@ -523,8 +522,8 @@ async fn health(
         "oracle_count": agents.values().map(|a| a.oracles.len()).sum::<usize>(),
         // Pre-Noise-handshake bundle — the former `GET /attest`
         // endpoint folded in here so bastion-app bootstraps in one
-        // fetch and we drop a CF Access bypass-app per env × per
-        // service. Stable per boot; `Arc` clones are effectively free
+        // fetch and keep Cloudflare routing app count lower. Stable
+        // per boot; `Arc` clones are effectively free
         // per request. `quote_b64` binds the raw Noise pubkey into
         // TDX `report_data`, self-authenticating via ITA.
         "noise": {
@@ -565,10 +564,9 @@ struct ExtraIngress {
     port: u16,
 }
 
-/// POST /register — the CF Access bypass app on this path lets anyone
-/// reach it; the real gate is ITA attestation in-code. We verify the
-/// agent's Intel-signed quote, create its tunnel, provision its CF
-/// Access apps, and return the tunnel token. `owner` / `env_label`
+/// POST /register — ITA attestation is the gate. We verify the
+/// agent's Intel-signed quote, create its tunnel, provision its
+/// Cloudflare routing apps, and return the tunnel token. `owner` / `env_label`
 /// used to be in the body for double-check; they're implicit now —
 /// the CP authoritatively owns them from its config and the ITA
 /// token authenticates the agent regardless.
@@ -608,8 +606,6 @@ async fn register(
         &s.cfg.cf,
         &s.cfg.common.env_label,
         &agent_hostname,
-        &s.cfg.common.owner,
-        &s.cfg.access.admin_email,
         &labels,
     )
     .await
@@ -679,8 +675,8 @@ struct IngressReplaceReq {
     /// /register. Used to look up the tunnel id in the CP's store.
     agent_id: String,
     /// Fresh Intel-signed attestation token from the agent — same
-    /// shape as /register, re-presented here because this endpoint
-    /// is CF Access-bypassed and the ITA verification is the auth.
+    /// shape as /register, re-presented here because ITA verification
+    /// is the auth.
     /// The agent already refreshes this token every few minutes for
     /// /health, so forwarding it on each call is trivial.
     ita_token: String,
@@ -699,11 +695,11 @@ struct IngressPair {
     port: u16,
 }
 
-/// POST /ingress/replace — CF-Access-bypassed; authenticated by the
-/// same Intel ITA token the agent already refreshes for /health.
-/// The agent forwards its full current ingress list; the CP re-PUTs
-/// the tunnel config + CNAMEs and reconciles per-workload CF Access
-/// bypass apps (creates new, deletes stale).
+/// POST /ingress/replace — authenticated by the same Intel ITA token
+/// the agent already refreshes for /health. The agent forwards its
+/// full current ingress list; the CP re-PUTs the tunnel config +
+/// CNAMEs and reconciles per-workload Cloudflare routing apps (creates
+/// new, deletes stale).
 async fn ingress_replace(
     State(s): State<St>,
     Json(req): Json<IngressReplaceReq>,
@@ -742,8 +738,6 @@ async fn ingress_replace(
         &s.cfg.cf,
         &s.cfg.common.env_label,
         &hostname,
-        &s.cfg.common.owner,
-        &s.cfg.access.admin_email,
         &labels,
     )
     .await
@@ -793,7 +787,82 @@ async fn mint_cp_ita(cfg: &Cfg, ee: &Ee) -> Result<String> {
 
 // ── Fleet dashboard ──────────────────────────────────────────────────────
 
-async fn fleet(State(s): State<St>) -> Response {
+fn path_and_query(uri: &Uri) -> &str {
+    uri.path_and_query().map(|p| p.as_str()).unwrap_or("/")
+}
+
+fn require_browser_auth(s: &St, headers: &HeaderMap, uri: &Uri) -> Option<Response> {
+    if s.cfg
+        .auth
+        .verify_session(&s.cfg.common.owner, headers)
+        .is_some()
+    {
+        None
+    } else {
+        let return_to = crate::auth::absolute_url(headers, &s.cfg.hostname, path_and_query(uri));
+        Some(crate::auth::unauthorized_or_redirect(
+            &s.cfg.auth,
+            headers,
+            &return_to,
+        ))
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct AuthStart {
+    return_to: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct AuthCallback {
+    code: Option<String>,
+    state: Option<String>,
+    error: Option<String>,
+}
+
+async fn auth_start(State(s): State<St>, Query(q): Query<AuthStart>) -> Response {
+    match s.cfg.auth.start_response(&q.return_to, &s.cfg.cf.domain) {
+        Ok(resp) => resp,
+        Err(e) => e.into_response(),
+    }
+}
+
+async fn auth_callback(
+    State(s): State<St>,
+    headers: HeaderMap,
+    Query(q): Query<AuthCallback>,
+) -> Response {
+    if let Some(error) = q.error {
+        return Error::BadRequest(format!("github auth failed: {error}")).into_response();
+    }
+    let Some(code) = q.code.as_deref() else {
+        return Error::BadRequest("missing github code".into()).into_response();
+    };
+    let Some(state) = q.state.as_deref() else {
+        return Error::BadRequest("missing github state".into()).into_response();
+    };
+    match s
+        .cfg
+        .auth
+        .callback_response(
+            &reqwest::Client::new(),
+            &s.cfg.common.owner,
+            code,
+            state,
+            &headers,
+            &s.cfg.cf.domain,
+        )
+        .await
+    {
+        Ok(resp) => resp,
+        Err(e) => e.into_response(),
+    }
+}
+
+async fn fleet(State(s): State<St>, headers: HeaderMap, uri: Uri) -> Response {
+    if let Some(resp) = require_browser_auth(&s, &headers, &uri) {
+        return resp;
+    }
     let agents = s.store.lock().await.clone();
     let mut rows = String::new();
     let mut by_id: Vec<_> = agents.into_iter().collect();
@@ -919,14 +988,14 @@ async fn fleet(State(s): State<St>) -> Response {
 //
 // Paired client-device X25519 pubkeys that the local Noise gateway
 // accepts during the handshake. POST + DELETE are behind the CP's
-// human CF Access app (admin enrollment); the machine-readable
+// human DD browser-auth app (admin enrollment); the machine-readable
 // `/trusted` view is edge-bypassed for cross-VM agent polls.
 
 /// GET /api/v1/admin/export — full state snapshot for a successor CP
 /// to hydrate from during a zero-downtime deploy. Returns the
 /// device registry (full records, including revoked) and the live
-/// agents HashMap. CF-Access-bypassed at the edge; gated in-code by
-/// a valid owner-scoped ITA Bearer (any attested enclave in the
+/// agents HashMap. Gated in-code by a valid owner-scoped ITA Bearer
+/// (any attested enclave in the
 /// fleet can authenticate). The new CP calls this against the old
 /// CP's still-pointed DNS before flipping CNAMEs.
 async fn export_state(
@@ -952,8 +1021,8 @@ async fn export_state(
 
 /// GET /api/v1/devices/trusted — minimal, machine-readable view:
 /// `{ "pubkeys": ["<hex>", ...] }` with only currently-trusted keys.
-/// CF-Access-bypassed at the edge so cross-VM dd-agent callers can
-/// reach it; gated in-code by the same three-way policy as
+/// Reachable by cross-VM dd-agent callers over the public tunnel;
+/// gated in-code by the same three-way policy as
 /// `/api/agents`. This is the agent's poll target for mirroring the
 /// trust list into its in-memory `TrustHandle`.
 async fn list_trusted_devices(
@@ -983,8 +1052,13 @@ struct CreateDeviceReq {
 /// pubkey: re-posting with a new label replaces the record in place.
 async fn create_device(
     State(s): State<St>,
+    headers: HeaderMap,
+    uri: Uri,
     Json(req): Json<CreateDeviceReq>,
 ) -> Result<(axum::http::StatusCode, Json<crate::devices::Device>)> {
+    if require_browser_auth(&s, &headers, &uri).is_some() {
+        return Err(Error::Unauthorized);
+    }
     let pubkey = req.pubkey.to_lowercase();
     crate::devices::validate_hex_pubkey(&pubkey).map_err(|e| Error::BadRequest(e.to_string()))?;
     let label = req.label.trim().to_string();
@@ -1008,8 +1082,13 @@ async fn create_device(
 /// pubkey isn't known or was already revoked.
 async fn revoke_device(
     State(s): State<St>,
+    headers: HeaderMap,
+    uri: Uri,
     Path(pubkey): Path<String>,
 ) -> Result<Json<serde_json::Value>> {
+    if require_browser_auth(&s, &headers, &uri).is_some() {
+        return Err(Error::Unauthorized);
+    }
     let pubkey = pubkey.to_lowercase();
     let now = chrono::Utc::now().timestamp_millis();
     let ok = s
@@ -1028,16 +1107,23 @@ async fn revoke_device(
 
 /// GET /admin/enroll?pubkey=…&label=… — human-facing confirmation
 /// page that a `bastion-app` (CLI or desktop) bounces the operator
-/// to. Behind the CP's human CF Access app: by the time this
-/// handler renders, the browser has a valid CF Access session
-/// cookie. The rendered page POSTs to `/api/v1/devices` with the
+/// to. Behind DD browser auth: by the time this handler renders, the
+/// browser has a valid DD session cookie. The rendered page POSTs to `/api/v1/devices` with the
 /// same cookie via `credentials: "same-origin"`, completing the
 /// enrollment that headless clients can't do themselves.
 ///
 /// Intent-over-GET: we deliberately don't enroll on page load —
 /// the user clicks Confirm so a copy-pasted link can't silently
 /// add a pubkey.
-async fn enroll_page(Query(q): Query<HashMap<String, String>>) -> Response {
+async fn enroll_page(
+    State(s): State<St>,
+    headers: HeaderMap,
+    uri: Uri,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    if let Some(resp) = require_browser_auth(&s, &headers, &uri) {
+        return resp;
+    }
     let pubkey = q.get("pubkey").cloned().unwrap_or_default();
     let label = q.get("label").cloned().unwrap_or_default();
 
@@ -1205,7 +1291,15 @@ async fn agents_auth_ok(
     false
 }
 
-async fn agent_detail(State(s): State<St>, Path(id): Path<String>) -> Response {
+async fn agent_detail(
+    State(s): State<St>,
+    headers: HeaderMap,
+    uri: Uri,
+    Path(id): Path<String>,
+) -> Response {
+    if let Some(resp) = require_browser_auth(&s, &headers, &uri) {
+        return resp;
+    }
     let agent = s.store.lock().await.get(&id).cloned();
     let Some(a) = agent else {
         return (
@@ -1321,7 +1415,7 @@ async fn agent_detail(State(s): State<St>, Path(id): Path<String>) -> Response {
         // `{hostname-base}-shell.{tld}` is the dd-shell subdomain (CP's own
         // tunnel publishes it; agents publish it via their register-time
         // `extra_ingress`). Flat shape so Universal SSL covers the cert.
-        // Human-gated by CF Access.
+        // Human-gated by DD browser auth.
         let term_host = html::escape(&cf::label_hostname(&a.hostname, "shell"));
         format!(
             r#"<p><a href="https://{term_host}/" target="_blank">Terminal ↗</a> · <a href="/health">health (incl. noise quote)</a> · <a href="/health?verbose=1">health?verbose=1 (incl. ita)</a></p>"#
@@ -1496,7 +1590,15 @@ fn unit_actions(a: &collector::Agent, u: &crate::units::ManagedUnit) -> String {
 /// GET /agent/control-plane/logs/{app} — show logs for a CP workload via the
 /// local easyenclave socket. For other agents we'd proxy to their dashboard;
 /// today the detail page links directly there instead.
-async fn agent_logs(State(s): State<St>, Path((id, app)): Path<(String, String)>) -> Response {
+async fn agent_logs(
+    State(s): State<St>,
+    headers: HeaderMap,
+    uri: Uri,
+    Path((id, app)): Path<(String, String)>,
+) -> Response {
+    if let Some(resp) = require_browser_auth(&s, &headers, &uri) {
+        return resp;
+    }
     if id != "control-plane" {
         return Error::NotFound.into_response();
     }

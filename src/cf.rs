@@ -85,7 +85,7 @@ async fn call(
     let parsed: serde_json::Value = resp.json().await?;
     // CF v4 API returns 200 with {success: false, errors: [...]} on
     // validation failures. We used to silently drop those — which led
-    // to Access apps that appeared created but never matched any
+    // to Cloudflare apps that appeared created but never matched any
     // requests (manifested as /health etc. 503'ing behind the root
     // human app). Promote to Err so the CP's `?` unwinding catches it.
     if parsed.get("success") == Some(&serde_json::Value::Bool(false)) {
@@ -387,45 +387,16 @@ pub async fn exists(http: &Client, cf: &CfCreds, tunnel_id: &str) -> Option<bool
     }
 }
 
-// ── CF Access (Zero Trust) provisioning ────────────────────────────────
+// ── Cloudflare self-hosted app provisioning ─────────────────────────────
 //
-// The CP provisions a handful of Access apps at startup and one human
-// app per agent at /register. Everything machine-to-machine uses
-// bypass apps + in-code auth (ITA for /register + /ingress/replace,
-// GitHub Actions OIDC for agent /deploy + /exec). No service tokens,
-// no External Evaluation — just CF Access for humans and bypass for
-// everything else.
+// The CP provisions Cloudflare self-hosted apps as routing bypasses
+// only. Browser auth is enforced in DD via GitHub App OAuth; machine
+// paths use in-code auth (ITA for /register + /ingress/replace,
+// GitHub Actions OIDC for agent /deploy + /exec).
 
-/// Return the UUID of the GitHub login method in this CF Access
-/// account, if configured. Manual one-time setup in the Cloudflare
-/// dashboard (Zero Trust → Settings → Authentication → Login methods
-/// → add GitHub) is required before the CP can provision org-based
-/// policies.
-pub async fn github_idp_uuid(http: &Client, cf: &CfCreds) -> Result<String> {
-    let resp = call(
-        http,
-        cf,
-        Method::GET,
-        &format!("/accounts/{}/access/identity_providers", cf.account_id),
-        None,
-    )
-    .await?;
-    resp["result"]
-        .as_array()
-        .and_then(|items| items.iter().find(|i| i["type"].as_str() == Some("github")))
-        .and_then(|i| i["id"].as_str())
-        .map(String::from)
-        .ok_or_else(|| {
-            Error::Upstream(
-                "CF Access has no GitHub identity provider — add one in \
-                 Zero Trust → Settings → Authentication → Login methods"
-                    .into(),
-            )
-        })
-}
-
-/// List all Access apps, return the full app JSON for one whose primary
-/// or included `domain` exactly matches `domain`, or `None`.
+/// List all Cloudflare self-hosted apps, return the full app JSON for
+/// one whose primary or included `domain` exactly matches `domain`, or
+/// `None`.
 async fn find_app_by_domain(
     http: &Client,
     cf: &CfCreds,
@@ -467,45 +438,6 @@ fn access_app_matches_domain(app: &serde_json::Value, domain: &str) -> bool {
     })
 }
 
-/// Build the human-facing CF Access policy used for the CP root and
-/// each per-agent dashboard. `admin_email` is always included as the
-/// operator escape hatch. The GitHub-side rule depends on the
-/// principal's kind, because Cloudflare Access has no include rule
-/// for "specific GitHub user login" or "specific repository":
-///
-///   kind=org  → adds a `github-organization` include — anyone in
-///                that org login is admitted.
-///   kind=user → admin_email-only. CF Access can't gate on a
-///                specific GitHub user login by name; the operator
-///                gets in by email.
-///   kind=repo → admin_email-only, same reason.
-///
-/// The two non-org kinds losing GitHub-side dashboard access is not
-/// a regression: the prior behavior — a `github-organization` rule
-/// configured with a user login — silently matched nobody.
-fn human_policy(
-    owner: &crate::gh_oidc::Principal,
-    admin_email: &str,
-    gh_idp_uuid: &str,
-) -> serde_json::Value {
-    let mut includes = vec![serde_json::json!({
-        "email": { "email": admin_email }
-    })];
-    if let crate::gh_oidc::PrincipalKind::Org = owner.kind {
-        includes.push(serde_json::json!({
-            "github-organization": {
-                "name": owner.name,
-                "identity_provider_id": gh_idp_uuid,
-            }
-        }));
-    }
-    serde_json::json!({
-        "name": "dd-human",
-        "decision": "allow",
-        "include": includes,
-    })
-}
-
 fn bypass_policy() -> serde_json::Value {
     serde_json::json!({
         "name": "dd-bypass",
@@ -514,7 +446,7 @@ fn bypass_policy() -> serde_json::Value {
     })
 }
 
-/// Idempotently upsert a self-hosted Access app at `domain` with the
+/// Idempotently upsert a Cloudflare self-hosted app at `domain` with the
 /// provided policy list. Matches on exact `domain`; updates in place
 /// if present, creates otherwise.
 async fn ensure_app(
@@ -561,10 +493,10 @@ async fn ensure_app(
     resp["result"]["id"]
         .as_str()
         .map(String::from)
-        .ok_or_else(|| Error::Upstream(format!("Access app create missing id for {domain}")))
+        .ok_or_else(|| Error::Upstream(format!("Cloudflare app create missing id for {domain}")))
 }
 
-/// Idempotently upsert a path-scoped bypass Access app. Anyone can
+/// Idempotently upsert a path-scoped bypass routing app. Anyone can
 /// reach `domain/path` without authentication; used for /health,
 /// /register (which is authenticated by ITA in-app), and every
 /// workload-exposed URL.
@@ -573,19 +505,18 @@ async fn ensure_bypass_app(http: &Client, cf: &CfCreds, name: &str, domain: &str
     Ok(())
 }
 
-/// Hostname labels that run admin workloads. These get a human CF
-/// Access app, not a public bypass.
+/// Hostname labels that run DD-authenticated admin workloads.
 const ADMIN_LABELS: &[&str] = &["shell"];
 
 fn is_admin_label(label: &str) -> bool {
     ADMIN_LABELS.contains(&label)
 }
 
-/// Provision the CP's Access apps at startup.
+/// Provision the CP's Access/routing apps at startup.
 ///
 /// Apps created:
-///   - Human: `{hostname}` — GitHub org or admin email (dashboard, /agent/*, /cp/*)
-///   - Human: `{hostname}-shell` — dd-shell, org members only
+///   - Bypass: `{hostname}` — dashboard, app-layer GitHub auth
+///   - Bypass: `{hostname}-shell` — dd-shell, app-layer GitHub auth
 ///   - Bypass: `{hostname}/health` — public (read-only fleet health;
 ///     also carries the Noise pre-handshake `{quote_b64, pubkey_hex}`)
 ///   - Bypass: `{hostname}/api/agents` — read-only agent list
@@ -597,25 +528,20 @@ pub async fn provision_cp_access(
     cf: &CfCreds,
     env: &str,
     hostname: &str,
-    owner: &crate::gh_oidc::Principal,
-    admin_email: &str,
     workload_labels: &[String],
 ) -> Result<()> {
-    let idp = github_idp_uuid(http, cf).await?;
-    let human = human_policy(owner, admin_email, &idp);
-
     ensure_app(
         http,
         cf,
         &format!("dd-{env}-cp"),
         hostname,
-        vec![human.clone()],
+        vec![bypass_policy()],
     )
     .await?;
 
-    // One CF Access app per CP-exposed workload label. Admin labels
-    // (from `ADMIN_LABELS`) get the human policy; anything else gets
-    // a public bypass.
+    // One Cloudflare self-hosted app per CP-exposed workload label.
+    // Admin labels are still bypass apps: DD checks browser sessions
+    // in-code, and non-admin workload URLs remain public by default.
     let desired: std::collections::HashSet<String> = workload_labels
         .iter()
         .map(|l| label_hostname(hostname, l))
@@ -628,7 +554,7 @@ pub async fn provision_cp_access(
                 cf,
                 &format!("dd-{env}-cp-{label}"),
                 &domain,
-                vec![human_policy(owner, admin_email, &idp)],
+                vec![bypass_policy()],
             )
             .await?;
         } else {
@@ -718,13 +644,13 @@ pub async fn provision_cp_access(
     Ok(())
 }
 
-/// Provision Access apps for one agent. Called at /register and again
+/// Provision routing apps for one agent. Called at /register and again
 /// at /ingress/replace so newly-exposed workload labels get their
 /// bypass apps and labels that disappeared get cleaned up.
 ///
-///   - Human: `{agent}.{domain}` — browser dashboard only
-///   - Human: `<admin-label>.{agent}.{domain}` for labels in
-///     `ADMIN_LABELS` — org members only
+///   - Bypass: `{agent}.{domain}` — browser dashboard, app-layer auth
+///   - Bypass: `<admin-label>.{agent}.{domain}` for labels in
+///     `ADMIN_LABELS` — app-layer auth
 ///   - Bypass: `dd-{env}-api-{uuid}.{domain}` — machine API only
 ///   - Bypass: `{agent}.{domain}/health` — public; carries the Noise
 ///     pre-handshake `{quote_b64, pubkey_hex}` in its response
@@ -743,19 +669,14 @@ pub async fn provision_agent_access(
     cf: &CfCreds,
     env: &str,
     agent_hostname: &str,
-    owner: &crate::gh_oidc::Principal,
-    admin_email: &str,
     workload_labels: &[String],
 ) -> Result<()> {
-    let idp = github_idp_uuid(http, cf).await?;
-    let human = human_policy(owner, admin_email, &idp);
-
     ensure_app(
         http,
         cf,
         &format!("dd-{env}-agent-{agent_hostname}"),
         agent_hostname,
-        vec![human],
+        vec![bypass_policy()],
     )
     .await?;
     for (suffix, label) in [
@@ -795,7 +716,7 @@ pub async fn provision_agent_access(
                 cf,
                 &format!("dd-{env}-workload-{domain}"),
                 &domain,
-                vec![human_policy(owner, admin_email, &idp)],
+                vec![bypass_policy()],
             )
             .await?;
         } else {
@@ -852,8 +773,8 @@ pub async fn provision_agent_access(
 }
 
 /// Cleanup hook invoked by the collector's orphan-GC path and by any
-/// explicit reap: delete the agent's human app, its /health bypass,
-/// and every `*.{agent_hostname}` workload bypass in one sweep.
+/// explicit reap: delete the agent's dashboard route, its /health
+/// route, and every `*.{agent_hostname}` workload route in one sweep.
 pub async fn delete_access_apps_for(http: &Client, cf: &CfCreds, agent_hostname: &str) {
     let Ok(resp) = call(
         http,

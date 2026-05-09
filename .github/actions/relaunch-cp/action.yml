@@ -30,7 +30,7 @@ inputs:
     required: false
     default: /home/tdx2/src/dd
   cf-api-token:
-    description: 'Cloudflare API token (tunnel + DNS + Access scopes)'
+    description: 'Cloudflare API token (tunnel + DNS + self-hosted app scopes)'
     required: true
   cf-account-id:
     description: 'Cloudflare account id'
@@ -38,12 +38,42 @@ inputs:
   cf-zone-id:
     description: 'Cloudflare zone id for the apex domain'
     required: true
-  admin-email:
-    description: 'Break-glass email for CF Access human policy'
-    required: true
   ita-api-key:
     description: 'Intel Trust Authority API key'
     required: true
+  auth-broker-url:
+    description: 'DD browser auth broker origin (normally https://app.<domain>)'
+    required: true
+  auth-cookie-domain:
+    description: 'Domain scope for DD browser session cookies'
+    required: true
+  auth-cookie-secret:
+    description: 'Shared DD browser session signing secret'
+    required: true
+  github-client-id:
+    description: 'GitHub App OAuth client id for this env'
+    required: false
+    default: ''
+  github-client-secret:
+    description: 'GitHub App OAuth client secret for this env'
+    required: false
+    default: ''
+  staging-github-client-id:
+    description: 'Staging GitHub App OAuth client id for brokered preview auth'
+    required: false
+    default: ''
+  staging-github-client-secret:
+    description: 'Staging GitHub App OAuth client secret for brokered preview auth'
+    required: false
+    default: ''
+  production-github-client-id:
+    description: 'Production GitHub App OAuth client id for brokered production auth'
+    required: false
+    default: ''
+  production-github-client-secret:
+    description: 'Production GitHub App OAuth client secret for brokered production auth'
+    required: false
+    default: ''
   release-tag:
     description: 'devopsdefender release tag (e.g. pr-abc123, latest)'
     required: true
@@ -76,8 +106,16 @@ runs:
         CLOUDFLARE_API_TOKEN:   ${{ inputs.cf-api-token }}
         CLOUDFLARE_ACCOUNT_ID:  ${{ inputs.cf-account-id }}
         CLOUDFLARE_ZONE_ID:     ${{ inputs.cf-zone-id }}
-        DD_ACCESS_ADMIN_EMAIL:  ${{ inputs.admin-email }}
         DD_ITA_API_KEY:         ${{ inputs.ita-api-key }}
+        DD_AUTH_BROKER_URL:     ${{ inputs.auth-broker-url }}
+        DD_AUTH_COOKIE_DOMAIN:  ${{ inputs.auth-cookie-domain }}
+        DD_AUTH_COOKIE_SECRET:  ${{ inputs.auth-cookie-secret }}
+        DD_GITHUB_CLIENT_ID:    ${{ inputs.github-client-id }}
+        DD_GITHUB_CLIENT_SECRET: ${{ inputs.github-client-secret }}
+        DD_STAGING_GITHUB_CLIENT_ID: ${{ inputs.staging-github-client-id }}
+        DD_STAGING_GITHUB_CLIENT_SECRET: ${{ inputs.staging-github-client-secret }}
+        DD_PRODUCTION_GITHUB_CLIENT_ID: ${{ inputs.production-github-client-id }}
+        DD_PRODUCTION_GITHUB_CLIENT_SECRET: ${{ inputs.production-github-client-secret }}
         DD_EE_CHANNEL:          ${{ inputs.ee-channel }}
         DD_EE_TAG:              ${{ inputs.ee-tag }}
         EE_OWNER:               ${{ inputs.owner }}
@@ -87,15 +125,17 @@ runs:
         host: ${{ inputs.host }}
         username: ${{ inputs.ssh-user }}
         key: ${{ inputs.ssh-key }}
-        envs: ENV_LABEL,CP_HOSTNAME,REF,RELEASE_TAG,CLOUDFLARE_API_TOKEN,CLOUDFLARE_ACCOUNT_ID,CLOUDFLARE_ZONE_ID,DD_ACCESS_ADMIN_EMAIL,DD_ITA_API_KEY,DD_EE_CHANNEL,DD_EE_TAG,EE_OWNER,EE_GITHUB_TOKEN,DD_REPO_ROOT
+        envs: ENV_LABEL,CP_HOSTNAME,REF,RELEASE_TAG,CLOUDFLARE_API_TOKEN,CLOUDFLARE_ACCOUNT_ID,CLOUDFLARE_ZONE_ID,DD_ITA_API_KEY,DD_AUTH_BROKER_URL,DD_AUTH_COOKIE_DOMAIN,DD_AUTH_COOKIE_SECRET,DD_GITHUB_CLIENT_ID,DD_GITHUB_CLIENT_SECRET,DD_STAGING_GITHUB_CLIENT_ID,DD_STAGING_GITHUB_CLIENT_SECRET,DD_PRODUCTION_GITHUB_CLIENT_ID,DD_PRODUCTION_GITHUB_CLIENT_SECRET,DD_EE_CHANNEL,DD_EE_TAG,EE_OWNER,EE_GITHUB_TOKEN,DD_REPO_ROOT
         script: |
           export ENV_LABEL CP_HOSTNAME REF RELEASE_TAG
           export CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID CLOUDFLARE_ZONE_ID
-          export DD_ACCESS_ADMIN_EMAIL DD_ITA_API_KEY DD_EE_CHANNEL DD_EE_TAG EE_OWNER EE_GITHUB_TOKEN DD_REPO_ROOT
+          export DD_ITA_API_KEY DD_AUTH_BROKER_URL DD_AUTH_COOKIE_DOMAIN DD_AUTH_COOKIE_SECRET
+          export DD_GITHUB_CLIENT_ID DD_GITHUB_CLIENT_SECRET DD_STAGING_GITHUB_CLIENT_ID DD_STAGING_GITHUB_CLIENT_SECRET DD_PRODUCTION_GITHUB_CLIENT_ID DD_PRODUCTION_GITHUB_CLIENT_SECRET
+          export DD_EE_CHANNEL DD_EE_TAG EE_OWNER EE_GITHUB_TOKEN DD_REPO_ROOT
           if [ ! -d "$DD_REPO_ROOT/.git" ]; then
             mkdir -p "$(dirname "$DD_REPO_ROOT")"
             git clone https://github.com/devopsdefender/dd.git "$DD_REPO_ROOT"
           fi
           git -C "$DD_REPO_ROOT" fetch --quiet origin "$REF"
           git -C "$DD_REPO_ROOT" checkout --quiet FETCH_HEAD -- apps/
-          env DD_REPO_ROOT="$DD_REPO_ROOT" CLOUDFLARE_API_TOKEN="$CLOUDFLARE_API_TOKEN" CLOUDFLARE_ACCOUNT_ID="$CLOUDFLARE_ACCOUNT_ID" CLOUDFLARE_ZONE_ID="$CLOUDFLARE_ZONE_ID" DD_ACCESS_ADMIN_EMAIL="$DD_ACCESS_ADMIN_EMAIL" DD_ITA_API_KEY="$DD_ITA_API_KEY" DD_EE_CHANNEL="$DD_EE_CHANNEL" DD_EE_TAG="$DD_EE_TAG" EE_OWNER="$EE_OWNER" EE_GITHUB_TOKEN="$EE_GITHUB_TOKEN" "$DD_REPO_ROOT/apps/_infra/dd-relaunch-cp.sh" "$ENV_LABEL" "$CP_HOSTNAME" "$REF" "$RELEASE_TAG"
+          env DD_REPO_ROOT="$DD_REPO_ROOT" CLOUDFLARE_API_TOKEN="$CLOUDFLARE_API_TOKEN" CLOUDFLARE_ACCOUNT_ID="$CLOUDFLARE_ACCOUNT_ID" CLOUDFLARE_ZONE_ID="$CLOUDFLARE_ZONE_ID" DD_ITA_API_KEY="$DD_ITA_API_KEY" DD_AUTH_BROKER_URL="$DD_AUTH_BROKER_URL" DD_AUTH_COOKIE_DOMAIN="$DD_AUTH_COOKIE_DOMAIN" DD_AUTH_COOKIE_SECRET="$DD_AUTH_COOKIE_SECRET" DD_GITHUB_CLIENT_ID="$DD_GITHUB_CLIENT_ID" DD_GITHUB_CLIENT_SECRET="$DD_GITHUB_CLIENT_SECRET" DD_STAGING_GITHUB_CLIENT_ID="$DD_STAGING_GITHUB_CLIENT_ID" DD_STAGING_GITHUB_CLIENT_SECRET="$DD_STAGING_GITHUB_CLIENT_SECRET" DD_PRODUCTION_GITHUB_CLIENT_ID="$DD_PRODUCTION_GITHUB_CLIENT_ID" DD_PRODUCTION_GITHUB_CLIENT_SECRET="$DD_PRODUCTION_GITHUB_CLIENT_SECRET" DD_EE_CHANNEL="$DD_EE_CHANNEL" DD_EE_TAG="$DD_EE_TAG" EE_OWNER="$EE_OWNER" EE_GITHUB_TOKEN="$EE_GITHUB_TOKEN" "$DD_REPO_ROOT/apps/_infra/dd-relaunch-cp.sh" "$ENV_LABEL" "$CP_HOSTNAME" "$REF" "$RELEASE_TAG"
