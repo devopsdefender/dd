@@ -163,7 +163,7 @@ impl Verifier {
         Arc::new(Self {
             owner,
             audience,
-            http: Client::new(),
+            http: crate::system_http_client(),
             keys: RwLock::new(HashMap::new()),
         })
     }
@@ -312,7 +312,7 @@ impl Verifier {
         Arc::new(Self {
             owner,
             audience,
-            http: Client::new(),
+            http: crate::system_http_client(),
             keys: RwLock::new(keys),
         })
     }

@@ -17,3 +17,10 @@ pub mod shell;
 pub mod stonith;
 pub mod taint;
 pub mod units;
+
+pub(crate) fn system_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .no_hickory_dns()
+        .build()
+        .expect("build system-resolver HTTP client")
+}

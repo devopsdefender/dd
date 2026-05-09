@@ -70,7 +70,7 @@ pub async fn run() -> Result<()> {
     let cfg = Arc::new(Cfg::from_env()?);
     let ee = Arc::new(Ee::new("/var/lib/easyenclave/agent.sock"));
 
-    let http = reqwest::Client::new();
+    let http = cf::http_client();
     let h = match ee.wait_ready(EE_READY_TIMEOUT).await {
         Ok(h) => h,
         Err(e) => {
@@ -589,7 +589,7 @@ async fn register(
         ita_claims.tcb_status.as_deref().unwrap_or("?")
     );
 
-    let http = reqwest::Client::new();
+    let http = cf::http_client();
     let name = cf::agent_tunnel_name(&s.cfg.common.env_label);
     let agent_hostname = format!("{name}.{}", s.cfg.cf.domain);
     let extras: Vec<(String, u16)> = req
@@ -734,7 +734,7 @@ async fn ingress_replace(
         .collect();
     let tunnel_extras = agent_tunnel_extras(&extras);
 
-    let http = reqwest::Client::new();
+    let http = cf::http_client();
     let hostnames =
         cf::update_ingress(&http, &s.cfg.cf, &tunnel_id, &hostname, &tunnel_extras).await?;
 
@@ -852,7 +852,7 @@ async fn auth_callback(
         .cfg
         .auth
         .callback_response(
-            &reqwest::Client::new(),
+            &crate::system_http_client(),
             &s.cfg.common.owner,
             code,
             state,

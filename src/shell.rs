@@ -303,8 +303,9 @@ pub async fn run() -> Result<()> {
         ee: Arc::new(Ee::new(ee_socket)),
         http: reqwest::Client::builder()
             .timeout(Duration::from_secs(3))
+            .no_hickory_dns()
             .build()
-            .unwrap_or_else(|_| reqwest::Client::new()),
+            .unwrap_or_else(|_| crate::system_http_client()),
         agent_api,
         owner: common.owner,
         auth,

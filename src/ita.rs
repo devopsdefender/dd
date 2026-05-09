@@ -89,7 +89,7 @@ struct MintResponse {
 /// is typically `https://api.trustauthority.intel.com`.
 pub async fn mint(base_url: &str, api_key: &str, quote_b64: &str) -> Result<String> {
     let url = format!("{}/appraisal/v1/attest", base_url.trim_end_matches('/'));
-    let resp = Client::new()
+    let resp = crate::system_http_client()
         .post(&url)
         .header("x-api-key", api_key)
         .header("Accept", "application/json")
@@ -123,7 +123,7 @@ impl Verifier {
         Arc::new(Self {
             jwks_url,
             issuer,
-            http: Client::new(),
+            http: crate::system_http_client(),
             keys: RwLock::new(HashMap::new()),
             local_key: None,
         })
@@ -133,7 +133,7 @@ impl Verifier {
         Arc::new(Self {
             jwks_url: String::new(),
             issuer,
-            http: Client::new(),
+            http: crate::system_http_client(),
             keys: RwLock::new(HashMap::new()),
             local_key: Some(secret.into_bytes()),
         })

@@ -160,7 +160,7 @@ pub async fn run() -> Result<()> {
         let token = ita_token.clone();
         let trust = trust.clone();
         tokio::spawn(async move {
-            let http = reqwest::Client::new();
+            let http = crate::system_http_client();
             loop {
                 if let Err(e) = sync_trusted_devices(&http, &cp_url, &token, &trust).await {
                     eprintln!("agent: device sync failed: {e}");
@@ -401,8 +401,9 @@ enum RegisterAttempt {
 async fn register(cfg: &Cfg, ee: &Ee) -> Result<(String, Bootstrap)> {
     let http = reqwest::Client::builder()
         .timeout(Duration::from_secs(60))
+        .no_hickory_dns()
         .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
+        .unwrap_or_else(|_| crate::system_http_client());
     let url = format!("{}/register", cfg.cp_url.trim_end_matches('/'));
     let extra_ingress: Vec<serde_json::Value> = cfg
         .extra_ingress
@@ -1320,7 +1321,7 @@ async fn push_extra_ingress(s: &St, label: String, port: u16) -> Result<()> {
     });
 
     let url = format!("{}/ingress/replace", s.cfg.cp_url.trim_end_matches('/'));
-    let resp = reqwest::Client::new()
+    let resp = crate::system_http_client()
         .post(&url)
         .json(&body)
         .send()

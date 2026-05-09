@@ -46,8 +46,9 @@ pub fn spawn_scrapers(specs: Vec<OracleSpec>, store: OracleStore) {
     }
     let http = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
+        .no_hickory_dns()
         .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
+        .unwrap_or_else(|_| crate::system_http_client());
     for spec in specs {
         let http = http.clone();
         let store = store.clone();

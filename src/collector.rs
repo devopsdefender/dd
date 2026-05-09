@@ -15,10 +15,12 @@
 //!   6. Refresh the `control-plane` entry (its claims come from CP startup).
 
 use std::collections::HashMap;
+use std::error::Error as StdError;
 use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, Notify};
 use tokio::time::MissedTickBehavior;
@@ -98,6 +100,74 @@ struct ScrapeTarget {
     known: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ScrapeFailureKind {
+    Dns,
+    Status(StatusCode),
+    Request,
+    PendingRegistration,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ScrapeFailure {
+    kind: ScrapeFailureKind,
+    message: String,
+}
+
+impl ScrapeFailure {
+    fn status(status: StatusCode) -> Self {
+        Self {
+            kind: ScrapeFailureKind::Status(status),
+            message: format!("status {status}"),
+        }
+    }
+
+    fn request(err: &reqwest::Error) -> Self {
+        let message = format!("{err:?}");
+        let kind = if reqwest_error_is_dns(err) {
+            ScrapeFailureKind::Dns
+        } else {
+            ScrapeFailureKind::Request
+        };
+        Self { kind, message }
+    }
+
+    fn pending_registration() -> Self {
+        Self {
+            kind: ScrapeFailureKind::PendingRegistration,
+            message: "fresh unknown tunnel pending registration".into(),
+        }
+    }
+
+    #[cfg(test)]
+    fn dns_for_test(message: impl Into<String>) -> Self {
+        Self {
+            kind: ScrapeFailureKind::Dns,
+            message: message.into(),
+        }
+    }
+
+    fn is_dns(&self) -> bool {
+        self.kind == ScrapeFailureKind::Dns
+    }
+
+    fn is_non_dead_signal(&self) -> bool {
+        matches!(
+            self.kind,
+            ScrapeFailureKind::PendingRegistration
+                | ScrapeFailureKind::Status(
+                    StatusCode::MOVED_PERMANENTLY
+                        | StatusCode::FOUND
+                        | StatusCode::SEE_OTHER
+                        | StatusCode::TEMPORARY_REDIRECT
+                        | StatusCode::PERMANENT_REDIRECT
+                        | StatusCode::UNAUTHORIZED
+                        | StatusCode::FORBIDDEN
+                )
+        )
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     store: Store,
@@ -113,8 +183,14 @@ pub async fn run(
     shard_total: u64,
 ) -> ! {
     let prefix = cf::agent_prefix(&env_label);
-    let http = reqwest::Client::builder()
+    let cf_http = reqwest::Client::builder()
         .timeout(Duration::from_secs(20))
+        .no_hickory_dns()
+        .build()
+        .unwrap_or_else(|_| crate::system_http_client());
+    let scrape_http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .hickory_dns(true)
         .build()
         .unwrap_or_else(|_| reqwest::Client::new());
 
@@ -141,7 +217,8 @@ pub async fn run(
         }
         tick(
             &store,
-            &http,
+            &cf_http,
+            &scrape_http,
             &cf,
             &prefix,
             &ee,
@@ -159,7 +236,8 @@ pub async fn run(
 #[allow(clippy::too_many_arguments)]
 async fn tick(
     store: &Store,
-    http: &reqwest::Client,
+    cf_http: &reqwest::Client,
+    scrape_http: &reqwest::Client,
     cf: &CfCreds,
     prefix: &str,
     ee: &Arc<Ee>,
@@ -171,7 +249,7 @@ async fn tick(
     shard_total: u64,
 ) {
     let mut targets = if discover {
-        discover_targets(store, http, cf, prefix).await
+        discover_targets(store, cf_http, cf, prefix).await
     } else {
         known_targets(store).await
     };
@@ -179,7 +257,7 @@ async fn tick(
 
     let now = Utc::now();
     let scrapes = targets.iter().map(|target| {
-        let http = http.clone();
+        let scrape_http = scrape_http.clone();
         let target = target.clone();
         async move {
             if !target.known && unknown_tunnel_should_wait_for_registration(target.created_at, now)
@@ -190,11 +268,11 @@ async fn tick(
                     target.host,
                     target.created_at,
                     None,
-                    Some("fresh unknown tunnel pending registration".into()),
+                    Some(ScrapeFailure::pending_registration()),
                 );
             }
             let health_host = cf::agent_api_hostname(&target.host);
-            let r = http
+            let r = scrape_http
                 .get(format!("https://{health_host}/health"))
                 .send()
                 .await;
@@ -216,7 +294,7 @@ async fn tick(
                     target.host,
                     target.created_at,
                     None,
-                    Some(format!("status {}", resp.status())),
+                    Some(ScrapeFailure::status(resp.status())),
                 ),
                 Err(e) => (
                     target.name,
@@ -224,7 +302,7 @@ async fn tick(
                     target.host,
                     target.created_at,
                     None,
-                    Some(format!("{e:?}")),
+                    Some(ScrapeFailure::request(&e)),
                 ),
             }
         }
@@ -312,16 +390,17 @@ async fn tick(
     if !orphans.is_empty() {
         for orphan in &orphans {
             eprintln!("cp: GC dead tunnel {}", orphan.name);
-            cf::delete_by_name(http, cf, &orphan.name).await;
-            let _ = cf::delete_cname(http, cf, &orphan.host).await;
-            let _ = cf::delete_cname(http, cf, &cf::agent_api_hostname(&orphan.host)).await;
+            cf::delete_by_name(cf_http, cf, &orphan.name).await;
+            let _ = cf::delete_cname(cf_http, cf, &orphan.host).await;
+            let _ = cf::delete_cname(cf_http, cf, &cf::agent_api_hostname(&orphan.host)).await;
             for (label, _) in &orphan.extras {
-                let _ = cf::delete_cname(http, cf, &cf::extra_hostname(&orphan.host, label)).await;
+                let _ =
+                    cf::delete_cname(cf_http, cf, &cf::extra_hostname(&orphan.host, label)).await;
             }
             // Sweep legacy Cloudflare Access apps for this agent so
             // stale exact host/path apps cannot intercept future
             // DNS+tunnel routes.
-            cf::delete_access_apps_for_agent(http, cf, &orphan.host).await;
+            cf::delete_access_apps_for_agent(cf_http, cf, &orphan.host).await;
         }
     }
 
@@ -444,17 +523,28 @@ async fn mark_stale_or_orphan(
     host: &str,
     name: &str,
     created_at: Option<DateTime<Utc>>,
-    err: &Option<String>,
+    err: &Option<ScrapeFailure>,
     now: DateTime<Utc>,
     orphans: &mut Vec<Orphan>,
 ) {
     let mut s = store.lock().await;
     if let Some(a) = s.values_mut().find(|a| a.hostname == *host) {
         let age = now.signed_duration_since(a.last_seen).num_seconds();
+        if a.status == "registering" && err.as_ref().is_some_and(ScrapeFailure::is_dns) {
+            if age <= DEAD_THRESHOLD_SECS {
+                eprintln!(
+                    "cp: collector: {name} DNS lookup failed for {}; still registering (age={}s): {}",
+                    cf::agent_api_hostname(host),
+                    age,
+                    scrape_failure_message(err)
+                );
+                return;
+            }
+        }
         if a.status == "registering" && age < UNKNOWN_TUNNEL_SCRAPE_DELAY_SECS {
             eprintln!(
                 "cp: collector: {name} scrape failed during registration grace: {}",
-                err.as_deref().unwrap_or("unknown error")
+                scrape_failure_message(err)
             );
             return;
         }
@@ -470,13 +560,13 @@ async fn mark_stale_or_orphan(
             a.status = "stale".into();
             eprintln!(
                 "cp: collector: {name} scrape failed: {}",
-                err.as_deref().unwrap_or("unknown error")
+                scrape_failure_message(err)
             );
         }
     } else if unknown_tunnel_is_gc_candidate(created_at, err, now) {
         eprintln!(
             "cp: collector: {name} unknown stale tunnel failed scrape; GC'ing: {}",
-            err.as_deref().unwrap_or("unknown error")
+            scrape_failure_message(err)
         );
         orphans.push(Orphan {
             name: name.to_string(),
@@ -484,15 +574,24 @@ async fn mark_stale_or_orphan(
             extras: Vec::new(),
         });
     } else if let Some(e) = err {
-        eprintln!(
-            "cp: collector: {name} not in store yet; preserving tunnel after scrape error: {e}"
-        );
+        if e.is_dns() {
+            eprintln!(
+                "cp: collector: {name} DNS lookup failed for {}; not in store yet, preserving tunnel: {}",
+                cf::agent_api_hostname(host),
+                e.message
+            );
+        } else {
+            eprintln!(
+                "cp: collector: {name} not in store yet; preserving tunnel after scrape error: {}",
+                e.message
+            );
+        }
     }
 }
 
 fn unknown_tunnel_is_gc_candidate(
     created_at: Option<DateTime<Utc>>,
-    err: &Option<String>,
+    err: &Option<ScrapeFailure>,
     now: DateTime<Utc>,
 ) -> bool {
     let Some(created_at) = created_at else {
@@ -543,31 +642,108 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
     hash
 }
 
-fn scrape_failure_is_dead_signal(err: &Option<String>) -> bool {
-    let Some(err) = err.as_deref() else {
+fn scrape_failure_is_dead_signal(err: &Option<ScrapeFailure>) -> bool {
+    let Some(err) = err else {
         return false;
     };
-    !matches!(
-        err,
-        "status 301 Moved Permanently"
-            | "status 302 Found"
-            | "status 303 See Other"
-            | "status 307 Temporary Redirect"
-            | "status 308 Permanent Redirect"
-            | "status 401 Unauthorized"
-            | "status 403 Forbidden"
-    )
+    !err.is_non_dead_signal()
+}
+
+fn scrape_failure_message(err: &Option<ScrapeFailure>) -> &str {
+    err.as_ref()
+        .map(|e| e.message.as_str())
+        .unwrap_or("unknown error")
+}
+
+fn reqwest_error_is_dns(err: &reqwest::Error) -> bool {
+    if error_text_is_dns(&format!("{err:?}")) {
+        return true;
+    }
+
+    let mut source = err.source();
+    while let Some(err) = source {
+        if error_text_is_dns(&err.to_string()) {
+            return true;
+        }
+        source = err.source();
+    }
+    false
+}
+
+fn error_text_is_dns(text: &str) -> bool {
+    let text = text.to_ascii_lowercase();
+    text.contains("dns error")
+        || text.contains("failed to lookup address information")
+        || text.contains("failed to resolve")
+        || text.contains("name or service not known")
+        || text.contains("temporary failure in name resolution")
+        || text.contains("no record found")
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
     use chrono::{Duration, Utc};
+    use tokio::sync::Mutex;
 
     use super::{
-        parse_extra_ingress, rendezvous_shard, scrape_failure_is_dead_signal, should_scrape_key,
-        unknown_tunnel_is_gc_candidate, unknown_tunnel_should_wait_for_registration,
+        mark_stale_or_orphan, parse_extra_ingress, rendezvous_shard, scrape_failure_is_dead_signal,
+        should_scrape_key, unknown_tunnel_is_gc_candidate,
+        unknown_tunnel_should_wait_for_registration, Agent, ScrapeFailure, Store,
         UNKNOWN_TUNNEL_SCRAPE_DELAY_SECS,
     };
+    use crate::ita;
+    use crate::taint::IntegrityState;
+    use crate::units::AgentMode;
+
+    fn status_failure(status: reqwest::StatusCode) -> Option<ScrapeFailure> {
+        Some(ScrapeFailure::status(status))
+    }
+
+    fn dns_failure() -> Option<ScrapeFailure> {
+        Some(ScrapeFailure::dns_for_test("dns error: no record found"))
+    }
+
+    fn request_failure() -> Option<ScrapeFailure> {
+        Some(ScrapeFailure {
+            kind: super::ScrapeFailureKind::Request,
+            message: "error sending request".into(),
+        })
+    }
+
+    fn test_agent(status: &str, last_seen: chrono::DateTime<chrono::Utc>) -> Agent {
+        Agent {
+            agent_id: "dd-test-agent-1".into(),
+            hostname: "dd-test-agent-1.example.com".into(),
+            vm_name: "dd-local-preview".into(),
+            attestation_type: "tdx".into(),
+            status: status.into(),
+            last_seen,
+            agent_mode: AgentMode::ReadWrite,
+            integrity_state: IntegrityState::Controlled,
+            deployment_count: 0,
+            deployment_names: Vec::new(),
+            unit_count: 0,
+            units: Vec::new(),
+            cpu_percent: 0,
+            memory_used_mb: 0,
+            memory_total_mb: 0,
+            nets: Vec::new(),
+            disks: Vec::new(),
+            ita: ita::Claims::default(),
+            tunnel_id: "tunnel-1".into(),
+            extras: Vec::new(),
+            oracles: Vec::new(),
+        }
+    }
+
+    async fn store_with(agent: Agent) -> Store {
+        let mut agents = HashMap::new();
+        agents.insert(agent.agent_id.clone(), agent);
+        Arc::new(Mutex::new(agents))
+    }
 
     #[test]
     fn missing_extra_ingress_preserves_existing_state() {
@@ -610,28 +786,30 @@ mod tests {
     fn auth_gate_scrape_failures_are_not_dead_signals() {
         for err in [
             None,
-            Some("status 302 Found".to_string()),
-            Some("status 401 Unauthorized".to_string()),
-            Some("status 403 Forbidden".to_string()),
+            status_failure(reqwest::StatusCode::FOUND),
+            status_failure(reqwest::StatusCode::UNAUTHORIZED),
+            status_failure(reqwest::StatusCode::FORBIDDEN),
+            Some(ScrapeFailure::pending_registration()),
         ] {
-            assert!(!scrape_failure_is_dead_signal(&err));
+            assert!(!scrape_failure_is_dead_signal(&err), "{err:?}");
         }
     }
 
     #[test]
     fn origin_scrape_failures_are_dead_signals() {
         for err in [
-            Some("status 530 <unknown status code>".to_string()),
-            Some("error sending request".to_string()),
+            status_failure(reqwest::StatusCode::from_u16(530).unwrap()),
+            request_failure(),
+            dns_failure(),
         ] {
-            assert!(scrape_failure_is_dead_signal(&err));
+            assert!(scrape_failure_is_dead_signal(&err), "{err:?}");
         }
     }
 
     #[test]
     fn unknown_tunnels_gc_only_after_grace_window() {
         let now = Utc::now();
-        let err = Some("error sending request".to_string());
+        let err = request_failure();
 
         assert!(!unknown_tunnel_is_gc_candidate(None, &err, now));
         assert!(!unknown_tunnel_is_gc_candidate(
@@ -649,10 +827,74 @@ mod tests {
     #[test]
     fn unknown_tunnels_keep_auth_gate_failures() {
         let now = Utc::now();
-        let err = Some("status 403 Forbidden".to_string());
+        let err = status_failure(reqwest::StatusCode::FORBIDDEN);
 
         assert!(!unknown_tunnel_is_gc_candidate(
             Some(now - Duration::seconds(1200)),
+            &err,
+            now
+        ));
+    }
+
+    #[tokio::test]
+    async fn dns_failure_keeps_fresh_registering_agent_registering() {
+        let now = Utc::now();
+        let store = store_with(test_agent(
+            "registering",
+            now - Duration::seconds(super::DEAD_THRESHOLD_SECS - 60),
+        ))
+        .await;
+        let mut orphans = Vec::new();
+
+        mark_stale_or_orphan(
+            &store,
+            "dd-test-agent-1.example.com",
+            "dd-test-agent-1",
+            Some(now - Duration::seconds(60)),
+            &dns_failure(),
+            now,
+            &mut orphans,
+        )
+        .await;
+
+        let agents = store.lock().await;
+        assert_eq!(agents["dd-test-agent-1"].status, "registering");
+        assert!(orphans.is_empty());
+    }
+
+    #[tokio::test]
+    async fn dns_failure_can_mark_old_registering_agent_dead() {
+        let now = Utc::now();
+        let store = store_with(test_agent(
+            "registering",
+            now - Duration::seconds(super::DEAD_THRESHOLD_SECS + 1),
+        ))
+        .await;
+        let mut orphans = Vec::new();
+
+        mark_stale_or_orphan(
+            &store,
+            "dd-test-agent-1.example.com",
+            "dd-test-agent-1",
+            Some(now - Duration::seconds(super::DEAD_THRESHOLD_SECS + 1)),
+            &dns_failure(),
+            now,
+            &mut orphans,
+        )
+        .await;
+
+        let agents = store.lock().await;
+        assert_eq!(agents["dd-test-agent-1"].status, "dead");
+        assert_eq!(orphans.len(), 1);
+    }
+
+    #[test]
+    fn dns_failure_can_gc_unknown_tunnel_after_grace_window() {
+        let now = Utc::now();
+        let err = dns_failure();
+
+        assert!(unknown_tunnel_is_gc_candidate(
+            Some(now - Duration::seconds(super::DEAD_THRESHOLD_SECS + 1)),
             &err,
             now
         ));
