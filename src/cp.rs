@@ -18,7 +18,7 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, Notify, RwLock};
 
 use crate::cf;
 use crate::collector::{self, Store};
@@ -46,6 +46,7 @@ struct St {
     cfg: Arc<Cfg>,
     ee: Arc<Ee>,
     store: Store,
+    collector_wake: Arc<Notify>,
     started: Instant,
     verifier: Arc<ita::Verifier>,
     /// The CP's own ITA token. Refreshed by a background task.
@@ -201,14 +202,13 @@ pub async fn run() -> Result<()> {
         shutdown_tx.clone(),
     ));
 
-    // Stage 4: provision Cloudflare self-hosted apps as bypass routing
-    // objects for our tunnel. DD owns browser and machine auth in-code.
-    // `/health` also carries the Noise pre-handshake quote + pubkey
-    // (the former `/attest`, now inlined to save a bootstrap round-trip).
+    // Stage 4: delete legacy Cloudflare Access apps for our published
+    // hosts/paths. DD owns browser and machine auth in-code; Cloudflare
+    // should only provide DNS + tunnel ingress.
     let cp_labels: Vec<String> = cp_extras.iter().map(|(l, _)| l.clone()).collect();
-    let mut routing_ready = false;
+    let mut access_cleanup_ready = false;
     for attempt in 1..=5 {
-        match cf::provision_cp_routing(
+        match cf::delete_cp_access_apps(
             &http,
             &cfg.cf,
             &cfg.common.env_label,
@@ -218,20 +218,20 @@ pub async fn run() -> Result<()> {
         .await
         {
             Ok(()) => {
-                routing_ready = true;
+                access_cleanup_ready = true;
                 break;
             }
             Err(e) => {
-                eprintln!("cp: Cloudflare app provisioning attempt {attempt}/5 failed: {e}");
+                eprintln!("cp: Cloudflare Access cleanup attempt {attempt}/5 failed: {e}");
                 tokio::time::sleep(Duration::from_secs(5 * attempt)).await;
             }
         }
     }
-    if !routing_ready {
-        eprintln!("cp: Cloudflare app provisioning failed after retries");
+    if !access_cleanup_ready {
+        eprintln!("cp: Cloudflare Access cleanup failed after retries");
         stonith::poweroff();
     }
-    eprintln!("cp: Cloudflare routing apps ready");
+    eprintln!("cp: Cloudflare Access cleanup complete");
     let cp_ita_token = Arc::new(RwLock::new(initial_token));
 
     // Seed the CP into the store before the collector starts ticking.
@@ -319,6 +319,7 @@ pub async fn run() -> Result<()> {
     // Start the collector with the verifier. It re-verifies each
     // scraped agent's ita_token, so expired / revoked / unsigned
     // agents drop off the dashboard automatically.
+    let collector_wake = Arc::new(Notify::new());
     tokio::spawn(collector::run(
         store.clone(),
         cfg.cf.clone(),
@@ -326,7 +327,11 @@ pub async fn run() -> Result<()> {
         cfg.hostname.clone(),
         ee.clone(),
         verifier.clone(),
+        collector_wake.clone(),
         Duration::from_secs(cfg.scrape_interval_secs),
+        Duration::from_secs(cfg.discovery_interval_secs),
+        cfg.scraper_shard_index,
+        cfg.scraper_shard_total,
     ));
 
     let gh = crate::gh_oidc::Verifier::new(cfg.common.owner.clone(), "dd-agent".into());
@@ -354,6 +359,7 @@ pub async fn run() -> Result<()> {
         cfg: cfg.clone(),
         ee,
         store,
+        collector_wake,
         started: Instant::now(),
         verifier,
         cp_ita_token,
@@ -565,8 +571,8 @@ struct ExtraIngress {
 }
 
 /// POST /register — ITA attestation is the gate. We verify the
-/// agent's Intel-signed quote, create its tunnel, provision its
-/// Cloudflare routing apps, and return the tunnel token. `owner` / `env_label`
+/// agent's Intel-signed quote, create its tunnel, remove legacy
+/// Cloudflare Access apps, and return the tunnel token. `owner` / `env_label`
 /// used to be in the body for double-check; they're implicit now —
 /// the CP authoritatively owns them from its config and the ITA
 /// token authenticates the agent regardless.
@@ -601,7 +607,7 @@ async fn register(
     }
 
     let labels: Vec<String> = tunnel_extras.iter().map(|(l, _)| l.clone()).collect();
-    if let Err(e) = cf::provision_agent_routing(
+    if let Err(e) = cf::delete_agent_access_apps(
         &http,
         &s.cfg.cf,
         &s.cfg.common.env_label,
@@ -610,7 +616,7 @@ async fn register(
     )
     .await
     {
-        eprintln!("cp: provision_agent_routing {agent_hostname} failed: {e}");
+        eprintln!("cp: delete_agent_access_apps {agent_hostname} failed: {e}");
     }
 
     // Seed the store so the dashboard shows the agent before the first
@@ -661,6 +667,7 @@ async fn register(
     }
 
     eprintln!("cp: registered {} as {}", req.vm_name, agent_hostname);
+    s.collector_wake.notify_one();
 
     Ok(Json(serde_json::json!({
         "tunnel_token": tunnel.token,
@@ -698,8 +705,7 @@ struct IngressPair {
 /// POST /ingress/replace — authenticated by the same Intel ITA token
 /// the agent already refreshes for /health. The agent forwards its
 /// full current ingress list; the CP re-PUTs the tunnel config +
-/// CNAMEs and reconciles per-workload Cloudflare routing apps (creates
-/// new, deletes stale).
+/// CNAMEs and removes legacy Cloudflare Access apps for those hosts.
 async fn ingress_replace(
     State(s): State<St>,
     Json(req): Json<IngressReplaceReq>,
@@ -733,7 +739,7 @@ async fn ingress_replace(
         cf::update_ingress(&http, &s.cfg.cf, &tunnel_id, &hostname, &tunnel_extras).await?;
 
     let labels: Vec<String> = tunnel_extras.iter().map(|(l, _)| l.clone()).collect();
-    if let Err(e) = cf::provision_agent_routing(
+    if let Err(e) = cf::delete_agent_access_apps(
         &http,
         &s.cfg.cf,
         &s.cfg.common.env_label,
@@ -742,7 +748,7 @@ async fn ingress_replace(
     )
     .await
     {
-        eprintln!("cp: provision_agent_routing on /ingress/replace failed: {e}");
+        eprintln!("cp: delete_agent_access_apps on /ingress/replace failed: {e}");
     }
 
     {
@@ -753,6 +759,7 @@ async fn ingress_replace(
     }
 
     eprintln!("cp: ingress/replace {} → {:?}", req.agent_id, hostnames);
+    s.collector_wake.notify_one();
     Ok(Json(serde_json::json!({
         "agent_id": req.agent_id,
         "extra_hostnames": hostnames,
@@ -987,9 +994,9 @@ async fn fleet(State(s): State<St>, headers: HeaderMap, uri: Uri) -> Response {
 // ── Devices API ─────────────────────────────────────────────────────────
 //
 // Paired client-device X25519 pubkeys that the local Noise gateway
-// accepts during the handshake. POST + DELETE are behind the CP's
-// human DD browser-auth app (admin enrollment); the machine-readable
-// `/trusted` view is edge-bypassed for cross-VM agent polls.
+// accepts during the handshake. POST + DELETE are behind DD browser
+// auth (admin enrollment); the machine-readable `/trusted` view is
+// gated in-code for cross-VM agent polls.
 
 /// GET /api/v1/admin/export — full state snapshot for a successor CP
 /// to hydrate from during a zero-downtime deploy. Returns the

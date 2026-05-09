@@ -15,9 +15,9 @@ Source layout (all under `src/`, flat module tree):
 
 | Module | Responsibility |
 |---|---|
-| `cp.rs` | CP HTTP: fleet dashboard, `/register` for agents, `/api/agents` public read, `/cp/attest`. Runs the collector + per-agent Cloudflare routing app + STONITH. |
+| `cp.rs` | CP HTTP: fleet dashboard, `/register` for agents, `/api/agents` public read, `/cp/attest`. Runs the collector, Cloudflare tunnel/DNS setup, legacy Access cleanup, and STONITH. |
 | `agent.rs` | Agent HTTP: per-VM dashboard, `/deploy` + `/exec` + `/logs/{app}` + `/ingress/replace`, GitHub-OIDC and ITA verification. |
-| `cf.rs` | Cloudflare API: tunnel CRUD, DNS CNAME, self-hosted app provisioning, flat `label_hostname`, orphan reaping. |
+| `cf.rs` | Cloudflare API: tunnel CRUD, DNS CNAME, legacy Access app cleanup, flat `label_hostname`, orphan reaping. |
 | `ee.rs` | Thin client for [EasyEnclave Mini](https://github.com/easyenclave/easyenclave-mini)'s unix socket — `Deploy`, `List`, `Logs`. |
 | `ita.rs` | Mint + verify Intel Trust Authority tokens (quote-v4 MRTD extraction). |
 | `gh_oidc.rs` | Verify GitHub Actions OIDC JWTs against GitHub's JWKS (`repository_owner == DD_OWNER`). |
@@ -74,12 +74,12 @@ Zero shared secrets. Cloudflare handles tunnel/DNS routing only; DD owns auth in
 
 No PATs. No Cloudflare service tokens. No Worker. Agents ship with nothing but an ITA API key; CI ships with nothing but its per-job GitHub OIDC token.
 
-Cloudflare self-hosted apps are provisioned programmatically by the CP at boot as bypass routing objects — one application per hostname (CP, agent, each routed workload label like `-shell`). Orphan apps from torn-down preview VMs are reaped on the next CP boot.
+Cloudflare Access is not part of request routing. DD uses Cloudflare for tunnels and DNS only, and cleans up old Access applications left by previous deployments so they cannot intercept DD-owned auth routes.
 
 First-time setup:
 1. Create the staging and production GitHub Apps with callback URL `https://app.devopsdefender.com/auth/github/callback`.
 2. Store the app client ids/secrets and `DD_AUTH_COOKIE_SECRET` in GitHub repo vars/secrets.
-3. Ensure `DD_CF_API_TOKEN` can manage Cloudflare tunnels, DNS, and self-hosted apps.
+3. Ensure `DD_CF_API_TOKEN` can manage Cloudflare tunnels, DNS, and legacy Access application cleanup.
 4. Deploy. No per-deploy OAuth callback setup.
 
 ## Deploy a workload from GitHub Actions

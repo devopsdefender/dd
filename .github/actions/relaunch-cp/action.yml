@@ -30,7 +30,7 @@ inputs:
     required: false
     default: /home/tdx2/src/dd
   cf-api-token:
-    description: 'Cloudflare API token (tunnel + DNS + self-hosted app scopes)'
+    description: 'Cloudflare API token (tunnel + DNS + legacy Access app cleanup scopes)'
     required: true
   cf-account-id:
     description: 'Cloudflare account id'

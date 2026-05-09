@@ -3,7 +3,9 @@
 //! Every agent entry in the store carries freshly-verified ITA claims. The
 //! collector scrapes `/health`, extracts the `ita_token` field, and runs
 //! it through the CP's verifier; agents whose tokens are missing, expired,
-//! or mis-signed don't enter the store. One tick:
+//! or mis-signed don't enter the store. Known registered agents are scraped
+//! frequently from the CP store; Cloudflare tunnel discovery runs on a slower
+//! interval for new/unknown tunnels and orphan cleanup. One discovery pass:
 //!
 //!   1. List CF tunnels whose name starts with `dd-{env}-agent-`.
 //!   2. Scrape `https://dd-{env}-api-{uuid}.{domain}/health` in parallel.
@@ -18,7 +20,8 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
+use tokio::time::MissedTickBehavior;
 
 use crate::cf;
 use crate::config::CfCreds;
@@ -86,6 +89,15 @@ struct Orphan {
     extras: Vec<(String, u16)>,
 }
 
+#[derive(Debug, Clone)]
+struct ScrapeTarget {
+    name: String,
+    tunnel_id: String,
+    host: String,
+    created_at: Option<DateTime<Utc>>,
+    known: bool,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     store: Store,
@@ -94,7 +106,11 @@ pub async fn run(
     cp_hostname: String,
     ee: Arc<Ee>,
     verifier: Arc<ita::Verifier>,
-    interval: Duration,
+    wake: Arc<Notify>,
+    scrape_interval: Duration,
+    discovery_interval: Duration,
+    shard_index: u64,
+    shard_total: u64,
 ) -> ! {
     let prefix = cf::agent_prefix(&env_label);
     let http = reqwest::Client::builder()
@@ -103,13 +119,26 @@ pub async fn run(
         .unwrap_or_else(|_| reqwest::Client::new());
 
     eprintln!(
-        "cp: collector starting (prefix={prefix}*, interval={}s)",
-        interval.as_secs()
+        "cp: collector starting (prefix={prefix}*, scrape={}s, discovery={}s, shard={}/{})",
+        scrape_interval.as_secs(),
+        discovery_interval.as_secs(),
+        shard_index + 1,
+        shard_total
     );
 
-    let mut ticker = tokio::time::interval(interval);
+    let mut ticker = tokio::time::interval(scrape_interval);
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut next_discovery = tokio::time::Instant::now();
     loop {
-        ticker.tick().await;
+        tokio::select! {
+            _ = ticker.tick() => {}
+            _ = wake.notified() => {}
+        }
+        let now = tokio::time::Instant::now();
+        let discover = now >= next_discovery;
+        if discover {
+            next_discovery = now + discovery_interval;
+        }
         tick(
             &store,
             &http,
@@ -119,6 +148,9 @@ pub async fn run(
             &verifier,
             &env_label,
             &cp_hostname,
+            discover,
+            shard_index,
+            shard_total,
         )
         .await;
     }
@@ -134,51 +166,34 @@ async fn tick(
     verifier: &Arc<ita::Verifier>,
     env_label: &str,
     cp_hostname: &str,
+    discover: bool,
+    shard_index: u64,
+    shard_total: u64,
 ) {
-    let tunnels: Vec<(String, String, String, Option<DateTime<Utc>>)> = cf::list(http, cf)
-        .await
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|t| {
-            let name = t["name"].as_str()?;
-            let id = t["id"].as_str()?;
-            if !name.starts_with(prefix) {
-                return None;
-            }
-            let hostname = format!("{name}.{}", cf.domain);
-            let created_at = t["created_at"]
-                .as_str()
-                .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-                .map(|dt| dt.with_timezone(&Utc));
-            Some((name.to_string(), id.to_string(), hostname, created_at))
-        })
-        .collect();
-
-    let known_hosts: std::collections::HashSet<String> = {
-        let s = store.lock().await;
-        s.values().map(|a| a.hostname.clone()).collect()
+    let mut targets = if discover {
+        discover_targets(store, http, cf, prefix).await
+    } else {
+        known_targets(store).await
     };
+    targets.retain(|t| should_scrape_key(&t.name, shard_index, shard_total));
 
     let now = Utc::now();
-    let scrapes = tunnels.iter().map(|(name, tunnel_id, host, created_at)| {
+    let scrapes = targets.iter().map(|target| {
         let http = http.clone();
-        let name = name.clone();
-        let tunnel_id = tunnel_id.clone();
-        let host = host.clone();
-        let created_at = *created_at;
-        let known = known_hosts.contains(&host);
+        let target = target.clone();
         async move {
-            if !known && unknown_tunnel_should_wait_for_registration(created_at, now) {
+            if !target.known && unknown_tunnel_should_wait_for_registration(target.created_at, now)
+            {
                 return (
-                    name,
-                    tunnel_id,
-                    host,
-                    created_at,
+                    target.name,
+                    target.tunnel_id,
+                    target.host,
+                    target.created_at,
                     None,
                     Some("fresh unknown tunnel pending registration".into()),
                 );
             }
-            let health_host = cf::agent_api_hostname(&host);
+            let health_host = cf::agent_api_hostname(&target.host);
             let r = http
                 .get(format!("https://{health_host}/health"))
                 .send()
@@ -186,21 +201,28 @@ async fn tick(
             match r {
                 Ok(resp) if resp.status().is_success() => {
                     let body = resp.json::<serde_json::Value>().await.ok();
-                    (name, tunnel_id, host, created_at, body, None)
+                    (
+                        target.name,
+                        target.tunnel_id,
+                        target.host,
+                        target.created_at,
+                        body,
+                        None,
+                    )
                 }
                 Ok(resp) => (
-                    name,
-                    tunnel_id,
-                    host,
-                    created_at,
+                    target.name,
+                    target.tunnel_id,
+                    target.host,
+                    target.created_at,
                     None,
                     Some(format!("status {}", resp.status())),
                 ),
                 Err(e) => (
-                    name,
-                    tunnel_id,
-                    host,
-                    created_at,
+                    target.name,
+                    target.tunnel_id,
+                    target.host,
+                    target.created_at,
                     None,
                     Some(format!("{e:?}")),
                 ),
@@ -296,11 +318,10 @@ async fn tick(
             for (label, _) in &orphan.extras {
                 let _ = cf::delete_cname(http, cf, &cf::extra_hostname(&orphan.host, label)).await;
             }
-            // Sweep the agent's Cloudflare routing apps: its
-            // dashboard route and every workload URL under this hostname.
-            // Without this the account accumulates dead apps every
-            // STONITH cycle.
-            cf::delete_routing_apps_for(http, cf, &orphan.host).await;
+            // Sweep legacy Cloudflare Access apps for this agent so
+            // stale exact host/path apps cannot intercept future
+            // DNS+tunnel routes.
+            cf::delete_access_apps_for_agent(http, cf, &orphan.host).await;
         }
     }
 
@@ -341,10 +362,65 @@ async fn tick(
     drop(store_lock);
 
     eprintln!(
-        "cp: scraped {} tunnels ({verified} verified, {} orphans GC'd)",
+        "cp: scraped {} {} ({verified} verified, {} orphans GC'd)",
         results.len(),
+        if discover {
+            "discovered targets"
+        } else {
+            "known agents"
+        },
         orphans.len()
     );
+}
+
+async fn discover_targets(
+    store: &Store,
+    http: &reqwest::Client,
+    cf: &CfCreds,
+    prefix: &str,
+) -> Vec<ScrapeTarget> {
+    let known_hosts: std::collections::HashSet<String> = {
+        let s = store.lock().await;
+        s.values().map(|a| a.hostname.clone()).collect()
+    };
+    cf::list(http, cf)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|t| {
+            let name = t["name"].as_str()?;
+            let id = t["id"].as_str()?;
+            if !name.starts_with(prefix) {
+                return None;
+            }
+            let hostname = format!("{name}.{}", cf.domain);
+            let created_at = t["created_at"]
+                .as_str()
+                .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                .map(|dt| dt.with_timezone(&Utc));
+            Some(ScrapeTarget {
+                name: name.to_string(),
+                tunnel_id: id.to_string(),
+                known: known_hosts.contains(&hostname),
+                host: hostname,
+                created_at,
+            })
+        })
+        .collect()
+}
+
+async fn known_targets(store: &Store) -> Vec<ScrapeTarget> {
+    let s = store.lock().await;
+    s.iter()
+        .filter(|(name, a)| name.as_str() != "control-plane" && !a.tunnel_id.is_empty())
+        .map(|(name, a)| ScrapeTarget {
+            name: name.clone(),
+            tunnel_id: a.tunnel_id.clone(),
+            host: a.hostname.clone(),
+            created_at: None,
+            known: true,
+        })
+        .collect()
 }
 
 fn parse_extra_ingress(h: &serde_json::Value) -> Option<Vec<(String, u16)>> {
@@ -428,6 +504,38 @@ fn unknown_tunnel_should_wait_for_registration(
     })
 }
 
+fn should_scrape_key(key: &str, shard_index: u64, shard_total: u64) -> bool {
+    if shard_total <= 1 {
+        return true;
+    }
+    rendezvous_shard(key, shard_total) == shard_index
+}
+
+fn rendezvous_shard(key: &str, shard_total: u64) -> u64 {
+    let mut best_shard = 0;
+    let mut best_score = 0;
+    for shard in 0..shard_total.max(1) {
+        let mut bytes = Vec::with_capacity(key.len() + 8);
+        bytes.extend_from_slice(key.as_bytes());
+        bytes.extend_from_slice(&shard.to_le_bytes());
+        let score = fnv1a64(&bytes);
+        if shard == 0 || score > best_score {
+            best_score = score;
+            best_shard = shard;
+        }
+    }
+    best_shard
+}
+
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
 fn scrape_failure_is_dead_signal(err: &Option<String>) -> bool {
     let Some(err) = err.as_deref() else {
         return false;
@@ -449,8 +557,8 @@ mod tests {
     use chrono::{Duration, Utc};
 
     use super::{
-        parse_extra_ingress, scrape_failure_is_dead_signal, unknown_tunnel_is_gc_candidate,
-        unknown_tunnel_should_wait_for_registration,
+        parse_extra_ingress, rendezvous_shard, scrape_failure_is_dead_signal, should_scrape_key,
+        unknown_tunnel_is_gc_candidate, unknown_tunnel_should_wait_for_registration,
     };
 
     #[test]
@@ -555,5 +663,22 @@ mod tests {
             now
         ));
         assert!(!unknown_tunnel_should_wait_for_registration(None, now));
+    }
+
+    #[test]
+    fn rendezvous_shards_assign_each_key_once() {
+        for key in ["agent-a", "agent-b", "agent-c", "agent-d"] {
+            let assigned = (0..4)
+                .filter(|idx| should_scrape_key(key, *idx, 4))
+                .collect::<Vec<_>>();
+            assert_eq!(assigned.len(), 1);
+            assert_eq!(assigned[0], rendezvous_shard(key, 4));
+        }
+    }
+
+    #[test]
+    fn single_shard_scrapes_every_key() {
+        assert!(should_scrape_key("agent-a", 0, 1));
+        assert!(should_scrape_key("agent-a", 7, 0));
     }
 }
