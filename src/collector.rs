@@ -530,16 +530,17 @@ async fn mark_stale_or_orphan(
     let mut s = store.lock().await;
     if let Some(a) = s.values_mut().find(|a| a.hostname == *host) {
         let age = now.signed_duration_since(a.last_seen).num_seconds();
-        if a.status == "registering" && err.as_ref().is_some_and(ScrapeFailure::is_dns) {
-            if age <= DEAD_THRESHOLD_SECS {
-                eprintln!(
-                    "cp: collector: {name} DNS lookup failed for {}; still registering (age={}s): {}",
-                    cf::agent_api_hostname(host),
-                    age,
-                    scrape_failure_message(err)
-                );
-                return;
-            }
+        if a.status == "registering"
+            && err.as_ref().is_some_and(ScrapeFailure::is_dns)
+            && age <= DEAD_THRESHOLD_SECS
+        {
+            eprintln!(
+                "cp: collector: {name} DNS lookup failed for {}; still registering (age={}s): {}",
+                cf::agent_api_hostname(host),
+                age,
+                scrape_failure_message(err)
+            );
+            return;
         }
         if a.status == "registering" && age < UNKNOWN_TUNNEL_SCRAPE_DELAY_SECS {
             eprintln!(
