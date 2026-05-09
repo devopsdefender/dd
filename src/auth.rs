@@ -67,11 +67,6 @@ struct GithubUser {
     id: u64,
 }
 
-#[derive(Deserialize)]
-struct GithubMembership {
-    state: String,
-}
-
 impl AuthConfig {
     pub fn from_env(hostname: &str, domain: &str) -> Result<Self> {
         let get = |k: &str| {
@@ -358,18 +353,14 @@ async fn authorize_user(
         PrincipalKind::Org => {
             let resp = http
                 .get(format!(
-                    "https://api.github.com/user/memberships/orgs/{}",
-                    owner.name
+                    "https://api.github.com/orgs/{}/public_members/{}",
+                    owner.name, user.login
                 ))
                 .bearer_auth(token)
                 .header(header::USER_AGENT, "devopsdefender")
                 .send()
                 .await?;
-            if !resp.status().is_success() {
-                return Err(Error::Unauthorized);
-            }
-            let membership: GithubMembership = resp.json().await?;
-            if membership.state == "active" {
+            if resp.status().is_success() {
                 Ok(())
             } else {
                 Err(Error::Unauthorized)
