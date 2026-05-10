@@ -117,23 +117,25 @@ it does not create a read-write terminal or any input path into the workload.
 
 DD separates terminal access by capability:
 
-- **Read-only workload terminals** show workload logs in the dd-shell xterm UI.
+- **Read-only workload terminals** show workload logs in the terminal UI.
   They are for oracle-style services where an operator should be able to inspect
   output without sending input, resizing a PTY, interrupting, or closing the
   process. Opening a read-only terminal is observation only, so it leaves the
   workload's user-facing integrity state clean.
-- **Read-write PTY sessions** are created inside `dd-shell`. They are for
+- **Read-write PTY sessions** are owned by `dd-sessiond`. They are for
   confidential shells and ZDR coding agents such as Codex or Claude. These
-  sessions are reconnectable and write encrypted transcript records under
-  `DD_SHELL_DIR`. A read-write PTY is controlled as soon as it exists because
-  the holder can send stdin, resize the terminal, and deliver terminal signals.
+  sessions are reconnectable and write encrypted transcript records. A
+  read-write PTY is controlled as soon as it exists because the holder can send
+  stdin, resize the terminal, and deliver terminal signals.
 
 The shell UI treats both as terminal views, but only read-write sessions get
 WebSocket input, resize, and close controls. Workloads do not opt into
 read-write access by putting metadata in `workload.json`; the boundary is the
-dd-shell API surface. Internally DD may still call this taint tracking, but the
-API/UI should speak in integrity terms: clean for observed-only logs,
-controlled for interactive PTYs or other human control paths.
+session protocol exposed by `dd-agent` over Noise. The current browser shell
+HTTP/WebSocket APIs are compatibility only while web/PWA moves to direct Noise.
+Internally DD may still call this taint tracking, but the API/UI should speak in
+integrity terms: clean for observed-only logs, controlled for interactive PTYs
+or other human control paths.
 
 The renderer uses vendored xterm assets and recognizes WezTerm-compatible
 notification escapes after the user grants browser notification permission:
@@ -192,12 +194,14 @@ Additional examples:
 - `apps/oracle-readonly`: standalone oracle example with the same scraper and
   vanity-address metadata; copy this shape into real oracle app repos.
 - `apps/confidential-shell`: legacy standalone shell workload for deployments
-  that still run the browser shell and PTY supervisor in one process.
-- `apps/codex-podman-shell`: alternative read-write shell workload. It exposes
-  the normal `-shell` label and carries an older self-contained Codex recipe
-  path. New deployments should prefer `dd-sessiond` + `dd-shell`.
+  that still run the browser shell and PTY supervisor in one process. Scheduled
+  for removal once all clients use `dd-sessiond` over Noise.
+- `apps/codex-podman-shell`: legacy read-write shell workload. It exposes the
+  normal `-shell` label and carries an older self-contained Codex recipe path.
+  Scheduled for removal; new deployments should use `dd-sessiond`.
 
-CP stays slim: `cloudflared` + `dd-management` + `dd-sessiond` + `dd-shell`.
+CP stays slim: `cloudflared` + `dd-management` + static/web client assets as
+needed. It must not carry shell, log, transcript, or PTY bytes.
 Preview agent VMs run a small read-only oracle plus agent + podman for CI to
 prove registration, scraping, vanity ingress, and dashboards end-to-end. Prod
 agent VMs use the

@@ -70,32 +70,34 @@ Acceptance:
 - Existing session metadata and transcripts are visible through the session API.
 - Restarting only the web/UI layer does not kill a running Codex session.
 
-## Phase 2: Stable Session API
+## Phase 2: Stable Client Protocol
 
-Expose session functionality through `dd-agent`, backed by local
-`dd-sessiond`.
+Expose session functionality through `dd-agent` Noise, backed by local
+`dd-sessiond`. The stable remote surface is the paired-device protocol, not
+cookie-auth HTTP session routes.
 
-Initial API:
+Initial protocol:
 
 ```text
-GET  /api/sessions
-POST /api/sessions
-GET  /api/sessions/:id
-WS   /api/sessions/:id/attach
-POST /api/sessions/:id/input
-POST /api/sessions/:id/resize
-POST /api/sessions/:id/close
-GET  /api/sessions/:id/transcript
-WS   /api/session-events
+shell.list_recipes
+shell.list_sessions
+shell.create_session
+shell.replay_session
+shell.resize_session
+shell.close_session
+shell.attach_session
+exec
 ```
 
 Implementation notes:
 
 - `dd-sessiond` listens only on a Unix socket on the VM.
-- `dd-agent` is the only remote gateway.
+- `dd-agent` is the only remote session gateway.
 - Multiple clients may attach to the same session.
 - Transcript and events are canonical session state, not UI state.
 - Mobile clients should not resize the canonical PTY by default.
+- The existing `/api/sessions*` and `/ws/sessions*` browser-shell routes are
+  transitional compatibility only. Do not add new client features there.
 
 ## Phase 3: Client-Side Fleet UI
 
@@ -148,8 +150,12 @@ Implemented first slice:
   `shell.close_session` JSON requests over Noise.
 - `shell.attach_session` returns one JSON ack, then switches the same Noise
   session into encrypted raw PTY byte streaming to local `dd-sessiond`.
+- Native `exec`, `replay`, `resize`, and `close` commands exercise the same
+  direct Noise path as `shell`.
 - CP Noise endpoints reject shell methods because they have no local sessiond
   adapter; agent Noise endpoints wire the adapter in.
+- The native CLI appraises the agent quote with Intel Trust Authority by
+  default and requires an explicit insecure flag for local preview/dev.
 
 Design rule:
 
@@ -161,10 +167,41 @@ dd-sessiond stays local-only
 dd-agent is the policy/encryption gateway
 ```
 
+## Removal Plan
+
+Now that the durable session owner is `dd-sessiond` and native clients can use
+direct Noise, remove the old shell stack in this order:
+
+1. Freeze cookie-auth browser shell APIs. Treat `src/shell.rs` routes
+   `/api/sessions*` and `/ws/sessions*` as compatibility only until the web/PWA
+   client speaks Noise directly.
+2. Remove old env compatibility names. `DD_SESSIOND_HISTORY_KEY` is the only
+   transcript-key override; do not continue accepting `DD_SHELL_HISTORY_KEY`.
+3. Move web/PWA to direct Noise. Store a paired device key in browser storage,
+   use CP only for enrollment and route discovery, then connect to the selected
+   agent `/noise/ws` for session RPCs and PTY bytes.
+4. Delete server-side browser shell proxying. Remove `src/shell.rs` session
+   proxy routes and WebSocket attach path once the web/PWA client uses direct
+   Noise. Keep only static asset serving if needed.
+5. Delete agent HTTP session proxying. Remove `/api/sessions*` from `dd-agent`
+   once native and web clients both use Noise for session control.
+6. Retire legacy combined shell workloads. Remove `apps/confidential-shell` and
+   `apps/codex-podman-shell` after deploy templates and docs no longer point at
+   `DD_MODE=shell` as a PTY owner.
+7. Rename remaining storage paths only with an explicit data migration. The
+   current `dd-shell` path names are confusing but may contain persistent
+   transcripts; do not silently strand them.
+
+Keep these pieces:
+
+- `dd-sessiond` and its local-only API. It is the session owner, not a fallback.
+- `shell_unavailable` on CP Noise endpoints. It is an explicit rejection for a
+  process that intentionally has no local sessiond.
+- CP route discovery and enrollment. CP stays in the trust/control path, not
+  the shell data path.
+
 ## Risks And Open Questions
 
-- Whether to keep a minimal cookie-auth shell UI only as temporary emergency
-  compatibility.
 - How to model recipes so CP UI and `dd-sessiond` agree on available launchers.
 - How to represent "input requested" events for Codex/Claude without making
   terminal parsing authoritative.

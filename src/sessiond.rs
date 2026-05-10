@@ -996,9 +996,7 @@ impl TranscriptStore {
 }
 
 async fn history_key(dir: &Path) -> Result<[u8; 32]> {
-    if let Ok(raw) =
-        std::env::var("DD_SESSIOND_HISTORY_KEY").or_else(|_| std::env::var("DD_SHELL_HISTORY_KEY"))
-    {
+    if let Ok(raw) = std::env::var("DD_SESSIOND_HISTORY_KEY") {
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(raw.trim())
             .or_else(|_| hex::decode(raw.trim()))
