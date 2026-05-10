@@ -128,18 +128,15 @@ DD separates terminal access by capability:
   read-write PTY is controlled as soon as it exists because the holder can send
   stdin, resize the terminal, and deliver terminal signals.
 
-The shell UI treats both as terminal views, but only read-write sessions get
-WebSocket input, resize, and close controls. Workloads do not opt into
-read-write access by putting metadata in `workload.json`; the boundary is the
-session protocol exposed by `dd-agent` over Noise. The current browser shell
-HTTP/WebSocket APIs are compatibility only while the native app takes over
-shell/session workflows.
+The native client treats both as terminal views, but only read-write sessions
+get input, resize, and close controls. Workloads do not opt into read-write
+access by putting metadata in `workload.json`; the boundary is the session
+protocol exposed by `dd-agent` over Noise.
 Internally DD may still call this taint tracking, but the API/UI should speak in
 integrity terms: clean for observed-only logs, controlled for interactive PTYs
 or other human control paths.
 
-The renderer uses vendored xterm assets and recognizes WezTerm-compatible
-notification escapes after the user grants browser notification permission:
+Native clients may recognize WezTerm-compatible notification escapes:
 
 ```sh
 printf '\033]9;%s\033\\' 'job finished'
@@ -189,9 +186,9 @@ inline in two places so both lifecycle points behave identically:
 Additional examples:
 
 - `apps/human-readonly`: tiny preview-only read-only oracle. It emits logs for
-  dd-shell's read-only terminal, serves `/oracle.json` on port 8082, gets a
-  vanity `oracle.<agent-hostname>` address, and appears in the dashboards. It
-  is a shell workload recipe, not a `devopsdefender` binary subcommand.
+  native clients, serves `/oracle.json` on port 8082, gets a vanity
+  `oracle.<agent-hostname>` address, and appears in the dashboards. It is a
+  shell workload recipe, not a `devopsdefender` binary subcommand.
 - `apps/oracle-readonly`: standalone oracle example with the same scraper and
   vanity-address metadata; copy this shape into real oracle app repos.
 - `apps/confidential-shell`: legacy standalone shell workload for deployments

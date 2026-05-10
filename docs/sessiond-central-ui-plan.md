@@ -98,8 +98,8 @@ Implementation notes:
 - Multiple clients may attach to the same session.
 - Transcript and events are canonical session state, not UI state.
 - Mobile clients should not resize the canonical PTY by default.
-- The existing `/api/sessions*` and `/ws/sessions*` browser-shell routes are
-  transitional compatibility only. Do not add new client features there.
+- Browser-shell interactive attach is removed. Do not add new client features
+  there; active shell UI work belongs in `devopsdefender/dd-client`.
 
 ## Phase 3: Native Fleet Client
 
@@ -126,8 +126,8 @@ Acceptance:
 
 Status:
 
-- Not implemented in the first branch slice. The native CLI is present so the
-  client protocol can be tested before replacing the browser shell proxy.
+- Native CLI exists in `devopsdefender/dd-client`. Browser shell attach and
+  cookie-auth session control have been removed from this repo.
 
 ## Phase 4: Auth, Attestation, And Noise
 
@@ -174,9 +174,7 @@ dd-agent is the policy/encryption gateway
 Now that the durable session owner is `dd-sessiond` and native clients can use
 direct Noise, remove the old shell stack in this order:
 
-1. Freeze cookie-auth browser shell APIs. Treat `src/shell.rs` routes
-   `/api/sessions*` and `/ws/sessions*` as compatibility only until the native
-   app covers the workflow.
+1. Remove cookie-auth browser shell attach and session control APIs.
 2. Remove old env compatibility names. `DD_SESSIOND_HISTORY_KEY` is the only
    transcript-key override; do not continue accepting `DD_SHELL_HISTORY_KEY`.
 3. Fix pairing durability without making CP a shell/session state owner. CP can
@@ -186,9 +184,8 @@ direct Noise, remove the old shell stack in this order:
    with shared client core, CLI, and native app. Store paired device keys in OS
    secure storage, use CP only for enrollment and route discovery, then connect
    to the selected agent `/noise/ws` for session RPCs and PTY bytes.
-5. Delete server-side browser shell proxying. Remove `src/shell.rs` session
-   proxy routes and WebSocket attach path once the native app covers
-   create/attach/replay/resize/close.
+5. Delete server-side browser shell proxying. Remove `src/shell.rs` entirely
+   once the shell subdomain is no longer needed as an authenticated endpoint.
 6. Delete agent HTTP session proxying. Remove `/api/sessions*` from `dd-agent`
    once native clients use Noise for session control.
 7. Retire legacy combined shell workloads. Remove `apps/confidential-shell` and

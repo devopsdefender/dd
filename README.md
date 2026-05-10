@@ -72,7 +72,7 @@ Zero shared secrets. Cloudflare handles tunnel/DNS routing only; DD owns auth in
 
 | Caller | Endpoint | Auth |
 | --- | --- | --- |
-| Human browser | CP `/`, agent `/`, dd-shell terminal | DD GitHub App OAuth broker + signed DD session cookie |
+| Human browser | CP `/`, agent `/` | DD GitHub App OAuth broker + signed DD session cookie |
 | Agent → CP | `/register`, `/ingress/replace` | Intel ITA token verified in-code |
 | CI → agent | `/deploy`, `/exec`, `/logs/{app}` | GitHub Actions OIDC JWT verified in-code (`repository_owner == DD_OWNER`) |
 | Anyone | `/health`, `/cp/attest`, `/api/agents`, workload URLs | Public read-only or self-authenticating content |
@@ -129,9 +129,8 @@ bytes or paired-device trust storage.
 Client implementations live outside this repo in
 [`devopsdefender/dd-client`](https://github.com/devopsdefender/dd-client),
 which contains the shared client core, CLI, and native app workspace.
-The browser remains dashboard and enrollment UI only; the existing cookie-auth
-browser shell is transitional compatibility while the native app takes over
-shell/session workflows.
+The browser remains dashboard and enrollment UI only. Shell/session workflows
+belong in `dd-client`.
 
 ## STONITH
 

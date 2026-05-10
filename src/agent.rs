@@ -8,8 +8,7 @@
 //!   - Browser routes (`/`, `/workload/*`) require a DD-signed
 //!     GitHub App session cookie. Cloudflare only routes traffic.
 //!   - Terminal access is provided by direct paired-device Noise sessions
-//!     to this agent, with browser shell HTTP routes kept as transitional
-//!     compatibility.
+//!     to this agent.
 //!   - `/deploy` and `/exec` are gated in-code by a GitHub Actions
 //!     OIDC token — any CI workflow whose
 //!     principal matches `DD_OWNER`/`DD_OWNER_ID`/`DD_OWNER_KIND`
