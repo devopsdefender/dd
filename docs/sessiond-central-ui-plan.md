@@ -141,6 +141,8 @@ Then strengthen:
 - Clients verify the agent quote and pin the attested Noise public key.
 - Browser/PWA uses the same direct agent Noise path once the browser crypto or
   WASM client is in place.
+- CP device enrollment survives CP redeploys. A paired native/web/mobile client
+  must not need to re-pair just because preview or production CP was relaunched.
 
 Implemented first slice:
 
@@ -177,18 +179,21 @@ direct Noise, remove the old shell stack in this order:
    client speaks Noise directly.
 2. Remove old env compatibility names. `DD_SESSIOND_HISTORY_KEY` is the only
    transcript-key override; do not continue accepting `DD_SHELL_HISTORY_KEY`.
-3. Move web/PWA to direct Noise. Store a paired device key in browser storage,
+3. Fix device registry durability. The CP trusted-device list must survive a
+   CP redeploy or hydrate from the predecessor before clients depend on it as
+   their only route to shell sessions.
+4. Move web/PWA to direct Noise. Store a paired device key in browser storage,
    use CP only for enrollment and route discovery, then connect to the selected
    agent `/noise/ws` for session RPCs and PTY bytes.
-4. Delete server-side browser shell proxying. Remove `src/shell.rs` session
+5. Delete server-side browser shell proxying. Remove `src/shell.rs` session
    proxy routes and WebSocket attach path once the web/PWA client uses direct
    Noise. Keep only static asset serving if needed.
-5. Delete agent HTTP session proxying. Remove `/api/sessions*` from `dd-agent`
+6. Delete agent HTTP session proxying. Remove `/api/sessions*` from `dd-agent`
    once native and web clients both use Noise for session control.
-6. Retire legacy combined shell workloads. Remove `apps/confidential-shell` and
+7. Retire legacy combined shell workloads. Remove `apps/confidential-shell` and
    `apps/codex-podman-shell` after deploy templates and docs no longer point at
    `DD_MODE=shell` as a PTY owner.
-7. Rename remaining storage paths only with an explicit data migration. The
+8. Rename remaining storage paths only with an explicit data migration. The
    current `dd-shell` path names are confusing but may contain persistent
    transcripts; do not silently strand them.
 
@@ -210,3 +215,5 @@ Keep these pieces:
 - How much of the existing transcript encryption format should move unchanged
   into `dd-sessiond`.
 - Browser Noise implementation choice: pure JS library versus small WASM client.
+- CP device registry storage location for SSH/preview CPs, since `/tmp` state
+  can disappear across relaunches if predecessor hydration does not run.
