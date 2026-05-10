@@ -1462,6 +1462,14 @@ main { max-width:none; padding:0; height:100dvh; display:grid; grid-template-col
 .notify-item .notify-title { display:flex; align-items:center; justify-content:space-between; gap:8px; font-size:12px; font-weight:700; }
 .notify-item .notify-time { color:#8791a5; font-size:10px; font-weight:400; white-space:nowrap; }
 .notify-item .notify-body { margin-top:3px; color:#8791a5; font-size:11px; line-height:1.4; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.prompt-feed { display:flex; flex-direction:column; gap:8px; margin:0 0 12px; }
+.prompt-card { background:#171c29; border:1px solid #7aa2f7; border-radius:7px; padding:10px; min-width:0; box-shadow:0 0 0 1px #1d3358 inset; }
+.prompt-card .prompt-head { display:flex; align-items:center; justify-content:space-between; gap:8px; font-size:12px; font-weight:800; }
+.prompt-card .prompt-meta { color:#8791a5; font-size:10px; white-space:nowrap; }
+.prompt-card .prompt-body { margin-top:6px; color:#d7deea; font-size:12px; line-height:1.45; overflow-wrap:anywhere; }
+.prompt-actions { display:flex; flex-wrap:wrap; gap:6px; margin-top:9px; }
+.prompt-actions button { flex:1 1 64px; min-width:0; padding:8px 9px; font-size:12px; }
+.prompt-actions button.dismiss { flex:0 0 auto; color:#8791a5; background:#171c29; border:1px solid #2b3242; }
 .notify-badge { display:none; min-width:18px; height:18px; border-radius:999px; background:#7aa2f7; color:#05070a; font-size:11px; font-weight:800; align-items:center; justify-content:center; padding:0 5px; }
 .notify-badge.active { display:inline-flex; }
 .toast-stack { position:fixed; top:60px; right:14px; z-index:50; display:flex; flex-direction:column; gap:8px; width:min(340px, calc(100vw - 28px)); pointer-events:none; }
@@ -1511,6 +1519,8 @@ button.secondary { background:#252a36; color:#d7deea; }
       <div class="panel active" data-panel="system">
         <div class="group-title">System</div>
         <div class="system" id="system"></div>
+        <div class="group-title">Prompt inbox</div>
+        <div class="prompt-feed" id="prompt-feed"></div>
         <div class="group-title">Notifications</div>
         <div class="notify-feed" id="notify-feed"></div>
       </div>
@@ -1592,6 +1602,9 @@ let cachedWorkloads = [];
 let activePanel = "system";
 let notifications = loadNotificationHistory();
 let unreadNotifications = 0;
+let promptRequests = loadPromptHistory();
+let promptScanBuffer = "";
+let lastPromptKey = "";
 const decoder = new TextDecoder();
 let serviceWorkerReady = null;
 installPwaMetadata();
@@ -1612,6 +1625,7 @@ async function refresh() {
     api("/api/workloads").catch(() => [])
   ]);
   renderSystem(system);
+  renderPromptFeed();
   renderNotificationFeed();
   cachedRecipes = recipes;
   renderRecipes();
@@ -1803,11 +1817,11 @@ async function attach(id) {
   };
   ws.onmessage = ev => {
     if (typeof ev.data === "string") {
-      scanNotifications(ev.data);
+      scanTerminalOutput(ev.data);
       term.write(ev.data);
     } else {
       const bytes = new Uint8Array(ev.data);
-      scanNotifications(bytes);
+      scanTerminalOutput(bytes);
       term.write(bytes);
     }
   };
@@ -2001,6 +2015,10 @@ async function sendResize() {
     body: JSON.stringify({cols: term.cols, rows: term.rows})
   }).catch(() => {});
 }
+function scanTerminalOutput(data) {
+  const text = scanNotifications(data);
+  scanPromptRequests(text);
+}
 function scanNotifications(data) {
   const text = typeof data === "string" ? data : decoder.decode(data, {stream:true});
   oscBuffer += text;
@@ -2014,6 +2032,124 @@ function scanNotifications(data) {
   }
   if (consumed > 0) oscBuffer = oscBuffer.slice(consumed);
   if (oscBuffer.length > 8192) oscBuffer = oscBuffer.slice(-1024);
+  return text;
+}
+function scanPromptRequests(text) {
+  if (!text) return;
+  promptScanBuffer = stripAnsi(promptScanBuffer + text).replace(/\r/g, "\n");
+  if (promptScanBuffer.length > 12000) promptScanBuffer = promptScanBuffer.slice(-8000);
+  const lines = promptScanBuffer.split("\n").map(l => l.trim()).filter(Boolean);
+  const recent = lines.slice(-18);
+  const prompt = detectPrompt(recent);
+  if (!prompt) return;
+  const key = `${current || "none"}:${prompt.kind}:${prompt.body}:${prompt.actions.map(a => a.input).join("|")}`;
+  if (key === lastPromptKey || promptRequests.some(p => p.key === key)) return;
+  lastPromptKey = key;
+  const item = {
+    id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+    key,
+    sessionId: current,
+    title: prompt.title,
+    body: prompt.body,
+    actions: prompt.actions,
+    ts: Date.now()
+  };
+  promptRequests.unshift(item);
+  promptRequests = promptRequests.slice(0, 20);
+  savePromptHistory();
+  renderPromptFeed();
+  notify("Codex needs input", prompt.body);
+}
+function detectPrompt(lines) {
+  const windowText = lines.join("\n");
+  if (!/\?|select|choose|enter|approve|allow|continue|proceed|permission|confirmation/i.test(windowText)) return null;
+  const numbered = [];
+  for (const line of lines.slice(-12)) {
+    const m = line.match(/^(?:\[?([1-9])\]?[\).:]?|([1-9])\s+[-:])\s+(.{1,90})$/);
+    if (!m) continue;
+    const n = m[1] || m[2];
+    const label = `${n}: ${(m[3] || "").trim()}`.slice(0, 44);
+    if (!numbered.some(a => a.input === `${n}\n`)) numbered.push({label, input:`${n}\n`});
+  }
+  if (numbered.length >= 2 && numbered.length <= 6) {
+    return {
+      kind: "numbered",
+      title: "Input requested",
+      body: summarizePrompt(lines),
+      actions: numbered
+    };
+  }
+  const yn = windowText.match(/\((?:y\/n|Y\/n|y\/N)\)|\[(?:y\/n|Y\/n|y\/N)\]/);
+  if (yn) {
+    return {
+      kind: "yesno",
+      title: "Confirmation requested",
+      body: summarizePrompt(lines),
+      actions: [{label:"Yes", input:"y\n"}, {label:"No", input:"n\n"}]
+    };
+  }
+  if (/press enter|enter for no changes|hit enter/i.test(windowText)) {
+    return {
+      kind: "enter",
+      title: "Continue requested",
+      body: summarizePrompt(lines),
+      actions: [{label:"Enter", input:"\n"}]
+    };
+  }
+  return null;
+}
+function summarizePrompt(lines) {
+  const useful = lines.slice(-8).filter(l => !/^[\s\-\|]+$/.test(l));
+  return useful.join(" ").replace(/\s+/g, " ").slice(0, 220);
+}
+function renderPromptFeed() {
+  const root = document.getElementById("prompt-feed");
+  if (!root) return;
+  const pending = promptRequests.filter(p => !p.dismissed).slice(0, 8);
+  if (!pending.length) {
+    root.innerHTML = `<div class="empty-mini">No pending prompts</div>`;
+    return;
+  }
+  root.innerHTML = pending.map(p => `
+    <div class="prompt-card">
+      <div class="prompt-head"><span>${escapeHtml(p.title || "Input requested")}</span><span class="prompt-meta">${escapeHtml(formatClock(p.ts))}</span></div>
+      <div class="prompt-body">${escapeHtml(p.body || "")}</div>
+      <div class="prompt-actions">
+        ${(p.actions || []).map((a, i) => `<button class="secondary" data-prompt="${escapeHtml(p.id)}" data-action="${i}">${escapeHtml(a.label || "Send")}</button>`).join("")}
+        <button class="dismiss" data-dismiss-prompt="${escapeHtml(p.id)}">Dismiss</button>
+      </div>
+    </div>
+  `).join("");
+  root.querySelectorAll("button[data-action]").forEach(btn => {
+    btn.onclick = () => sendPromptInput(btn.dataset.prompt, Number(btn.dataset.action));
+  });
+  root.querySelectorAll("button[data-dismiss-prompt]").forEach(btn => {
+    btn.onclick = () => dismissPrompt(btn.dataset.dismissPrompt);
+  });
+}
+function sendPromptInput(id, actionIndex) {
+  if (currentKind !== "session" || !ws || ws.readyState !== WebSocket.OPEN) {
+    document.getElementById("status").textContent = "Attach session before sending prompt input";
+    return;
+  }
+  const prompt = promptRequests.find(p => p.id === id);
+  const action = prompt && Array.isArray(prompt.actions) ? prompt.actions[actionIndex] : null;
+  if (!action) return;
+  const input = action.input || "";
+  ws.send(input || "");
+  dismissPrompt(id);
+  document.getElementById("status").textContent = "Prompt input sent";
+}
+function dismissPrompt(id) {
+  const prompt = promptRequests.find(p => p.id === id);
+  if (prompt) prompt.dismissed = true;
+  savePromptHistory();
+  renderPromptFeed();
+}
+function stripAnsi(value) {
+  return value
+    .replace(/\x1b\][^\x07]*(?:\x07|\x1b\\)/g, "")
+    .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "");
 }
 function notify(title, body) {
   const item = {
@@ -2072,6 +2208,17 @@ function loadNotificationHistory() {
 }
 function saveNotificationHistory() {
   localStorage.setItem("dd-shell-notifications", JSON.stringify(notifications.slice(0, 50)));
+}
+function loadPromptHistory() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem("dd-shell-prompts") || "[]");
+    return Array.isArray(parsed) ? parsed.slice(0, 20) : [];
+  } catch (_) {
+    return [];
+  }
+}
+function savePromptHistory() {
+  localStorage.setItem("dd-shell-prompts", JSON.stringify(promptRequests.slice(0, 20)));
 }
 function showToast(item) {
   const stack = document.getElementById("toast-stack");
