@@ -32,8 +32,7 @@ use axum::Router;
 use tokio::sync::RwLock;
 
 /// Live set of device pubkeys the local Noise responder will accept.
-/// Mutated by `devices::Store` (on the CP) or by the agent's
-/// `sync_trusted_devices` poll loop.
+/// Mutated by the local `devices::Store` next to the process enforcing trust.
 pub type TrustHandle = Arc<RwLock<HashSet<[u8; 32]>>>;
 
 pub fn new_trust_handle() -> TrustHandle {
@@ -45,6 +44,7 @@ pub struct State {
     pub attest: Arc<attest::Attestor>,
     pub trust: TrustHandle,
     pub upstream: Arc<upstream::EeAgent>,
+    pub shell: Arc<upstream::Sessiond>,
 }
 
 pub fn router(state: State) -> Router {

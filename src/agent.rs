@@ -7,9 +7,8 @@
 //! Auth after registration:
 //!   - Browser routes (`/`, `/workload/*`) require a DD-signed
 //!     GitHub App session cookie. Cloudflare only routes traffic.
-//!   - Terminal access is provided by the `dd-shell` workload on the
-//!     `shell` label. It exposes read-only workload logs and read-write
-//!     PTY sessions as separate capabilities.
+//!   - Terminal access is provided by direct paired-device Noise sessions
+//!     to this agent.
 //!   - `/deploy` and `/exec` are gated in-code by a GitHub Actions
 //!     OIDC token — any CI workflow whose
 //!     principal matches `DD_OWNER`/`DD_OWNER_ID`/`DD_OWNER_KIND`
@@ -25,7 +24,7 @@ use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, Uri};
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use base64::Engine as _;
 use futures_util::{SinkExt, StreamExt};
@@ -52,10 +51,6 @@ use crate::units::{self, AgentMode, ManagedUnit, UnitKind};
 /// minutes; refresh well before so `/health` always serves a live
 /// token to the CP's collector.
 const ITA_REFRESH: Duration = Duration::from_secs(180);
-
-/// Poll interval for syncing the device trust list from the CP.
-/// Tuned so a revoke propagates within ~30s.
-const DEVICES_POLL: Duration = Duration::from_secs(30);
 
 const EE_READY_TIMEOUT: Duration = Duration::from_secs(90);
 
@@ -110,6 +105,9 @@ struct St {
     /// Local raw attach socket used to proxy PTY bytes over WebSocket.
     sessiond_attach_addr: String,
     http: reqwest::Client,
+    /// Agent-local paired-device store. This is the trust source enforced by
+    /// the local Noise gateway.
+    devices: Arc<crate::devices::Store>,
 }
 
 pub async fn run() -> Result<()> {
@@ -162,24 +160,9 @@ pub async fn run() -> Result<()> {
     // CLIs can attach directly to the agent's EE instance without
     // going through the CP.
     let trust = noise_gateway::new_trust_handle();
-
-    // Background poll for the device trust list. Mutates `trust`
-    // in place so the local Noise responder picks up revocations
-    // within ~DEVICES_POLL.
-    {
-        let cp_url = cfg.cp_url.clone();
-        let token = ita_token.clone();
-        let trust = trust.clone();
-        tokio::spawn(async move {
-            let http = crate::system_http_client();
-            loop {
-                if let Err(e) = sync_trusted_devices(&http, &cp_url, &token, &trust).await {
-                    eprintln!("agent: device sync failed: {e}");
-                }
-                tokio::time::sleep(DEVICES_POLL).await;
-            }
-        });
-    }
+    let devices = crate::devices::Store::load(cfg.devices_path.clone(), trust.clone())
+        .await
+        .map_err(|e| Error::Internal(format!("agent devices store load: {e}")))?;
 
     // Attestation keypair + upstream EE client for the Noise gateway.
     let noise_key_path: std::path::PathBuf = std::env::var("DD_NOISE_KEY_PATH")
@@ -196,17 +179,22 @@ pub async fn run() -> Result<()> {
         std::path::PathBuf::from(noise_gateway::upstream::DEFAULT_EE_AGENT_SOCK),
         ee_token,
     ));
-    let ng_state = noise_gateway::State {
-        attest: attestor.clone(),
-        trust,
-        upstream,
-    };
-
-    let gh = gh_oidc::Verifier::new(cfg.common.owner.clone(), "dd-agent".into());
     let sessiond_http_url =
         std::env::var("DD_SESSIOND_HTTP_URL").unwrap_or_else(|_| "http://127.0.0.1:7683".into());
     let sessiond_attach_addr =
         std::env::var("DD_SESSIOND_ATTACH_ADDR").unwrap_or_else(|_| "127.0.0.1:7684".into());
+    let shell = Arc::new(noise_gateway::upstream::Sessiond::new(
+        sessiond_http_url.clone(),
+        sessiond_attach_addr.clone(),
+    ));
+    let ng_state = noise_gateway::State {
+        attest: attestor.clone(),
+        trust,
+        upstream,
+        shell,
+    };
+
+    let gh = gh_oidc::Verifier::new(cfg.common.owner.clone(), "dd-agent".into());
 
     // Seed taint set. Boot-time facts go in now; runtime events
     // (CustomerOwnerEnabled, CustomerWorkloadDeployed) are appended
@@ -233,6 +221,7 @@ pub async fn run() -> Result<()> {
         sessiond_http_url,
         sessiond_attach_addr,
         http: crate::system_http_client(),
+        devices,
     };
     let api_state = state.clone();
     let api_ng_state = ng_state.clone();
@@ -254,6 +243,9 @@ pub async fn run() -> Result<()> {
         .route("/api/sessions/{id}/resize", post(resize_session))
         .route("/api/sessions/{id}/close", post(close_session))
         .route("/api/sessions/{id}/attach", get(attach_session))
+        .route("/api/v1/devices", post(create_device))
+        .route("/api/v1/devices/{pubkey}", delete(revoke_device))
+        .route("/admin/enroll", get(enroll_page))
         .route("/workload/{id}", get(workload_page))
         .route("/logs/{app}", get(logs));
     if !cfg.confidential {
@@ -367,51 +359,6 @@ async fn log_http(
     let res = next.run(req).await;
     eprintln!("agent: OUT {method} {path} -> {}", res.status().as_u16());
     res
-}
-
-/// Pull the CP's device registry (`{"pubkeys": ["<hex>", ...]}`) and
-/// atomically replace the local `TrustHandle`. The local Noise
-/// responder reads this set directly; revocations propagate within
-/// one `DEVICES_POLL` tick.
-async fn sync_trusted_devices(
-    http: &reqwest::Client,
-    cp_url: &str,
-    ita_token: &Arc<RwLock<String>>,
-    trust: &noise_gateway::TrustHandle,
-) -> Result<()> {
-    // `/api/v1/devices/trusted` is reachable over the public tunnel.
-    // Auth is in-code: loopback / GH-OIDC / ITA,
-    // same three-way policy as `/api/agents`.
-    let url = format!("{}/api/v1/devices/trusted", cp_url.trim_end_matches('/'));
-    let token = ita_token.read().await.clone();
-    let resp = http
-        .get(&url)
-        .bearer_auth(token)
-        .send()
-        .await
-        .map_err(|e| Error::Upstream(format!("devices GET {url}: {e}")))?;
-    if !resp.status().is_success() {
-        return Err(Error::Upstream(format!(
-            "devices GET {url} → {}",
-            resp.status()
-        )));
-    }
-    let body: serde_json::Value = resp.json().await?;
-    let mut fresh: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
-    if let Some(arr) = body["pubkeys"].as_array() {
-        for v in arr {
-            let Some(s) = v.as_str() else { continue };
-            let Ok(bytes) = hex::decode(s) else { continue };
-            if bytes.len() != 32 {
-                continue;
-            }
-            let mut k = [0u8; 32];
-            k.copy_from_slice(&bytes);
-            fresh.insert(k);
-        }
-    }
-    *trust.write().await = fresh;
-    Ok(())
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -990,6 +937,154 @@ async fn attach_session(
             eprintln!("agent: session attach ended: {e:#}");
         }
     }))
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateDeviceReq {
+    pubkey: String,
+    label: String,
+}
+
+/// POST /api/v1/devices — enroll a device pubkey on this agent.
+/// Idempotent on pubkey: re-posting with a new label replaces the record.
+async fn create_device(
+    State(s): State<St>,
+    headers: HeaderMap,
+    uri: Uri,
+    Json(req): Json<CreateDeviceReq>,
+) -> Result<(axum::http::StatusCode, Json<crate::devices::Device>)> {
+    ensure_browser_auth(&s, &headers, &uri)?;
+    let pubkey = req.pubkey.to_lowercase();
+    crate::devices::validate_hex_pubkey(&pubkey).map_err(|e| Error::BadRequest(e.to_string()))?;
+    let label = req.label.trim().to_string();
+    if label.is_empty() || label.len() > 128 {
+        return Err(Error::BadRequest("label must be 1..=128 chars".into()));
+    }
+    let device = crate::devices::Device {
+        pubkey,
+        label,
+        created_at_ms: chrono::Utc::now().timestamp_millis(),
+        revoked_at_ms: None,
+    };
+    s.devices
+        .upsert(device.clone())
+        .await
+        .map_err(|e| Error::Internal(format!("devices upsert: {e}")))?;
+    Ok((axum::http::StatusCode::CREATED, Json(device)))
+}
+
+/// DELETE /api/v1/devices/{pubkey} — revoke a paired device on this agent.
+async fn revoke_device(
+    State(s): State<St>,
+    headers: HeaderMap,
+    uri: Uri,
+    Path(pubkey): Path<String>,
+) -> Result<Json<serde_json::Value>> {
+    ensure_browser_auth(&s, &headers, &uri)?;
+    let pubkey = pubkey.to_lowercase();
+    let now = chrono::Utc::now().timestamp_millis();
+    let ok = s
+        .devices
+        .revoke(&pubkey, now)
+        .await
+        .map_err(|e| Error::Internal(format!("devices revoke: {e}")))?;
+    if !ok {
+        return Err(Error::NotFound);
+    }
+    Ok(Json(serde_json::json!({
+        "revoked": pubkey,
+        "at_ms": now,
+    })))
+}
+
+/// GET /admin/enroll?pubkey=...&label=... — authenticated confirmation
+/// page. The mutation lands on this agent, so CP does not own paired-device
+/// trust.
+async fn enroll_page(
+    State(s): State<St>,
+    headers: HeaderMap,
+    uri: Uri,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    if let Some(resp) = require_browser_auth(&s, &headers, &uri) {
+        return resp;
+    }
+    let pubkey = q.get("pubkey").cloned().unwrap_or_default();
+    let label = q.get("label").cloned().unwrap_or_default();
+
+    if let Err(e) = crate::devices::validate_hex_pubkey(&pubkey) {
+        return Html(shell(
+            "Enroll device",
+            "",
+            &format!(
+                r#"<div class="card"><h1>Invalid pubkey</h1><p class="dim">{}</p></div>"#,
+                html::escape(&e.to_string())
+            ),
+        ))
+        .into_response();
+    }
+    if label.trim().is_empty() || label.len() > 128 {
+        return Html(shell(
+            "Enroll device",
+            "",
+            r#"<div class="card"><h1>Invalid label</h1><p class="dim">label must be 1..=128 chars</p></div>"#,
+        ))
+        .into_response();
+    }
+
+    let short = &pubkey[..16];
+    let body = format!(
+        r#"<div class="card">
+  <h1>Enroll this device?</h1>
+  <div class="row"><span>Label</span><span>{label}</span></div>
+  <div class="row"><span>Pubkey</span><code>{short}...</code></div>
+  <p class="dim">
+    Confirming adds this X25519 public key to this agent's trust list. A
+    client holding the matching private key can open Noise_IK sessions to this
+    enclave. Revoke with <code>DELETE /api/v1/devices/&lt;pubkey&gt;</code>.
+  </p>
+  <p id="status"></p>
+  <div style="display:flex;gap:8px">
+    <button id="confirm" class="ok">Confirm</button>
+    <a href="/" class="btn">Cancel</a>
+  </div>
+</div>
+<script>
+  const pubkey = {pubkey_js};
+  const label  = {label_js};
+  const status = document.getElementById("status");
+  document.getElementById("confirm").addEventListener("click", async (ev) => {{
+    ev.target.disabled = true;
+    status.textContent = "Enrolling...";
+    try {{
+      const resp = await fetch("/api/v1/devices", {{
+        method: "POST",
+        credentials: "same-origin",
+        headers: {{ "Content-Type": "application/json" }},
+        body: JSON.stringify({{ pubkey, label }}),
+      }});
+      if (!resp.ok) {{
+        const text = await resp.text();
+        status.innerHTML = "<span class='err'>Enrollment failed: " +
+          resp.status + " " + text.slice(0, 400).replace(/</g, "&lt;") +
+          "</span>";
+        ev.target.disabled = false;
+        return;
+      }}
+      status.innerHTML = "<span class='ok'>Enrolled - you can close this tab</span>";
+    }} catch (e) {{
+      status.innerHTML = "<span class='err'>Network error: " + String(e) + "</span>";
+      ev.target.disabled = false;
+    }}
+  }});
+</script>"#,
+        label = html::escape(&label),
+        short = html::escape(short),
+        pubkey_js = serde_json::to_string(&pubkey).unwrap_or_else(|_| "\"\"".into()),
+        label_js = serde_json::to_string(&label).unwrap_or_else(|_| "\"\"".into()),
+    );
+
+    Html(shell("Enroll device", "", &body)).into_response()
 }
 
 #[derive(Debug, Deserialize)]

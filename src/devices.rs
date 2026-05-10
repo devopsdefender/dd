@@ -1,11 +1,12 @@
 //! Device pubkey registry.
 //!
-//! Holds the X25519 pubkeys of paired client devices. Source of truth
-//! lives on the CP's disk at [`Store::path`] (JSON, pretty-printed for
-//! human editability in a pinch). The live set of *non-revoked*
-//! pubkeys is also mirrored into a [`noise_gateway::TrustHandle`] so
-//! the locally-running Noise gateway can read it directly from shared
-//! memory — no on-disk runtime view, no cross-process file contract.
+//! Holds the X25519 pubkeys of paired client devices. The store lives
+//! next to the process that enforces trust, normally `dd-agent`
+//! (JSON, pretty-printed for human editability in a pinch). The live
+//! set of *non-revoked* pubkeys is mirrored into a
+//! [`noise_gateway::TrustHandle`] so the locally-running Noise gateway
+//! can read it directly from shared memory — no on-disk runtime view,
+//! no cross-process file contract.
 //!
 //! Wire format on disk:
 //! ```json

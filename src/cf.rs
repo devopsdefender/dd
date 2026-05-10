@@ -484,9 +484,8 @@ async fn delete_access_apps_for_domains(
 ///   - `{hostname}` — dashboard, app-layer GitHub auth
 ///   - `{hostname}-shell` — dd-shell, app-layer GitHub auth
 ///   - `{hostname}/health` — public (read-only fleet health;
-///     also carries the Noise pre-handshake `{quote_b64, pubkey_hex}`)
+///     CP does not expose shell/client Noise)
 ///   - `{hostname}/api/agents` — read-only agent list
-///   - `{hostname}/noise/ws` — Noise_IK-gated in code
 ///   - `{hostname}/register` — ITA-gated in code
 ///   - `{hostname}/ingress/replace` — ITA-gated in code
 pub async fn delete_cp_access_apps(
@@ -506,9 +505,7 @@ pub async fn delete_cp_access_apps(
         [
             "/health",
             "/api/agents",
-            "/api/v1/devices/trusted",
             "/api/v1/admin/export",
-            "/noise/ws",
             "/register",
             "/ingress/replace",
             // Legacy route from the old two-step Noise pre-handshake.
@@ -533,7 +530,7 @@ pub async fn delete_cp_access_apps(
 ///   - `{agent}.{domain}/owner` — fleet-GH-OIDC-gated in code
 ///   - `{agent}.{domain}/logs/*` — GH-OIDC-gated in code
 ///   - `{agent}.{domain}/noise/ws` — Noise_IK-gated in code
-///     against the CP-trusted paired device pubkey set
+///     against the agent-local paired device pubkey set
 ///   - `{label}.{agent}.{domain}` — workload URL, DD/agent-owned
 pub async fn delete_agent_access_apps(
     http: &Client,

@@ -168,12 +168,6 @@ pub struct Cp {
     pub scraper_shard_index: u64,
     pub scraper_shard_total: u64,
     pub ita: Ita,
-    /// Source-of-truth file for the device registry (JSON). Survives
-    /// CP restart; mutations fsync through to disk.
-    pub devices_path: std::path::PathBuf,
-    /// Where the Noise gateway persists its X25519 static private key
-    /// (tmpfs). Fresh per-boot when missing.
-    pub noise_key_path: std::path::PathBuf,
 }
 
 impl Cp {
@@ -207,20 +201,6 @@ impl Cp {
                 "DD_SCRAPER_SHARD_INDEX ({scraper_shard_index}) must be less than DD_SCRAPER_SHARD_TOTAL ({scraper_shard_total})"
             )));
         }
-        // `/tmp/` (tmpfs) is the only universally-writable path in the
-        // EE workload sandbox — the root FS is RO, and `/var/lib/` +
-        // `/data/` are both unavailable on the CP VM (no mount-data
-        // in the CP boot set; root FS read-only for workloads).
-        // Ephemeral across CP restarts is OK: the zero-downtime
-        // boot hydrates devices from the predecessor CP via
-        // `/api/v1/admin/export` before flipping DNS, so the on-disk
-        // copy is a cache, not source of truth.
-        let devices_path = std::env::var("DD_CP_DEVICES_PATH")
-            .unwrap_or_else(|_| "/tmp/devopsdefender/devices.json".into())
-            .into();
-        let noise_key_path = std::env::var("DD_NOISE_KEY_PATH")
-            .unwrap_or_else(|_| "/run/devopsdefender/noise.key".into())
-            .into();
         let ita = Ita::from_env(&common.env_label)?;
         Ok(Self {
             common,
@@ -232,8 +212,6 @@ impl Cp {
             scraper_shard_index,
             scraper_shard_total,
             ita,
-            devices_path,
-            noise_key_path,
         })
     }
 }
@@ -285,6 +263,9 @@ pub struct Agent {
     /// third parties that the code is sealed. Backward-compatible:
     /// unset = default (mutation endpoints enabled).
     pub confidential: bool,
+    /// Source-of-truth file for paired-device pubkeys enforced by this
+    /// agent's Noise gateway.
+    pub devices_path: std::path::PathBuf,
     /// Read-only oracle endpoints baked into the boot workload set.
     /// `apps/_infra/local-agents.sh` extracts DD-level `oracle`
     /// metadata from workload JSON and injects it here as base64 JSON
@@ -310,6 +291,9 @@ impl Agent {
             .unwrap_or_else(|_| "/var/lib/easyenclave/agent.sock".into());
         let extra_ingress = parse_extra_ingress()?;
         let confidential = parse_truthy("DD_CONFIDENTIAL");
+        let devices_path = std::env::var("DD_AGENT_DEVICES_PATH")
+            .unwrap_or_else(|_| "/var/lib/easyenclave/data/dd-agent/devices.json".into())
+            .into();
         let oracles = parse_oracles()?;
         let ita = Ita::from_env(&common.env_label)?;
         Ok(Self {
@@ -320,6 +304,7 @@ impl Agent {
             auth,
             extra_ingress,
             confidential,
+            devices_path,
             oracles,
         })
     }

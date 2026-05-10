@@ -117,34 +117,34 @@ it does not create a read-write terminal or any input path into the workload.
 
 DD separates terminal access by capability:
 
-- **Read-only workload terminals** show workload logs in the dd-shell xterm UI.
+- **Read-only workload terminals** show workload logs in the terminal UI.
   They are for oracle-style services where an operator should be able to inspect
   output without sending input, resizing a PTY, interrupting, or closing the
   process. Opening a read-only terminal is observation only, so it leaves the
   workload's user-facing integrity state clean.
-- **Read-write PTY sessions** are created inside `dd-shell`. They are for
+- **Read-write PTY sessions** are owned by `dd-sessiond`. They are for
   confidential shells and ZDR coding agents such as Codex or Claude. These
-  sessions are reconnectable and write encrypted transcript records under
-  `DD_SHELL_DIR`. A read-write PTY is controlled as soon as it exists because
-  the holder can send stdin, resize the terminal, and deliver terminal signals.
+  sessions are reconnectable and write encrypted transcript records. A
+  read-write PTY is controlled as soon as it exists because the holder can send
+  stdin, resize the terminal, and deliver terminal signals.
 
-The shell UI treats both as terminal views, but only read-write sessions get
-WebSocket input, resize, and close controls. Workloads do not opt into
-read-write access by putting metadata in `workload.json`; the boundary is the
-dd-shell API surface. Internally DD may still call this taint tracking, but the
-API/UI should speak in integrity terms: clean for observed-only logs,
-controlled for interactive PTYs or other human control paths.
+The native client treats both as terminal views, but only read-write sessions
+get input, resize, and close controls. Workloads do not opt into read-write
+access by putting metadata in `workload.json`; the boundary is the session
+protocol exposed by `dd-agent` over Noise.
+Internally DD may still call this taint tracking, but the API/UI should speak in
+integrity terms: clean for observed-only logs, controlled for interactive PTYs
+or other human control paths.
 
-The renderer uses vendored xterm assets and recognizes WezTerm-compatible
-notification escapes after the user grants browser notification permission:
+Native clients may recognize WezTerm-compatible notification escapes:
 
 ```sh
 printf '\033]9;%s\033\\' 'job finished'
 printf '\033]777;notify;%s;%s\033\\' 'oracle' 'new result available'
 ```
 
-For mobile web, this is the first step toward a PWA-style shell inbox: read-only
-workload cards, read-write Codex/Claude session cards, and push-backed
+The native desktop/mobile app is the target for shell inbox workflows:
+read-only workload cards, read-write Codex/Claude session cards, and
 notifications for long-running jobs.
 
 Per-workload ingress is **boot-time only** today. Workloads POSTed later via
@@ -175,7 +175,8 @@ inline in two places so both lifecycle points behave identically:
 | `busybox` | | ✅ | ✅ |
 | `cloudflared` | ✅ | ✅ | ✅ |
 | `dd-agent` | | ✅ | ✅ |
-| `dd-shell` | | ✅ | ✅ |
+| `dd-sessiond` | ✅ | ✅ | ✅ |
+| `dd-shell` | ✅ | ✅ | ✅ |
 | `human-readonly` | | ✅ | |
 | `dd-management` | ✅ | | |
 | `podman-static` | | ✅ | ✅ |
@@ -185,29 +186,23 @@ inline in two places so both lifecycle points behave identically:
 Additional examples:
 
 - `apps/human-readonly`: tiny preview-only read-only oracle. It emits logs for
-  dd-shell's read-only terminal, serves `/oracle.json` on port 8082, gets a
-  vanity `oracle.<agent-hostname>` address, and appears in the dashboards. It
-  is a shell workload recipe, not a `devopsdefender` binary subcommand.
+  native clients, serves `/oracle.json` on port 8082, gets a vanity
+  `oracle.<agent-hostname>` address, and appears in the dashboards. It is a
+  shell workload recipe, not a `devopsdefender` binary subcommand.
 - `apps/oracle-readonly`: standalone oracle example with the same scraper and
   vanity-address metadata; copy this shape into real oracle app repos.
-- `apps/confidential-shell`: runs dd-shell with
-  `DD_SHELL_DIR=/var/lib/easyenclave/data/dd-shell` so read-write PTY
-  transcript history survives on the workload disk.
-- `apps/codex-podman-shell`: alternative read-write shell workload. It exposes
-  the normal `-shell` label, stores encrypted dd-shell history under
-  `/var/lib/easyenclave/data/dd-shell`, and advertises a Codex recipe in the
-  shell UI. The normal shell recipe remains available. Launching Codex starts a
-  Podman-backed Node container with per-session home, workspace, cache, and tmp
-  directories supplied by dd-shell. The container installs `@openai/codex` on
-  first use, so `codex login` can be completed interactively from the browser
-  terminal. Session scratch is intentionally ephemeral in this first slice; the
-  encrypted transcript remains under `DD_SHELL_DIR`. Use this instead of
-  `dd-shell`, not alongside it, unless you give one of them a different
-  `hostname_label`.
+- `apps/confidential-shell`: legacy standalone shell workload for deployments
+  that still run the browser shell and PTY supervisor in one process. Scheduled
+  for removal once all clients use `dd-sessiond` over Noise.
+- `apps/codex-podman-shell`: legacy read-write shell workload. It exposes the
+  normal `-shell` label and carries an older self-contained Codex recipe path.
+  Scheduled for removal; new deployments should use `dd-sessiond`.
 
-CP stays slim: just `cloudflared` + `dd-management`. Preview agent VMs run a
-small read-only oracle plus agent + podman for CI to prove registration,
-scraping, vanity ingress, and dashboards end-to-end. Prod agent VMs use the
+CP stays slim: `cloudflared` + `dd-management` + static/web client assets as
+needed. It must not carry shell, log, transcript, or PTY bytes.
+Preview agent VMs run a small read-only oracle plus agent + podman for CI to
+prove registration, scraping, vanity ingress, and dashboards end-to-end. Prod
+agent VMs use the
 same CPU-only boot shape without demo workloads for now. `dd-local-dogfood`
 uses that same prod boot chain but is manually managed, sized larger by
 default, and not relaunched by CI.

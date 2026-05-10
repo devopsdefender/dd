@@ -153,6 +153,9 @@ build_config_iso() {
       DD_OWNER_ID="$EE_OWNER_ID" \
       DD_OWNER_KIND="$EE_OWNER_KIND" \
       bake "$REPO_ROOT/apps/dd-management/workload.json.tmpl"
+    DD_SESSIOND_DIR=/tmp/dd-shell \
+      DD_SESSIOND_SCRATCH_DIR=/tmp/dd-shell/sessions \
+      bake "$REPO_ROOT/apps/dd-sessiond/workload.json.tmpl"
     DD_DOMAIN="$DD_DOMAIN" \
       DD_HOSTNAME="$HOSTNAME" \
       DD_ENV="$ENV_LABEL" \

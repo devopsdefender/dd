@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, Uri};
-use axum::response::{Html, IntoResponse, Response};
+use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
@@ -29,7 +29,6 @@ use crate::error::{Error, Result};
 use crate::html::{self, shell};
 use crate::ita;
 use crate::metrics;
-use crate::noise_gateway;
 use crate::stonith;
 use crate::taint::IntegrityState;
 use crate::units::{AgentMode, UnitKind};
@@ -54,16 +53,6 @@ struct St {
     /// GH OIDC verifier for `/api/agents` callers (CI, humans). Same
     /// audience as dd-agent, shared owner claim.
     gh: Arc<crate::gh_oidc::Verifier>,
-    /// Paired device pubkeys. Mutations persist to disk and emit a
-    /// runtime view for the local ee-proxy workload.
-    devices: Arc<crate::devices::Store>,
-    /// TDX-quote + Noise-static-pubkey bundle. Surfaced by `/health`
-    /// as `{ noise: { quote_b64, pubkey_hex } }` so a bastion-app
-    /// bootstraps in one fetch (the former standalone `/attest`
-    /// endpoint was folded in). Shared `Arc` with the Noise gateway
-    /// module's handshake responder — one keypair / one quote per
-    /// boot.
-    attest: Arc<noise_gateway::attest::Attestor>,
 }
 
 pub async fn run() -> Result<()> {
@@ -138,10 +127,6 @@ pub async fn run() -> Result<()> {
     // safe to run unconditionally — it doesn't touch the poisonable
     // hostname at all.
     let store: Store = Arc::new(Mutex::new(HashMap::new()));
-    let trust = noise_gateway::new_trust_handle();
-    let devices = crate::devices::Store::load(cfg.devices_path.clone(), trust.clone())
-        .await
-        .map_err(|e| Error::Internal(format!("devices store load: {e}")))?;
     let predecessor_prefix = cf::cp_prefix(&cfg.common.env_label);
     let has_predecessor = match cf::list(&http, &cfg.cf).await {
         Ok(tunnels) => tunnels.iter().any(|t| {
@@ -159,7 +144,7 @@ pub async fn run() -> Result<()> {
         }
     };
     if has_predecessor {
-        hydrate_from_peer(&http, &cfg.hostname, &initial_token, &devices, &store).await;
+        hydrate_from_peer(&http, &cfg.hostname, &initial_token, &store).await;
     } else {
         eprintln!("cp: no predecessor {predecessor_prefix}* tunnel — skipping hydrate (fresh env)");
     }
@@ -336,25 +321,6 @@ pub async fn run() -> Result<()> {
 
     let gh = crate::gh_oidc::Verifier::new(cfg.common.owner.clone(), "dd-agent".into());
 
-    // Noise gateway state. `devices` already loaded in Stage 2 + any
-    // inherited records merged in; `trust` is already populated.
-    let attestor = Arc::new(
-        noise_gateway::attest::Attestor::load_or_mint(&cfg.noise_key_path)
-            .await
-            .map_err(|e| Error::Internal(format!("noise keypair: {e}")))?,
-    );
-    eprintln!("cp: noise_pubkey={}", hex::encode(attestor.public_key()));
-    let ee_token = std::env::var("EE_TOKEN").ok();
-    let upstream = Arc::new(noise_gateway::upstream::EeAgent::new(
-        std::path::PathBuf::from(noise_gateway::upstream::DEFAULT_EE_AGENT_SOCK),
-        ee_token,
-    ));
-    let ng_state = noise_gateway::State {
-        attest: attestor.clone(),
-        trust: trust.clone(),
-        upstream,
-    };
-
     let state = St {
         cfg: cfg.clone(),
         ee,
@@ -364,8 +330,6 @@ pub async fn run() -> Result<()> {
         verifier,
         cp_ita_token,
         gh,
-        devices,
-        attest: attestor,
     };
 
     let app = Router::new()
@@ -378,16 +342,9 @@ pub async fn run() -> Result<()> {
         .route("/agent/{id}", get(agent_detail))
         .route("/agent/{id}/logs/{app}", get(agent_logs))
         .route("/api/agents", get(api_agents))
-        .route("/api/v1/devices", post(create_device))
-        .route("/api/v1/devices/trusted", get(list_trusted_devices))
-        .route(
-            "/api/v1/devices/{pubkey}",
-            axum::routing::delete(revoke_device),
-        )
         .route("/api/v1/admin/export", get(export_state))
         .route("/admin/enroll", get(enroll_page))
-        .with_state(state)
-        .merge(noise_gateway::router(ng_state));
+        .with_state(state);
 
     let addr = format!("0.0.0.0:{}", cfg.common.port);
     eprintln!("cp: listening on {addr}");
@@ -435,8 +392,8 @@ fn spawn_cloudflared(token: String) {
     });
 }
 
-/// Try to pull devices + agent snapshot from a predecessor CP still
-/// serving at `hostname`. The CNAME hasn't flipped yet when this runs,
+/// Try to pull an agent snapshot from a predecessor CP still serving
+/// at `hostname`. The CNAME hasn't flipped yet when this runs,
 /// so any existing DNS record still points at the old CP's tunnel.
 /// Failures (first boot, DNS miss, old code, timeout) are logged and
 /// swallowed — deploy still proceeds as if fresh.
@@ -444,7 +401,6 @@ async fn hydrate_from_peer(
     http: &reqwest::Client,
     hostname: &str,
     ita_token: &str,
-    devices: &crate::devices::Store,
     agents: &Store,
 ) {
     let url = format!("https://{hostname}/api/v1/admin/export");
@@ -474,21 +430,6 @@ async fn hydrate_from_peer(
         }
     };
 
-    let mut imported_devices = 0usize;
-    if let Some(arr) = body.get("devices").cloned() {
-        match serde_json::from_value::<Vec<crate::devices::Device>>(arr) {
-            Ok(devs) => {
-                let n = devs.len();
-                if let Err(e) = devices.import_merge(devs).await {
-                    eprintln!("cp: hydrate devices.import_merge: {e}");
-                } else {
-                    imported_devices = n;
-                }
-            }
-            Err(e) => eprintln!("cp: hydrate devices shape mismatch: {e}"),
-        }
-    }
-
     let mut imported_agents = 0usize;
     if let Some(arr) = body.get("agents").cloned() {
         match serde_json::from_value::<Vec<collector::Agent>>(arr) {
@@ -503,9 +444,7 @@ async fn hydrate_from_peer(
         }
     }
 
-    eprintln!(
-        "cp: hydrated from {hostname} — {imported_devices} device(s), {imported_agents} agent(s)"
-    );
+    eprintln!("cp: hydrated from {hostname} — {imported_agents} agent(s)");
 }
 
 // ── Routes ──────────────────────────────────────────────────────────────
@@ -514,7 +453,6 @@ async fn health(
     State(s): State<St>,
     Query(q): Query<HashMap<String, String>>,
 ) -> Json<serde_json::Value> {
-    use base64::Engine as _;
     let agents = s.store.lock().await;
     let mut body = serde_json::json!({
         "ok": true,
@@ -526,21 +464,9 @@ async fn health(
         "agent_count": agents.len(),
         "healthy_count": agents.values().filter(|a| a.status == "healthy").count(),
         "oracle_count": agents.values().map(|a| a.oracles.len()).sum::<usize>(),
-        // Pre-Noise-handshake bundle — the former `GET /attest`
-        // endpoint folded in here so bastion-app bootstraps in one
-        // fetch and keep Cloudflare routing app count lower. Stable
-        // per boot; `Arc` clones are effectively free
-        // per request. `quote_b64` binds the raw Noise pubkey into
-        // TDX `report_data`, self-authenticating via ITA.
-        "noise": {
-            "quote_b64": base64::engine::general_purpose::STANDARD.encode(s.attest.quote()),
-            "pubkey_hex": hex::encode(s.attest.public_key()),
-        },
     });
     // `?verbose=1` folds in the CP's current ITA token so operators
-    // can inspect the CP VM's TDX measurement without a second route
-    // (the old `/cp/ita` + `/cp/attest` paths were removed; the
-    // TDX quote for the Noise pubkey is also above, unconditionally).
+    // can inspect the CP VM's TDX measurement without a second route.
     if q.get("verbose").map(|v| v.as_str()) == Some("1") {
         if let Some(obj) = body.as_object_mut() {
             obj.insert(
@@ -991,20 +917,17 @@ async fn fleet(State(s): State<St>, headers: HeaderMap, uri: Uri) -> Response {
     .into_response()
 }
 
-// ── Devices API ─────────────────────────────────────────────────────────
+// ── Enrollment broker ───────────────────────────────────────────────────
 //
-// Paired client-device X25519 pubkeys that the local Noise gateway
-// accepts during the handshake. POST + DELETE are behind DD browser
-// auth (admin enrollment); the machine-readable `/trusted` view is
-// gated in-code for cross-VM agent polls.
+// CP keeps enrollment stateless: it authenticates the browser and redirects
+// to a read-write agent. The agent stores and enforces paired-device trust.
 
 /// GET /api/v1/admin/export — full state snapshot for a successor CP
-/// to hydrate from during a zero-downtime deploy. Returns the
-/// device registry (full records, including revoked) and the live
+/// to hydrate from during a zero-downtime deploy. Returns the live
 /// agents HashMap. Gated in-code by a valid owner-scoped ITA Bearer
-/// (any attested enclave in the
-/// fleet can authenticate). The new CP calls this against the old
-/// CP's still-pointed DNS before flipping CNAMEs.
+/// (any attested enclave in the fleet can authenticate). The new CP
+/// calls this against the old CP's still-pointed DNS before flipping
+/// CNAMEs.
 async fn export_state(
     State(s): State<St>,
     headers: axum::http::HeaderMap,
@@ -1018,110 +941,16 @@ async fn export_state(
     // MRTD list once we stop rotating measurements every dev push.
     let _ = s.verifier.verify(bearer).await?;
 
-    let devices = s.devices.export_full().await;
     let agents: Vec<collector::Agent> = s.store.lock().await.values().cloned().collect();
     Ok(Json(serde_json::json!({
-        "devices": devices,
         "agents": agents,
     })))
 }
 
-/// GET /api/v1/devices/trusted — minimal, machine-readable view:
-/// `{ "pubkeys": ["<hex>", ...] }` with only currently-trusted keys.
-/// Reachable by cross-VM dd-agent callers over the public tunnel;
-/// gated in-code by the same three-way policy as
-/// `/api/agents`. This is the agent's poll target for mirroring the
-/// trust list into its in-memory `TrustHandle`.
-async fn list_trusted_devices(
-    State(s): State<St>,
-    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
-    headers: axum::http::HeaderMap,
-) -> Result<Json<serde_json::Value>> {
-    if !agents_auth_ok(&s, peer, &headers).await {
-        return Err(Error::Unauthorized);
-    }
-    let devices = s.devices.list().await;
-    let pubkeys: Vec<String> = devices
-        .into_iter()
-        .filter(|d| d.revoked_at_ms.is_none())
-        .map(|d| d.pubkey)
-        .collect();
-    Ok(Json(serde_json::json!({ "pubkeys": pubkeys })))
-}
-
-#[derive(Debug, Deserialize)]
-struct CreateDeviceReq {
-    pubkey: String,
-    label: String,
-}
-
-/// POST /api/v1/devices — enroll a device pubkey. Idempotent on
-/// pubkey: re-posting with a new label replaces the record in place.
-async fn create_device(
-    State(s): State<St>,
-    headers: HeaderMap,
-    uri: Uri,
-    Json(req): Json<CreateDeviceReq>,
-) -> Result<(axum::http::StatusCode, Json<crate::devices::Device>)> {
-    if require_browser_auth(&s, &headers, &uri).is_some() {
-        return Err(Error::Unauthorized);
-    }
-    let pubkey = req.pubkey.to_lowercase();
-    crate::devices::validate_hex_pubkey(&pubkey).map_err(|e| Error::BadRequest(e.to_string()))?;
-    let label = req.label.trim().to_string();
-    if label.is_empty() || label.len() > 128 {
-        return Err(Error::BadRequest("label must be 1..=128 chars".into()));
-    }
-    let device = crate::devices::Device {
-        pubkey,
-        label,
-        created_at_ms: chrono::Utc::now().timestamp_millis(),
-        revoked_at_ms: None,
-    };
-    s.devices
-        .upsert(device.clone())
-        .await
-        .map_err(|e| Error::Internal(format!("devices upsert: {e}")))?;
-    Ok((axum::http::StatusCode::CREATED, Json(device)))
-}
-
-/// DELETE /api/v1/devices/{pubkey} — revoke. Returns 404 if the
-/// pubkey isn't known or was already revoked.
-async fn revoke_device(
-    State(s): State<St>,
-    headers: HeaderMap,
-    uri: Uri,
-    Path(pubkey): Path<String>,
-) -> Result<Json<serde_json::Value>> {
-    if require_browser_auth(&s, &headers, &uri).is_some() {
-        return Err(Error::Unauthorized);
-    }
-    let pubkey = pubkey.to_lowercase();
-    let now = chrono::Utc::now().timestamp_millis();
-    let ok = s
-        .devices
-        .revoke(&pubkey, now)
-        .await
-        .map_err(|e| Error::Internal(format!("devices revoke: {e}")))?;
-    if !ok {
-        return Err(Error::NotFound);
-    }
-    Ok(Json(serde_json::json!({
-        "revoked": pubkey,
-        "at_ms": now,
-    })))
-}
-
 /// GET /admin/enroll?pubkey=…&label=… — human-facing confirmation
-/// page that a `bastion-app` (CLI or desktop) bounces the operator
-/// to. Behind DD browser auth: by the time this handler renders, the
-/// browser has a valid DD session cookie. The rendered page POSTs to `/api/v1/devices` with the
-/// same cookie via `credentials: "same-origin"`, completing the
-/// enrollment that headless clients can't do themselves.
-///
-/// Intent-over-GET: we deliberately don't enroll on page load —
-/// the user clicks Confirm so a copy-pasted link can't silently
-/// add a pubkey.
+/// broker. CP does not store paired-device trust; it redirects the
+/// authenticated browser to a healthy read-write agent, where the
+/// agent-local enrollment page performs the mutation.
 async fn enroll_page(
     State(s): State<St>,
     headers: HeaderMap,
@@ -1154,61 +983,26 @@ async fn enroll_page(
         .into_response();
     }
 
-    let short = &pubkey[..16];
-    let body = format!(
-        r#"<div class="card">
-  <h1>Enroll this device?</h1>
-  <div class="row"><span>Label</span><span>{label}</span></div>
-  <div class="row"><span>Pubkey</span><code>{short}…</code></div>
-  <p class="dim">
-    Confirming adds this X25519 public key to the trust list. Every
-    DD agent mirrors that list within 30&nbsp;s; thereafter, a client
-    holding the matching private key can open Noise_IK sessions to
-    any enclave in the fleet. Revoke any time with
-    <code>DELETE /api/v1/devices/&lt;pubkey&gt;</code>.
-  </p>
-  <p id="status"></p>
-  <div style="display:flex;gap:8px">
-    <button id="confirm" class="ok">Confirm</button>
-    <a href="/" class="btn">Cancel</a>
-  </div>
-</div>
-<script>
-  const pubkey = {pubkey_js};
-  const label  = {label_js};
-  const status = document.getElementById("status");
-  document.getElementById("confirm").addEventListener("click", async (ev) => {{
-    ev.target.disabled = true;
-    status.textContent = "Enrolling…";
-    try {{
-      const resp = await fetch("/api/v1/devices", {{
-        method: "POST",
-        credentials: "same-origin",
-        headers: {{ "Content-Type": "application/json" }},
-        body: JSON.stringify({{ pubkey, label }}),
-      }});
-      if (!resp.ok) {{
-        const text = await resp.text();
-        status.innerHTML = "<span class='err'>Enrollment failed: " +
-          resp.status + " " + text.slice(0, 400).replace(/</g, "&lt;") +
-          "</span>";
-        ev.target.disabled = false;
-        return;
-      }}
-      status.innerHTML = "<span class='ok'>Enrolled ✓ — you can close this tab</span>";
-    }} catch (e) {{
-      status.innerHTML = "<span class='err'>Network error: " + String(e) + "</span>";
-      ev.target.disabled = false;
-    }}
-  }});
-</script>"#,
-        label = html::escape(&label),
-        short = html::escape(short),
-        pubkey_js = serde_json::to_string(&pubkey).unwrap_or_else(|_| "\"\"".into()),
-        label_js = serde_json::to_string(&label).unwrap_or_else(|_| "\"\"".into()),
+    let agents = s.store.lock().await;
+    let Some(agent) = agents.values().find(|a| {
+        a.status == "healthy"
+            && a.agent_mode == AgentMode::ReadWrite
+            && a.agent_id != "control-plane"
+    }) else {
+        return Html(shell(
+            "Enroll device",
+            "",
+            r#"<div class="card"><h1>No read-write agent available</h1><p class="dim">Try again after an agent registers.</p></div>"#,
+        ))
+        .into_response();
+    };
+    let url = format!(
+        "https://{}/admin/enroll?pubkey={}&label={}",
+        agent.hostname,
+        urlencoding::encode(&pubkey),
+        urlencoding::encode(&label),
     );
-
-    Html(shell("Enroll device", "", &body)).into_response()
+    Redirect::temporary(&url).into_response()
 }
 
 /// GET /api/agents — JSON list of
