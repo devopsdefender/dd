@@ -123,7 +123,8 @@ Trust Authority, checks that the quote binds `noise.pubkey_hex` into TDX
 `shell.replay_session`, `shell.resize_session`, `shell.close_session`, and the
 streaming `shell.attach_session` method. Session control and PTY bytes flow
 inside the Noise transport to the agent and then to local `dd-sessiond`; the CP
-is used for enrollment and route discovery, not for shell/log/session bytes.
+is used for enrollment brokering and route discovery, not for shell/log/session
+bytes or paired-device trust storage.
 
 The bundled native CLI exercises that path directly:
 

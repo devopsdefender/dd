@@ -506,7 +506,6 @@ pub async fn delete_cp_access_apps(
         [
             "/health",
             "/api/agents",
-            "/api/v1/devices/trusted",
             "/api/v1/admin/export",
             "/noise/ws",
             "/register",
@@ -533,7 +532,7 @@ pub async fn delete_cp_access_apps(
 ///   - `{agent}.{domain}/owner` — fleet-GH-OIDC-gated in code
 ///   - `{agent}.{domain}/logs/*` — GH-OIDC-gated in code
 ///   - `{agent}.{domain}/noise/ws` — Noise_IK-gated in code
-///     against the CP-trusted paired device pubkey set
+///     against the agent-local paired device pubkey set
 ///   - `{label}.{agent}.{domain}` — workload URL, DD/agent-owned
 pub async fn delete_agent_access_apps(
     http: &Client,

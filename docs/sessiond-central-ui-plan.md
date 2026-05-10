@@ -10,7 +10,7 @@ dogfood VM or killing active Codex/Claude sessions.
 
 ```text
 native/web/mobile client
-  -> CP route discovery + device enrollment
+  -> CP route discovery + enrollment broker
   -> selected agent /noise/ws
   -> dd-sessiond Unix socket on that VM
   -> PTY + child process group
@@ -27,7 +27,7 @@ Agent VM responsibilities:
 
 Control-plane responsibilities:
 
-- Own device enrollment, revocation, policy, and route discovery.
+- Broker device enrollment and own route discovery.
 - Optionally serve static web/PWA assets.
 - Never carry shell, log, transcript, or PTY bytes.
 
@@ -131,7 +131,8 @@ Status:
 
 Start simple:
 
-- CP brokers enrollment and exposes current routes.
+- CP brokers enrollment by redirecting to the selected agent and exposes
+  current routes.
 - Agents hold the trusted device set they enforce for direct Noise sessions.
 - Native CLI/desktop/mobile clients use direct `/noise/ws` channels for
   session RPCs.
@@ -180,9 +181,9 @@ direct Noise, remove the old shell stack in this order:
    client speaks Noise directly.
 2. Remove old env compatibility names. `DD_SESSIOND_HISTORY_KEY` is the only
    transcript-key override; do not continue accepting `DD_SHELL_HISTORY_KEY`.
-3. Fix pairing durability without making CP a shell/session state owner. If CP
-   participates in enrollment, it should broker or cache trust material rather
-   than become the only durable source needed to reach shell sessions.
+3. Fix pairing durability without making CP a shell/session state owner. CP can
+   broker enrollment, but durable paired-device trust must live with the
+   enforcement point or an explicitly chosen non-CP store.
 4. Move web/PWA to direct Noise. Store a paired device key in browser storage,
    use CP only for enrollment and route discovery, then connect to the selected
    agent `/noise/ws` for session RPCs and PTY bytes.
@@ -203,8 +204,8 @@ Keep these pieces:
 - `dd-sessiond` and its local-only API. It is the session owner, not a fallback.
 - `shell_unavailable` on CP Noise endpoints. It is an explicit rejection for a
   process that intentionally has no local sessiond.
-- CP route discovery and enrollment. CP stays in the trust/control path, not
-  the shell data path or shell state path.
+- CP route discovery and enrollment brokering. CP stays in the trust/control
+  path, not the shell data path or shell state path.
 
 ## Risks And Open Questions
 
