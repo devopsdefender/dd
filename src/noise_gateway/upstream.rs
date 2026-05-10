@@ -126,12 +126,7 @@ impl Sessiond {
             "shell.create_session" => self.post_json("/api/sessions", &session_body(req)).await,
             "shell.replay_session" => {
                 let id = required_str(&req, "id")?;
-                let path = if let Some(max_bytes) = req.get("max_bytes").and_then(|v| v.as_u64()) {
-                    format!("/api/sessions/{id}/replay?max_bytes={max_bytes}")
-                } else {
-                    format!("/api/sessions/{id}/replay")
-                };
-                self.get_json(&path).await
+                self.get_json(&format!("/api/sessions/{id}/replay")).await
             }
             "shell.resize_session" => {
                 let id = required_str(&req, "id")?;

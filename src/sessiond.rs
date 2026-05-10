@@ -14,7 +14,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use axum::extract::{Path as AxPath, Query, State};
+use axum::extract::{Path as AxPath, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -41,8 +41,6 @@ const DEFAULT_DIR: &str = "/var/lib/devopsdefender/sessiond";
 const EE_DATA_MOUNT: &str = "/var/lib/easyenclave/data";
 const DATA_MOUNT_WAIT_SECS: u64 = 60;
 const RING_LIMIT: usize = 256 * 1024;
-const DEFAULT_REPLAY_MAX_BYTES: usize = 32 * 1024;
-const ABSOLUTE_REPLAY_MAX_BYTES: usize = 32 * 1024;
 
 const CODEX_PODMAN_RECIPE: &str = r#"#!/var/lib/easyenclave/bin/busybox sh
 set -eu
@@ -228,12 +226,6 @@ pub struct ResizeSession {
 pub struct ReplayResponse {
     pub id: String,
     pub bytes_b64: String,
-    pub truncated: bool,
-}
-
-#[derive(Deserialize)]
-struct ReplayQuery {
-    max_bytes: Option<usize>,
 }
 
 struct RecipeSeed {
@@ -421,17 +413,11 @@ async fn create_session(
 async fn replay_session(
     State(app): State<App>,
     AxPath(id): AxPath<String>,
-    Query(query): Query<ReplayQuery>,
 ) -> Result<Json<ReplayResponse>> {
-    let max_bytes = query
-        .max_bytes
-        .unwrap_or(DEFAULT_REPLAY_MAX_BYTES)
-        .min(ABSOLUTE_REPLAY_MAX_BYTES);
-    let (bytes, truncated) = app.store.replay(&id, max_bytes).await?;
+    let bytes = app.store.replay(&id).await?;
     Ok(Json(ReplayResponse {
         id,
         bytes_b64: base64::engine::general_purpose::STANDARD.encode(bytes),
-        truncated,
     }))
 }
 
@@ -957,14 +943,13 @@ impl TranscriptStore {
         Ok(())
     }
 
-    async fn replay(&self, id: &str, max_bytes: usize) -> Result<(Vec<u8>, bool)> {
+    async fn replay(&self, id: &str) -> Result<Vec<u8>> {
         let path = self.path(id);
         if !Path::new(&path).exists() {
             return Err(Error::NotFound);
         }
         let text = tokio::fs::read_to_string(path).await?;
         let mut out = Vec::new();
-        let mut truncated = false;
         for line in text.lines().filter(|l| !l.trim().is_empty()) {
             let plain = self.decrypt_line(line)?;
             let record: TranscriptRecord =
@@ -974,14 +959,9 @@ impl TranscriptStore {
                     .decode(record.data_b64)
                     .map_err(|e| Error::Internal(e.to_string()))?;
                 out.extend_from_slice(&bytes);
-                if out.len() > max_bytes {
-                    let drop_len = out.len() - max_bytes;
-                    out.drain(..drop_len);
-                    truncated = true;
-                }
             }
         }
-        Ok((out, truncated))
+        Ok(out)
     }
 
     fn path(&self, id: &str) -> PathBuf {
