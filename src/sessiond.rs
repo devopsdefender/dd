@@ -38,6 +38,8 @@ use crate::taint::IntegrityState;
 const DEFAULT_HTTP_ADDR: &str = "127.0.0.1:7683";
 const DEFAULT_ATTACH_ADDR: &str = "127.0.0.1:7684";
 const DEFAULT_DIR: &str = "/var/lib/devopsdefender/sessiond";
+const EE_DATA_MOUNT: &str = "/var/lib/easyenclave/data";
+const DATA_MOUNT_WAIT_SECS: u64 = 60;
 const RING_LIMIT: usize = 256 * 1024;
 
 const CODEX_PODMAN_RECIPE: &str = r#"#!/var/lib/easyenclave/bin/busybox sh
@@ -262,6 +264,7 @@ pub async fn run() -> Result<()> {
         .unwrap_or_else(|_| PathBuf::from(&dir).join("sessions"));
 
     let root = PathBuf::from(&dir);
+    wait_for_required_mounts(&[root.as_path(), scratch_root.as_path()]).await?;
     let store = TranscriptStore::new(root.clone()).await?;
     tokio::fs::create_dir_all(&scratch_root).await?;
     set_private_dir_permissions(&scratch_root).await?;
@@ -300,6 +303,40 @@ pub async fn run() -> Result<()> {
     axum::serve(listener, app.into_make_service())
         .await
         .map_err(|e| Error::Internal(e.to_string()))
+}
+
+async fn wait_for_required_mounts(paths: &[&Path]) -> Result<()> {
+    let data_mount = Path::new(EE_DATA_MOUNT);
+    if !paths.iter().any(|path| path.starts_with(data_mount)) {
+        return Ok(());
+    }
+
+    for attempt in 0..=DATA_MOUNT_WAIT_SECS {
+        if mount_present(data_mount).await? {
+            if attempt > 0 {
+                eprintln!("dd-sessiond: {EE_DATA_MOUNT} mounted after {attempt}s");
+            }
+            return Ok(());
+        }
+        if attempt == 0 {
+            eprintln!("dd-sessiond: waiting for {EE_DATA_MOUNT} before initializing storage");
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+
+    Err(Error::Internal(format!(
+        "{EE_DATA_MOUNT} did not mount within {DATA_MOUNT_WAIT_SECS}s"
+    )))
+}
+
+async fn mount_present(target: &Path) -> Result<bool> {
+    let mounts = tokio::fs::read_to_string("/proc/mounts").await?;
+    let target = target.to_string_lossy();
+    Ok(mounts.lines().any(|line| {
+        line.split_whitespace()
+            .nth(1)
+            .is_some_and(|mountpoint| mountpoint == target)
+    }))
 }
 
 async fn list_recipes(State(app): State<App>) -> Json<Vec<Recipe>> {
