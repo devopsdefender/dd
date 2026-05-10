@@ -46,8 +46,8 @@ Client responsibilities:
 - No CP relay or mailbox relay for shell/log/session bytes.
 - No browser/PWA shell client. Browser stays dashboard/enrollment only; the
   session client is native app/CLI.
-- No bundled client CLI in `dd`. Client core, CLI, and native app live in a
-  separate `dd-client` repo.
+- No bundled client CLI in `dd`. Client core, CLI, and native app live in
+  [`devopsdefender/dd-client`](https://github.com/devopsdefender/dd-client).
 
 ## Phase 1: One Disruptive Dogfood Upgrade
 
@@ -136,8 +136,8 @@ Start simple:
 - CP brokers enrollment by redirecting to the selected agent and exposes
   current routes.
 - Agents hold the trusted device set they enforce for direct Noise sessions.
-- Native CLI/desktop/mobile clients from `dd-client` use direct `/noise/ws` channels for
-  session RPCs.
+- Native CLI/desktop/mobile clients from `dd-client` use direct `/noise/ws`
+  channels for session RPCs.
 
 Then strengthen:
 
@@ -182,10 +182,10 @@ direct Noise, remove the old shell stack in this order:
 3. Fix pairing durability without making CP a shell/session state owner. CP can
    broker enrollment, but durable paired-device trust must live with the
    enforcement point or an explicitly chosen non-CP store.
-4. Create `dd-client` with shared client core, CLI, and native app. Store
-   paired device keys in OS secure storage, use CP only for enrollment and
-   route discovery, then connect to the selected agent `/noise/ws` for session
-   RPCs and PTY bytes.
+4. Build out [`devopsdefender/dd-client`](https://github.com/devopsdefender/dd-client)
+   with shared client core, CLI, and native app. Store paired device keys in OS
+   secure storage, use CP only for enrollment and route discovery, then connect
+   to the selected agent `/noise/ws` for session RPCs and PTY bytes.
 5. Delete server-side browser shell proxying. Remove `src/shell.rs` session
    proxy routes and WebSocket attach path once the native app covers
    create/attach/replay/resize/close.
