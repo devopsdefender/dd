@@ -1,10 +1,11 @@
 //! Multi-session shell sidecar.
 //!
-//! One process per VM, multiple reconnectable PTY sessions, read-only workload
-//! terminals, and encrypted append-only transcripts on disk.
+//! Transitional browser shell proxy.
+//!
+//! Native clients in `devopsdefender/dd-client` are the primary shell/session
+//! workflow. This sidecar keeps only the minimal browser attach surface while
+//! forwarding session state and PTY bytes to local `dd-sessiond`.
 
-use std::collections::HashMap;
-use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -13,27 +14,20 @@ use axum::http::{HeaderMap, StatusCode, Uri};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use base64::Engine as _;
 use futures_util::{SinkExt, StreamExt};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-use crate::ee::Ee;
 use crate::error::{Error, Result};
 use crate::html;
-use crate::oracle::OracleStatus;
-use crate::taint::IntegrityState;
-use crate::units::{self, AgentMode, ManagedUnit, UnitKind};
 
 const DEFAULT_PORT: u16 = 7681;
 
 #[derive(Clone)]
 struct App {
-    ee: Arc<Ee>,
     http: reqwest::Client,
-    agent_api: String,
     sessiond_http_url: String,
     sessiond_attach_addr: String,
     owner: crate::gh_oidc::Principal,
@@ -55,26 +49,6 @@ struct ResizeSession {
     rows: u16,
 }
 
-#[derive(Serialize)]
-struct ReplayResponse {
-    id: String,
-    bytes_b64: String,
-}
-
-#[derive(Serialize)]
-struct SystemProbe {
-    ok: bool,
-    status: String,
-    detail: Option<String>,
-    data: Option<serde_json::Value>,
-}
-
-#[derive(Serialize)]
-struct SystemStatus {
-    ee: SystemProbe,
-    agent: SystemProbe,
-}
-
 pub async fn run() -> Result<()> {
     let common = crate::config::Common::from_env()?;
     let domain = std::env::var("DD_CF_DOMAIN")
@@ -88,23 +62,17 @@ pub async fn run() -> Result<()> {
         .ok()
         .and_then(|s| s.parse::<u16>().ok())
         .unwrap_or(DEFAULT_PORT);
-    let ee_socket = std::env::var("DD_SHELL_EE_SOCKET")
-        .unwrap_or_else(|_| "/var/lib/easyenclave/agent.sock".into());
-    let agent_api = std::env::var("DD_SHELL_AGENT_API_URL")
-        .unwrap_or_else(|_| format!("http://127.0.0.1:{}", crate::cf::AGENT_API_PORT));
     let sessiond_http_url =
         std::env::var("DD_SESSIOND_HTTP_URL").unwrap_or_else(|_| "http://127.0.0.1:7683".into());
     let sessiond_attach_addr =
         std::env::var("DD_SESSIOND_ATTACH_ADDR").unwrap_or_else(|_| "127.0.0.1:7684".into());
 
     let app_state = App {
-        ee: Arc::new(Ee::new(ee_socket)),
         http: reqwest::Client::builder()
             .timeout(Duration::from_secs(3))
             .no_hickory_dns()
             .build()
             .unwrap_or_else(|_| crate::system_http_client()),
-        agent_api,
         sessiond_http_url,
         sessiond_attach_addr,
         owner: common.owner,
@@ -123,10 +91,6 @@ pub async fn run() -> Result<()> {
         .route("/api/sessions/{id}/replay", get(replay_session))
         .route("/api/sessions/{id}/resize", post(resize_session))
         .route("/api/sessions/{id}/close", post(close_session))
-        .route("/api/system", get(system_status))
-        .route("/api/oracles", get(list_oracles))
-        .route("/api/workloads", get(list_workloads))
-        .route("/api/workloads/{app}/replay", get(replay_workload))
         .route("/ws/sessions/{id}", get(attach_session))
         .with_state(app_state);
 
@@ -243,192 +207,6 @@ async fn replay_session(
         .map(Json)
 }
 
-async fn list_workloads(
-    State(app): State<App>,
-    headers: HeaderMap,
-    uri: Uri,
-) -> Result<Json<Vec<ManagedUnit>>> {
-    ensure_shell_auth(&app, &headers, &uri)?;
-    if let Ok(units) = agent_get(&app, "/api/units").await {
-        return Ok(Json(units));
-    }
-
-    let oracles = load_oracles(&app).await;
-    let mut oracle_by_app: HashMap<String, OracleStatus> = oracles
-        .into_iter()
-        .map(|oracle| (oracle.app_name.clone(), oracle))
-        .collect();
-    let mut workloads = Vec::new();
-
-    match app.ee.list().await {
-        Ok(list) => {
-            if let Some(deployments) = list["deployments"].as_array() {
-                for d in deployments {
-                    let Some(app_name) = d["app_name"].as_str() else {
-                        continue;
-                    };
-                    let id = d["id"].as_str().unwrap_or(app_name).to_string();
-                    let oracle = oracle_by_app.remove(app_name);
-                    let kind = units::kind_for_app(app_name);
-                    let mut capabilities = units::base_capabilities(kind);
-                    capabilities.push("logs".into());
-                    if oracle.is_some() {
-                        capabilities.push("oracle".into());
-                    }
-                    workloads.push(ManagedUnit {
-                        id: id.clone(),
-                        app_name: app_name.to_string(),
-                        title: units::title_for_app(app_name),
-                        kind,
-                        agent_mode: AgentMode::ReadWrite,
-                        agent_integrity_state: IntegrityState::Controlled,
-                        status: d["status"].as_str().unwrap_or("unknown").to_string(),
-                        image: non_empty_string(&d["image"]),
-                        started_at: non_empty_string(&d["started_at"]),
-                        error_message: non_empty_string(&d["error_message"]),
-                        source: units::source_for_app(app_name),
-                        log_line_count: workload_log_line_count(&app.ee, &id).await,
-                        capabilities,
-                        refs: fallback_refs(app_name, kind, oracle.as_ref()),
-                        oracle,
-                    });
-                }
-            }
-        }
-        Err(e) => {
-            eprintln!("dd-shell: ee workload probe unavailable: {e}");
-        }
-    }
-
-    workloads.extend(oracle_by_app.into_values().map(|oracle| ManagedUnit {
-        id: oracle.app_name.clone(),
-        app_name: oracle.app_name.clone(),
-        title: oracle.title.clone(),
-        kind: UnitKind::Workload,
-        agent_mode: AgentMode::ReadWrite,
-        agent_integrity_state: IntegrityState::Controlled,
-        status: oracle.status.clone(),
-        image: None,
-        started_at: None,
-        error_message: oracle.last_error.clone(),
-        source: units::source_for_app(&oracle.app_name),
-        log_line_count: 0,
-        capabilities: vec!["oracle".into()],
-        refs: fallback_refs(&oracle.app_name, UnitKind::Workload, Some(&oracle)),
-        oracle: Some(oracle),
-    }));
-    workloads.sort_by(|a, b| a.app_name.cmp(&b.app_name));
-    Ok(Json(workloads))
-}
-
-async fn workload_log_line_count(ee: &Ee, id: &str) -> usize {
-    match ee.logs(id).await {
-        Ok(logs) => logs["lines"].as_array().map(|a| a.len()).unwrap_or(0),
-        Err(e) => {
-            eprintln!("dd-shell: workload log probe unavailable for {id}: {e}");
-            0
-        }
-    }
-}
-
-fn fallback_refs(
-    app_name: &str,
-    _kind: UnitKind,
-    oracle: Option<&OracleStatus>,
-) -> Vec<units::UnitRef> {
-    let mut refs = units::source_for_app(app_name)
-        .map(|source| vec![units::ref_item("source", "source", source)])
-        .unwrap_or_default();
-    if let Some(oracle) = oracle {
-        if let Some(url) = &oracle.vanity_url {
-            refs.push(units::ref_item("url", "oracle", url.clone()));
-        }
-        refs.push(units::ref_item(
-            "url",
-            "oracle-local",
-            oracle.local_url.clone(),
-        ));
-    }
-    refs
-}
-
-fn non_empty_string(value: &serde_json::Value) -> Option<String> {
-    value
-        .as_str()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(String::from)
-}
-
-async fn list_oracles(
-    State(app): State<App>,
-    headers: HeaderMap,
-    uri: Uri,
-) -> Result<Json<Vec<OracleStatus>>> {
-    ensure_shell_auth(&app, &headers, &uri)?;
-    Ok(Json(load_oracles(&app).await))
-}
-
-async fn load_oracles(app: &App) -> Vec<OracleStatus> {
-    match agent_get(app, "/api/oracles").await {
-        Ok(oracles) => oracles,
-        Err(e) => {
-            eprintln!("dd-shell: agent oracle probe unavailable: {e}");
-            Vec::new()
-        }
-    }
-}
-
-async fn system_status(
-    State(app): State<App>,
-    headers: HeaderMap,
-    uri: Uri,
-) -> Result<Json<SystemStatus>> {
-    ensure_shell_auth(&app, &headers, &uri)?;
-    let ee = match app.ee.health().await {
-        Ok(data) => SystemProbe {
-            ok: true,
-            status: "healthy".into(),
-            detail: None,
-            data: Some(data),
-        },
-        Err(e) => SystemProbe {
-            ok: false,
-            status: "unavailable".into(),
-            detail: Some(e.to_string()),
-            data: None,
-        },
-    };
-    let agent = match agent_get(&app, "/health").await {
-        Ok(data) => SystemProbe {
-            ok: true,
-            status: "healthy".into(),
-            detail: None,
-            data: Some(data),
-        },
-        Err(e) => SystemProbe {
-            ok: false,
-            status: "unavailable".into(),
-            detail: Some(e.to_string()),
-            data: None,
-        },
-    };
-    Ok(Json(SystemStatus { ee, agent }))
-}
-
-async fn agent_get<T: DeserializeOwned>(app: &App, path: &str) -> Result<T> {
-    let url = format!("{}{}", app.agent_api.trim_end_matches('/'), path);
-    let resp = app.http.get(url).send().await?;
-    let status = resp.status();
-    if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        return Err(Error::Upstream(format!(
-            "agent api {path}: HTTP {status}: {body}"
-        )));
-    }
-    Ok(resp.json().await?)
-}
-
 async fn sessiond_get<T: DeserializeOwned>(app: &App, path: &str) -> Result<T> {
     let url = format!("{}{}", app.sessiond_http_url.trim_end_matches('/'), path);
     let resp = app.http.get(url).send().await?;
@@ -486,31 +264,6 @@ async fn decode_sessiond_empty(path: &str, resp: reqwest::Response) -> Result<St
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn replay_workload(
-    State(app): State<App>,
-    headers: HeaderMap,
-    uri: Uri,
-    AxPath(name): AxPath<String>,
-) -> Result<Json<ReplayResponse>> {
-    ensure_shell_auth(&app, &headers, &uri)?;
-    let list = app.ee.list().await?;
-    let id = list["deployments"]
-        .as_array()
-        .and_then(|a| {
-            a.iter()
-                .find(|d| d["app_name"].as_str() == Some(name.as_str()))
-        })
-        .and_then(|d| d["id"].as_str())
-        .map(String::from)
-        .ok_or(Error::NotFound)?;
-    let logs = app.ee.logs(&id).await?;
-    let bytes = workload_log_bytes(&logs);
-    Ok(Json(ReplayResponse {
-        id: name,
-        bytes_b64: base64::engine::general_purpose::STANDARD.encode(bytes),
-    }))
-}
-
 async fn close_session(
     State(app): State<App>,
     headers: HeaderMap,
@@ -519,17 +272,6 @@ async fn close_session(
 ) -> Result<StatusCode> {
     ensure_shell_auth(&app, &headers, &uri)?;
     sessiond_post_empty(&app, &format!("/api/sessions/{id}/close")).await
-}
-
-fn workload_log_bytes(logs: &serde_json::Value) -> Vec<u8> {
-    let mut out = Vec::new();
-    if let Some(lines) = logs["lines"].as_array() {
-        for line in lines.iter().filter_map(|v| v.as_str()) {
-            out.extend_from_slice(line.as_bytes());
-            out.extend_from_slice(b"\r\n");
-        }
-    }
-    out
 }
 
 async fn resize_session(
@@ -621,146 +363,64 @@ const SHELL_HTML: &str = r##"
 <link rel="stylesheet" href="/assets/xterm/xterm.css">
 <style>
 body { background:#0b0d12; color:#d7deea; overflow:hidden; }
-main { max-width:none; padding:0; height:100dvh; display:grid; grid-template-columns:320px 1fr; }
+main { max-width:none; padding:0; height:100dvh; display:grid; grid-template-columns:280px 1fr; }
 .sidebar { border-right:1px solid #252a36; background:#111520; overflow:auto; min-height:0; }
-.sidebar-top { position:sticky; top:0; z-index:5; background:#111520; padding:16px 16px 12px; border-bottom:1px solid #252a36; }
-.sidebar-scroll { padding:0 16px 16px; }
+.sidebar-top { padding:16px; border-bottom:1px solid #252a36; }
+.sidebar-scroll { padding:16px; }
 .terminal-wrap { height:100dvh; display:flex; flex-direction:column; min-width:0; }
-.toolbar { height:48px; border-bottom:1px solid #252a36; display:flex; align-items:center; gap:8px; padding:0 12px; background:#111520; }
+.toolbar { min-height:48px; border-bottom:1px solid #252a36; display:flex; align-items:center; gap:8px; padding:0 12px; background:#111520; }
 .term { flex:1; min-height:0; background:#05070a; overflow:hidden; padding:8px; }
 .term .xterm { height:100%; }
 .term .xterm-viewport { background:#05070a !important; }
-.groups { display:flex; flex-direction:column; gap:18px; }
-.group-title { position:sticky; top:126px; z-index:4; color:#8791a5; font-size:11px; font-weight:700; letter-spacing:0; text-transform:uppercase; margin:0 -16px 8px; padding:8px 16px; background:#111520; border-bottom:1px solid #202634; }
+.group-title { color:#8791a5; font-size:11px; font-weight:700; letter-spacing:0; text-transform:uppercase; margin:18px 0 8px; }
+.group-title:first-child { margin-top:0; }
 .sessions { display:flex; flex-direction:column; gap:8px; }
 .session { text-align:left; color:#d7deea; background:#171c29; border:1px solid #2b3242; border-radius:6px; padding:10px; cursor:pointer; }
 .session.active { border-color:#7aa2f7; }
 .session .name { font-weight:700; font-size:13px; }
 .session .meta { margin:3px 0 0; font-size:11px; color:#8791a5; }
-.session.readonly { background:#131720; border-style:dashed; }
 .recipe-launcher { display:grid; grid-template-columns:1fr auto; gap:8px; }
 .recipe-select { min-width:0; background:#0b0d12; color:#d7deea; border:1px solid #2b3242; border-radius:6px; padding:9px 10px; font:inherit; font-size:13px; }
 .recipe-summary { margin-top:8px; color:#8791a5; font-size:11px; line-height:1.4; }
-.badges { display:flex; flex-wrap:wrap; gap:5px; margin-top:7px; }
-.badge { border:1px solid #2b3242; border-radius:999px; padding:1px 6px; color:#8791a5; font-size:10px; }
-.badge.ok { color:#9ece6a; border-color:#334b35; }
-.badge.bad { color:#f7768e; border-color:#57323d; }
-.system { display:flex; flex-direction:column; gap:8px; }
-.metrics { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
-.metric { background:#171c29; border:1px solid #2b3242; border-radius:6px; padding:10px; min-width:0; }
-.metric .label { color:#8791a5; font-size:10px; text-transform:uppercase; }
-.metric .value { margin-top:3px; font-size:16px; font-weight:700; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-.metric .subvalue { margin-top:2px; color:#8791a5; font-size:11px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-.probe { color:#d7deea; background:#171c29; border:1px solid #2b3242; border-radius:6px; padding:10px; }
-.probe .row { display:flex; align-items:center; justify-content:space-between; gap:8px; }
-.probe .name { font-weight:700; font-size:13px; }
-.probe .meta { margin-top:3px; color:#8791a5; font-size:11px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-.pill { border:1px solid #2b3242; border-radius:999px; padding:2px 7px; color:#8791a5; font-size:11px; }
-.pill.ok { color:#9ece6a; border-color:#334b35; }
-.pill.bad { color:#f7768e; border-color:#57323d; }
-.notify-feed { display:flex; flex-direction:column; gap:8px; margin-top:8px; }
-.notify-item { background:#171c29; border:1px solid #2b3242; border-radius:6px; padding:9px 10px; min-width:0; }
-.notify-item .notify-title { display:flex; align-items:center; justify-content:space-between; gap:8px; font-size:12px; font-weight:700; }
-.notify-item .notify-time { color:#8791a5; font-size:10px; font-weight:400; white-space:nowrap; }
-.notify-item .notify-body { margin-top:3px; color:#8791a5; font-size:11px; line-height:1.4; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-.prompt-feed { display:flex; flex-direction:column; gap:8px; margin:0 0 12px; }
-.prompt-card { background:#171c29; border:1px solid #7aa2f7; border-radius:7px; padding:10px; min-width:0; box-shadow:0 0 0 1px #1d3358 inset; }
-.prompt-card .prompt-head { display:flex; align-items:center; justify-content:space-between; gap:8px; font-size:12px; font-weight:800; }
-.prompt-card .prompt-meta { color:#8791a5; font-size:10px; white-space:nowrap; }
-.prompt-card .prompt-body { margin-top:6px; color:#d7deea; font-size:12px; line-height:1.45; overflow-wrap:anywhere; }
-.prompt-actions { display:flex; flex-wrap:wrap; gap:6px; margin-top:9px; }
-.prompt-actions button { flex:1 1 64px; min-width:0; padding:8px 9px; font-size:12px; }
-.prompt-actions button.dismiss { flex:0 0 auto; color:#8791a5; background:#171c29; border:1px solid #2b3242; }
-.notify-badge { display:none; min-width:18px; height:18px; border-radius:999px; background:#7aa2f7; color:#05070a; font-size:11px; font-weight:800; align-items:center; justify-content:center; padding:0 5px; }
-.notify-badge.active { display:inline-flex; }
-.toast-stack { position:fixed; top:60px; right:14px; z-index:50; display:flex; flex-direction:column; gap:8px; width:min(340px, calc(100vw - 28px)); pointer-events:none; }
-.toast { background:#171c29; border:1px solid #3a4256; box-shadow:0 12px 30px #0008; border-radius:7px; padding:10px 12px; opacity:0; transform:translateY(-8px); transition:opacity .14s ease, transform .14s ease; }
-.toast.show { opacity:1; transform:translateY(0); }
-.toast .notify-title { font-size:12px; font-weight:800; }
-.toast .notify-body { margin-top:3px; color:#d7deea; font-size:12px; line-height:1.35; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-.filter { width:100%; margin-top:10px; box-sizing:border-box; background:#0b0d12; color:#d7deea; border:1px solid #2b3242; border-radius:6px; padding:9px 10px; font:inherit; font-size:13px; }
-.filter:focus { outline:1px solid #7aa2f7; border-color:#7aa2f7; }
+.status { color:#8791a5; font-size:12px; margin-left:auto; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .empty-mini { color:#8791a5; font-size:12px; padding:8px 2px; }
-.status { color:#8791a5; font-size:12px; margin-left:auto; }
 button.secondary { background:#252a36; color:#d7deea; }
-.mobile-tabs { display:none; }
-.panel { display:block; }
-.panel-close { display:none; }
+.mobile-toggle { display:none; }
 @media (max-width:860px) {
   main { display:block; height:100dvh; }
-  .terminal-wrap { height:calc(100dvh - 52px); padding-bottom:env(safe-area-inset-bottom); }
-  .toolbar { height:44px; padding:0 8px; gap:6px; }
+  .terminal-wrap { height:100dvh; padding-bottom:env(safe-area-inset-bottom); }
+  .toolbar { min-height:44px; padding:0 8px; gap:6px; }
   .toolbar button { padding:8px 10px; font-size:12px; }
-  .status { font-size:11px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .term { padding:4px; }
-  .sidebar { position:fixed; left:0; right:0; bottom:52px; z-index:20; height:min(64dvh,520px); border-right:0; border-top:1px solid #252a36; border-radius:10px 10px 0 0; transform:translateY(105%); transition:transform .16s ease; box-shadow:0 -16px 40px #0008; }
+  .sidebar { position:fixed; left:0; right:0; bottom:0; z-index:20; height:min(58dvh,460px); border-right:0; border-top:1px solid #252a36; border-radius:10px 10px 0 0; transform:translateY(105%); transition:transform .16s ease; box-shadow:0 -16px 40px #0008; }
   .sidebar.open { transform:translateY(0); }
-  .sidebar-top { padding:12px 14px; }
-  .sidebar-scroll { padding:0 14px 14px; }
-  .groups { gap:0; }
-  .panel { display:none; }
-  .panel.active { display:block; }
-  .group-title { position:static; margin:0 -14px 10px; padding:10px 14px; }
-  .panel-close { display:inline-flex; position:absolute; top:10px; right:12px; padding:7px 10px; }
-  .mobile-tabs { position:fixed; left:0; right:0; bottom:0; z-index:30; display:grid; grid-template-columns:repeat(4,1fr); height:52px; padding-bottom:env(safe-area-inset-bottom); background:#111520; border-top:1px solid #252a36; }
-  .mobile-tabs button { border:0; border-right:1px solid #252a36; border-radius:0; background:#111520; color:#8791a5; font-size:12px; padding:8px 4px; }
-  .mobile-tabs button.active { color:#d7deea; background:#171c29; }
-  .toast-stack { top:52px; right:8px; width:calc(100vw - 16px); }
+  .mobile-toggle { display:inline-flex; }
 }
 </style>
-<div class="sidebar">
+<div class="sidebar" id="sidebar">
   <div class="sidebar-top">
     <h1>Shell</h1>
-    <div class="sub">Observed logs and controlled PTYs</div>
-    <button class="secondary panel-close" id="panel-close">Done</button>
-    <input class="filter" id="workload-filter" type="search" placeholder="Filter workloads">
+    <div class="sub">Transitional browser attach. Use dd-client for the native workflow.</div>
   </div>
   <div class="sidebar-scroll">
-    <div class="groups">
-      <div class="panel active" data-panel="system">
-        <div class="group-title">System</div>
-        <div class="system" id="system"></div>
-        <div class="group-title">Prompt inbox</div>
-        <div class="prompt-feed" id="prompt-feed"></div>
-        <div class="group-title">Notifications</div>
-        <div class="notify-feed" id="notify-feed"></div>
-      </div>
-      <div class="panel" data-panel="recipes">
-        <div class="group-title">New session</div>
-        <div class="recipe-launcher">
-          <select class="recipe-select" id="recipe-select"></select>
-          <button class="secondary" id="launch-recipe">Start</button>
-        </div>
-        <div class="recipe-summary" id="recipe-summary"></div>
-      </div>
-      <div class="panel" data-panel="sessions">
-        <div class="group-title">Read-write sessions</div>
-        <div class="sessions" id="sessions"></div>
-      </div>
-      <div class="panel" data-panel="workloads">
-        <div class="group-title">Read-only workloads</div>
-        <div class="sessions" id="workloads"></div>
-      </div>
+    <div class="group-title">New session</div>
+    <div class="recipe-launcher">
+      <select class="recipe-select" id="recipe-select"></select>
+      <button class="secondary" id="launch-recipe">Start</button>
     </div>
+    <div class="recipe-summary" id="recipe-summary"></div>
+    <div class="group-title">Sessions</div>
+    <div class="sessions" id="sessions"></div>
   </div>
 </div>
 <div class="terminal-wrap">
   <div class="toolbar">
-    <button class="secondary" id="panels">Panels</button>
+    <button class="secondary mobile-toggle" id="panels">Sessions</button>
+    <button class="secondary" id="detach">Detach</button>
     <button class="secondary" id="close">Close session</button>
-    <button class="secondary" id="notify" title="Enable notifications">Notify</button>
-    <button class="secondary" id="notify-test" title="Send a test notification">Test</button>
-    <span class="notify-badge" id="notify-badge">0</span>
     <span class="status" id="status">No session</span>
   </div>
   <div class="term" id="terminal"></div>
-</div>
-<div class="toast-stack" id="toast-stack"></div>
-<div class="mobile-tabs" id="mobile-tabs">
-  <button data-panel="system" class="active">System</button>
-  <button data-panel="recipes">New</button>
-  <button data-panel="sessions">Sessions</button>
-  <button data-panel="workloads">Logs</button>
 </div>
 <script src="/assets/xterm/xterm.js"></script>
 <script src="/assets/xterm/addon-fit.js"></script>
@@ -792,21 +452,9 @@ term.loadAddon(fitAddon);
 term.open(terminalEl);
 terminalEl.addEventListener("click", () => term.focus());
 let current = null;
-let currentKind = null;
 let ws = null;
 let resizeTimer = null;
-let workloadTimer = null;
-let notifyMode = localStorage.getItem("dd-shell-notify") || "always";
-let oscBuffer = "";
 let cachedRecipes = [];
-let cachedWorkloads = [];
-let activePanel = "system";
-let notifications = loadNotificationHistory();
-let unreadNotifications = 0;
-let promptRequests = loadPromptHistory();
-let promptScanBuffer = "";
-let lastPromptKey = "";
-const decoder = new TextDecoder();
 
 async function api(path, opts) {
   const res = await fetch(path, opts);
@@ -816,29 +464,13 @@ async function api(path, opts) {
 }
 
 async function refresh() {
-  const [system, recipes, sessions, workloads] = await Promise.all([
-    api("/api/system").catch(() => null),
+  const [recipes, sessions] = await Promise.all([
     api("/api/recipes").catch(() => []),
-    api("/api/sessions").catch(() => []),
-    api("/api/workloads").catch(() => [])
+    api("/api/sessions").catch(() => [])
   ]);
-  renderSystem(system);
-  renderPromptFeed();
-  renderNotificationFeed();
   cachedRecipes = recipes;
   renderRecipes();
-  cachedWorkloads = workloads;
-  const root = document.getElementById("sessions");
-  root.innerHTML = "";
-  sessions.forEach(s => {
-    const el = document.createElement("button");
-    el.className = "session" + (currentKind === "session" && s.id === current ? " active" : "");
-    const recipe = s.recipe_title || s.recipe_id || "Shell";
-    el.innerHTML = `<div class="name">${escapeHtml(s.name)}</div><div class="meta">${escapeHtml(recipe)} - read-write - controlled - ${s.status} - ${new Date(s.updated_at*1000).toLocaleString()}</div>`;
-    el.onclick = () => attach(s.id);
-    root.appendChild(el);
-  });
-  renderWorkloads();
+  renderSessions(sessions);
 }
 
 function renderRecipes() {
@@ -871,266 +503,104 @@ function renderRecipeSummary() {
   document.getElementById("recipe-summary").textContent = recipe ? (recipe.description || recipe.command || recipe.id) : "";
 }
 
-function renderWorkloads() {
-  const workloadRoot = document.getElementById("workloads");
-  const query = document.getElementById("workload-filter").value.trim().toLowerCase();
-  const workloads = cachedWorkloads.filter(w => workloadSearchText(w).includes(query));
-  workloadRoot.innerHTML = "";
-  if (workloads.length === 0) {
-    workloadRoot.innerHTML = `<div class="empty-mini">${query ? "No matching workloads" : "No workloads"}</div>`;
+function renderSessions(sessions) {
+  const root = document.getElementById("sessions");
+  root.innerHTML = "";
+  if (!sessions.length) {
+    root.innerHTML = `<div class="empty-mini">No sessions</div>`;
     return;
   }
-  workloads.forEach(w => {
+  sessions.forEach(s => {
     const el = document.createElement("button");
-    el.className = "session readonly" + (currentKind === "workload" && w.app_name === current ? " active" : "");
-    el.innerHTML = workloadButtonHtml(w);
-    el.onclick = () => attachWorkload(w.app_name);
-    workloadRoot.appendChild(el);
+    el.className = "session" + (s.id === current ? " active" : "");
+    const recipe = s.recipe_title || s.recipe_id || "Shell";
+    el.innerHTML = `<div class="name">${escapeHtml(s.name)}</div><div class="meta">${escapeHtml(recipe)} - ${escapeHtml(s.status)} - ${new Date(s.updated_at*1000).toLocaleString()}</div>`;
+    el.onclick = () => attach(s.id);
+    root.appendChild(el);
   });
-}
-
-function workloadSearchText(w) {
-  const caps = Array.isArray(w.capabilities) ? w.capabilities.join(" ") : "";
-  const refs = Array.isArray(w.refs) ? w.refs.map(r => `${r.label} ${r.value}`).join(" ") : "";
-  return `${w.title || ""} ${w.app_name || ""} ${w.kind || ""} ${w.status || ""} ${caps} ${refs}`.toLowerCase();
-}
-
-function renderSystem(system) {
-  const root = document.getElementById("system");
-  if (!system) {
-    root.innerHTML = `<div class="probe"><div class="row"><span class="name">Shell</span><span class="pill bad">unknown</span></div><div class="meta">system probe unavailable</div></div>`;
-    return;
-  }
-  root.innerHTML = [
-    metricsHtml(system.agent && system.agent.data),
-    notificationHtml(),
-    probeHtml("EasyEnclave", system.ee),
-    probeHtml("Agent API", system.agent)
-  ].join("");
-}
-
-function metricsHtml(data) {
-  if (!data) return "";
-  const cpu = data.cpu_percent ?? data.cpu_pct;
-  const memUsed = data.memory_used_mb ?? data.mem_used_mb;
-  const memTotal = data.memory_total_mb ?? data.mem_total_mb;
-  const uptime = data.system_uptime_secs ?? data.uptime_secs;
-  const load = data.load_1m;
-  const disks = Array.isArray(data.disks) ? data.disks : [];
-  const nets = Array.isArray(data.nets) ? data.nets : [];
-  const disk = disks.find(d => d.mount === "/var/lib/easyenclave/data") || disks.find(d => d.mount === "/") || disks[0];
-  const netRx = nets.reduce((sum, n) => sum + Number(n.rx_bytes || 0), 0);
-  const netTx = nets.reduce((sum, n) => sum + Number(n.tx_bytes || 0), 0);
-  const netNames = nets.map(n => n.iface).filter(Boolean).join(", ");
-  return `<div class="metrics">
-    ${metricHtml("CPU", cpu === undefined ? "unknown" : `${cpu}%`, load === undefined ? "load unknown" : `load ${Number(load).toFixed(2)}`)}
-    ${metricHtml("Memory", memUsed === undefined || memTotal === undefined ? "unknown" : `${memUsed}/${memTotal} MB`, memTotal ? `${Math.round((memUsed / memTotal) * 100)}% used` : "")}
-    ${metricHtml("Disk", disk ? `${formatBytes(disk.used_bytes)} / ${formatBytes(disk.total_bytes)}` : "unknown", disk ? disk.mount : "no disk data")}
-    ${metricHtml("Network", nets.length ? `${formatBytes(netRx)} / ${formatBytes(netTx)}` : "unknown", nets.length ? `rx / tx ${netNames}` : "no net data")}
-    ${metricHtml("Uptime", uptime === undefined ? "unknown" : formatDuration(uptime), data.vm_name || "agent")}
-  </div>`;
-}
-
-function metricHtml(label, value, subvalue) {
-  return `<div class="metric"><div class="label">${escapeHtml(label)}</div><div class="value">${escapeHtml(value)}</div><div class="subvalue">${escapeHtml(subvalue || "")}</div></div>`;
-}
-
-function notificationHtml() {
-  const supported = "Notification" in window;
-  const permission = supported ? Notification.permission : "unavailable";
-  const enabled = supported && permission === "granted" && notifyMode !== "off";
-  const detail = supported ? `native ${permission}; in-app history on` : "in-app history on; native unavailable";
-  return `<div class="probe"><div class="row"><span class="name">Notifications</span><span class="pill ${enabled ? "ok" : "bad"}">${enabled ? "native" : "in-app"}</span></div><div class="meta">${escapeHtml(detail)}</div></div>`;
-}
-
-function renderNotificationFeed() {
-  const root = document.getElementById("notify-feed");
-  const badge = document.getElementById("notify-badge");
-  if (!root || !badge) return;
-  badge.textContent = unreadNotifications > 99 ? "99+" : String(unreadNotifications);
-  badge.classList.toggle("active", unreadNotifications > 0);
-  if (!notifications.length) {
-    root.innerHTML = `<div class="empty-mini">No notifications yet</div>`;
-    return;
-  }
-  root.innerHTML = notifications.slice(0, 12).map(n => `
-    <div class="notify-item">
-      <div class="notify-title"><span>${escapeHtml(n.title || "Shell")}</span><span class="notify-time">${escapeHtml(formatClock(n.ts))}</span></div>
-      <div class="notify-body">${escapeHtml(n.body || "")}</div>
-    </div>
-  `).join("");
-}
-
-function probeHtml(name, probe) {
-  const ok = probe && probe.ok;
-  const status = probe ? probe.status : "unknown";
-  const detail = probeSummary(probe);
-  return `<div class="probe"><div class="row"><span class="name">${escapeHtml(name)}</span><span class="pill ${ok ? "ok" : "bad"}">${escapeHtml(status)}</span></div><div class="meta">${escapeHtml(detail)}</div></div>`;
-}
-
-function probeSummary(probe) {
-  if (!probe) return "no data";
-  if (!probe.ok) return probe.detail || "unavailable";
-  const data = probe.data || {};
-  const count = data.workload_count ?? data.deployment_count ?? (Array.isArray(data.deployments) ? data.deployments.length : null);
-  const oracleCount = data.oracle_count ?? (Array.isArray(data.oracles) ? data.oracles.length : null);
-  const parts = [];
-  if (count !== null) parts.push(`${count} workload(s)`);
-  if (oracleCount !== null) parts.push(`${oracleCount} oracle(s)`);
-  if (data.integrity_state) parts.push(data.integrity_state);
-  if (data.vm_name) parts.push(data.vm_name);
-  return parts.length ? parts.join(" - ") : "reachable";
 }
 
 async function createSession(recipeId) {
   const body = recipeId ? {recipe_id: recipeId} : {};
   const r = await api("/api/sessions", {method:"POST", headers:{"content-type":"application/json"}, body:JSON.stringify(body)});
-  await refresh();
   closePanels();
+  await refresh();
   attach(r.id);
 }
 
 async function attach(id) {
-  if (ws) ws.close();
-  stopWorkloadRefresh();
+  detach();
   current = id;
-  currentKind = "session";
   term.reset();
   fitAndResize();
   term.focus();
-  document.getElementById("close").disabled = false;
-  document.getElementById("status").textContent = "Loading history";
+  setStatus("Loading history");
   const history = await api(`/api/sessions/${id}/replay`).catch(() => null);
   if (current !== id) return;
   if (history) await writeTerminal(base64Bytes(history.bytes_b64));
   term.scrollToBottom();
-  document.getElementById("status").textContent = "Connecting";
+  setStatus("Connecting");
   ws = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws/sessions/${id}?tail=false`);
   ws.binaryType = "arraybuffer";
   ws.onopen = () => {
-    document.getElementById("status").textContent = "Controlled PTY";
+    setStatus("Attached");
     fitAndResize();
     term.focus();
   };
-  ws.onmessage = ev => {
-    if (typeof ev.data === "string") {
-      scanTerminalOutput(ev.data);
-      term.write(ev.data);
-    } else {
-      const bytes = new Uint8Array(ev.data);
-      scanTerminalOutput(bytes);
-      term.write(bytes);
-    }
+  ws.onmessage = ev => term.write(typeof ev.data === "string" ? ev.data : new Uint8Array(ev.data));
+  ws.onclose = () => {
+    if (ws) ws = null;
+    setStatus(current ? "Detached" : "No session");
   };
-  ws.onclose = () => document.getElementById("status").textContent = "Detached";
   refresh();
-  closePanels();
-  setTimeout(() => term.focus(), 0);
 }
 
-async function attachWorkload(name) {
-  if (ws) ws.close();
-  ws = null;
-  stopWorkloadRefresh();
-  current = name;
-  currentKind = "workload";
-  await loadWorkload(name);
-  closePanels();
-  workloadTimer = setInterval(() => loadWorkload(name), 2000);
+function detach() {
+  if (ws) {
+    const closing = ws;
+    ws = null;
+    closing.close();
+  }
+  setStatus(current ? "Detached" : "No session");
 }
 
-async function loadWorkload(name) {
-  if (currentKind !== "workload" || current !== name) return;
+async function closeCurrent() {
+  if (!current) return;
+  const id = current;
+  detach();
+  current = null;
+  await api(`/api/sessions/${id}/close`, {method:"POST"});
   term.reset();
-  term.focus();
-  document.getElementById("close").disabled = true;
-  document.getElementById("status").textContent = "Loading read-only workload";
-  const [workloads, history] = await Promise.all([
-    api("/api/workloads").catch(() => []),
-    api(`/api/workloads/${encodeURIComponent(name)}/replay`).catch(() => null)
-  ]);
-  if (currentKind !== "workload" || current !== name) return;
-  const workload = workloads.find(w => w.app_name === name);
-  if (workload) await writeTerminal(workloadText(workload));
-  const logBytes = history ? base64Bytes(history.bytes_b64) : new Uint8Array();
-  if (logBytes.length) await writeTerminal(logBytes);
-  else await writeTerminal("No logs yet\r\n");
-  term.scrollToBottom();
-  document.getElementById("status").textContent = "Observed read-only";
-  refresh();
-}
-
-function stopWorkloadRefresh() {
-  if (workloadTimer) clearInterval(workloadTimer);
-  workloadTimer = null;
+  setStatus("Session closed");
+  await refresh();
 }
 
 term.onData(data => {
-  if (currentKind === "session" && ws && ws.readyState === WebSocket.OPEN) ws.send(data);
+  if (ws && ws.readyState === WebSocket.OPEN) ws.send(data);
 });
 
-document.getElementById("workload-filter").oninput = renderWorkloads;
-document.getElementById("recipe-select").onchange = renderRecipeSummary;
-document.getElementById("launch-recipe").onclick = () => {
-  const id = document.getElementById("recipe-select").value;
-  if (id) createSession(id);
-};
-document.getElementById("panels").onclick = () => openPanels(activePanel);
-document.getElementById("panel-close").onclick = closePanels;
-document.querySelectorAll("#mobile-tabs button").forEach(btn => {
-  btn.onclick = () => {
-    setPanel(btn.dataset.panel);
-    openPanels(btn.dataset.panel);
-  };
-});
-document.getElementById("close").onclick = async () => {
-  if (!current || currentKind !== "session") return;
-  await api(`/api/sessions/${current}/close`, {method:"POST"});
-  if (ws) ws.close();
-  await refresh();
-};
-document.getElementById("notify").onclick = async () => {
-  if (!("Notification" in window)) {
-    document.getElementById("status").textContent = "Notifications unavailable";
-    return;
-  }
-  const permission = Notification.permission === "default" ? await Notification.requestPermission() : Notification.permission;
-  if (permission === "granted") {
-    notifyMode = "always";
-    localStorage.setItem("dd-shell-notify", notifyMode);
-    document.getElementById("status").textContent = "Notifications enabled";
-    renderSystem(await api("/api/system").catch(() => null));
-  } else {
-    notifyMode = "off";
-    localStorage.setItem("dd-shell-notify", notifyMode);
-    document.getElementById("status").textContent = "Notifications blocked";
-    renderSystem(await api("/api/system").catch(() => null));
-  }
-};
-document.getElementById("notify-test").onclick = async () => {
-  if ("Notification" in window && Notification.permission !== "granted") {
-    await document.getElementById("notify").onclick();
-  }
-  notify("DD Shell", "notification test");
-};
-
-function setPanel(panel) {
-  activePanel = panel || "system";
-  document.querySelectorAll(".panel").forEach(el => el.classList.toggle("active", el.dataset.panel === activePanel));
-  document.querySelectorAll("#mobile-tabs button").forEach(el => el.classList.toggle("active", el.dataset.panel === activePanel));
-  if (activePanel === "system") {
-    unreadNotifications = 0;
-    renderNotificationFeed();
-  }
+function fitAndResize() {
+  try { fitAddon.fit(); } catch (_) {}
+  if (!current || !ws || ws.readyState !== WebSocket.OPEN) return;
+  clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(sendResize, 50);
 }
 
-function openPanels(panel) {
-  setPanel(panel || activePanel);
-  document.querySelector(".sidebar").classList.add("open");
+async function sendResize() {
+  if (!current || term.cols < 2 || term.rows < 1) return;
+  await fetch(`/api/sessions/${current}/resize`, {
+    method: "POST",
+    headers: {"content-type": "application/json"},
+    body: JSON.stringify({cols: term.cols, rows: term.rows})
+  }).catch(() => {});
+}
+
+function openPanels() {
+  document.getElementById("sidebar").classList.add("open");
 }
 
 function closePanels() {
-  document.querySelector(".sidebar").classList.remove("open");
+  document.getElementById("sidebar").classList.remove("open");
 }
 
 function base64Bytes(value) {
@@ -1139,304 +609,30 @@ function base64Bytes(value) {
   for (let i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
   return bytes;
 }
+
 function writeTerminal(data) {
   return new Promise(resolve => term.write(data, resolve));
 }
 
-function workloadButtonHtml(w) {
-  const oracle = w.oracle;
-  const caps = Array.isArray(w.capabilities) ? w.capabilities : [];
-  const badges = caps.map(cap => {
-    const cls = cap === "oracle" && oracle && oracle.status === "healthy" ? " ok" : cap === "oracle" && oracle && oracle.status === "error" ? " bad" : "";
-    return `<span class="badge${cls}">${escapeHtml(cap)}</span>`;
-  }).join("");
-  const status = oracle ? `${w.status} / oracle ${oracle.status}` : w.status;
-  const kind = String(w.kind || "workload").replaceAll("_", " ");
-  const logs = Number.isFinite(w.log_line_count) ? `${w.log_line_count} log line(s)` : "logs unknown";
-  return `<div class="name">${escapeHtml(w.title || w.app_name)}</div><div class="meta">${escapeHtml(kind)} - ${escapeHtml(w.agent_mode || "unknown")} - ${escapeHtml(w.agent_integrity_state || "unknown")} - ${escapeHtml(status)} - ${escapeHtml(logs)}</div><div class="badges">${badges}</div>`;
+function setStatus(value) {
+  document.getElementById("status").textContent = value;
 }
 
-function workloadText(w) {
-  const lines = [
-    `${w.title || w.app_name}`,
-    `app: ${w.app_name}`,
-    `kind: ${w.kind || "workload"}`,
-    `agent mode: ${w.agent_mode || "unknown"}`,
-    `agent integrity: ${w.agent_integrity_state || "unknown"}`,
-    `status: ${w.status}`,
-    `deployment id: ${w.id || "unknown"}`,
-    `source: ${w.source || "unknown"}`,
-    `image: ${w.image || "none"}`,
-    `started: ${w.started_at || "unknown"}`,
-    `log lines: ${w.log_line_count ?? 0}`
-  ];
-  if (w.error_message) lines.push(`error: ${w.error_message}`);
-  const refs = Array.isArray(w.refs) ? w.refs : [];
-  if (refs.length) {
-    lines.push("", "refs:");
-    refs.forEach(ref => lines.push(`${ref.label}: ${ref.value}`));
-  }
-  const o = w.oracle;
-  if (!o) {
-    lines.push("", "logs:");
-    return lines.join("\r\n") + "\r\n";
-  }
-  lines.push(
-    "",
-    "oracle:",
-    `title: ${o.title || o.app_name}`,
-    `status: ${o.status}`,
-    `last ok: ${o.last_ok || "never"}`,
-    `local: ${o.local_url || "unknown"}`
-  );
-  if (o.vanity_url) lines.push(`vanity: ${o.vanity_url}`);
-  if (o.last_error) lines.push(`error: ${o.last_error}`);
-  if (o.sample !== null && o.sample !== undefined) {
-    lines.push("", "sample:", JSON.stringify(o.sample, null, 2));
-  }
-  lines.push("", "logs:");
-  return lines.join("\r\n") + "\r\n";
-}
-function fitAndResize() {
-  try { fitAddon.fit(); } catch (_) {}
-  if (!current || currentKind !== "session") return;
-  clearTimeout(resizeTimer);
-  resizeTimer = setTimeout(sendResize, 50);
-}
-async function sendResize() {
-  if (!current || currentKind !== "session" || term.cols < 2 || term.rows < 1) return;
-  await fetch(`/api/sessions/${current}/resize`, {
-    method: "POST",
-    headers: {"content-type": "application/json"},
-    body: JSON.stringify({cols: term.cols, rows: term.rows})
-  }).catch(() => {});
-}
-function scanTerminalOutput(data) {
-  const text = scanNotifications(data);
-  scanPromptRequests(text);
-}
-function scanNotifications(data) {
-  const text = typeof data === "string" ? data : decoder.decode(data, {stream:true});
-  oscBuffer += text;
-  const pattern = /\x1b\](9;([^\x07\x1b]*?)|777;notify;([^\x07\x1b]*?);([^\x07\x1b]*?))(\x07|\x1b\\)/g;
-  let match;
-  let consumed = 0;
-  while ((match = pattern.exec(oscBuffer))) {
-    consumed = pattern.lastIndex;
-    if (match[2] !== undefined) notify("Shell", match[2]);
-    else notify(match[3] || "Shell", match[4] || "");
-  }
-  if (consumed > 0) oscBuffer = oscBuffer.slice(consumed);
-  if (oscBuffer.length > 8192) oscBuffer = oscBuffer.slice(-1024);
-  return text;
-}
-function scanPromptRequests(text) {
-  if (!text) return;
-  promptScanBuffer = stripAnsi(promptScanBuffer + text).replace(/\r/g, "\n");
-  if (promptScanBuffer.length > 12000) promptScanBuffer = promptScanBuffer.slice(-8000);
-  const lines = promptScanBuffer.split("\n").map(l => l.trim()).filter(Boolean);
-  const recent = lines.slice(-18);
-  const prompt = detectPrompt(recent);
-  if (!prompt) return;
-  const key = `${current || "none"}:${prompt.kind}:${prompt.body}:${prompt.actions.map(a => a.input).join("|")}`;
-  if (key === lastPromptKey || promptRequests.some(p => p.key === key)) return;
-  lastPromptKey = key;
-  const item = {
-    id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
-    key,
-    sessionId: current,
-    title: prompt.title,
-    body: prompt.body,
-    actions: prompt.actions,
-    ts: Date.now()
-  };
-  promptRequests.unshift(item);
-  promptRequests = promptRequests.slice(0, 20);
-  savePromptHistory();
-  renderPromptFeed();
-  notify("Codex needs input", prompt.body);
-}
-function detectPrompt(lines) {
-  const windowText = lines.join("\n");
-  if (!/\?|select|choose|enter|approve|allow|continue|proceed|permission|confirmation/i.test(windowText)) return null;
-  const numbered = [];
-  for (const line of lines.slice(-12)) {
-    const m = line.match(/^(?:\[?([1-9])\]?[\).:]?|([1-9])\s+[-:])\s+(.{1,90})$/);
-    if (!m) continue;
-    const n = m[1] || m[2];
-    const label = `${n}: ${(m[3] || "").trim()}`.slice(0, 44);
-    if (!numbered.some(a => a.input === `${n}\n`)) numbered.push({label, input:`${n}\n`});
-  }
-  if (numbered.length >= 2 && numbered.length <= 6) {
-    return {
-      kind: "numbered",
-      title: "Input requested",
-      body: summarizePrompt(lines),
-      actions: numbered
-    };
-  }
-  const yn = windowText.match(/\((?:y\/n|Y\/n|y\/N)\)|\[(?:y\/n|Y\/n|y\/N)\]/);
-  if (yn) {
-    return {
-      kind: "yesno",
-      title: "Confirmation requested",
-      body: summarizePrompt(lines),
-      actions: [{label:"Yes", input:"y\n"}, {label:"No", input:"n\n"}]
-    };
-  }
-  if (/press enter|enter for no changes|hit enter/i.test(windowText)) {
-    return {
-      kind: "enter",
-      title: "Continue requested",
-      body: summarizePrompt(lines),
-      actions: [{label:"Enter", input:"\n"}]
-    };
-  }
-  return null;
-}
-function summarizePrompt(lines) {
-  const useful = lines.slice(-8).filter(l => !/^[\s\-\|]+$/.test(l));
-  return useful.join(" ").replace(/\s+/g, " ").slice(0, 220);
-}
-function renderPromptFeed() {
-  const root = document.getElementById("prompt-feed");
-  if (!root) return;
-  const pending = promptRequests.filter(p => !p.dismissed).slice(0, 8);
-  if (!pending.length) {
-    root.innerHTML = `<div class="empty-mini">No pending prompts</div>`;
-    return;
-  }
-  root.innerHTML = pending.map(p => `
-    <div class="prompt-card">
-      <div class="prompt-head"><span>${escapeHtml(p.title || "Input requested")}</span><span class="prompt-meta">${escapeHtml(formatClock(p.ts))}</span></div>
-      <div class="prompt-body">${escapeHtml(p.body || "")}</div>
-      <div class="prompt-actions">
-        ${(p.actions || []).map((a, i) => `<button class="secondary" data-prompt="${escapeHtml(p.id)}" data-action="${i}">${escapeHtml(a.label || "Send")}</button>`).join("")}
-        <button class="dismiss" data-dismiss-prompt="${escapeHtml(p.id)}">Dismiss</button>
-      </div>
-    </div>
-  `).join("");
-  root.querySelectorAll("button[data-action]").forEach(btn => {
-    btn.onclick = () => sendPromptInput(btn.dataset.prompt, Number(btn.dataset.action));
-  });
-  root.querySelectorAll("button[data-dismiss-prompt]").forEach(btn => {
-    btn.onclick = () => dismissPrompt(btn.dataset.dismissPrompt);
-  });
-}
-function sendPromptInput(id, actionIndex) {
-  if (currentKind !== "session" || !ws || ws.readyState !== WebSocket.OPEN) {
-    document.getElementById("status").textContent = "Attach session before sending prompt input";
-    return;
-  }
-  const prompt = promptRequests.find(p => p.id === id);
-  const action = prompt && Array.isArray(prompt.actions) ? prompt.actions[actionIndex] : null;
-  if (!action) return;
-  const input = action.input || "";
-  ws.send(input || "");
-  dismissPrompt(id);
-  document.getElementById("status").textContent = "Prompt input sent";
-}
-function dismissPrompt(id) {
-  const prompt = promptRequests.find(p => p.id === id);
-  if (prompt) prompt.dismissed = true;
-  savePromptHistory();
-  renderPromptFeed();
-}
-function stripAnsi(value) {
-  return value
-    .replace(/\x1b\][^\x07]*(?:\x07|\x1b\\)/g, "")
-    .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "");
-}
-function notify(title, body) {
-  const item = {
-    title: title || "Shell",
-    body: body || "",
-    ts: Date.now()
-  };
-  notifications.unshift(item);
-  notifications = notifications.slice(0, 50);
-  saveNotificationHistory();
-  if (activePanel !== "system") unreadNotifications++;
-  renderNotificationFeed();
-  showToast(item);
-  deliverNativeNotification(item);
-}
-async function deliverNativeNotification(item) {
-  if (!("Notification" in window) || Notification.permission !== "granted") return;
-  if (notifyMode !== "always" && document.hasFocus()) return;
-  const title = item.title || "DD Shell";
-  const body = item.body || "";
-  const tag = current ? `dd-shell-${current}` : "dd-shell";
-  const n = new Notification(title, {body, tag});
-  n.onclick = () => { window.focus(); term.focus(); n.close(); };
-}
-function loadNotificationHistory() {
-  try {
-    const parsed = JSON.parse(localStorage.getItem("dd-shell-notifications") || "[]");
-    return Array.isArray(parsed) ? parsed.slice(0, 50) : [];
-  } catch (_) {
-    return [];
-  }
-}
-function saveNotificationHistory() {
-  localStorage.setItem("dd-shell-notifications", JSON.stringify(notifications.slice(0, 50)));
-}
-function loadPromptHistory() {
-  try {
-    const parsed = JSON.parse(localStorage.getItem("dd-shell-prompts") || "[]");
-    return Array.isArray(parsed) ? parsed.slice(0, 20) : [];
-  } catch (_) {
-    return [];
-  }
-}
-function savePromptHistory() {
-  localStorage.setItem("dd-shell-prompts", JSON.stringify(promptRequests.slice(0, 20)));
-}
-function showToast(item) {
-  const stack = document.getElementById("toast-stack");
-  if (!stack) return;
-  const el = document.createElement("div");
-  el.className = "toast";
-  el.innerHTML = `<div class="notify-title">${escapeHtml(item.title || "Shell")}</div><div class="notify-body">${escapeHtml(item.body || "")}</div>`;
-  stack.prepend(el);
-  requestAnimationFrame(() => el.classList.add("show"));
-  setTimeout(() => {
-    el.classList.remove("show");
-    setTimeout(() => el.remove(), 180);
-  }, 4200);
-}
-function formatClock(ts) {
-  try {
-    return new Date(ts).toLocaleTimeString([], {hour:"2-digit", minute:"2-digit"});
-  } catch (_) {
-    return "";
-  }
-}
-function formatBytes(value) {
-  const n = Number(value || 0);
-  if (n < 1024) return `${n} B`;
-  const units = ["KB", "MB", "GB", "TB"];
-  let v = n / 1024;
-  let i = 0;
-  while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
-  return `${v >= 10 ? v.toFixed(0) : v.toFixed(1)} ${units[i]}`;
-}
-function formatDuration(value) {
-  let s = Number(value || 0);
-  const d = Math.floor(s / 86400); s %= 86400;
-  const h = Math.floor(s / 3600); s %= 3600;
-  const m = Math.floor(s / 60);
-  if (d) return `${d}d ${h}h`;
-  if (h) return `${h}h ${m}m`;
-  return `${m}m`;
-}
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
+
+document.getElementById("recipe-select").onchange = renderRecipeSummary;
+document.getElementById("launch-recipe").onclick = () => {
+  const id = document.getElementById("recipe-select").value;
+  if (id) createSession(id);
+};
+document.getElementById("panels").onclick = openPanels;
+document.getElementById("detach").onclick = detach;
+document.getElementById("close").onclick = closeCurrent;
 window.addEventListener("resize", fitAndResize);
 new ResizeObserver(fitAndResize).observe(terminalEl);
 refresh();
-setPanel("system");
 fitAndResize();
 term.focus();
 </script>
