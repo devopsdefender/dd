@@ -46,6 +46,8 @@ Client responsibilities:
 - No CP relay or mailbox relay for shell/log/session bytes.
 - No browser/PWA shell client. Browser stays dashboard/enrollment only; the
   session client is native app/CLI.
+- No bundled client CLI in `dd`. Client core, CLI, and native app live in a
+  separate `dd-client` repo.
 
 ## Phase 1: One Disruptive Dogfood Upgrade
 
@@ -134,13 +136,14 @@ Start simple:
 - CP brokers enrollment by redirecting to the selected agent and exposes
   current routes.
 - Agents hold the trusted device set they enforce for direct Noise sessions.
-- Native CLI/desktop/mobile clients use direct `/noise/ws` channels for
+- Native CLI/desktop/mobile clients from `dd-client` use direct `/noise/ws` channels for
   session RPCs.
 
 Then strengthen:
 
 - Clients verify the agent quote and pin the attested Noise public key.
-- Native desktop/mobile apps reuse the same direct agent Noise path as the CLI.
+- Native desktop/mobile apps reuse the same direct agent Noise path as the
+  `dd-client` CLI.
 - Pairing survives CP redeploys without putting shell/session state in CP. A
   paired native/web/mobile client must not need to re-pair just because preview
   or production CP was relaunched.
@@ -153,12 +156,8 @@ Implemented first slice:
   `shell.close_session` JSON requests over Noise.
 - `shell.attach_session` returns one JSON ack, then switches the same Noise
   session into encrypted raw PTY byte streaming to local `dd-sessiond`.
-- Native `exec`, `replay`, `resize`, and `close` commands exercise the same
-  direct Noise path as `shell`.
 - CP does not run the client Noise gateway. Agent Noise endpoints wire the
   sessiond adapter in.
-- The native CLI appraises the agent quote with Intel Trust Authority by
-  default and requires an explicit insecure flag for local preview/dev.
 
 Design rule:
 
@@ -183,10 +182,10 @@ direct Noise, remove the old shell stack in this order:
 3. Fix pairing durability without making CP a shell/session state owner. CP can
    broker enrollment, but durable paired-device trust must live with the
    enforcement point or an explicitly chosen non-CP store.
-4. Extract the native Noise client into a reusable app library. Store paired
-   device keys in OS secure storage, use CP only for enrollment and route
-   discovery, then connect to the selected agent `/noise/ws` for session RPCs
-   and PTY bytes.
+4. Create `dd-client` with shared client core, CLI, and native app. Store
+   paired device keys in OS secure storage, use CP only for enrollment and
+   route discovery, then connect to the selected agent `/noise/ws` for session
+   RPCs and PTY bytes.
 5. Delete server-side browser shell proxying. Remove `src/shell.rs` session
    proxy routes and WebSocket attach path once the native app covers
    create/attach/replay/resize/close.
@@ -216,5 +215,5 @@ Keep these pieces:
   into `dd-sessiond`.
 - Where durable paired-device trust should live if CP only brokers enrollment
   and route discovery.
-- Native app shell: Tauri/Rust shell versus platform-native UI around the Rust
-  Noise client library.
+- Native app shell: Tauri/Rust shell versus platform-native UI around the
+  `dd-client` Rust core.

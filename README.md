@@ -126,21 +126,9 @@ inside the Noise transport to the agent and then to local `dd-sessiond`; the CP
 is used for enrollment brokering and route discovery, not for shell/log/session
 bytes or paired-device trust storage.
 
-The bundled native CLI exercises that path directly:
-
-```bash
-devopsdefender noise keygen --cp-url https://app.devopsdefender.com --label laptop
-devopsdefender noise recipes --url https://<agent-host>
-devopsdefender noise shell --url https://<agent-host> --recipe shell
-```
-
-The CLI uses `DD_ITA_API_KEY` for quote appraisal. `DD_ITA_BASE_URL`,
-`DD_ITA_JWKS_URL`, and `DD_ITA_ISSUER` default to Intel Trust Authority's
-production endpoints and can be overridden when needed. Local preview/dev runs
-without ITA credentials must pass `--insecure-skip-quote-verify` explicitly.
-
-The native CLI is the protocol reference for the future desktop/mobile app. The
-browser remains dashboard and enrollment UI only; the existing cookie-auth
+Client implementations live outside this repo, starting with the planned
+`dd-client` repo that will contain the shared client core, CLI, and native app.
+The browser remains dashboard and enrollment UI only; the existing cookie-auth
 browser shell is transitional compatibility while the native app takes over
 shell/session workflows.
 
