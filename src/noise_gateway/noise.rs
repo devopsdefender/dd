@@ -123,15 +123,7 @@ async fn handle(mut socket: WebSocket, state: AppState) -> anyhow::Result<()> {
                 }
             }
             Ok(allowlist::Method::ShellAttachSession) => {
-                let Some(shell) = &state.shell else {
-                    let resp = serde_json::json!({
-                        "error": "shell_unavailable",
-                        "detail": "this Noise endpoint is not connected to sessiond",
-                    });
-                    send_encrypted_json(&mut transport, &mut socket, &resp).await?;
-                    continue;
-                };
-                match shell.attach_stream(request).await {
+                match state.shell.attach_stream(request).await {
                     Ok((ack, stream)) => {
                         send_encrypted_json(&mut transport, &mut socket, &ack).await?;
                         bridge_attach(&mut transport, &mut socket, stream).await?;
@@ -155,15 +147,7 @@ async fn handle(mut socket: WebSocket, state: AppState) -> anyhow::Result<()> {
                 | allowlist::Method::ShellReplaySession
                 | allowlist::Method::ShellResizeSession,
             ) => {
-                let Some(shell) = &state.shell else {
-                    let resp = serde_json::json!({
-                        "error": "shell_unavailable",
-                        "detail": "this Noise endpoint is not connected to sessiond",
-                    });
-                    send_encrypted_json(&mut transport, &mut socket, &resp).await?;
-                    continue;
-                };
-                let response = shell.call(request).await.unwrap_or_else(|e| {
+                let response = state.shell.call(request).await.unwrap_or_else(|e| {
                     serde_json::json!({
                         "error": "shell_failed",
                         "detail": e.to_string(),

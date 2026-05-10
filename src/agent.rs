@@ -192,7 +192,7 @@ pub async fn run() -> Result<()> {
         attest: attestor.clone(),
         trust,
         upstream,
-        shell: Some(shell),
+        shell,
     };
 
     let gh = gh_oidc::Verifier::new(cfg.common.owner.clone(), "dd-agent".into());
