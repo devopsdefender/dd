@@ -168,9 +168,6 @@ pub struct Cp {
     pub scraper_shard_index: u64,
     pub scraper_shard_total: u64,
     pub ita: Ita,
-    /// Where the Noise gateway persists its X25519 static private key
-    /// (tmpfs). Fresh per-boot when missing.
-    pub noise_key_path: std::path::PathBuf,
 }
 
 impl Cp {
@@ -204,9 +201,6 @@ impl Cp {
                 "DD_SCRAPER_SHARD_INDEX ({scraper_shard_index}) must be less than DD_SCRAPER_SHARD_TOTAL ({scraper_shard_total})"
             )));
         }
-        let noise_key_path = std::env::var("DD_NOISE_KEY_PATH")
-            .unwrap_or_else(|_| "/run/devopsdefender/noise.key".into())
-            .into();
         let ita = Ita::from_env(&common.env_label)?;
         Ok(Self {
             common,
@@ -218,7 +212,6 @@ impl Cp {
             scraper_shard_index,
             scraper_shard_total,
             ita,
-            noise_key_path,
         })
     }
 }

@@ -29,7 +29,6 @@ use crate::error::{Error, Result};
 use crate::html::{self, shell};
 use crate::ita;
 use crate::metrics;
-use crate::noise_gateway;
 use crate::stonith;
 use crate::taint::IntegrityState;
 use crate::units::{AgentMode, UnitKind};
@@ -54,13 +53,6 @@ struct St {
     /// GH OIDC verifier for `/api/agents` callers (CI, humans). Same
     /// audience as dd-agent, shared owner claim.
     gh: Arc<crate::gh_oidc::Verifier>,
-    /// TDX-quote + Noise-static-pubkey bundle. Surfaced by `/health`
-    /// as `{ noise: { quote_b64, pubkey_hex } }` so a bastion-app
-    /// bootstraps in one fetch (the former standalone `/attest`
-    /// endpoint was folded in). Shared `Arc` with the Noise gateway
-    /// module's handshake responder — one keypair / one quote per
-    /// boot.
-    attest: Arc<noise_gateway::attest::Attestor>,
 }
 
 pub async fn run() -> Result<()> {
@@ -135,7 +127,6 @@ pub async fn run() -> Result<()> {
     // safe to run unconditionally — it doesn't touch the poisonable
     // hostname at all.
     let store: Store = Arc::new(Mutex::new(HashMap::new()));
-    let trust = noise_gateway::new_trust_handle();
     let predecessor_prefix = cf::cp_prefix(&cfg.common.env_label);
     let has_predecessor = match cf::list(&http, &cfg.cf).await {
         Ok(tunnels) => tunnels.iter().any(|t| {
@@ -330,26 +321,6 @@ pub async fn run() -> Result<()> {
 
     let gh = crate::gh_oidc::Verifier::new(cfg.common.owner.clone(), "dd-agent".into());
 
-    // CP serves its attested Noise key for management methods, but it does not
-    // own paired-device trust for shell sessions.
-    let attestor = Arc::new(
-        noise_gateway::attest::Attestor::load_or_mint(&cfg.noise_key_path)
-            .await
-            .map_err(|e| Error::Internal(format!("noise keypair: {e}")))?,
-    );
-    eprintln!("cp: noise_pubkey={}", hex::encode(attestor.public_key()));
-    let ee_token = std::env::var("EE_TOKEN").ok();
-    let upstream = Arc::new(noise_gateway::upstream::EeAgent::new(
-        std::path::PathBuf::from(noise_gateway::upstream::DEFAULT_EE_AGENT_SOCK),
-        ee_token,
-    ));
-    let ng_state = noise_gateway::State {
-        attest: attestor.clone(),
-        trust: trust.clone(),
-        upstream,
-        shell: None,
-    };
-
     let state = St {
         cfg: cfg.clone(),
         ee,
@@ -359,7 +330,6 @@ pub async fn run() -> Result<()> {
         verifier,
         cp_ita_token,
         gh,
-        attest: attestor,
     };
 
     let app = Router::new()
@@ -374,8 +344,7 @@ pub async fn run() -> Result<()> {
         .route("/api/agents", get(api_agents))
         .route("/api/v1/admin/export", get(export_state))
         .route("/admin/enroll", get(enroll_page))
-        .with_state(state)
-        .merge(noise_gateway::router(ng_state));
+        .with_state(state);
 
     let addr = format!("0.0.0.0:{}", cfg.common.port);
     eprintln!("cp: listening on {addr}");
@@ -484,7 +453,6 @@ async fn health(
     State(s): State<St>,
     Query(q): Query<HashMap<String, String>>,
 ) -> Json<serde_json::Value> {
-    use base64::Engine as _;
     let agents = s.store.lock().await;
     let mut body = serde_json::json!({
         "ok": true,
@@ -496,21 +464,9 @@ async fn health(
         "agent_count": agents.len(),
         "healthy_count": agents.values().filter(|a| a.status == "healthy").count(),
         "oracle_count": agents.values().map(|a| a.oracles.len()).sum::<usize>(),
-        // Pre-Noise-handshake bundle — the former `GET /attest`
-        // endpoint folded in here so bastion-app bootstraps in one
-        // fetch and keep Cloudflare routing app count lower. Stable
-        // per boot; `Arc` clones are effectively free
-        // per request. `quote_b64` binds the raw Noise pubkey into
-        // TDX `report_data`, self-authenticating via ITA.
-        "noise": {
-            "quote_b64": base64::engine::general_purpose::STANDARD.encode(s.attest.quote()),
-            "pubkey_hex": hex::encode(s.attest.public_key()),
-        },
     });
     // `?verbose=1` folds in the CP's current ITA token so operators
-    // can inspect the CP VM's TDX measurement without a second route
-    // (the old `/cp/ita` + `/cp/attest` paths were removed; the
-    // TDX quote for the Noise pubkey is also above, unconditionally).
+    // can inspect the CP VM's TDX measurement without a second route.
     if q.get("verbose").map(|v| v.as_str()) == Some("1") {
         if let Some(obj) = body.as_object_mut() {
             obj.insert(

@@ -156,8 +156,8 @@ Implemented first slice:
   session into encrypted raw PTY byte streaming to local `dd-sessiond`.
 - Native `exec`, `replay`, `resize`, and `close` commands exercise the same
   direct Noise path as `shell`.
-- CP Noise endpoints reject shell methods because they have no local sessiond
-  adapter; agent Noise endpoints wire the adapter in.
+- CP does not run the client Noise gateway. Agent Noise endpoints wire the
+  sessiond adapter in.
 - The native CLI appraises the agent quote with Intel Trust Authority by
   default and requires an explicit insecure flag for local preview/dev.
 
@@ -202,8 +202,6 @@ direct Noise, remove the old shell stack in this order:
 Keep these pieces:
 
 - `dd-sessiond` and its local-only API. It is the session owner, not a fallback.
-- `shell_unavailable` on CP Noise endpoints. It is an explicit rejection for a
-  process that intentionally has no local sessiond.
 - CP route discovery and enrollment brokering. CP stays in the trust/control
   path, not the shell data path or shell state path.
 
