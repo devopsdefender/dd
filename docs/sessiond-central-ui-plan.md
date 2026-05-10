@@ -1,4 +1,4 @@
-# Sessiond + Central UI Plan
+# Sessiond + Native Client Plan
 
 ## Goal
 
@@ -9,7 +9,7 @@ dogfood VM or killing active Codex/Claude sessions.
 ## Target Shape
 
 ```text
-native/web/mobile client
+native desktop/mobile client or CLI
   -> CP route discovery + enrollment broker
   -> selected agent /noise/ws
   -> dd-sessiond Unix socket on that VM
@@ -28,7 +28,7 @@ Agent VM responsibilities:
 Control-plane responsibilities:
 
 - Broker device enrollment and own route discovery.
-- Optionally serve static web/PWA assets.
+- Serve dashboards and enrollment broker pages.
 - Never carry shell, log, transcript, or PTY bytes.
 
 Client responsibilities:
@@ -44,8 +44,8 @@ Client responsibilities:
 - No fallback in-process PTY mode once `dd-sessiond` is introduced.
 - No CRIU/checkpoint work in the first implementation.
 - No CP relay or mailbox relay for shell/log/session bytes.
-- No full browser-side Noise handshake in the first implementation; native CLI
-  is the first protocol exerciser.
+- No browser/PWA shell client. Browser stays dashboard/enrollment only; the
+  session client is native app/CLI.
 
 ## Phase 1: One Disruptive Dogfood Upgrade
 
@@ -99,33 +99,33 @@ Implementation notes:
 - The existing `/api/sessions*` and `/ws/sessions*` browser-shell routes are
   transitional compatibility only. Do not add new client features there.
 
-## Phase 3: Client-Side Fleet UI
+## Phase 3: Native Fleet Client
 
-Move active shell UI development to clients that use CP only for routes and
-agent/device policy.
+Move active shell UI development to a native client that uses CP only for
+routes and enrollment brokering.
 
 Deliverables:
 
 - Add CP route discovery for agent sessions.
-- UI lists sessions for the selected agent.
-- UI can create, attach, input, resize, close, and replay sessions by opening
-  Noise directly to the selected agent.
+- Native app lists sessions for the selected agent.
+- Native app can create, attach, input, resize, close, and replay sessions by
+  opening Noise directly to the selected agent.
 - Desktop terminal view remains raw PTY-first.
-- Mobile view can add touch controls, smart sizing, and assistant-style
-  rendering without changing agent-side session ownership.
-- The web/PWA interface becomes a client implementation of the same protocol,
-  not a server-side shell proxy.
+- Mobile app can add touch controls, smart sizing, notifications, and
+  assistant-style rendering without changing agent-side session ownership.
+- Browser dashboard links users to the native app/CLI enrollment and route
+  discovery flows; it does not become a terminal/PWA client.
 
 Acceptance:
 
-- Updating static web/PWA assets updates the browser shell/mobile experience.
-- No dogfood agent restart is needed for UI-only changes.
+- Updating the native app updates shell/mobile experience without changing the
+  agent/sessiond data plane.
 - Active dogfood Codex sessions survive web/client updates.
 
 Status:
 
 - Not implemented in the first branch slice. The native CLI is present so the
-  client-side protocol can be tested before replacing the browser shell proxy.
+  client protocol can be tested before replacing the browser shell proxy.
 
 ## Phase 4: Auth, Attestation, And Noise
 
@@ -140,8 +140,7 @@ Start simple:
 Then strengthen:
 
 - Clients verify the agent quote and pin the attested Noise public key.
-- Browser/PWA uses the same direct agent Noise path once the browser crypto or
-  WASM client is in place.
+- Native desktop/mobile apps reuse the same direct agent Noise path as the CLI.
 - Pairing survives CP redeploys without putting shell/session state in CP. A
   paired native/web/mobile client must not need to re-pair just because preview
   or production CP was relaunched.
@@ -177,21 +176,22 @@ Now that the durable session owner is `dd-sessiond` and native clients can use
 direct Noise, remove the old shell stack in this order:
 
 1. Freeze cookie-auth browser shell APIs. Treat `src/shell.rs` routes
-   `/api/sessions*` and `/ws/sessions*` as compatibility only until the web/PWA
-   client speaks Noise directly.
+   `/api/sessions*` and `/ws/sessions*` as compatibility only until the native
+   app covers the workflow.
 2. Remove old env compatibility names. `DD_SESSIOND_HISTORY_KEY` is the only
    transcript-key override; do not continue accepting `DD_SHELL_HISTORY_KEY`.
 3. Fix pairing durability without making CP a shell/session state owner. CP can
    broker enrollment, but durable paired-device trust must live with the
    enforcement point or an explicitly chosen non-CP store.
-4. Move web/PWA to direct Noise. Store a paired device key in browser storage,
-   use CP only for enrollment and route discovery, then connect to the selected
-   agent `/noise/ws` for session RPCs and PTY bytes.
+4. Extract the native Noise client into a reusable app library. Store paired
+   device keys in OS secure storage, use CP only for enrollment and route
+   discovery, then connect to the selected agent `/noise/ws` for session RPCs
+   and PTY bytes.
 5. Delete server-side browser shell proxying. Remove `src/shell.rs` session
-   proxy routes and WebSocket attach path once the web/PWA client uses direct
-   Noise. Keep only static asset serving if needed.
+   proxy routes and WebSocket attach path once the native app covers
+   create/attach/replay/resize/close.
 6. Delete agent HTTP session proxying. Remove `/api/sessions*` from `dd-agent`
-   once native and web clients both use Noise for session control.
+   once native clients use Noise for session control.
 7. Retire legacy combined shell workloads. Remove `apps/confidential-shell` and
    `apps/codex-podman-shell` after deploy templates and docs no longer point at
    `DD_MODE=shell` as a PTY owner.
@@ -214,6 +214,7 @@ Keep these pieces:
   passing or exec handoff.
 - How much of the existing transcript encryption format should move unchanged
   into `dd-sessiond`.
-- Browser Noise implementation choice: pure JS library versus small WASM client.
 - Where durable paired-device trust should live if CP only brokers enrollment
   and route discovery.
+- Native app shell: Tauri/Rust shell versus platform-native UI around the Rust
+  Noise client library.

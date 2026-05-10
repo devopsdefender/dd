@@ -139,11 +139,10 @@ The CLI uses `DD_ITA_API_KEY` for quote appraisal. `DD_ITA_BASE_URL`,
 production endpoints and can be overridden when needed. Local preview/dev runs
 without ITA credentials must pass `--insecure-skip-quote-verify` explicitly.
 
-The web shell should become another client implementation of the same protocol:
-it keeps its own paired device identity, asks CP for current routes, and opens
-Noise directly to the agent. The existing cookie-auth browser shell is
-transitional compatibility only; new shell features should land on the Noise
-client protocol.
+The native CLI is the protocol reference for the future desktop/mobile app. The
+browser remains dashboard and enrollment UI only; the existing cookie-auth
+browser shell is transitional compatibility while the native app takes over
+shell/session workflows.
 
 ## STONITH
 

@@ -132,7 +132,8 @@ The shell UI treats both as terminal views, but only read-write sessions get
 WebSocket input, resize, and close controls. Workloads do not opt into
 read-write access by putting metadata in `workload.json`; the boundary is the
 session protocol exposed by `dd-agent` over Noise. The current browser shell
-HTTP/WebSocket APIs are compatibility only while web/PWA moves to direct Noise.
+HTTP/WebSocket APIs are compatibility only while the native app takes over
+shell/session workflows.
 Internally DD may still call this taint tracking, but the API/UI should speak in
 integrity terms: clean for observed-only logs, controlled for interactive PTYs
 or other human control paths.
@@ -145,8 +146,8 @@ printf '\033]9;%s\033\\' 'job finished'
 printf '\033]777;notify;%s;%s\033\\' 'oracle' 'new result available'
 ```
 
-For mobile web, this is the first step toward a PWA-style shell inbox: read-only
-workload cards, read-write Codex/Claude session cards, and push-backed
+The native desktop/mobile app is the target for shell inbox workflows:
+read-only workload cards, read-write Codex/Claude session cards, and
 notifications for long-running jobs.
 
 Per-workload ingress is **boot-time only** today. Workloads POSTed later via
