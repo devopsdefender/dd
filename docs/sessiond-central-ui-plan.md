@@ -131,8 +131,8 @@ Status:
 
 Start simple:
 
-- CP enrolls paired device public keys and exposes current routes.
-- Agents poll CP for the trusted device set and route/policy freshness.
+- CP brokers enrollment and exposes current routes.
+- Agents hold the trusted device set they enforce for direct Noise sessions.
 - Native CLI/desktop/mobile clients use direct `/noise/ws` channels for
   session RPCs.
 
@@ -141,8 +141,9 @@ Then strengthen:
 - Clients verify the agent quote and pin the attested Noise public key.
 - Browser/PWA uses the same direct agent Noise path once the browser crypto or
   WASM client is in place.
-- CP device enrollment survives CP redeploys. A paired native/web/mobile client
-  must not need to re-pair just because preview or production CP was relaunched.
+- Pairing survives CP redeploys without putting shell/session state in CP. A
+  paired native/web/mobile client must not need to re-pair just because preview
+  or production CP was relaunched.
 
 Implemented first slice:
 
@@ -163,7 +164,7 @@ Design rule:
 
 ```text
 remote clients never trust naked tunnel DNS
-remote clients trust CP-enrolled device identity plus attested agent keys
+remote clients trust paired device identity plus attested agent keys
 CP is route/key authority only, never a session data plane
 dd-sessiond stays local-only
 dd-agent is the policy/encryption gateway
@@ -179,9 +180,9 @@ direct Noise, remove the old shell stack in this order:
    client speaks Noise directly.
 2. Remove old env compatibility names. `DD_SESSIOND_HISTORY_KEY` is the only
    transcript-key override; do not continue accepting `DD_SHELL_HISTORY_KEY`.
-3. Fix device registry durability. The CP trusted-device list must survive a
-   CP redeploy or hydrate from the predecessor before clients depend on it as
-   their only route to shell sessions.
+3. Fix pairing durability without making CP a shell/session state owner. If CP
+   participates in enrollment, it should broker or cache trust material rather
+   than become the only durable source needed to reach shell sessions.
 4. Move web/PWA to direct Noise. Store a paired device key in browser storage,
    use CP only for enrollment and route discovery, then connect to the selected
    agent `/noise/ws` for session RPCs and PTY bytes.
@@ -203,7 +204,7 @@ Keep these pieces:
 - `shell_unavailable` on CP Noise endpoints. It is an explicit rejection for a
   process that intentionally has no local sessiond.
 - CP route discovery and enrollment. CP stays in the trust/control path, not
-  the shell data path.
+  the shell data path or shell state path.
 
 ## Risks And Open Questions
 
@@ -215,5 +216,5 @@ Keep these pieces:
 - How much of the existing transcript encryption format should move unchanged
   into `dd-sessiond`.
 - Browser Noise implementation choice: pure JS library versus small WASM client.
-- CP device registry storage location for SSH/preview CPs, since `/tmp` state
-  can disappear across relaunches if predecessor hydration does not run.
+- Where durable paired-device trust should live if CP only brokers enrollment
+  and route discovery.
