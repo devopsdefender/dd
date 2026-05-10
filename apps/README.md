@@ -175,7 +175,8 @@ inline in two places so both lifecycle points behave identically:
 | `busybox` | | ✅ | ✅ |
 | `cloudflared` | ✅ | ✅ | ✅ |
 | `dd-agent` | | ✅ | ✅ |
-| `dd-shell` | | ✅ | ✅ |
+| `dd-sessiond` | ✅ | ✅ | ✅ |
+| `dd-shell` | ✅ | ✅ | ✅ |
 | `human-readonly` | | ✅ | |
 | `dd-management` | ✅ | | |
 | `podman-static` | | ✅ | ✅ |
@@ -190,24 +191,16 @@ Additional examples:
   is a shell workload recipe, not a `devopsdefender` binary subcommand.
 - `apps/oracle-readonly`: standalone oracle example with the same scraper and
   vanity-address metadata; copy this shape into real oracle app repos.
-- `apps/confidential-shell`: runs dd-shell with
-  `DD_SHELL_DIR=/var/lib/easyenclave/data/dd-shell` so read-write PTY
-  transcript history survives on the workload disk.
+- `apps/confidential-shell`: legacy standalone shell workload for deployments
+  that still run the browser shell and PTY supervisor in one process.
 - `apps/codex-podman-shell`: alternative read-write shell workload. It exposes
-  the normal `-shell` label, stores encrypted dd-shell history under
-  `/var/lib/easyenclave/data/dd-shell`, and advertises a Codex recipe in the
-  shell UI. The normal shell recipe remains available. Launching Codex starts a
-  Podman-backed Node container with per-session home, workspace, cache, and tmp
-  directories supplied by dd-shell. The container installs `@openai/codex` on
-  first use, so `codex login` can be completed interactively from the browser
-  terminal. Session scratch is intentionally ephemeral in this first slice; the
-  encrypted transcript remains under `DD_SHELL_DIR`. Use this instead of
-  `dd-shell`, not alongside it, unless you give one of them a different
-  `hostname_label`.
+  the normal `-shell` label and carries an older self-contained Codex recipe
+  path. New deployments should prefer `dd-sessiond` + `dd-shell`.
 
-CP stays slim: just `cloudflared` + `dd-management`. Preview agent VMs run a
-small read-only oracle plus agent + podman for CI to prove registration,
-scraping, vanity ingress, and dashboards end-to-end. Prod agent VMs use the
+CP stays slim: `cloudflared` + `dd-management` + `dd-sessiond` + `dd-shell`.
+Preview agent VMs run a small read-only oracle plus agent + podman for CI to
+prove registration, scraping, vanity ingress, and dashboards end-to-end. Prod
+agent VMs use the
 same CPU-only boot shape without demo workloads for now. `dd-local-dogfood`
 uses that same prod boot chain but is manually managed, sized larger by
 default, and not relaunched by CI.

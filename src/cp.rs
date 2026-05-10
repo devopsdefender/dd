@@ -353,6 +353,7 @@ pub async fn run() -> Result<()> {
         attest: attestor.clone(),
         trust: trust.clone(),
         upstream,
+        shell: None,
     };
 
     let state = St {

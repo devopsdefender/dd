@@ -3,16 +3,15 @@
 ## Goal
 
 Accept one disruptive dogfood redeploy to install a durable session backend.
-After that, iterate on desktop/mobile/assistant UI from the centralized fleet
-control plane without restarting the dogfood VM or killing active Codex/Claude
-sessions.
+After that, iterate on desktop/mobile/assistant clients without restarting the
+dogfood VM or killing active Codex/Claude sessions.
 
 ## Target Shape
 
 ```text
-browser
-  -> app.devopsdefender.com fleet UI
-  -> selected agent session gateway
+native/web/mobile client
+  -> CP route discovery + device enrollment
+  -> selected agent /noise/ws
   -> dd-sessiond Unix socket on that VM
   -> PTY + child process group
 ```
@@ -28,10 +27,15 @@ Agent VM responsibilities:
 
 Control-plane responsibilities:
 
-- Serve the desktop shell UI, mobile UI, and Claude-style assistant view.
-- Let users select a fleet agent and attach to sessions through that agent's
-  session API.
-- Ship UI updates via normal CP/web deploys, without touching agent VMs.
+- Own device enrollment, revocation, policy, and route discovery.
+- Optionally serve static web/PWA assets.
+- Never carry shell, log, transcript, or PTY bytes.
+
+Client responsibilities:
+
+- Hold a paired device identity.
+- Ask CP for current routes and capabilities.
+- Connect directly to the selected agent over Noise for runtime data.
 
 ## Non-Goals
 
@@ -39,7 +43,9 @@ Control-plane responsibilities:
 - No hot-swappable UI directory as the primary mechanism.
 - No fallback in-process PTY mode once `dd-sessiond` is introduced.
 - No CRIU/checkpoint work in the first implementation.
-- No full browser-side Noise handshake in the first implementation.
+- No CP relay or mailbox relay for shell/log/session bytes.
+- No full browser-side Noise handshake in the first implementation; native CLI
+  is the first protocol exerciser.
 
 ## Phase 1: One Disruptive Dogfood Upgrade
 
@@ -52,8 +58,8 @@ Deliverables:
 - Add a `dd-sessiond` boot workload for dogfood agents. Implemented in this branch.
 - Change interactive sessions so `dd-sessiond` owns PTYs. Implemented for `dd-shell`
   by proxying session create/list/attach/resize/close/replay to sessiond.
-- Change `dd-agent` to proxy session APIs to `dd-sessiond`. Implemented with
-  browser-auth-gated routes for the first cut.
+- Change `dd-agent` to proxy session APIs to `dd-sessiond`. Implemented over
+  paired-device Noise for the first durable client path.
 - Keep Codex launch working through the session manager.
 - Preserve persistent disk state, including Codex/npm/login state.
 
@@ -91,57 +97,74 @@ Implementation notes:
 - Transcript and events are canonical session state, not UI state.
 - Mobile clients should not resize the canonical PTY by default.
 
-## Phase 3: Centralized Fleet UI
+## Phase 3: Client-Side Fleet UI
 
-Move active shell UI development to the CP/fleet dashboard.
+Move active shell UI development to clients that use CP only for routes and
+agent/device policy.
 
 Deliverables:
 
-- Add CP route for agent sessions.
+- Add CP route discovery for agent sessions.
 - UI lists sessions for the selected agent.
-- UI can create, attach, input, resize, close, and replay sessions.
+- UI can create, attach, input, resize, close, and replay sessions by opening
+  Noise directly to the selected agent.
 - Desktop terminal view remains raw PTY-first.
 - Mobile view can add touch controls, smart sizing, and assistant-style
   rendering without changing agent-side session ownership.
+- The web/PWA interface becomes a client implementation of the same protocol,
+  not a server-side shell proxy.
 
 Acceptance:
 
-- Updating CP UI via PR/release updates the shell/mobile experience.
+- Updating static web/PWA assets updates the browser shell/mobile experience.
 - No dogfood agent restart is needed for UI-only changes.
-- Active dogfood Codex sessions survive CP UI updates.
+- Active dogfood Codex sessions survive web/client updates.
 
 Status:
 
-- Not implemented in the first branch slice. The agent-side session gateway is
-  present so the CP UI can target it next.
+- Not implemented in the first branch slice. The native CLI is present so the
+  client-side protocol can be tested before replacing the browser shell proxy.
 
 ## Phase 4: Auth, Attestation, And Noise
 
 Start simple:
 
-- CP issues short-lived scoped session tokens.
-- Tokens bind user, agent id, session/action scope, and expiry.
-- `dd-agent` validates tokens before proxying to `dd-sessiond`.
+- CP enrolls paired device public keys and exposes current routes.
+- Agents poll CP for the trusted device set and route/policy freshness.
+- Native CLI/desktop/mobile clients use direct `/noise/ws` channels for
+  session RPCs.
 
 Then strengthen:
 
-- Bind session authorization to the attested agent Noise public key.
-- CP tracks agent attestation and `noise_pubkey`.
-- Desktop/CLI clients can eventually use a direct Noise channel.
-- Browser UI can stay token-over-HTTPS until custom browser crypto is worth it.
+- Clients verify the agent quote and pin the attested Noise public key.
+- Browser/PWA uses the same direct agent Noise path once the browser crypto or
+  WASM client is in place.
+
+Implemented first slice:
+
+- `/health` exposes the quote and Noise public key that clients verify and pin.
+- A paired device can send `shell.list_recipes`, `shell.list_sessions`,
+  `shell.create_session`, `shell.replay_session`, `shell.resize_session`, and
+  `shell.close_session` JSON requests over Noise.
+- `shell.attach_session` returns one JSON ack, then switches the same Noise
+  session into encrypted raw PTY byte streaming to local `dd-sessiond`.
+- CP Noise endpoints reject shell methods because they have no local sessiond
+  adapter; agent Noise endpoints wire the adapter in.
 
 Design rule:
 
 ```text
 remote clients never trust naked tunnel DNS
-remote clients trust CP-issued scoped authorization and, later, attested keys
+remote clients trust CP-enrolled device identity plus attested agent keys
+CP is route/key authority only, never a session data plane
 dd-sessiond stays local-only
 dd-agent is the policy/encryption gateway
 ```
 
 ## Risks And Open Questions
 
-- Whether to keep a minimal agent-local shell UI for emergency access.
+- Whether to keep a minimal cookie-auth shell UI only as temporary emergency
+  compatibility.
 - How to model recipes so CP UI and `dd-sessiond` agree on available launchers.
 - How to represent "input requested" events for Codex/Claude without making
   terminal parsing authoritative.
@@ -149,3 +172,4 @@ dd-agent is the policy/encryption gateway
   passing or exec handoff.
 - How much of the existing transcript encryption format should move unchanged
   into `dd-sessiond`.
+- Browser Noise implementation choice: pure JS library versus small WASM client.

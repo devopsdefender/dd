@@ -4,10 +4,11 @@
 //!   DD_MODE=agent   devopsdefender    # in-VM agent
 //!   DD_MODE=shell   devopsdefender    # shell web service
 //!   DD_MODE=sessiond devopsdefender   # local session supervisor
+//!   devopsdefender noise ...          # native Noise client
 //!
 //! (Also accepts `devopsdefender cp` / `devopsdefender agent` for local dev.)
 
-use devopsdefender::{agent, cp, sessiond, shell};
+use devopsdefender::{agent, cp, noise_client, sessiond, shell};
 
 #[tokio::main]
 async fn main() {
@@ -20,8 +21,9 @@ async fn main() {
         Some("agent") => agent::run().await.map_err(Into::into),
         Some("shell") => shell::run().await.map_err(Into::into),
         Some("sessiond") => sessiond::run().await.map_err(Into::into),
+        Some("noise") | Some("cli") => noise_client::run_cli().await,
         _ => {
-            eprintln!("usage: devopsdefender <cp|agent|shell|sessiond>");
+            eprintln!("usage: devopsdefender <cp|agent|shell|sessiond|noise>");
             eprintln!("   or: DD_MODE=<mode> devopsdefender");
             std::process::exit(2);
         }

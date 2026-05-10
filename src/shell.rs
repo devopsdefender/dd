@@ -2,17 +2,10 @@
 //!
 //! One process per VM, multiple reconnectable PTY sessions, read-only workload
 //! terminals, and encrypted append-only transcripts on disk.
-#![allow(dead_code, unused_imports)]
 
-use std::cmp::Reverse;
-use std::collections::{HashMap, VecDeque};
-use std::fs::File as StdFile;
-use std::os::fd::{AsRawFd, FromRawFd};
-use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path as AxPath, Query, State};
@@ -21,20 +14,11 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::Engine as _;
-use chacha20poly1305::aead::{Aead, KeyInit};
-use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use futures_util::{SinkExt, StreamExt};
-use rand::RngCore;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
-use tokio::fs::File as TokioFile;
-use tokio::fs::OpenOptions;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::process::{Child, Command};
-use tokio::sync::{broadcast, Mutex, RwLock};
-use uuid::Uuid;
 
 use crate::ee::Ee;
 use crate::error::{Error, Result};
@@ -44,104 +28,9 @@ use crate::taint::IntegrityState;
 use crate::units::{self, AgentMode, ManagedUnit, UnitKind};
 
 const DEFAULT_PORT: u16 = 7681;
-const DEFAULT_DIR: &str = "/var/lib/devopsdefender/shell";
-const RING_LIMIT: usize = 256 * 1024;
-const CODEX_PODMAN_RECIPE: &str = r#"#!/var/lib/easyenclave/bin/busybox sh
-set -eu
-BB=/var/lib/easyenclave/bin/busybox
-BIN=/var/lib/easyenclave/bin
-PODMAN=$BIN/podman
-SESSION_ID=${DD_SESSION_ID:-manual-$$}
-SESSION_DIR=${DD_SESSION_DIR:-/var/lib/easyenclave/data/dd-shell/sessions/$SESSION_ID}
-WORKSPACE=${DD_WORKSPACE:-$SESSION_DIR/workspace}
-HOME_DIR=${DD_HOME:-$SESSION_DIR/home}
-CACHE_DIR=${DD_CACHE:-$SESSION_DIR/cache}
-TMP_DIR=${TMPDIR:-$SESSION_DIR/tmp}
-until [ -x "$PODMAN" ]; do echo "codex-podman: waiting for podman"; $BB sleep 2; done
-$BB mkdir -p "$HOME_DIR" "$WORKSPACE" "$CACHE_DIR" "$TMP_DIR"
-$BB chmod 1777 "$TMP_DIR"
-SAFE_SESSION=$(printf '%s' "$SESSION_ID" | $BB tr -c 'A-Za-z0-9_.-' '-')
-exec "$PODMAN" run --rm --replace -it --pull=missing \
-  --cgroups=disabled \
-  --network=host \
-  --name "codex-shell-$SAFE_SESSION" \
-  -e HOME=/root \
-  -e TERM=xterm-256color \
-  -e COLORTERM=truecolor \
-  -e NPM_CONFIG_PREFIX=/root/.npm-global \
-  -v "$HOME_DIR:/root" \
-  -v "$WORKSPACE:/workspace" \
-  -v "$CACHE_DIR:/root/.cache" \
-  -v "$TMP_DIR:/tmp" \
-  -w /workspace \
-  docker.io/library/node:22-bookworm \
-  sh -lc 'set -e; mkdir -p "$HOME/.npm-global/bin" "$HOME/.local/bin"; printf "%s\n" "export NPM_CONFIG_PREFIX=\${NPM_CONFIG_PREFIX:-\$HOME/.npm-global}" "export PATH=\"\$HOME/.npm-global/bin:\$HOME/.local/bin:\$PATH\"" > "$HOME/.bashrc"; printf "%s\n" "[ -r \"\$HOME/.bashrc\" ] && . \"\$HOME/.bashrc\"" > "$HOME/.bash_profile"; export PATH="$HOME/.npm-global/bin:$HOME/.local/bin:$PATH"; if ! command -v codex >/dev/null 2>&1; then npm install -g @openai/codex; fi; exec bash -l'
-"#;
-const PODMAN_UBUNTU_RECIPE: &str = r#"#!/var/lib/easyenclave/bin/busybox sh
-set -eu
-BB=/var/lib/easyenclave/bin/busybox
-BIN=/var/lib/easyenclave/bin
-PODMAN=$BIN/podman
-SESSION_ID=${DD_SESSION_ID:-manual-$$}
-SESSION_DIR=${DD_SESSION_DIR:-/var/lib/easyenclave/data/dd-shell/sessions/$SESSION_ID}
-WORKSPACE=${DD_WORKSPACE:-$SESSION_DIR/workspace}
-HOME_DIR=${DD_HOME:-$SESSION_DIR/home}
-CACHE_DIR=${DD_CACHE:-$SESSION_DIR/cache}
-TMP_DIR=${TMPDIR:-$SESSION_DIR/tmp}
-until [ -x "$PODMAN" ]; do echo "podman-ubuntu: waiting for podman"; $BB sleep 2; done
-$BB mkdir -p "$HOME_DIR" "$WORKSPACE" "$CACHE_DIR" "$TMP_DIR"
-$BB chmod 1777 "$TMP_DIR"
-SAFE_SESSION=$(printf '%s' "$SESSION_ID" | $BB tr -c 'A-Za-z0-9_.-' '-')
-exec "$PODMAN" run --rm --replace -it --pull=missing \
-  --cgroups=disabled \
-  --network=host \
-  --name "ubuntu-shell-$SAFE_SESSION" \
-  -e HOME=/root \
-  -e TERM=xterm-256color \
-  -e COLORTERM=truecolor \
-  -v "$HOME_DIR:/root" \
-  -v "$WORKSPACE:/workspace" \
-  -v "$CACHE_DIR:/root/.cache" \
-  -v "$TMP_DIR:/tmp" \
-  -w /workspace \
-  docker.io/library/ubuntu:24.04 \
-  bash -l
-"#;
-const PODMAN_ALPINE_RECIPE: &str = r#"#!/var/lib/easyenclave/bin/busybox sh
-set -eu
-BB=/var/lib/easyenclave/bin/busybox
-BIN=/var/lib/easyenclave/bin
-PODMAN=$BIN/podman
-SESSION_ID=${DD_SESSION_ID:-manual-$$}
-SESSION_DIR=${DD_SESSION_DIR:-/var/lib/easyenclave/data/dd-shell/sessions/$SESSION_ID}
-WORKSPACE=${DD_WORKSPACE:-$SESSION_DIR/workspace}
-HOME_DIR=${DD_HOME:-$SESSION_DIR/home}
-CACHE_DIR=${DD_CACHE:-$SESSION_DIR/cache}
-TMP_DIR=${TMPDIR:-$SESSION_DIR/tmp}
-until [ -x "$PODMAN" ]; do echo "podman-alpine: waiting for podman"; $BB sleep 2; done
-$BB mkdir -p "$HOME_DIR" "$WORKSPACE" "$CACHE_DIR" "$TMP_DIR"
-$BB chmod 1777 "$TMP_DIR"
-SAFE_SESSION=$(printf '%s' "$SESSION_ID" | $BB tr -c 'A-Za-z0-9_.-' '-')
-exec "$PODMAN" run --rm --replace -it --pull=missing \
-  --cgroups=disabled \
-  --network=host \
-  --name "alpine-shell-$SAFE_SESSION" \
-  -e HOME=/root \
-  -e TERM=xterm-256color \
-  -e COLORTERM=truecolor \
-  -v "$HOME_DIR:/root" \
-  -v "$WORKSPACE:/workspace" \
-  -v "$CACHE_DIR:/root/.cache" \
-  -v "$TMP_DIR:/tmp" \
-  -w /workspace \
-  docker.io/library/alpine:3.20 \
-  /bin/sh
-"#;
 
 #[derive(Clone)]
 struct App {
-    sessions: Arc<RwLock<HashMap<String, Arc<Session>>>>,
-    store: TranscriptStore,
     ee: Arc<Ee>,
     http: reqwest::Client,
     agent_api: String,
@@ -150,75 +39,6 @@ struct App {
     owner: crate::gh_oidc::Principal,
     auth: crate::auth::AuthConfig,
     hostname: String,
-    recipes: Arc<Vec<Recipe>>,
-    scratch_root: PathBuf,
-}
-
-struct Session {
-    meta: RwLock<SessionMeta>,
-    input: Mutex<TokioFile>,
-    master_fd: i32,
-    child: Mutex<Child>,
-    pgid: i32,
-    tx: broadcast::Sender<Vec<u8>>,
-    ring: Mutex<VecDeque<u8>>,
-    scratch_dir: Option<PathBuf>,
-    cleanup_scratch_on_exit: bool,
-}
-
-#[derive(Clone, Serialize)]
-struct SessionMeta {
-    id: String,
-    name: String,
-    recipe_id: String,
-    recipe_title: String,
-    workspace_policy: WorkspacePolicy,
-    command: String,
-    cwd: String,
-    terminal_mode: TerminalMode,
-    integrity_state: IntegrityState,
-    integrity_reason: &'static str,
-    created_at: i64,
-    updated_at: i64,
-    status: SessionStatus,
-    exit_code: Option<i32>,
-}
-
-#[derive(Clone, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum TerminalMode {
-    ReadWrite,
-}
-
-#[derive(Clone, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum SessionStatus {
-    Running,
-    Exited,
-}
-
-#[derive(Clone, Serialize)]
-struct Recipe {
-    id: String,
-    title: String,
-    description: String,
-    command: String,
-    cwd: String,
-    workspace_policy: WorkspacePolicy,
-}
-
-struct RecipeSeed {
-    id: &'static str,
-    title: &'static str,
-    description: &'static str,
-    script_name: &'static str,
-    script: &'static str,
-}
-
-#[derive(Clone, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum WorkspacePolicy {
-    EphemeralScratch,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -229,28 +49,10 @@ struct CreateSession {
     cwd: Option<String>,
 }
 
-#[derive(Serialize)]
-struct CreateSessionResponse {
-    id: String,
-}
-
 #[derive(Deserialize, Serialize)]
 struct ResizeSession {
     cols: u16,
     rows: u16,
-}
-
-#[derive(Clone)]
-struct TranscriptStore {
-    dir: PathBuf,
-    key: [u8; 32],
-}
-
-#[derive(Serialize, Deserialize)]
-struct TranscriptRecord {
-    ts: i64,
-    kind: String,
-    data_b64: String,
 }
 
 #[derive(Serialize)]
@@ -286,11 +88,6 @@ pub async fn run() -> Result<()> {
         .ok()
         .and_then(|s| s.parse::<u16>().ok())
         .unwrap_or(DEFAULT_PORT);
-    let dir = std::env::var("DD_SHELL_DIR").unwrap_or_else(|_| DEFAULT_DIR.into());
-    let requested_shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
-    let scratch_root = std::env::var("DD_SHELL_SCRATCH_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(&dir).join("sessions"));
     let ee_socket = std::env::var("DD_SHELL_EE_SOCKET")
         .unwrap_or_else(|_| "/var/lib/easyenclave/agent.sock".into());
     let agent_api = std::env::var("DD_SHELL_AGENT_API_URL")
@@ -299,18 +96,8 @@ pub async fn run() -> Result<()> {
         std::env::var("DD_SESSIOND_HTTP_URL").unwrap_or_else(|_| "http://127.0.0.1:7683".into());
     let sessiond_attach_addr =
         std::env::var("DD_SESSIOND_ATTACH_ADDR").unwrap_or_else(|_| "127.0.0.1:7684".into());
-    let shell_dir = PathBuf::from(&dir);
-    let store = TranscriptStore::new(shell_dir.clone()).await?;
-    tokio::fs::create_dir_all(&scratch_root).await?;
-    set_private_dir_permissions(&scratch_root).await?;
-    let recipe_dir = shell_dir.join("recipes");
-    let default_shell = install_default_shell_command(&recipe_dir, &requested_shell).await?;
-    let recipe_scripts = install_builtin_recipe_scripts(&recipe_dir).await?;
-    let recipes = Arc::new(load_recipes(&default_shell, recipe_scripts));
 
     let app_state = App {
-        sessions: Arc::new(RwLock::new(HashMap::new())),
-        store,
         ee: Arc::new(Ee::new(ee_socket)),
         http: reqwest::Client::builder()
             .timeout(Duration::from_secs(3))
@@ -323,8 +110,6 @@ pub async fn run() -> Result<()> {
         owner: common.owner,
         auth,
         hostname,
-        recipes,
-        scratch_root,
     };
 
     let app = Router::new()
@@ -523,283 +308,6 @@ async fn create_session(
 ) -> Result<Json<crate::sessiond::CreateSessionResponse>> {
     ensure_shell_auth(&app, &headers, &uri)?;
     sessiond_post(&app, "/api/sessions", &req).await.map(Json)
-}
-
-fn select_recipe(app: &App, recipe_id: Option<&str>, command: Option<String>) -> Result<Recipe> {
-    if let Some(command) = command {
-        let command = command.trim();
-        if command.is_empty() {
-            return Err(Error::BadRequest("command must not be empty".into()));
-        }
-        return Ok(Recipe {
-            id: "custom".into(),
-            title: "Custom".into(),
-            description: "Custom command".into(),
-            command: command.into(),
-            cwd: "/".into(),
-            workspace_policy: WorkspacePolicy::EphemeralScratch,
-        });
-    }
-
-    let id = recipe_id.unwrap_or("shell");
-    app.recipes
-        .iter()
-        .find(|recipe| recipe.id == id)
-        .cloned()
-        .ok_or_else(|| Error::BadRequest(format!("unknown recipe: {id}")))
-}
-
-async fn install_default_shell_command(dir: &Path, requested_shell: &str) -> Result<String> {
-    if executable_exists(requested_shell).await {
-        return Ok(requested_shell.into());
-    }
-    if executable_exists("/bin/sh").await {
-        return Ok("/bin/sh".into());
-    }
-    if executable_exists("/var/lib/easyenclave/bin/busybox").await {
-        tokio::fs::create_dir_all(dir).await?;
-        set_private_dir_permissions(dir).await?;
-        let path = dir.join("plain-shell");
-        tokio::fs::write(
-            &path,
-            "#!/var/lib/easyenclave/bin/busybox sh\nexec /var/lib/easyenclave/bin/busybox sh\n",
-        )
-        .await?;
-        set_private_file_permissions(&path).await?;
-        return Ok(path.display().to_string());
-    }
-    Ok(requested_shell.into())
-}
-
-async fn executable_exists(path: &str) -> bool {
-    match tokio::fs::metadata(path).await {
-        Ok(meta) => meta.is_file() && meta.permissions().mode() & 0o111 != 0,
-        Err(_) => false,
-    }
-}
-
-async fn install_builtin_recipe_scripts(dir: &Path) -> Result<Vec<Recipe>> {
-    tokio::fs::create_dir_all(dir).await?;
-    set_private_dir_permissions(dir).await?;
-
-    let mut recipes = Vec::new();
-    for seed in builtin_recipe_seeds() {
-        let path = dir.join(seed.script_name);
-        tokio::fs::write(&path, seed.script).await?;
-        set_private_file_permissions(&path).await?;
-        recipes.push(Recipe {
-            id: seed.id.into(),
-            title: seed.title.into(),
-            description: seed.description.into(),
-            command: path.display().to_string(),
-            cwd: "/".into(),
-            workspace_policy: WorkspacePolicy::EphemeralScratch,
-        });
-    }
-    Ok(recipes)
-}
-
-fn load_recipes(default_shell: &str, mut builtin_recipes: Vec<Recipe>) -> Vec<Recipe> {
-    let mut recipes = vec![Recipe {
-        id: "shell".into(),
-        title: "Shell".into(),
-        description: "Plain interactive shell with encrypted transcript history".into(),
-        command: default_shell.into(),
-        cwd: "/".into(),
-        workspace_policy: WorkspacePolicy::EphemeralScratch,
-    }];
-    recipes.append(&mut builtin_recipes);
-
-    if let Ok(command) = std::env::var("DD_SHELL_CODEX_COMMAND") {
-        let command = command.trim();
-        if !command.is_empty() {
-            upsert_recipe(
-                &mut recipes,
-                Recipe {
-                    id: "codex-podman".into(),
-                    title: "Codex".into(),
-                    description: "Podman-backed Codex development session".into(),
-                    command: command.into(),
-                    cwd: "/".into(),
-                    workspace_policy: WorkspacePolicy::EphemeralScratch,
-                },
-            );
-        }
-    }
-
-    recipes
-}
-
-fn upsert_recipe(recipes: &mut Vec<Recipe>, recipe: Recipe) {
-    if let Some(existing) = recipes.iter_mut().find(|r| r.id == recipe.id) {
-        *existing = recipe;
-    } else {
-        recipes.push(recipe);
-    }
-}
-
-fn builtin_recipe_seeds() -> Vec<RecipeSeed> {
-    vec![
-        RecipeSeed {
-            id: "codex-podman",
-            title: "Codex",
-            description: "Podman-backed Codex development session",
-            script_name: "codex-podman",
-            script: CODEX_PODMAN_RECIPE,
-        },
-        RecipeSeed {
-            id: "podman-ubuntu",
-            title: "Ubuntu",
-            description: "Podman Ubuntu 24.04 shell",
-            script_name: "podman-ubuntu",
-            script: PODMAN_UBUNTU_RECIPE,
-        },
-        RecipeSeed {
-            id: "podman-alpine",
-            title: "Alpine",
-            description: "Podman Alpine shell",
-            script_name: "podman-alpine",
-            script: PODMAN_ALPINE_RECIPE,
-        },
-    ]
-}
-
-async fn prepare_scratch_dir(
-    app: &App,
-    id: &str,
-    policy: &WorkspacePolicy,
-) -> Result<Option<PathBuf>> {
-    match policy {
-        WorkspacePolicy::EphemeralScratch => {
-            let root = app.scratch_root.join(id);
-            tokio::fs::create_dir_all(&root).await?;
-            set_private_dir_permissions(&root).await?;
-            for name in ["workspace", "home", "containers", "cache", "tmp"] {
-                let path = root.join(name);
-                tokio::fs::create_dir_all(&path).await?;
-                set_private_dir_permissions(&path).await?;
-            }
-            Ok(Some(root))
-        }
-    }
-}
-
-async fn set_private_dir_permissions(path: &Path) -> Result<()> {
-    let permissions = std::fs::Permissions::from_mode(0o700);
-    tokio::fs::set_permissions(path, permissions).await?;
-    Ok(())
-}
-
-async fn set_private_file_permissions(path: &Path) -> Result<()> {
-    let permissions = std::fs::Permissions::from_mode(0o700);
-    tokio::fs::set_permissions(path, permissions).await?;
-    Ok(())
-}
-
-fn session_env(id: &str, scratch_dir: Option<&Path>) -> Vec<(String, String)> {
-    let mut env = vec![("DD_SESSION_ID".into(), id.into())];
-    if let Some(root) = scratch_dir {
-        env.push(("DD_SESSION_DIR".into(), root.display().to_string()));
-        env.push((
-            "DD_WORKSPACE".into(),
-            root.join("workspace").display().to_string(),
-        ));
-        env.push(("DD_HOME".into(), root.join("home").display().to_string()));
-        env.push((
-            "DD_CONTAINER_ROOT".into(),
-            root.join("containers").display().to_string(),
-        ));
-        env.push(("DD_CACHE".into(), root.join("cache").display().to_string()));
-        env.push(("TMPDIR".into(), root.join("tmp").display().to_string()));
-    }
-    env
-}
-
-fn session_name(recipe: &Recipe, id: &str) -> String {
-    format!("{}-{}", recipe.id, &id[..8])
-}
-
-fn spawn_pty(
-    command: &str,
-    cwd: &str,
-    env_vars: &[(String, String)],
-) -> Result<(Child, TokioFile, TokioFile, i32)> {
-    let mut master = -1;
-    let mut slave = -1;
-    let winsize = libc::winsize {
-        ws_row: 24,
-        ws_col: 80,
-        ws_xpixel: 0,
-        ws_ypixel: 0,
-    };
-    let open_rc = unsafe {
-        libc::openpty(
-            &mut master,
-            &mut slave,
-            std::ptr::null_mut(),
-            std::ptr::null(),
-            &winsize,
-        )
-    };
-    if open_rc != 0 {
-        return Err(Error::Internal(format!(
-            "openpty: {}",
-            std::io::Error::last_os_error()
-        )));
-    }
-
-    let master = unsafe { StdFile::from_raw_fd(master) };
-    let output = TokioFile::from_std(
-        master
-            .try_clone()
-            .map_err(|e| Error::Internal(format!("pty master clone: {e}")))?,
-    );
-    let input = TokioFile::from_std(master);
-    let slave = unsafe { StdFile::from_raw_fd(slave) };
-    let slave_fd = slave.as_raw_fd();
-
-    let dup_slave = || -> std::io::Result<StdFile> {
-        let fd = unsafe { libc::dup(slave_fd) };
-        if fd < 0 {
-            Err(std::io::Error::last_os_error())
-        } else {
-            Ok(unsafe { StdFile::from_raw_fd(fd) })
-        }
-    };
-
-    let mut cmd = Command::new(command);
-    cmd.current_dir(cwd)
-        .env("TERM", "xterm-256color")
-        .env("COLORTERM", "truecolor")
-        .stdin(Stdio::from(
-            dup_slave().map_err(|e| Error::Internal(format!("pty stdin dup: {e}")))?,
-        ))
-        .stdout(Stdio::from(
-            dup_slave().map_err(|e| Error::Internal(format!("pty stdout dup: {e}")))?,
-        ))
-        .stderr(Stdio::from(
-            dup_slave().map_err(|e| Error::Internal(format!("pty stderr dup: {e}")))?,
-        ));
-    for (key, value) in env_vars {
-        cmd.env(key, value);
-    }
-    unsafe {
-        cmd.pre_exec(move || {
-            if libc::setsid() < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            if libc::ioctl(slave_fd, libc::TIOCSCTTY, 0) < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-    let child = cmd
-        .spawn()
-        .map_err(|e| Error::BadRequest(format!("spawn {command}: {e}")))?;
-    let pgid = child.id().map(|pid| pid as i32).unwrap_or_default();
-    drop(slave);
-    Ok((child, output, input, pgid))
 }
 
 async fn replay_session(
@@ -1092,31 +600,6 @@ async fn close_session(
     sessiond_post_empty(&app, &format!("/api/sessions/{id}/close")).await
 }
 
-fn terminate_process_group(id: String, pgid: i32) {
-    if pgid <= 0 {
-        return;
-    }
-    tokio::spawn(async move {
-        for (signal, delay) in [
-            (libc::SIGHUP, Duration::from_millis(250)),
-            (libc::SIGTERM, Duration::from_millis(1500)),
-            (libc::SIGKILL, Duration::ZERO),
-        ] {
-            let rc = unsafe { libc::kill(-pgid, signal) };
-            if rc != 0 {
-                let err = std::io::Error::last_os_error();
-                if err.raw_os_error() != Some(libc::ESRCH) {
-                    eprintln!("dd-shell: signal {signal} for {id}: {err}");
-                }
-                break;
-            }
-            if !delay.is_zero() {
-                tokio::time::sleep(delay).await;
-            }
-        }
-    });
-}
-
 fn workload_log_bytes(logs: &serde_json::Value) -> Vec<u8> {
     let mut out = Vec::new();
     if let Some(lines) = logs["lines"].as_array() {
@@ -1207,209 +690,6 @@ async fn attach(
     }
     output.abort();
     Ok(())
-}
-
-fn spawn_reader<R>(store: TranscriptStore, session: Arc<Session>, mut reader: R, kind: &'static str)
-where
-    R: tokio::io::AsyncRead + Unpin + Send + 'static,
-{
-    tokio::spawn(async move {
-        let id = session.meta.read().await.id.clone();
-        let mut buf = [0u8; 4096];
-        loop {
-            match reader.read(&mut buf).await {
-                Ok(0) => break,
-                Ok(n) => {
-                    let bytes = buf[..n].to_vec();
-                    push_ring(&session, &bytes).await;
-                    let _ = session.tx.send(bytes.clone());
-                    if let Err(e) = store.append_bytes(&id, kind, &bytes).await {
-                        eprintln!("dd-shell: transcript append failed: {e}");
-                    }
-                    session.meta.write().await.updated_at = unix_ts();
-                }
-                Err(e) => {
-                    eprintln!("dd-shell: {kind} read failed: {e}");
-                    break;
-                }
-            }
-        }
-    });
-}
-
-fn spawn_waiter(store: TranscriptStore, session: Arc<Session>) {
-    tokio::spawn(async move {
-        let status = {
-            let mut child = session.child.lock().await;
-            child.wait().await
-        };
-        mark_session_exited(&store, &session, status.ok().and_then(|s| s.code())).await;
-        cleanup_session_scratch(&session).await;
-    });
-}
-
-async fn mark_session_exited(store: &TranscriptStore, session: &Session, exit_code: Option<i32>) {
-    let mut meta = session.meta.write().await;
-    if matches!(meta.status, SessionStatus::Exited) {
-        return;
-    }
-    meta.updated_at = unix_ts();
-    meta.status = SessionStatus::Exited;
-    meta.exit_code = exit_code;
-    if let Err(e) = store.append_meta(&meta).await {
-        eprintln!("dd-shell: exit meta append failed: {e}");
-    }
-}
-
-async fn cleanup_session_scratch(session: &Session) {
-    if !session.cleanup_scratch_on_exit {
-        return;
-    }
-    let Some(path) = &session.scratch_dir else {
-        return;
-    };
-    match tokio::fs::remove_dir_all(path).await {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => eprintln!(
-            "dd-shell: scratch cleanup failed for {}: {e}",
-            path.display()
-        ),
-    }
-}
-
-async fn push_ring(session: &Session, bytes: &[u8]) {
-    let mut ring = session.ring.lock().await;
-    for b in bytes {
-        if ring.len() >= RING_LIMIT {
-            ring.pop_front();
-        }
-        ring.push_back(*b);
-    }
-}
-
-impl TranscriptStore {
-    async fn new(dir: PathBuf) -> Result<Self> {
-        tokio::fs::create_dir_all(&dir).await?;
-        let key = history_key(&dir).await?;
-        Ok(Self { dir, key })
-    }
-
-    async fn append_meta(&self, meta: &SessionMeta) -> Result<()> {
-        let bytes = serde_json::to_vec(meta).map_err(|e| Error::Internal(e.to_string()))?;
-        self.append_bytes(&meta.id, "meta", &bytes).await
-    }
-
-    async fn append_bytes(&self, id: &str, kind: &str, bytes: &[u8]) -> Result<()> {
-        let record = TranscriptRecord {
-            ts: unix_ts(),
-            kind: kind.to_string(),
-            data_b64: base64::engine::general_purpose::STANDARD.encode(bytes),
-        };
-        let plain = serde_json::to_vec(&record).map_err(|e| Error::Internal(e.to_string()))?;
-        let line = self.encrypt_line(&plain)?;
-        let path = self.path(id);
-        let mut f = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-            .await?;
-        f.write_all(line.as_bytes()).await?;
-        f.write_all(b"\n").await?;
-        Ok(())
-    }
-
-    async fn replay(&self, id: &str) -> Result<Vec<u8>> {
-        let path = self.path(id);
-        if !Path::new(&path).exists() {
-            return Err(Error::NotFound);
-        }
-        let text = tokio::fs::read_to_string(path).await?;
-        let mut out = Vec::new();
-        for line in text.lines().filter(|l| !l.trim().is_empty()) {
-            let plain = self.decrypt_line(line)?;
-            let record: TranscriptRecord =
-                serde_json::from_slice(&plain).map_err(|e| Error::Internal(e.to_string()))?;
-            if record.kind == "pty" || record.kind == "stdout" || record.kind == "stderr" {
-                let bytes = base64::engine::general_purpose::STANDARD
-                    .decode(record.data_b64)
-                    .map_err(|e| Error::Internal(e.to_string()))?;
-                out.extend_from_slice(&bytes);
-            }
-        }
-        Ok(out)
-    }
-
-    fn path(&self, id: &str) -> PathBuf {
-        self.dir.join(format!("{id}.log.enc"))
-    }
-
-    fn encrypt_line(&self, plain: &[u8]) -> Result<String> {
-        let cipher = ChaCha20Poly1305::new(Key::from_slice(&self.key));
-        let mut nonce = [0u8; 12];
-        rand::thread_rng().fill_bytes(&mut nonce);
-        let ciphertext = cipher
-            .encrypt(Nonce::from_slice(&nonce), plain)
-            .map_err(|e| Error::Internal(format!("encrypt transcript: {e}")))?;
-        let mut packed = nonce.to_vec();
-        packed.extend_from_slice(&ciphertext);
-        Ok(base64::engine::general_purpose::STANDARD.encode(packed))
-    }
-
-    fn decrypt_line(&self, line: &str) -> Result<Vec<u8>> {
-        let packed = base64::engine::general_purpose::STANDARD
-            .decode(line)
-            .map_err(|e| Error::Internal(e.to_string()))?;
-        if packed.len() < 13 {
-            return Err(Error::Internal("truncated transcript record".into()));
-        }
-        let (nonce, ciphertext) = packed.split_at(12);
-        let cipher = ChaCha20Poly1305::new(Key::from_slice(&self.key));
-        cipher
-            .decrypt(Nonce::from_slice(nonce), ciphertext)
-            .map_err(|e| Error::Internal(format!("decrypt transcript: {e}")))
-    }
-}
-
-async fn history_key(dir: &Path) -> Result<[u8; 32]> {
-    if let Ok(raw) = std::env::var("DD_SHELL_HISTORY_KEY") {
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(raw.trim())
-            .or_else(|_| hex::decode(raw.trim()))
-            .map_err(|_| Error::BadRequest("DD_SHELL_HISTORY_KEY must be base64 or hex".into()))?;
-        if bytes.len() != 32 {
-            return Err(Error::BadRequest(
-                "DD_SHELL_HISTORY_KEY must decode to 32 bytes".into(),
-            ));
-        }
-        let mut key = [0u8; 32];
-        key.copy_from_slice(&bytes);
-        return Ok(key);
-    }
-
-    let key_path = dir.join("history.key");
-    if let Ok(bytes) = tokio::fs::read(&key_path).await {
-        if bytes.len() == 32 {
-            let mut key = [0u8; 32];
-            key.copy_from_slice(&bytes);
-            return Ok(key);
-        }
-    }
-
-    let mut material = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut material);
-    tokio::fs::write(&key_path, material).await?;
-    let mut hasher = Sha256::new();
-    hasher.update(material);
-    hasher.update(b"dd-shell-history-v1");
-    Ok(hasher.finalize().into())
-}
-
-fn unix_ts() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or(Duration::ZERO)
-        .as_secs() as i64
 }
 
 const XTERM_CSS: &str = include_str!("../assets/xterm/xterm.css");

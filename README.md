@@ -111,12 +111,37 @@ The agent verifies the OIDC token against GitHub's JWKS, checks `repository_owne
 
 ## Terminal access
 
-Each VM runs `dd-shell` as a workload on a `-shell` labelled subdomain (for example `app-shell.devopsdefender.com` or `<agent>-shell.devopsdefender.com`). DD gates it behind the same GitHub App broker session as the dashboards. The shell UI separates observed read-only workload logs from controlled read-write PTY sessions. Read-only viewing does not change integrity state because it cannot send input or signals; read-write PTYs are controlled as soon as they exist and keep encrypted transcript history inside the enclave.
+Each VM runs `dd-sessiond` as the local session supervisor. `dd-sessiond` owns
+PTYs, child process groups, resize/close control, and encrypted transcript
+history inside the enclave.
 
-The shell is installable as a small PWA. Browser notifications are always
-delivered by default when permission is granted; on mobile, install the shell
-from the browser so the service worker can present notifications through the
-platform notification surface while the shell is active.
+Native clients use a paired device key against the agent's `/noise/ws` endpoint.
+The bootstrap flow fetches `/health`, appraises `noise.quote_b64` with Intel
+Trust Authority, checks that the quote binds `noise.pubkey_hex` into TDX
+`report_data`, and then runs Noise_IK over WebSocket. The exposed session RPC surface is
+`shell.list_recipes`, `shell.list_sessions`, `shell.create_session`,
+`shell.replay_session`, `shell.resize_session`, `shell.close_session`, and the
+streaming `shell.attach_session` method. Session control and PTY bytes flow
+inside the Noise transport to the agent and then to local `dd-sessiond`; the CP
+is used for enrollment and route discovery, not for shell/log/session bytes.
+
+The bundled native CLI exercises that path directly:
+
+```bash
+devopsdefender noise keygen --cp-url https://app.devopsdefender.com --label laptop
+devopsdefender noise recipes --url https://<agent-host>
+devopsdefender noise shell --url https://<agent-host> --recipe shell
+```
+
+The CLI uses `DD_ITA_API_KEY` for quote appraisal. `DD_ITA_BASE_URL`,
+`DD_ITA_JWKS_URL`, and `DD_ITA_ISSUER` default to Intel Trust Authority's
+production endpoints and can be overridden when needed. Local preview/dev runs
+without ITA credentials must pass `--insecure-skip-quote-verify` explicitly.
+
+The web shell should become another client implementation of the same protocol:
+it keeps its own paired device identity, asks CP for current routes, and opens
+Noise directly to the agent. The existing cookie-auth browser shell remains a
+compatibility surface while that client-side Noise implementation lands.
 
 ## STONITH
 

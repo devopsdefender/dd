@@ -196,17 +196,22 @@ pub async fn run() -> Result<()> {
         std::path::PathBuf::from(noise_gateway::upstream::DEFAULT_EE_AGENT_SOCK),
         ee_token,
     ));
-    let ng_state = noise_gateway::State {
-        attest: attestor.clone(),
-        trust,
-        upstream,
-    };
-
-    let gh = gh_oidc::Verifier::new(cfg.common.owner.clone(), "dd-agent".into());
     let sessiond_http_url =
         std::env::var("DD_SESSIOND_HTTP_URL").unwrap_or_else(|_| "http://127.0.0.1:7683".into());
     let sessiond_attach_addr =
         std::env::var("DD_SESSIOND_ATTACH_ADDR").unwrap_or_else(|_| "127.0.0.1:7684".into());
+    let shell = Arc::new(noise_gateway::upstream::Sessiond::new(
+        sessiond_http_url.clone(),
+        sessiond_attach_addr.clone(),
+    ));
+    let ng_state = noise_gateway::State {
+        attest: attestor.clone(),
+        trust,
+        upstream,
+        shell: Some(shell),
+    };
+
+    let gh = gh_oidc::Verifier::new(cfg.common.owner.clone(), "dd-agent".into());
 
     // Seed taint set. Boot-time facts go in now; runtime events
     // (CustomerOwnerEnabled, CustomerWorkloadDeployed) are appended

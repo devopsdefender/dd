@@ -269,7 +269,6 @@ jobs:
               DD_AUTH_COOKIE_DOMAIN="$DD_AUTH_COOKIE_DOMAIN" \
               DD_AUTH_COOKIE_SECRET="$DD_AUTH_COOKIE_SECRET" \
               bake apps/dd-shell/workload.json.tmpl
-            bake apps/ee-proxy/workload.json.tmpl
           } | jq -cs '.')
 
           # EE_CAPTURE_SOCKET tells EE (post-capture-socket patch) to tee

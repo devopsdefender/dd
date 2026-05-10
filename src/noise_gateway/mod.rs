@@ -45,6 +45,7 @@ pub struct State {
     pub attest: Arc<attest::Attestor>,
     pub trust: TrustHandle,
     pub upstream: Arc<upstream::EeAgent>,
+    pub shell: Option<Arc<upstream::Sessiond>>,
 }
 
 pub fn router(state: State) -> Router {

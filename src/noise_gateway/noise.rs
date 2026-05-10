@@ -26,7 +26,7 @@ use axum::routing::get;
 use axum::Router;
 use futures_util::StreamExt;
 use snow::{Builder, HandshakeState, TransportState};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use super::{allowlist, State as AppState};
 
@@ -122,6 +122,55 @@ async fn handle(mut socket: WebSocket, state: AppState) -> anyhow::Result<()> {
                     }
                 }
             }
+            Ok(allowlist::Method::ShellAttachSession) => {
+                let Some(shell) = &state.shell else {
+                    let resp = serde_json::json!({
+                        "error": "shell_unavailable",
+                        "detail": "this Noise endpoint is not connected to sessiond",
+                    });
+                    send_encrypted_json(&mut transport, &mut socket, &resp).await?;
+                    continue;
+                };
+                match shell.attach_stream(request).await {
+                    Ok((ack, stream)) => {
+                        send_encrypted_json(&mut transport, &mut socket, &ack).await?;
+                        bridge_attach(&mut transport, &mut socket, stream).await?;
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        let resp = serde_json::json!({
+                            "error": "shell_attach_failed",
+                            "detail": e.to_string(),
+                        });
+                        send_encrypted_json(&mut transport, &mut socket, &resp).await?;
+                        continue;
+                    }
+                }
+            }
+            Ok(
+                allowlist::Method::ShellCloseSession
+                | allowlist::Method::ShellCreateSession
+                | allowlist::Method::ShellListRecipes
+                | allowlist::Method::ShellListSessions
+                | allowlist::Method::ShellReplaySession
+                | allowlist::Method::ShellResizeSession,
+            ) => {
+                let Some(shell) = &state.shell else {
+                    let resp = serde_json::json!({
+                        "error": "shell_unavailable",
+                        "detail": "this Noise endpoint is not connected to sessiond",
+                    });
+                    send_encrypted_json(&mut transport, &mut socket, &resp).await?;
+                    continue;
+                };
+                let response = shell.call(request).await.unwrap_or_else(|e| {
+                    serde_json::json!({
+                        "error": "shell_failed",
+                        "detail": e.to_string(),
+                    })
+                });
+                send_encrypted_json(&mut transport, &mut socket, &response).await?;
+            }
             Ok(_method) => {
                 let response = state.upstream.call(request).await.unwrap_or_else(|e| {
                     serde_json::json!({
@@ -172,28 +221,28 @@ async fn send_encrypted_bytes(
 async fn bridge_attach(
     transport: &mut TransportState,
     socket: &mut WebSocket,
-    ee_stream: tokio::net::UnixStream,
+    stream: impl AsyncRead + AsyncWrite + Unpin,
 ) -> anyhow::Result<()> {
-    let (mut ee_rd, mut ee_wr) = ee_stream.into_split();
+    let (mut stream_rd, mut stream_wr) = tokio::io::split(stream);
     let mut ee_buf = [0u8; ATTACH_CHUNK];
 
     loop {
         tokio::select! {
             biased;
-            // EE → client: raw PTY bytes, encrypted and forwarded.
-            n = ee_rd.read(&mut ee_buf) => {
+            // Upstream → client: raw PTY bytes, encrypted and forwarded.
+            n = stream_rd.read(&mut ee_buf) => {
                 match n? {
-                    0 => break, // EE closed (shell exited)
+                    0 => break, // Upstream closed (shell exited)
                     n => send_encrypted_bytes(transport, socket, &ee_buf[..n]).await?,
                 }
             }
-            // Client → EE: decrypt and write stdin.
+            // Client → upstream: decrypt and write stdin.
             frame = next_binary(socket) => {
                 match frame? {
                     Some(cipher) => {
                         let mut plain = vec![0u8; cipher.len()];
                         let n = transport.read_message(&cipher, &mut plain)?;
-                        ee_wr.write_all(&plain[..n]).await?;
+                        stream_wr.write_all(&plain[..n]).await?;
                     }
                     None => break, // WS closed
                 }

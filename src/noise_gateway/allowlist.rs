@@ -15,6 +15,13 @@ pub enum Method {
     Health,
     List,
     Logs,
+    ShellAttachSession,
+    ShellCloseSession,
+    ShellCreateSession,
+    ShellListRecipes,
+    ShellListSessions,
+    ShellReplaySession,
+    ShellResizeSession,
 }
 
 impl Method {
@@ -26,6 +33,13 @@ impl Method {
             Self::Health => "health",
             Self::List => "list",
             Self::Logs => "logs",
+            Self::ShellAttachSession => "shell.attach_session",
+            Self::ShellCloseSession => "shell.close_session",
+            Self::ShellCreateSession => "shell.create_session",
+            Self::ShellListRecipes => "shell.list_recipes",
+            Self::ShellListSessions => "shell.list_sessions",
+            Self::ShellReplaySession => "shell.replay_session",
+            Self::ShellResizeSession => "shell.resize_session",
         }
     }
 }
@@ -45,6 +59,13 @@ pub fn classify(raw: &serde_json::Value) -> Result<Method, ClassifyError> {
         "health" => Ok(Method::Health),
         "list" => Ok(Method::List),
         "logs" => Ok(Method::Logs),
+        "shell.attach_session" => Ok(Method::ShellAttachSession),
+        "shell.close_session" => Ok(Method::ShellCloseSession),
+        "shell.create_session" => Ok(Method::ShellCreateSession),
+        "shell.list_recipes" => Ok(Method::ShellListRecipes),
+        "shell.list_sessions" => Ok(Method::ShellListSessions),
+        "shell.replay_session" => Ok(Method::ShellReplaySession),
+        "shell.resize_session" => Ok(Method::ShellResizeSession),
         "deploy" => Err(ClassifyError::Disallowed("deploy".into())),
         other => Err(ClassifyError::Unknown(other.into())),
     }
@@ -74,6 +95,12 @@ mod tests {
     fn exec_allowed() {
         let r = classify(&serde_json::json!({"method": "exec", "argv": ["ls"]}));
         assert_eq!(r.unwrap(), Method::Exec);
+    }
+
+    #[test]
+    fn shell_attach_allowed() {
+        let r = classify(&serde_json::json!({"method": "shell.attach_session", "id": "abc"}));
+        assert_eq!(r.unwrap(), Method::ShellAttachSession);
     }
 
     #[test]
