@@ -220,8 +220,9 @@ export EE_OWNER="posix4e" # or an org/repo principal
 ```
 
 The script defines and starts `dd-local-dogfood` against
-`https://app.devopsdefender.com`. It follows the production stable EE image and
-the `latest` DD release by default. It preserves
+`https://app.devopsdefender.com`. By default it reuses the already-synced local
+EasyEnclave base tag, falling back to the EasyEnclave staging channel only when
+no local tag exists. It uses the `latest` DD release by default. It preserves
 `/var/lib/libvirt/images/dd-local-dogfood-workload.qcow2` across runs, so
 Podman images, shell transcript storage, and Codex login state survive explicit
 operator refreshes. Production deploys do not call this script and do not

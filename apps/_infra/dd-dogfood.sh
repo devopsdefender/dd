@@ -19,9 +19,15 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$REPO_ROOT"
 
-# Dogfood follows production's stable EE image and latest DD binary unless
-# the operator deliberately pins either value for a one-off test.
-export DD_EE_CHANNEL="${DD_EE_CHANNEL:-stable}"
+# Dogfood is an operator VM, not CI. Prefer the already-synced local EE base
+# when present so a manual dogfood refresh does not depend on channel metadata
+# moving in easyenclave/easyenclave-mini. Explicit DD_EE_TAG still wins, and
+# DD_EE_CHANNEL remains available for deliberate channel refreshes.
+if [ -z "${DD_EE_TAG:-}" ] && [ -r /var/lib/libvirt/images/easyenclave-local.qcow2.tag ]; then
+  export DD_EE_TAG
+  DD_EE_TAG="$(cat /var/lib/libvirt/images/easyenclave-local.qcow2.tag)"
+fi
+export DD_EE_CHANNEL="${DD_EE_CHANNEL:-staging}"
 export DD_RELEASE_TAG="${DD_RELEASE_TAG:-latest}"
 export DD_AUTH_BROKER_URL="${DD_AUTH_BROKER_URL:-https://app.devopsdefender.com}"
 export DD_AUTH_COOKIE_DOMAIN="${DD_AUTH_COOKIE_DOMAIN:-.devopsdefender.com}"
