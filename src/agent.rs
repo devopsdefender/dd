@@ -64,8 +64,14 @@ struct St {
     /// CP keys off this to look up the tunnel_id.
     agent_id: String,
     started: Instant,
-    /// Current Intel-signed JWT. Refreshed by a background task.
+    /// Current Intel-signed JWT minted over a freshness nonce. Used by the CP's
+    /// scrape-and-verify loop. Refreshed by a background task.
     ita_token: Arc<RwLock<String>>,
+    /// Intel-signed JWT minted over the *Noise* quote (binds the Noise pubkey in
+    /// `report_data`). Served as `noise.ita_token` so clients can verify the
+    /// agent's attestation against Intel's public JWKS without an ITA account of
+    /// their own — they verify, they don't mint. Refreshed alongside `ita_token`.
+    noise_ita_token: Arc<RwLock<String>>,
     /// Live set of per-workload ingress rules this agent has asked
     /// the CP to publish. Seeded from boot `cfg.extra_ingress`;
     /// appended each time a POSTed workload declares `expose`. The
@@ -174,6 +180,34 @@ pub async fn run() -> Result<()> {
             .map_err(|e| Error::Internal(format!("noise keypair: {e}")))?,
     );
     eprintln!("agent: noise_pubkey={}", hex::encode(attestor.public_key()));
+
+    // Mint an ITA token over the Noise quote so clients can verify the agent's
+    // attestation against Intel's public JWKS without minting (and thus without
+    // an Intel account). Stable per boot; refreshed before expiry like the
+    // registration token.
+    let noise_ita_token = Arc::new(RwLock::new(
+        mint_noise_ita(&cfg, &attestor).await.unwrap_or_else(|e| {
+            eprintln!("agent: initial noise ITA mint failed ({e}); serving empty until refresh");
+            String::new()
+        }),
+    ));
+    {
+        let cfg = cfg.clone();
+        let attestor = attestor.clone();
+        let token = noise_ita_token.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(ITA_REFRESH).await;
+                match mint_noise_ita(&cfg, &attestor).await {
+                    Ok(t) => *token.write().await = t,
+                    Err(e) => {
+                        eprintln!("agent: noise ITA refresh failed (keeping stale token): {e}")
+                    }
+                }
+            }
+        });
+    }
+
     let ee_token = std::env::var("EE_TOKEN").ok();
     let upstream = Arc::new(noise_gateway::upstream::EeAgent::new(
         std::path::PathBuf::from(noise_gateway::upstream::DEFAULT_EE_AGENT_SOCK),
@@ -212,6 +246,7 @@ pub async fn run() -> Result<()> {
         agent_id: b.agent_id,
         started: Instant::now(),
         ita_token,
+        noise_ita_token,
         extras: Arc::new(RwLock::new(cfg.extra_ingress.clone())),
         gh,
         attest: attestor,
@@ -487,6 +522,18 @@ async fn mint_ita(cfg: &Cfg, ee: &Ee) -> Result<String> {
     ita::mint(&cfg.ita.base_url, &cfg.ita.api_key, &quote_b64).await
 }
 
+/// Mint an Intel-signed appraisal of the *Noise* quote (the one binding the
+/// Noise pubkey into `report_data`). Served on `/health` as `noise.ita_token`
+/// so clients can verify it against Intel's public JWKS without an account.
+async fn mint_noise_ita(cfg: &Cfg, attest: &noise_gateway::attest::Attestor) -> Result<String> {
+    if cfg.ita.mode == ItaMode::Local {
+        return ita::mint_local(&cfg.ita.issuer, &cfg.ita.api_key, &cfg.common.vm_name);
+    }
+    use base64::Engine;
+    let quote_b64 = base64::engine::general_purpose::STANDARD.encode(attest.quote());
+    ita::mint(&cfg.ita.base_url, &cfg.ita.api_key, &quote_b64).await
+}
+
 fn spawn_cloudflared(token: String) {
     tokio::spawn(async move {
         eprintln!("agent: spawning cloudflared");
@@ -546,6 +593,7 @@ async fn health(State(s): State<St>) -> Json<serde_json::Value> {
         .unwrap_or_default();
     let m = metrics::collect().await;
     let ita_token = s.ita_token.read().await.clone();
+    let noise_ita_token = s.noise_ita_token.read().await.clone();
     let agent_owner = s.agent_owner.read().await.clone();
     let oracles = s.oracles.read().await.clone();
     let taint_reasons = s.taint.snapshot().await;
@@ -630,6 +678,10 @@ async fn health(State(s): State<St>) -> Json<serde_json::Value> {
         "noise": {
             "quote_b64": base64::engine::general_purpose::STANDARD.encode(s.attest.quote()),
             "pubkey_hex": hex::encode(s.attest.public_key()),
+            // Intel-signed appraisal of the Noise quote. Clients verify this
+            // against Intel's public JWKS (no account) instead of minting their
+            // own. Empty if minting failed at boot / in local ITA mode.
+            "ita_token": noise_ita_token,
         },
     }))
 }
