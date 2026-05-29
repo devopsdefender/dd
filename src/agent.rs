@@ -258,6 +258,23 @@ pub async fn run() -> Result<()> {
         http: crate::system_http_client(),
         devices,
     };
+    // Seed sessiond's E2E history recipient set in the background, retrying
+    // until sessiond is up. Without this, sessiond starts with no recipients
+    // and (correctly) refuses to persist history until a device mutation pushes
+    // the set. Re-pushed on every later enroll/revoke from their handlers.
+    {
+        let seed_state = state.clone();
+        tokio::spawn(async move {
+            for _ in 0..60 {
+                if push_history_recipients(&seed_state).await.is_ok() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+            eprintln!("agent: gave up seeding sessiond history recipients after retries");
+        });
+    }
+
     let api_state = state.clone();
     let api_ng_state = ng_state.clone();
 
@@ -1022,6 +1039,9 @@ async fn create_device(
         .upsert(device.clone())
         .await
         .map_err(|e| Error::Internal(format!("devices upsert: {e}")))?;
+    if let Err(e) = push_history_recipients(&s).await {
+        eprintln!("agent: failed to push history recipients after enroll: {e}");
+    }
     Ok((axum::http::StatusCode::CREATED, Json(device)))
 }
 
@@ -1042,6 +1062,9 @@ async fn revoke_device(
         .map_err(|e| Error::Internal(format!("devices revoke: {e}")))?;
     if !ok {
         return Err(Error::NotFound);
+    }
+    if let Err(e) = push_history_recipients(&s).await {
+        eprintln!("agent: failed to push history recipients after revoke: {e}");
     }
     Ok(Json(serde_json::json!({
         "revoked": pubkey,
@@ -1194,6 +1217,20 @@ async fn attach_to_sessiond(
     }
     output.abort();
     Ok(())
+}
+
+/// Push the current non-revoked device pubkey set to `dd-sessiond` so it seals
+/// persisted history to exactly those recipients. Called at startup (with retry,
+/// since sessiond may still be coming up) and after every device mutation.
+async fn push_history_recipients(s: &St) -> Result<()> {
+    let pubkeys = s.devices.live_pubkeys().await;
+    sessiond_post_empty_json(
+        s,
+        "/api/recipients",
+        &serde_json::json!({ "pubkeys": pubkeys }),
+    )
+    .await
+    .map(|_| ())
 }
 
 async fn sessiond_get<T: DeserializeOwned>(s: &St, path: &str) -> Result<T> {

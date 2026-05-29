@@ -75,6 +75,19 @@ impl Store {
         self.inner.read().await.values().cloned().collect()
     }
 
+    /// Hex pubkeys of all non-revoked devices — the recipient set that
+    /// `dd-sessiond` seals persisted history to. Mirrors the membership of the
+    /// noise-gateway [`TrustHandle`], but as hex strings ready to POST.
+    pub async fn live_pubkeys(&self) -> Vec<String> {
+        self.inner
+            .read()
+            .await
+            .values()
+            .filter(|d| d.revoked_at_ms.is_none())
+            .map(|d| d.pubkey.clone())
+            .collect()
+    }
+
     pub async fn upsert(&self, device: Device) -> anyhow::Result<()> {
         {
             let mut w = self.inner.write().await;
