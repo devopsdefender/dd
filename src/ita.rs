@@ -67,80 +67,9 @@ impl Claims {
             attester_type: get("attester_type"),
             mrtd: get("tdx_mrtd"),
             mrsigner: get("tdx_mrsigner"),
-            // Real Intel tokens carry the quote's report_data as `tdx_report_data`;
-            // the local dev issuer (`mint_local`) puts it in `attester_held_data`.
-            report_data: get("tdx_report_data").or_else(|| get("attester_held_data")),
+            report_data: get("attester_held_data"),
             extra: v,
         }
-    }
-}
-
-/// Expected enclave measurement allowlist — pins attestation to known-good code.
-///
-/// Sourced from env (see [`Self::from_env`]). When no MRTD is configured the
-/// fleet/measurement is *unpinned*: [`Self::check`] passes everything (the agent
-/// MRTD is still logged at register/scrape). Once pinned, mismatches are rejected
-/// (or, with enforcement off, logged as a warning for canary rollout).
-#[derive(Debug, Clone, Default)]
-pub struct ExpectedMeasurements {
-    /// Accepted MRTDs (lowercase hex), any-of. Empty = unpinned.
-    pub mrtds: Vec<String>,
-    /// Required TCB status (e.g. "UpToDate"); defaults to "UpToDate" once pinned.
-    pub tcb_status: Option<String>,
-    /// Reject on mismatch (true) vs. warn-and-allow (false, canary).
-    pub enforce: bool,
-}
-
-impl ExpectedMeasurements {
-    /// `DD_EXPECTED_MRTD` = comma/space-separated hex MRTDs (empty = unpinned).
-    /// `DD_EXPECTED_TCB`  = required TCB status (default "UpToDate" when pinned).
-    /// `DD_MEASUREMENT_ENFORCE` = "0"/"false" to warn instead of reject.
-    pub fn from_env() -> Self {
-        let mrtds: Vec<String> = std::env::var("DD_EXPECTED_MRTD")
-            .unwrap_or_default()
-            .split([',', ' ', '\n', '\t'])
-            .map(|s| s.trim().to_lowercase())
-            .filter(|s| !s.is_empty())
-            .collect();
-        let tcb_status = std::env::var("DD_EXPECTED_TCB")
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .or_else(|| (!mrtds.is_empty()).then(|| "UpToDate".to_string()));
-        let enforce = !matches!(
-            std::env::var("DD_MEASUREMENT_ENFORCE").as_deref(),
-            Ok("0") | Ok("false") | Ok("no")
-        );
-        Self {
-            mrtds,
-            tcb_status,
-            enforce,
-        }
-    }
-
-    pub fn is_pinned(&self) -> bool {
-        !self.mrtds.is_empty()
-    }
-
-    /// `Ok(())` if unpinned or matching; `Err(reason)` if pinned and mismatched.
-    pub fn check(&self, claims: &Claims) -> std::result::Result<(), String> {
-        if self.mrtds.is_empty() {
-            return Ok(());
-        }
-        let mrtd = claims.mrtd.as_deref().unwrap_or("").to_lowercase();
-        if !self.mrtds.contains(&mrtd) {
-            return Err(format!(
-                "mrtd {} not in expected allowlist",
-                if mrtd.is_empty() { "<none>" } else { &mrtd }
-            ));
-        }
-        if let Some(want) = &self.tcb_status {
-            let got = claims.tcb_status.as_deref().unwrap_or("");
-            if got != want {
-                return Err(format!("tcb_status {got:?} != expected {want:?}"));
-            }
-        }
-        Ok(())
     }
 }
 
@@ -385,42 +314,5 @@ mod tests {
         assert_eq!(c.mrsigner.as_deref(), Some("bb"));
         assert_eq!(c.report_data.as_deref(), Some("cc"));
         assert_eq!(c.extra, v);
-    }
-
-    fn claims_with(mrtd: &str, tcb: &str) -> Claims {
-        Claims {
-            mrtd: Some(mrtd.into()),
-            tcb_status: Some(tcb.into()),
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn unpinned_allows_anything() {
-        let exp = ExpectedMeasurements::default();
-        assert!(!exp.is_pinned());
-        assert!(exp.check(&claims_with("deadbeef", "OutOfDate")).is_ok());
-    }
-
-    #[test]
-    fn pinned_accepts_match_rejects_mismatch() {
-        let exp = ExpectedMeasurements {
-            mrtds: vec!["aa".into(), "bb".into()],
-            tcb_status: Some("UpToDate".into()),
-            enforce: true,
-        };
-        assert!(exp.check(&claims_with("bb", "UpToDate")).is_ok());
-        assert!(exp.check(&claims_with("cc", "UpToDate")).is_err()); // wrong mrtd
-        assert!(exp.check(&claims_with("aa", "OutOfDate")).is_err()); // bad tcb
-    }
-
-    #[test]
-    fn mrtd_match_is_case_insensitive() {
-        let exp = ExpectedMeasurements {
-            mrtds: vec!["abcd".into()],
-            tcb_status: None,
-            enforce: true,
-        };
-        assert!(exp.check(&claims_with("ABCD", "UpToDate")).is_ok());
     }
 }
