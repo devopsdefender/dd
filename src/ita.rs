@@ -67,8 +67,9 @@ impl Claims {
             attester_type: get("attester_type"),
             mrtd: get("tdx_mrtd"),
             mrsigner: get("tdx_mrsigner"),
-            // Intel TDX tokens carry the quote's report_data as `tdx_report_data`.
-            report_data: get("tdx_report_data"),
+            // Real Intel tokens carry the quote's report_data as `tdx_report_data`;
+            // the local dev issuer (`mint_local`) puts it in `attester_held_data`.
+            report_data: get("tdx_report_data").or_else(|| get("attester_held_data")),
             extra: v,
         }
     }
