@@ -166,26 +166,11 @@ pub async fn run() -> Result<()> {
 
     spawn_cloudflared(tunnel.token.clone());
 
-    {
-        let http = http.clone();
-        let cf = cfg.cf.clone();
-        let id = tunnel.id.clone();
-        let env = cfg.common.env_label.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(5)).await;
-            stonith::kill_old_tunnels(&http, &cf, &id, &env).await;
-        });
-    }
-
-    // Graceful shutdown signal. The watchdog triggers it when the
-    // tunnel's been reaped by a successor CP; axum::serve below
-    // awaits it and drains in-flight connections before exiting.
-    let (shutdown_tx, mut shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
-    tokio::spawn(stonith::self_watchdog(
-        cfg.cf.clone(),
-        tunnel.id.clone(),
-        shutdown_tx.clone(),
-    ));
+    // STONITH (new-CP-evicts-old: tunnel-delete + a self-watchdog that
+    // powered the old CP off when its tunnel vanished) was removed — it
+    // churned the Cloudflare tunnel hand-off, and the SSH/prod relaunch
+    // already destroys the old CP VM before booting this one. We just
+    // create our tunnel, flip the CNAME (in `cf::create`), and serve.
 
     // Stage 4: delete legacy Cloudflare Access apps for our published
     // hosts/paths. DD owns browser and machine auth in-code; Cloudflare
@@ -357,10 +342,6 @@ pub async fn run() -> Result<()> {
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
-    .with_graceful_shutdown(async move {
-        let _ = shutdown_rx.recv().await;
-        eprintln!("cp: graceful shutdown signaled; draining in-flight requests");
-    })
     .await
     .map_err(|e| Error::Internal(e.to_string()))
 }
