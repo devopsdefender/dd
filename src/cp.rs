@@ -48,9 +48,6 @@ struct St {
     collector_wake: Arc<Notify>,
     started: Instant,
     verifier: Arc<ita::Verifier>,
-    /// Expected enclave measurement allowlist (MRTD/TCB). Pins the fleet to
-    /// known-good code; unpinned = observe-only.
-    expected: Arc<ita::ExpectedMeasurements>,
     /// The CP's own ITA token. Refreshed by a background task.
     cp_ita_token: Arc<RwLock<String>>,
     /// GH OIDC verifier for `/api/agents` callers (CI, humans). Same
@@ -307,18 +304,6 @@ pub async fn run() -> Result<()> {
     // Start the collector with the verifier. It re-verifies each
     // scraped agent's ita_token, so expired / revoked / unsigned
     // agents drop off the dashboard automatically.
-    let expected = Arc::new(ita::ExpectedMeasurements::from_env());
-    if expected.is_pinned() {
-        eprintln!(
-            "cp: measurement pinning ON ({} mrtd(s), tcb={}, enforce={})",
-            expected.mrtds.len(),
-            expected.tcb_status.as_deref().unwrap_or("any"),
-            expected.enforce
-        );
-    } else {
-        eprintln!("cp: measurement pinning OFF (DD_EXPECTED_MRTD unset) — observe only");
-    }
-
     let collector_wake = Arc::new(Notify::new());
     tokio::spawn(collector::run(
         store.clone(),
@@ -327,7 +312,6 @@ pub async fn run() -> Result<()> {
         cfg.hostname.clone(),
         ee.clone(),
         verifier.clone(),
-        expected.clone(),
         collector_wake.clone(),
         Duration::from_secs(cfg.scrape_interval_secs),
         Duration::from_secs(cfg.discovery_interval_secs),
@@ -344,7 +328,6 @@ pub async fn run() -> Result<()> {
         collector_wake,
         started: Instant::now(),
         verifier,
-        expected,
         cp_ita_token,
         gh,
     };
@@ -531,16 +514,6 @@ async fn register(
         ita_claims.mrtd.as_deref().unwrap_or("?"),
         ita_claims.tcb_status.as_deref().unwrap_or("?")
     );
-    if let Err(reason) = s.expected.check(&ita_claims) {
-        if s.expected.enforce {
-            eprintln!("cp: REJECT register {}: {reason}", req.vm_name);
-            return Err(Error::Unauthorized);
-        }
-        eprintln!(
-            "cp: WARN register {} measurement mismatch (not enforced): {reason}",
-            req.vm_name
-        );
-    }
 
     let http = cf::http_client();
     let name = cf::agent_tunnel_name(&s.cfg.common.env_label);

@@ -227,7 +227,6 @@ pub async fn run(
     cp_hostname: String,
     ee: Arc<Ee>,
     verifier: Arc<ita::Verifier>,
-    expected: Arc<ita::ExpectedMeasurements>,
     wake: Arc<Notify>,
     scrape_interval: Duration,
     discovery_interval: Duration,
@@ -271,7 +270,6 @@ pub async fn run(
             &prefix,
             &ee,
             &verifier,
-            &expected,
             &env_label,
             &cp_hostname,
             discover,
@@ -291,7 +289,6 @@ async fn tick(
     prefix: &str,
     ee: &Arc<Ee>,
     verifier: &Arc<ita::Verifier>,
-    expected: &Arc<ita::ExpectedMeasurements>,
     env_label: &str,
     cp_hostname: &str,
     discover: bool,
@@ -378,13 +375,6 @@ async fn tick(
                 continue;
             }
         };
-        if let Err(reason) = expected.check(&claims) {
-            if expected.enforce {
-                eprintln!("cp: collector: {name} measurement mismatch — dropping: {reason}");
-                continue;
-            }
-            eprintln!("cp: collector: {name} measurement mismatch (not enforced): {reason}");
-        }
         // Store key is the tunnel name (authoritative on the CP side),
         // NOT the agent's self-reported agent_id.
         let mut s = store.lock().await;
