@@ -21,9 +21,10 @@ use axum::{Json, Router};
 use base64::Engine as _;
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
+use hkdf::Hkdf;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use sha2::Sha256;
 use tokio::fs::File as TokioFile;
 use tokio::fs::OpenOptions;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -31,6 +32,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::process::{Child, Command};
 use tokio::sync::{broadcast, Mutex, RwLock};
 use uuid::Uuid;
+use x25519_dalek::{PublicKey, StaticSecret};
 
 use crate::error::{Error, Result};
 use crate::taint::IntegrityState;
@@ -136,12 +138,19 @@ exec "$PODMAN" run --rm --replace -it --pull=missing \
   /bin/sh
 "#;
 
+/// Live set of paired device X25519 pubkeys that persisted history is
+/// end-to-end-encrypted to. Pushed in by `dd-agent` (which owns the device
+/// registry) via `POST /api/recipients`. The enclave can encrypt to these but,
+/// holding no device private key, cannot decrypt the result.
+type Recipients = Arc<RwLock<Vec<[u8; 32]>>>;
+
 #[derive(Clone)]
 struct App {
     sessions: Arc<RwLock<HashMap<String, Arc<Session>>>>,
     store: TranscriptStore,
     recipes: Arc<Vec<Recipe>>,
     scratch_root: PathBuf,
+    recipients: Recipients,
 }
 
 struct Session {
@@ -172,6 +181,20 @@ pub struct SessionMeta {
     pub updated_at: i64,
     pub status: SessionStatus,
     pub exit_code: Option<i32>,
+    /// Whether persisted scrollback is being captured (E2E) or dropped because
+    /// no device is paired to decrypt it. Reflects the recipient set at session
+    /// start.
+    pub history: HistoryState,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HistoryState {
+    /// History is sealed to paired device pubkeys; the enclave cannot read it.
+    E2e,
+    /// No paired device at session start — history capture is disabled rather
+    /// than fall back to a server-readable key.
+    DisabledNoDevice,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -222,10 +245,19 @@ pub struct ResizeSession {
     pub rows: u16,
 }
 
+/// Replay returns the raw end-to-end-encrypted records. The enclave does not
+/// (and cannot) decrypt them — the paired device decrypts client-side. `records`
+/// are the on-disk sealed lines in order; see [`SealedLine`] for the format.
 #[derive(Deserialize, Serialize)]
 pub struct ReplayResponse {
     pub id: String,
-    pub bytes_b64: String,
+    pub version: u32,
+    pub records: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct SetRecipients {
+    pubkeys: Vec<String>,
 }
 
 struct RecipeSeed {
@@ -239,7 +271,10 @@ struct RecipeSeed {
 #[derive(Clone)]
 struct TranscriptStore {
     dir: PathBuf,
-    key: [u8; 32],
+    recipients: Recipients,
+    /// Set once we've logged the "no paired devices" warning, so it isn't
+    /// repeated on every PTY chunk.
+    warned_no_recipients: Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -247,6 +282,26 @@ struct TranscriptRecord {
     ts: i64,
     kind: String,
     data_b64: String,
+}
+
+/// One sealed transcript line. `body` is the record encrypted under a random
+/// content key (CEK); each `rcpts` stanza wraps that CEK to one device pubkey
+/// via an ephemeral X25519 key + HKDF-SHA256. The enclave discards the CEK and
+/// ephemeral secrets after sealing, so only a holder of a device private key can
+/// recover the plaintext.
+#[derive(Serialize, Deserialize)]
+struct SealedLine {
+    v: u32,
+    rcpts: Vec<RecipientStanza>,
+    bn: String,
+    body: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct RecipientStanza {
+    epk: String,
+    n: String,
+    wk: String,
 }
 
 pub async fn run() -> Result<()> {
@@ -265,7 +320,8 @@ pub async fn run() -> Result<()> {
 
     let root = PathBuf::from(&dir);
     wait_for_required_mounts(&[root.as_path(), scratch_root.as_path()]).await?;
-    let store = TranscriptStore::new(root.clone()).await?;
+    let recipients: Recipients = Arc::new(RwLock::new(Vec::new()));
+    let store = TranscriptStore::new(root.clone(), recipients.clone()).await?;
     tokio::fs::create_dir_all(&scratch_root).await?;
     set_private_dir_permissions(&scratch_root).await?;
     let recipe_dir = root.join("recipes");
@@ -278,6 +334,7 @@ pub async fn run() -> Result<()> {
         store,
         recipes,
         scratch_root,
+        recipients,
     };
 
     {
@@ -296,6 +353,7 @@ pub async fn run() -> Result<()> {
         .route("/api/sessions/{id}/replay", get(replay_session))
         .route("/api/sessions/{id}/resize", post(resize_session))
         .route("/api/sessions/{id}/close", post(close_session))
+        .route("/api/recipients", post(set_recipients))
         .with_state(app_state);
 
     eprintln!("dd-sessiond: http listening on {http_addr}");
@@ -370,6 +428,12 @@ async fn create_session(
     let master_fd = input.as_raw_fd();
     let (tx, _) = broadcast::channel(512);
 
+    let history = if app.recipients.read().await.is_empty() {
+        HistoryState::DisabledNoDevice
+    } else {
+        HistoryState::E2e
+    };
+
     let meta = SessionMeta {
         id: id.clone(),
         name,
@@ -385,6 +449,7 @@ async fn create_session(
         updated_at: now,
         status: SessionStatus::Running,
         exit_code: None,
+        history,
     };
     app.store.append_meta(&meta).await?;
 
@@ -414,11 +479,36 @@ async fn replay_session(
     State(app): State<App>,
     AxPath(id): AxPath<String>,
 ) -> Result<Json<ReplayResponse>> {
-    let bytes = app.store.replay(&id).await?;
+    let records = app.store.replay(&id).await?;
     Ok(Json(ReplayResponse {
         id,
-        bytes_b64: base64::engine::general_purpose::STANDARD.encode(bytes),
+        version: 2,
+        records,
     }))
+}
+
+/// Loopback-only: `dd-agent` pushes the current non-revoked device pubkey set
+/// here whenever it changes. Subsequent transcript records are sealed to this
+/// set. Replaces the set wholesale.
+async fn set_recipients(
+    State(app): State<App>,
+    Json(req): Json<SetRecipients>,
+) -> Result<StatusCode> {
+    let mut parsed = Vec::with_capacity(req.pubkeys.len());
+    for pk in &req.pubkeys {
+        let bytes = hex::decode(pk)
+            .map_err(|_| Error::BadRequest("recipient pubkey must be hex".into()))?;
+        if bytes.len() != 32 {
+            return Err(Error::BadRequest(
+                "recipient pubkey must decode to 32 bytes".into(),
+            ));
+        }
+        let mut k = [0u8; 32];
+        k.copy_from_slice(&bytes);
+        parsed.push(k);
+    }
+    *app.recipients.write().await = parsed;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn resize_session(
@@ -913,10 +1003,13 @@ async fn push_ring(session: &Session, bytes: &[u8]) {
 }
 
 impl TranscriptStore {
-    async fn new(dir: PathBuf) -> Result<Self> {
+    async fn new(dir: PathBuf, recipients: Recipients) -> Result<Self> {
         tokio::fs::create_dir_all(&dir).await?;
-        let key = history_key(&dir).await?;
-        Ok(Self { dir, key })
+        Ok(Self {
+            dir,
+            recipients,
+            warned_no_recipients: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        })
     }
 
     async fn append_meta(&self, meta: &SessionMeta) -> Result<()> {
@@ -925,13 +1018,28 @@ impl TranscriptStore {
     }
 
     async fn append_bytes(&self, id: &str, kind: &str, bytes: &[u8]) -> Result<()> {
+        let recipients = self.recipients.read().await.clone();
+        if recipients.is_empty() {
+            // No paired device means nothing can ever decrypt this history. We
+            // refuse to persist rather than fall back to a server-readable key,
+            // which would defeat end-to-end encryption. Warn once.
+            use std::sync::atomic::Ordering;
+            if !self.warned_no_recipients.swap(true, Ordering::Relaxed) {
+                eprintln!(
+                    "dd-sessiond: no paired devices; history capture disabled \
+                     (end-to-end encryption requires at least one recipient)"
+                );
+            }
+            return Ok(());
+        }
+
         let record = TranscriptRecord {
             ts: unix_ts(),
             kind: kind.to_string(),
             data_b64: base64::engine::general_purpose::STANDARD.encode(bytes),
         };
         let plain = serde_json::to_vec(&record).map_err(|e| Error::Internal(e.to_string()))?;
-        let line = self.encrypt_line(&plain)?;
+        let line = seal_record(&recipients, &plain)?;
         let path = self.path(id);
         let mut f = OpenOptions::new()
             .create(true)
@@ -943,92 +1051,84 @@ impl TranscriptStore {
         Ok(())
     }
 
-    async fn replay(&self, id: &str) -> Result<Vec<u8>> {
+    /// Returns the raw sealed records in order. The enclave does not decrypt
+    /// them — the caller's paired device does, client-side.
+    async fn replay(&self, id: &str) -> Result<Vec<String>> {
         let path = self.path(id);
         if !Path::new(&path).exists() {
             return Err(Error::NotFound);
         }
         let text = tokio::fs::read_to_string(path).await?;
-        let mut out = Vec::new();
-        for line in text.lines().filter(|l| !l.trim().is_empty()) {
-            let plain = self.decrypt_line(line)?;
-            let record: TranscriptRecord =
-                serde_json::from_slice(&plain).map_err(|e| Error::Internal(e.to_string()))?;
-            if record.kind == "pty" || record.kind == "stdout" || record.kind == "stderr" {
-                let bytes = base64::engine::general_purpose::STANDARD
-                    .decode(record.data_b64)
-                    .map_err(|e| Error::Internal(e.to_string()))?;
-                out.extend_from_slice(&bytes);
-            }
-        }
-        Ok(out)
+        Ok(text
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| l.to_string())
+            .collect())
     }
 
     fn path(&self, id: &str) -> PathBuf {
         self.dir.join(format!("{id}.log.enc"))
     }
-
-    fn encrypt_line(&self, plain: &[u8]) -> Result<String> {
-        let cipher = ChaCha20Poly1305::new(Key::from_slice(&self.key));
-        let mut nonce = [0u8; 12];
-        rand::thread_rng().fill_bytes(&mut nonce);
-        let ciphertext = cipher
-            .encrypt(Nonce::from_slice(&nonce), plain)
-            .map_err(|e| Error::Internal(format!("encrypt transcript: {e}")))?;
-        let mut packed = nonce.to_vec();
-        packed.extend_from_slice(&ciphertext);
-        Ok(base64::engine::general_purpose::STANDARD.encode(packed))
-    }
-
-    fn decrypt_line(&self, line: &str) -> Result<Vec<u8>> {
-        let packed = base64::engine::general_purpose::STANDARD
-            .decode(line)
-            .map_err(|e| Error::Internal(e.to_string()))?;
-        if packed.len() < 13 {
-            return Err(Error::Internal("truncated transcript record".into()));
-        }
-        let (nonce, ciphertext) = packed.split_at(12);
-        let cipher = ChaCha20Poly1305::new(Key::from_slice(&self.key));
-        cipher
-            .decrypt(Nonce::from_slice(nonce), ciphertext)
-            .map_err(|e| Error::Internal(format!("decrypt transcript: {e}")))
-    }
 }
 
-async fn history_key(dir: &Path) -> Result<[u8; 32]> {
-    if let Ok(raw) = std::env::var("DD_SESSIOND_HISTORY_KEY") {
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(raw.trim())
-            .or_else(|_| hex::decode(raw.trim()))
-            .map_err(|_| {
-                Error::BadRequest("DD_SESSIOND_HISTORY_KEY must be base64 or hex".into())
-            })?;
-        if bytes.len() != 32 {
-            return Err(Error::BadRequest(
-                "DD_SESSIOND_HISTORY_KEY must decode to 32 bytes".into(),
-            ));
-        }
-        let mut key = [0u8; 32];
-        key.copy_from_slice(&bytes);
-        return Ok(key);
+/// Domain-separated per-recipient key-wrapping key from an X25519 shared secret.
+fn derive_wrap_key(shared: &[u8; 32], epk: &[u8; 32], rpk: &[u8; 32]) -> [u8; 32] {
+    let hk = Hkdf::<Sha256>::new(None, shared);
+    let mut info = Vec::with_capacity(b"dd-sessiond-e2e-v2".len() + 64);
+    info.extend_from_slice(b"dd-sessiond-e2e-v2");
+    info.extend_from_slice(epk);
+    info.extend_from_slice(rpk);
+    let mut out = [0u8; 32];
+    hk.expand(&info, &mut out)
+        .expect("hkdf expand of 32 bytes never fails");
+    out
+}
+
+/// Seal `plain` to every recipient pubkey. A random content key encrypts the
+/// body; that content key is wrapped to each recipient via an ephemeral X25519
+/// key + HKDF. The ephemeral secrets and content key are dropped on return, so
+/// the enclave cannot recover the plaintext afterwards.
+fn seal_record(recipients: &[[u8; 32]], plain: &[u8]) -> Result<String> {
+    let mut rng = rand::thread_rng();
+
+    let mut cek = [0u8; 32];
+    rng.fill_bytes(&mut cek);
+
+    let mut bn = [0u8; 12];
+    rng.fill_bytes(&mut bn);
+    let body = ChaCha20Poly1305::new(Key::from_slice(&cek))
+        .encrypt(Nonce::from_slice(&bn), plain)
+        .map_err(|e| Error::Internal(format!("seal transcript body: {e}")))?;
+
+    let mut rcpts = Vec::with_capacity(recipients.len());
+    for r in recipients {
+        let mut e_bytes = [0u8; 32];
+        rng.fill_bytes(&mut e_bytes);
+        let e_sk = StaticSecret::from(e_bytes);
+        let e_pk = PublicKey::from(&e_sk);
+        let shared = e_sk.diffie_hellman(&PublicKey::from(*r));
+        let wrap_key = derive_wrap_key(shared.as_bytes(), e_pk.as_bytes(), r);
+
+        let mut n = [0u8; 12];
+        rng.fill_bytes(&mut n);
+        let wk = ChaCha20Poly1305::new(Key::from_slice(&wrap_key))
+            .encrypt(Nonce::from_slice(&n), cek.as_ref())
+            .map_err(|e| Error::Internal(format!("wrap content key: {e}")))?;
+
+        rcpts.push(RecipientStanza {
+            epk: hex::encode(e_pk.as_bytes()),
+            n: hex::encode(n),
+            wk: base64::engine::general_purpose::STANDARD.encode(wk),
+        });
     }
 
-    let key_path = dir.join("history.key");
-    if let Ok(bytes) = tokio::fs::read(&key_path).await {
-        if bytes.len() == 32 {
-            let mut key = [0u8; 32];
-            key.copy_from_slice(&bytes);
-            return Ok(key);
-        }
-    }
-
-    let mut material = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut material);
-    tokio::fs::write(&key_path, material).await?;
-    let mut hasher = Sha256::new();
-    hasher.update(material);
-    hasher.update(b"dd-sessiond-history-v1");
-    Ok(hasher.finalize().into())
+    let line = SealedLine {
+        v: 2,
+        rcpts,
+        bn: hex::encode(bn),
+        body: base64::engine::general_purpose::STANDARD.encode(body),
+    };
+    serde_json::to_string(&line).map_err(|e| Error::Internal(e.to_string()))
 }
 
 fn unix_ts() -> i64 {
@@ -1036,4 +1136,130 @@ fn unix_ts() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or(Duration::ZERO)
         .as_secs() as i64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const B64: base64::engine::general_purpose::GeneralPurpose =
+        base64::engine::general_purpose::STANDARD;
+
+    /// A test client device. Holds the X25519 private key the enclave never sees.
+    struct TestDevice {
+        sk: StaticSecret,
+        pk: [u8; 32],
+    }
+
+    impl TestDevice {
+        fn new(seed: u8) -> Self {
+            let sk = StaticSecret::from([seed; 32]);
+            let pk = *PublicKey::from(&sk).as_bytes();
+            Self { sk, pk }
+        }
+    }
+
+    fn hex32(s: &str) -> [u8; 32] {
+        let v = hex::decode(s).unwrap();
+        let mut k = [0u8; 32];
+        k.copy_from_slice(&v);
+        k
+    }
+    fn hex12(s: &str) -> [u8; 12] {
+        let v = hex::decode(s).unwrap();
+        let mut k = [0u8; 12];
+        k.copy_from_slice(&v);
+        k
+    }
+
+    /// Client-side decryption — the operation the enclave structurally cannot
+    /// perform (it holds no device private key). Mirrors what dd-client does.
+    fn open_record(device: &TestDevice, line: &str) -> Option<Vec<u8>> {
+        let parsed: SealedLine = serde_json::from_str(line).ok()?;
+        let bn = hex12(&parsed.bn);
+        let body = B64.decode(&parsed.body).ok()?;
+        for st in &parsed.rcpts {
+            let epk = hex32(&st.epk);
+            let shared = device.sk.diffie_hellman(&PublicKey::from(epk));
+            let wrap_key = derive_wrap_key(shared.as_bytes(), &epk, &device.pk);
+            let n = hex12(&st.n);
+            let wk = B64.decode(&st.wk).ok()?;
+            if let Ok(cek) = ChaCha20Poly1305::new(Key::from_slice(&wrap_key))
+                .decrypt(Nonce::from_slice(&n), wk.as_ref())
+            {
+                let cek: [u8; 32] = cek.try_into().ok()?;
+                return ChaCha20Poly1305::new(Key::from_slice(&cek))
+                    .decrypt(Nonce::from_slice(&bn), body.as_ref())
+                    .ok();
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn round_trip_single_recipient() {
+        let dev = TestDevice::new(1);
+        let plain = b"codex: hello world";
+        let line = seal_record(&[dev.pk], plain).unwrap();
+        // On-disk line is opaque: plaintext must not appear anywhere in it.
+        assert!(!line.as_bytes().windows(plain.len()).any(|w| w == plain));
+        assert_eq!(open_record(&dev, &line).unwrap(), plain);
+    }
+
+    #[test]
+    fn multi_recipient_each_opens_outsider_cannot() {
+        let a = TestDevice::new(1);
+        let b = TestDevice::new(2);
+        let c = TestDevice::new(3); // never a recipient
+        let plain = b"shared scrollback";
+        let line = seal_record(&[a.pk, b.pk], plain).unwrap();
+        assert_eq!(open_record(&a, &line).unwrap(), plain);
+        assert_eq!(open_record(&b, &line).unwrap(), plain);
+        assert!(open_record(&c, &line).is_none());
+    }
+
+    #[tokio::test]
+    async fn no_recipients_persists_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let recipients: Recipients = Arc::new(RwLock::new(Vec::new()));
+        let store = TranscriptStore::new(dir.path().to_path_buf(), recipients)
+            .await
+            .unwrap();
+        store
+            .append_bytes("sess", "pty", b"secret bytes")
+            .await
+            .unwrap();
+        // Nothing written, and replay reports no history rather than leaking.
+        assert!(!Path::new(&store.path("sess")).exists());
+        assert!(matches!(store.replay("sess").await, Err(Error::NotFound)));
+    }
+
+    #[tokio::test]
+    async fn recipient_set_changes_apply_to_subsequent_records() {
+        let a = TestDevice::new(1);
+        let b = TestDevice::new(2);
+        let dir = tempfile::tempdir().unwrap();
+        let recipients: Recipients = Arc::new(RwLock::new(vec![a.pk]));
+        let store = TranscriptStore::new(dir.path().to_path_buf(), recipients.clone())
+            .await
+            .unwrap();
+
+        store.append_bytes("s", "pty", b"first").await.unwrap();
+        *recipients.write().await = vec![b.pk];
+        store.append_bytes("s", "pty", b"second").await.unwrap();
+
+        let lines = store.replay("s").await.unwrap();
+        assert_eq!(lines.len(), 2);
+
+        // Record 1 is readable only by A, record 2 only by B.
+        let r1: TranscriptRecord =
+            serde_json::from_slice(&open_record(&a, &lines[0]).unwrap()).unwrap();
+        assert_eq!(B64.decode(r1.data_b64).unwrap(), b"first");
+        assert!(open_record(&b, &lines[0]).is_none());
+
+        let r2: TranscriptRecord =
+            serde_json::from_slice(&open_record(&b, &lines[1]).unwrap()).unwrap();
+        assert_eq!(B64.decode(r2.data_b64).unwrap(), b"second");
+        assert!(open_record(&a, &lines[1]).is_none());
+    }
 }
