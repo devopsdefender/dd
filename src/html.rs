@@ -43,6 +43,12 @@ button:hover { background:#74c7ec; }
 .err { color:#f38ba8; font-size:13px; margin-bottom:12px; }
 pre { background:#11111b; border:1px solid #313244; border-radius:8px; padding:16px; overflow:auto; font-size:12px; line-height:1.5; color:#a6adc8; }
 code { background:#11111b; padding:2px 6px; border-radius:3px; font-size:12px; }
+.livebar { display:flex; align-items:baseline; gap:12px; margin-bottom:4px; }
+.livebar h1 { margin:0; }
+.live { font-size:12px; color:#a6e3a1; }
+.live::before { content:"\25CF\00a0"; }
+.live.stale { color:#fab387; }
+.live.dead { color:#f38ba8; }
 @media (max-width:640px) { main { padding:16px; } .cards { grid-template-columns:1fr 1fr; } }
 "#;
 
