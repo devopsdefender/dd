@@ -223,6 +223,7 @@ pub async fn run() -> Result<()> {
             last_seen: chrono::Utc::now(),
             agent_mode: AgentMode::ReadWrite,
             integrity_state: IntegrityState::Controlled,
+            owner: None,
             deployment_count: 0,
             deployment_names: Vec::new(),
             unit_count: 0,
@@ -338,6 +339,8 @@ pub async fn run() -> Result<()> {
         .route("/", get(fleet))
         .route("/auth/github/start", get(auth_start))
         .route("/auth/github/callback", get(auth_callback))
+        .route("/auth/device/start", post(device_start))
+        .route("/auth/device/poll", post(device_poll))
         .route("/health", get(health))
         .route("/register", post(register))
         .route("/ingress/replace", post(ingress_replace))
@@ -582,6 +585,7 @@ async fn register(
                 last_seen: now,
                 agent_mode: AgentMode::ReadWrite,
                 integrity_state: IntegrityState::Controlled,
+                owner: None,
                 deployment_count: 0,
                 deployment_names: Vec::new(),
                 unit_count: 0,
@@ -801,6 +805,60 @@ async fn auth_callback(
     }
 }
 
+/// `POST /auth/device/start` — native/iOS client begins GitHub device
+/// flow. Returns `{device_code, user_code, verification_uri, interval,
+/// expires_in}`; the client shows the user code + opens the URL, then
+/// polls `/auth/device/poll`.
+async fn device_start(State(s): State<St>) -> Response {
+    match s.cfg.auth.device_start(&crate::system_http_client()).await {
+        Ok(body) => Json(body).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct DevicePollReq {
+    device_code: String,
+}
+
+/// `POST /auth/device/poll {device_code}` — exchange an approved device
+/// code for a CP-issued bearer. 202 `{status:"pending"}` until the user
+/// approves; then `{status:"ready", token, exp, login, is_fleet_admin}`.
+/// The bearer is the same signed session the cookie carries; send it as
+/// `Authorization: Bearer` to `/api/fleet`.
+async fn device_poll(State(s): State<St>, Json(req): Json<DevicePollReq>) -> Response {
+    match s
+        .cfg
+        .auth
+        .device_poll(
+            &crate::system_http_client(),
+            &s.cfg.common.owner,
+            &req.device_code,
+        )
+        .await
+    {
+        Ok(crate::auth::DevicePoll::Pending) => (
+            axum::http::StatusCode::ACCEPTED,
+            Json(serde_json::json!({ "status": "pending" })),
+        )
+            .into_response(),
+        Ok(crate::auth::DevicePoll::Ready {
+            token,
+            exp,
+            login,
+            is_fleet_admin,
+        }) => Json(serde_json::json!({
+            "status": "ready",
+            "token": token,
+            "exp": exp,
+            "login": login,
+            "is_fleet_admin": is_fleet_admin,
+        }))
+        .into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
 /// Live dashboard script: poll `/api/fleet` every 5s, swap the
 /// `#fleet-body` fragment, and drive the "updated Xs ago" indicator —
 /// which goes amber then red if polling stalls (frozen or unreachable
@@ -824,12 +882,101 @@ const FLEET_POLL_JS: &str = r#"(function(){
   setInterval(tick,5000); setInterval(ago,1000); tick();
 })();"#;
 
-/// Take a stable, id-sorted snapshot of the fleet store. Shared by the
-/// dashboard page and the `/api/fleet` poll endpoint.
-async fn fleet_snapshot(s: &St) -> Vec<(String, collector::Agent)> {
-    let mut by_id: Vec<_> = s.store.lock().await.clone().into_iter().collect();
+/// Resolve the human caller (native-client bearer OR browser session
+/// cookie), bound to this fleet. `Err` is the ready-to-return
+/// redirect-to-login (browser) or 401 (API).
+// The `Err` arm is a ready-to-return axum `Response` (inherently large);
+// boxing it would just churn every call site for no real benefit.
+#[allow(clippy::result_large_err)]
+fn human_session(
+    s: &St,
+    headers: &HeaderMap,
+    uri: &Uri,
+) -> std::result::Result<crate::auth::Session, Response> {
+    match s.cfg.auth.verify_human(&s.cfg.common.owner, headers) {
+        Some(sess) => Ok(sess),
+        None => Err(crate::auth::unauthorized_or_redirect(
+            &s.cfg.auth,
+            headers,
+            &crate::auth::absolute_url(headers, &s.cfg.hostname, path_and_query(uri)),
+        )),
+    }
+}
+
+/// Whether `session` may see `agent`. Fleet admins (fleet owner / org
+/// member) see everything; everyone else sees an agent only if its owner
+/// matches their GitHub login/id or one of their orgs. Unowned agents
+/// (incl. the `control-plane` entry) are admin-only.
+fn agent_visible(session: &crate::auth::Session, agent: &collector::Agent) -> bool {
+    owner_visible(session, agent.owner.as_ref())
+}
+
+/// Pure visibility decision (extracted for testing): admin sees all;
+/// otherwise the item is visible only if its owner matches the viewer.
+fn owner_visible(
+    session: &crate::auth::Session,
+    owner: Option<&crate::gh_oidc::Principal>,
+) -> bool {
+    session.is_fleet_admin || owner.is_some_and(|p| principal_matches_viewer(p, session))
+}
+
+fn principal_matches_viewer(p: &crate::gh_oidc::Principal, s: &crate::auth::Session) -> bool {
+    use crate::gh_oidc::PrincipalKind::{Org, Repo, User};
+    match p.kind {
+        User => p.id == s.user_id || p.name.eq_ignore_ascii_case(&s.login),
+        Org => s.orgs.iter().any(|o| o.eq_ignore_ascii_case(&p.name)),
+        // "owner/repo" — match the owner segment against login or orgs.
+        Repo => {
+            let seg = p.name.split('/').next().unwrap_or(&p.name);
+            seg.eq_ignore_ascii_case(&s.login) || s.orgs.iter().any(|o| o.eq_ignore_ascii_case(seg))
+        }
+    }
+}
+
+/// Id-sorted fleet snapshot scoped to what `session` may see.
+async fn scoped_snapshot(
+    s: &St,
+    session: &crate::auth::Session,
+) -> Vec<(String, collector::Agent)> {
+    let mut by_id: Vec<_> = s
+        .store
+        .lock()
+        .await
+        .iter()
+        .filter(|(_, a)| agent_visible(session, a))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
     by_id.sort_by(|a, b| a.0.cmp(&b.0));
     by_id
+}
+
+/// Does the caller want JSON (the native client) vs the HTML fragment
+/// (the browser dashboard poll)?
+fn wants_json(headers: &HeaderMap) -> bool {
+    headers
+        .get(axum::http::header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.contains("application/json"))
+        .unwrap_or(false)
+}
+
+/// Scoped fleet snapshot as JSON for the native/iOS client.
+fn fleet_json(s: &St, by_id: &[(String, collector::Agent)]) -> serde_json::Value {
+    let healthy = by_id.iter().filter(|(_, a)| a.status == "healthy").count();
+    let unit_total: usize = by_id.iter().map(|(_, a)| a.units.len()).sum();
+    let oracle_total: usize = by_id.iter().map(|(_, a)| a.oracles.len()).sum();
+    serde_json::json!({
+        "generated_at": chrono::Utc::now().to_rfc3339(),
+        "env": s.cfg.common.env_label,
+        "hostname": s.cfg.hostname,
+        "summary": {
+            "agents": by_id.len(),
+            "healthy": healthy,
+            "units": unit_total,
+            "oracles": oracle_total,
+        },
+        "agents": by_id.iter().map(|(_, a)| a).collect::<Vec<_>>(),
+    })
 }
 
 /// Render the live-swappable fleet body: summary line, count cards, the
@@ -946,10 +1093,11 @@ fn render_fleet_body(host: &str, env: &str, by_id: &[(String, collector::Agent)]
 }
 
 async fn fleet(State(s): State<St>, headers: HeaderMap, uri: Uri) -> Response {
-    if let Some(resp) = require_browser_auth(&s, &headers, &uri) {
-        return resp;
-    }
-    let by_id = fleet_snapshot(&s).await;
+    let session = match human_session(&s, &headers, &uri) {
+        Ok(sess) => sess,
+        Err(resp) => return resp,
+    };
+    let by_id = scoped_snapshot(&s, &session).await;
     let body = render_fleet_body(&s.cfg.hostname, &s.cfg.common.env_label, &by_id);
     Html(shell(
         "DD Fleet",
@@ -963,22 +1111,28 @@ async fn fleet(State(s): State<St>, headers: HeaderMap, uri: Uri) -> Response {
     .into_response()
 }
 
-/// `GET /api/fleet` — the live-refresh fragment: exactly the body
-/// `fleet()` renders initially, so the dashboard's 5s poll can swap it in
-/// place. Browser-gated like the dashboard (the poll fetches it
-/// same-origin with the session cookie); CF Access also covers it at the
-/// edge since it has no bypass app of its own.
+/// `GET /api/fleet` — ownership-scoped fleet, for both the browser
+/// dashboard poll (HTML fragment) and the native/iOS client
+/// (`Accept: application/json`). Auth is `verify_human`: the `dd_session`
+/// cookie (browser) OR a CP-issued `Authorization: Bearer` (native).
+/// The result is filtered to what the caller may see — admins get the
+/// whole fleet, everyone else only the deployments they own.
 async fn fleet_fragment(State(s): State<St>, headers: HeaderMap, uri: Uri) -> Response {
-    if let Some(resp) = require_browser_auth(&s, &headers, &uri) {
-        return resp;
+    let session = match human_session(&s, &headers, &uri) {
+        Ok(sess) => sess,
+        Err(resp) => return resp,
+    };
+    let by_id = scoped_snapshot(&s, &session).await;
+    if wants_json(&headers) {
+        Json(fleet_json(&s, &by_id)).into_response()
+    } else {
+        Html(render_fleet_body(
+            &s.cfg.hostname,
+            &s.cfg.common.env_label,
+            &by_id,
+        ))
+        .into_response()
     }
-    let by_id = fleet_snapshot(&s).await;
-    Html(render_fleet_body(
-        &s.cfg.hostname,
-        &s.cfg.common.env_label,
-        &by_id,
-    ))
-    .into_response()
 }
 
 // ── Enrollment broker ───────────────────────────────────────────────────
@@ -1162,11 +1316,14 @@ async fn agent_detail(
     uri: Uri,
     Path(id): Path<String>,
 ) -> Response {
-    if let Some(resp) = require_browser_auth(&s, &headers, &uri) {
-        return resp;
-    }
+    let session = match human_session(&s, &headers, &uri) {
+        Ok(sess) => sess,
+        Err(resp) => return resp,
+    };
     let agent = s.store.lock().await.get(&id).cloned();
-    let Some(a) = agent else {
+    // Scope: hide agents the caller may not see behind the same 404 as a
+    // missing one, so a non-admin can't probe for agents they don't own.
+    let Some(a) = agent.filter(|a| agent_visible(&session, a)) else {
         return (
             axum::http::StatusCode::NOT_FOUND,
             Html(shell("Not found", "", "<h1>Not found</h1>")),
@@ -1505,6 +1662,97 @@ async fn agent_logs(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gh_oidc::{Principal, PrincipalKind};
+
+    fn sess(login: &str, user_id: u64, orgs: &[&str], admin: bool) -> crate::auth::Session {
+        crate::auth::Session {
+            login: login.into(),
+            user_id,
+            exp: i64::MAX,
+            owner_name: "devopsdefender".into(),
+            owner_id: 1,
+            owner_kind: PrincipalKind::Org,
+            orgs: orgs.iter().map(|o| o.to_string()).collect(),
+            is_fleet_admin: admin,
+        }
+    }
+    fn principal(kind: PrincipalKind, name: &str, id: u64) -> Principal {
+        Principal {
+            name: name.into(),
+            id,
+            kind,
+        }
+    }
+
+    #[test]
+    fn admin_sees_everything_including_unowned() {
+        let admin = sess("ops", 7, &[], true);
+        assert!(owner_visible(&admin, None));
+        assert!(owner_visible(
+            &admin,
+            Some(&principal(PrincipalKind::User, "someone", 999))
+        ));
+    }
+
+    #[test]
+    fn non_admin_cannot_see_unowned() {
+        let user = sess("alice", 42, &["acme"], false);
+        assert!(!owner_visible(&user, None));
+    }
+
+    #[test]
+    fn non_admin_sees_own_by_user_id_or_login() {
+        let user = sess("alice", 42, &[], false);
+        // match by numeric id (login differs / renamed)
+        assert!(owner_visible(
+            &user,
+            Some(&principal(PrincipalKind::User, "renamed", 42))
+        ));
+        // match by login (case-insensitive)
+        assert!(owner_visible(
+            &user,
+            Some(&principal(PrincipalKind::User, "ALICE", 999))
+        ));
+        // different user → hidden
+        assert!(!owner_visible(
+            &user,
+            Some(&principal(PrincipalKind::User, "bob", 43))
+        ));
+    }
+
+    #[test]
+    fn non_admin_sees_org_owned_only_if_member() {
+        let user = sess("alice", 42, &["acme", "widgets"], false);
+        assert!(owner_visible(
+            &user,
+            Some(&principal(PrincipalKind::Org, "Acme", 5))
+        ));
+        assert!(!owner_visible(
+            &user,
+            Some(&principal(PrincipalKind::Org, "other-co", 6))
+        ));
+    }
+
+    #[test]
+    fn non_admin_repo_owner_matches_owner_segment() {
+        let user = sess("alice", 42, &["acme"], false);
+        // repo owned by org the viewer belongs to
+        assert!(owner_visible(
+            &user,
+            Some(&principal(PrincipalKind::Repo, "acme/app", 9))
+        ));
+        // repo owned by the viewer's own login
+        let solo = sess("alice", 42, &[], false);
+        assert!(owner_visible(
+            &solo,
+            Some(&principal(PrincipalKind::Repo, "alice/tool", 10))
+        ));
+        // repo owned by a stranger org
+        assert!(!owner_visible(
+            &user,
+            Some(&principal(PrincipalKind::Repo, "evil/app", 11))
+        ));
+    }
 
     #[test]
     fn fleet_body_empty_fleet_renders_zeroed_summary() {

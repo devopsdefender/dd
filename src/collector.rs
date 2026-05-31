@@ -55,6 +55,13 @@ pub struct Agent {
     pub last_seen: DateTime<Utc>,
     pub agent_mode: AgentMode,
     pub integrity_state: IntegrityState,
+    /// Runtime tenant that owns this agent (the `agent_owner_principal`
+    /// from the agent's `/health`), if any. Drives ownership-scoped fleet
+    /// visibility: a non-admin viewer sees an agent only if its owner
+    /// matches their GitHub login/id or one of their orgs. `None` = no
+    /// tenant assigned (admin-only visibility).
+    #[serde(default)]
+    pub owner: Option<crate::gh_oidc::Principal>,
     pub deployment_count: usize,
     pub deployment_names: Vec<String>,
     pub unit_count: usize,
@@ -406,6 +413,10 @@ async fn tick(
                     .unwrap_or(AgentMode::ReadWrite),
                 integrity_state: serde_json::from_value(h["integrity_state"].clone())
                     .unwrap_or(IntegrityState::Controlled),
+                // Runtime tenant from /health (None if unowned or absent).
+                owner: serde_json::from_value(h["agent_owner_principal"].clone())
+                    .ok()
+                    .flatten(),
                 deployment_count: h["deployment_count"].as_u64().unwrap_or(0) as usize,
                 deployment_names: h["deployments"]
                     .as_array()
@@ -781,6 +792,7 @@ mod tests {
             last_seen,
             agent_mode: AgentMode::ReadWrite,
             integrity_state: IntegrityState::Controlled,
+            owner: None,
             deployment_count: 0,
             deployment_names: Vec::new(),
             unit_count: 0,
