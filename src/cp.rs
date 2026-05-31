@@ -344,6 +344,7 @@ pub async fn run() -> Result<()> {
         .route("/agent/{id}", get(agent_detail))
         .route("/agent/{id}/logs/{app}", get(agent_logs))
         .route("/api/agents", get(api_agents))
+        .route("/api/fleet", get(fleet_fragment))
         .route("/api/v1/admin/export", get(export_state))
         .route("/admin/enroll", get(enroll_page))
         .with_state(state);
@@ -800,14 +801,42 @@ async fn auth_callback(
     }
 }
 
-async fn fleet(State(s): State<St>, headers: HeaderMap, uri: Uri) -> Response {
-    if let Some(resp) = require_browser_auth(&s, &headers, &uri) {
-        return resp;
-    }
-    let agents = s.store.lock().await.clone();
-    let mut rows = String::new();
-    let mut by_id: Vec<_> = agents.into_iter().collect();
+/// Live dashboard script: poll `/api/fleet` every 5s, swap the
+/// `#fleet-body` fragment, and drive the "updated Xs ago" indicator —
+/// which goes amber then red if polling stalls (frozen or unreachable
+/// CP), so liveness is visible at a glance without any alerting backend.
+const FLEET_POLL_JS: &str = r#"(function(){
+  var body=document.getElementById('fleet-body');
+  var stat=document.getElementById('fleet-status');
+  if(!body||!stat)return;
+  var last=Date.now();
+  function ago(){
+    var s=Math.round((Date.now()-last)/1000);
+    stat.textContent='updated '+(s<2?'just now':s+'s ago');
+    stat.className='live'+(s>20?' stale':'')+(s>60?' dead':'');
+  }
+  function tick(){
+    fetch('/api/fleet',{credentials:'same-origin'})
+      .then(function(r){ if(!r.ok) throw new Error(r.status); return r.text(); })
+      .then(function(h){ body.innerHTML=h; last=Date.now(); ago(); })
+      .catch(function(){ ago(); });
+  }
+  setInterval(tick,5000); setInterval(ago,1000); tick();
+})();"#;
+
+/// Take a stable, id-sorted snapshot of the fleet store. Shared by the
+/// dashboard page and the `/api/fleet` poll endpoint.
+async fn fleet_snapshot(s: &St) -> Vec<(String, collector::Agent)> {
+    let mut by_id: Vec<_> = s.store.lock().await.clone().into_iter().collect();
     by_id.sort_by(|a, b| a.0.cmp(&b.0));
+    by_id
+}
+
+/// Render the live-swappable fleet body: summary line, count cards, the
+/// agent table, and the managed-units table. Shared by the initial
+/// server-rendered `fleet()` page and the `/api/fleet` poll fragment so
+/// the two never diverge.
+fn render_fleet_body(host: &str, env: &str, by_id: &[(String, collector::Agent)]) -> String {
     let healthy = by_id.iter().filter(|(_, a)| a.status == "healthy").count();
     let read_only = by_id
         .iter()
@@ -819,7 +848,9 @@ async fn fleet(State(s): State<St>, headers: HeaderMap, uri: Uri) -> Response {
         .count();
     let unit_total: usize = by_id.iter().map(|(_, a)| a.units.len()).sum();
     let oracle_total: usize = by_id.iter().map(|(_, a)| a.oracles.len()).sum();
-    for (_, a) in &by_id {
+
+    let mut rows = String::new();
+    for (_, a) in by_id {
         let mem = if a.memory_total_mb > 0 {
             format!("{}/{} MB", a.memory_used_mb, a.memory_total_mb)
         } else {
@@ -848,7 +879,7 @@ async fn fleet(State(s): State<St>, headers: HeaderMap, uri: Uri) -> Response {
     }
 
     let mut unit_rows = String::new();
-    for (_, a) in &by_id {
+    for (_, a) in by_id {
         for u in &a.units {
             let refs = if u.refs.is_empty() {
                 r#"<span class="dim">none</span>"#.into()
@@ -898,11 +929,8 @@ async fn fleet(State(s): State<St>, headers: HeaderMap, uri: Uri) -> Response {
         )
     };
 
-    Html(shell(
-        "DD Fleet",
-        &html::nav(&[("Fleet", "/", true)]),
-        &format!(
-            r#"<h1>Fleet</h1><div class="sub">{host} · env {env} · {n} agent(s)</div>
+    format!(
+        r#"<div class="sub">{host} · env {env} · {n} agent(s)</div>
 <div class="cards">
   <div class="card"><div class="label">Healthy</div><div class="value green">{healthy}/{n}</div></div>
   <div class="card"><div class="label">Read/write</div><div class="value blue">{read_write}</div></div>
@@ -911,16 +939,44 @@ async fn fleet(State(s): State<St>, headers: HeaderMap, uri: Uri) -> Response {
   <div class="card"><div class="label">Oracles</div><div class="value green">{oracle_total}</div></div>
 </div>
 {table}{unit_table}"#,
-            host = html::escape(&s.cfg.hostname),
-            env = html::escape(&s.cfg.common.env_label),
-            n = by_id.len(),
-            healthy = healthy,
-            read_write = read_write,
-            read_only = read_only,
-            unit_total = unit_total,
-            oracle_total = oracle_total,
-            unit_table = unit_table,
+        host = html::escape(host),
+        env = html::escape(env),
+        n = by_id.len(),
+    )
+}
+
+async fn fleet(State(s): State<St>, headers: HeaderMap, uri: Uri) -> Response {
+    if let Some(resp) = require_browser_auth(&s, &headers, &uri) {
+        return resp;
+    }
+    let by_id = fleet_snapshot(&s).await;
+    let body = render_fleet_body(&s.cfg.hostname, &s.cfg.common.env_label, &by_id);
+    Html(shell(
+        "DD Fleet",
+        &html::nav(&[("Fleet", "/", true)]),
+        &format!(
+            r#"<div class="livebar"><h1>Fleet</h1><span id="fleet-status" class="live">updated just now</span></div>
+<div id="fleet-body">{body}</div>
+<script>{FLEET_POLL_JS}</script>"#
         ),
+    ))
+    .into_response()
+}
+
+/// `GET /api/fleet` — the live-refresh fragment: exactly the body
+/// `fleet()` renders initially, so the dashboard's 5s poll can swap it in
+/// place. Browser-gated like the dashboard (the poll fetches it
+/// same-origin with the session cookie); CF Access also covers it at the
+/// edge since it has no bypass app of its own.
+async fn fleet_fragment(State(s): State<St>, headers: HeaderMap, uri: Uri) -> Response {
+    if let Some(resp) = require_browser_auth(&s, &headers, &uri) {
+        return resp;
+    }
+    let by_id = fleet_snapshot(&s).await;
+    Html(render_fleet_body(
+        &s.cfg.hostname,
+        &s.cfg.common.env_label,
+        &by_id,
     ))
     .into_response()
 }
@@ -1444,4 +1500,29 @@ async fn agent_logs(
         ),
     ))
     .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fleet_body_empty_fleet_renders_zeroed_summary() {
+        let body = render_fleet_body("app.example.com", "production", &[]);
+        // Summary line reflects host/env/count.
+        assert!(body.contains("app.example.com · env production · 0 agent(s)"));
+        // Healthy card shows 0/0; five summary cards present.
+        assert!(body.contains(r#"<div class="value green">0/0</div>"#));
+        assert_eq!(body.matches(r#"<div class="card">"#).count(), 5);
+        // Empty-state rows for both tables.
+        assert!(body.contains("No agents registered"));
+        assert!(body.contains("No managed units reported yet"));
+    }
+
+    #[test]
+    fn fleet_body_escapes_host_and_env() {
+        let body = render_fleet_body("a<b>", "e&f", &[]);
+        assert!(body.contains("a&lt;b&gt; · env e&amp;f"));
+        assert!(!body.contains("a<b>"));
+    }
 }
