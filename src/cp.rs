@@ -452,6 +452,12 @@ async fn hydrate_from_peer(
 
 // ── Routes ──────────────────────────────────────────────────────────────
 
+/// Commit SHA this binary was built from. Baked at compile time via the
+/// `DD_BUILD_SHA` env in the CI release build step; "dev" otherwise.
+fn build_sha() -> &'static str {
+    option_env!("DD_BUILD_SHA").unwrap_or("dev")
+}
+
 async fn health(
     State(s): State<St>,
     Query(q): Query<HashMap<String, String>>,
@@ -462,6 +468,12 @@ async fn health(
         "service": "cp",
         "hostname": s.cfg.hostname,
         "env": s.cfg.common.env_label,
+        // Commit this binary was built from, baked at compile time
+        // (`DD_BUILD_SHA` env in the release build step). "dev" for local
+        // builds. Lets a deploy confirm which build is actually live —
+        // observability, and a guard that the running CP isn't a stale
+        // leftover dev binary.
+        "build": build_sha(),
         "ita_mode": s.cfg.ita.mode.as_str(),
         "uptime_secs": s.started.elapsed().as_secs(),
         "agent_count": agents.len(),

@@ -81,6 +81,10 @@ jobs:
         run: cargo test --workspace --target x86_64-unknown-linux-musl
 
       - name: Build static binaries
+        env:
+          # Baked into the binary and surfaced on the CP's /health as
+          # `.build`, so a deploy can confirm which commit is actually live.
+          DD_BUILD_SHA: ${{ github.sha }}
         run: |
           cargo build --release -p devopsdefender --target x86_64-unknown-linux-musl
           mkdir -p target/workload-assets
