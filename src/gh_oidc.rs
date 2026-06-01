@@ -74,7 +74,7 @@ impl PrincipalKind {
 
 /// One of the three principal kinds the agent's `/deploy` verifier
 /// accepts. See module docs for shape.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Principal {
     pub name: String,
     pub id: u64,

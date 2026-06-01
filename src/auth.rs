@@ -44,6 +44,37 @@ pub struct Session {
     pub owner_name: String,
     pub owner_id: u64,
     pub owner_kind: PrincipalKind,
+    /// GitHub org logins (lowercased) the viewer belongs to — used to
+    /// scope deployment visibility by org. `#[serde(default)]` so tokens
+    /// minted before this field deserialize as "no orgs".
+    #[serde(default)]
+    pub orgs: Vec<String>,
+    /// True if the viewer is an admin of THIS fleet (the fleet owner, a
+    /// member of the fleet-owner org, or a repo collaborator). Admins see
+    /// the whole fleet; everyone else is scoped to deployments they own.
+    #[serde(default)]
+    pub is_fleet_admin: bool,
+}
+
+/// What `classify_user` learns about a freshly-authenticated GitHub user
+/// relative to this fleet. Unlike the old `authorize_user` (which
+/// rejected non-members), this admits any valid GitHub user and records
+/// how to scope them — admins see all, others see only what they own.
+struct Classification {
+    is_fleet_admin: bool,
+    orgs: Vec<String>,
+}
+
+/// Result of a device-flow poll. `Pending` while the user hasn't approved
+/// in the browser yet; `Ready` carries the minted DD bearer for the client.
+pub enum DevicePoll {
+    Pending,
+    Ready {
+        token: String,
+        exp: i64,
+        login: String,
+        is_fleet_admin: bool,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -184,16 +215,8 @@ impl AuthConfig {
 
         let token = exchange_code(http, self, &state.app, code).await?;
         let user = fetch_user(http, &token).await?;
-        authorize_user(http, &token, owner, &user).await?;
-
-        let session = Session {
-            login: user.login,
-            user_id: user.id,
-            exp: now_ts() + SESSION_TTL_SECS,
-            owner_name: owner.name.clone(),
-            owner_id: owner.id,
-            owner_kind: owner.kind,
-        };
+        let class = classify_user(http, &token, owner, &user).await?;
+        let session = self.new_session(owner, &user, class);
         let token = sign(&self.cookie_secret, &session)?;
         let mut resp = Redirect::temporary(&state.return_to).into_response();
         append_set_cookie(
@@ -213,8 +236,23 @@ impl AuthConfig {
         Ok(resp)
     }
 
-    pub fn verify_session(&self, owner: &Principal, headers: &HeaderMap) -> Option<Session> {
-        let token = cookie_value(headers, SESSION_COOKIE)?;
+    fn new_session(&self, owner: &Principal, user: &GithubUser, class: Classification) -> Session {
+        Session {
+            login: user.login.clone(),
+            user_id: user.id,
+            exp: now_ts() + SESSION_TTL_SECS,
+            owner_name: owner.name.clone(),
+            owner_id: owner.id,
+            owner_kind: owner.kind,
+            orgs: class.orgs,
+            is_fleet_admin: class.is_fleet_admin,
+        }
+    }
+
+    /// Verify a DD-signed session token (used for both the `dd_session`
+    /// cookie and native-client bearer — same HMAC, same shape). Checks
+    /// signature, expiry, and that the token is bound to THIS fleet.
+    fn verify_token(&self, owner: &Principal, token: &str) -> Option<Session> {
         let session: Session = verify(&self.cookie_secret, token).ok()?;
         if session.exp < now_ts() {
             return None;
@@ -226,6 +264,100 @@ impl AuthConfig {
             return None;
         }
         Some(session)
+    }
+
+    pub fn verify_session(&self, owner: &Principal, headers: &HeaderMap) -> Option<Session> {
+        let token = cookie_value(headers, SESSION_COOKIE)?;
+        self.verify_token(owner, token)
+    }
+
+    /// Verify a human caller from either a native-client `Authorization:
+    /// Bearer <dd-token>` (checked first) or the browser `dd_session`
+    /// cookie. The fleet API accepts both; browser pages use
+    /// `verify_session` via `require_browser_auth`.
+    pub fn verify_human(&self, owner: &Principal, headers: &HeaderMap) -> Option<Session> {
+        if let Some(tok) = bearer_token(headers) {
+            if let Some(s) = self.verify_token(owner, tok) {
+                return Some(s);
+            }
+        }
+        self.verify_session(owner, headers)
+    }
+
+    /// GitHub OAuth **device flow** step 1 (for the native/iOS client):
+    /// ask GitHub for a device + user code. Returns the JSON the client
+    /// shows the user (`user_code`, `verification_uri`) plus the
+    /// `device_code` it polls back with. Requires the GitHub App to have
+    /// device flow enabled.
+    pub async fn device_start(&self, http: &Client) -> Result<serde_json::Value> {
+        let app = app_for_return_to(&self.broker_origin).unwrap_or_else(|_| "production".into());
+        let (client_id, _) = self.client_for(&app)?;
+        let resp = http
+            .post("https://github.com/login/device/code")
+            .header(header::ACCEPT, "application/json")
+            .header(header::USER_AGENT, "devopsdefender")
+            .json(&serde_json::json!({ "client_id": client_id, "scope": "read:org" }))
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(Error::Upstream(format!(
+                "GitHub device/code returned {}",
+                resp.status()
+            )));
+        }
+        let body: serde_json::Value = resp.json().await?;
+        Ok(serde_json::json!({
+            "device_code": body.get("device_code").cloned().unwrap_or_default(),
+            "user_code": body.get("user_code").cloned().unwrap_or_default(),
+            "verification_uri": body.get("verification_uri").cloned().unwrap_or_default(),
+            "expires_in": body.get("expires_in").cloned().unwrap_or_default(),
+            "interval": body.get("interval").cloned().unwrap_or(serde_json::json!(5)),
+        }))
+    }
+
+    /// Device flow step 2: poll GitHub with the `device_code`. While the
+    /// user hasn't approved yet → `Pending`. On approval, fetch + classify
+    /// the user and mint a DD bearer (same signed-`Session` the cookie
+    /// uses) the client sends as `Authorization: Bearer`.
+    pub async fn device_poll(
+        &self,
+        http: &Client,
+        owner: &Principal,
+        device_code: &str,
+    ) -> Result<DevicePoll> {
+        let app = app_for_return_to(&self.broker_origin).unwrap_or_else(|_| "production".into());
+        let (client_id, client_secret) = self.client_for(&app)?;
+        let resp = http
+            .post("https://github.com/login/oauth/access_token")
+            .header(header::ACCEPT, "application/json")
+            .header(header::USER_AGENT, "devopsdefender")
+            .json(&serde_json::json!({
+                "client_id": client_id,
+                "client_secret": client_secret,
+                "device_code": device_code,
+                "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+            }))
+            .send()
+            .await?;
+        let body: GithubTokenResponse = resp.json().await?;
+        if let Some(err) = body.error.as_deref() {
+            // Device flow signals progress via error codes, not HTTP status.
+            return match err {
+                "authorization_pending" | "slow_down" => Ok(DevicePoll::Pending),
+                other => Err(Error::Upstream(format!("device flow: {other}"))),
+            };
+        }
+        let token = body.access_token.ok_or(Error::Unauthorized)?;
+        let user = fetch_user(http, &token).await?;
+        let class = classify_user(http, &token, owner, &user).await?;
+        let session = self.new_session(owner, &user, class);
+        let bearer = sign(&self.cookie_secret, &session)?;
+        Ok(DevicePoll::Ready {
+            token: bearer,
+            exp: session.exp,
+            login: session.login,
+            is_fleet_admin: session.is_fleet_admin,
+        })
     }
 
     fn client_for(&self, app: &str) -> Result<(&str, &str)> {
@@ -294,6 +426,15 @@ pub fn cookie_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     })
 }
 
+/// Extract a non-empty `Authorization: Bearer <token>` (native client).
+fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    let v = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
+    v.strip_prefix("Bearer ")
+        .or_else(|| v.strip_prefix("bearer "))
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+}
+
 async fn exchange_code(http: &Client, cfg: &AuthConfig, app: &str, code: &str) -> Result<String> {
     let (client_id, client_secret) = cfg.client_for(app)?;
     let resp = http
@@ -336,50 +477,68 @@ async fn fetch_user(http: &Client, token: &str) -> Result<GithubUser> {
     Ok(resp.json().await?)
 }
 
-async fn authorize_user(
+/// Classify a freshly-authenticated GitHub user against this fleet.
+/// **Admits any valid GitHub user** (unlike the old reject-on-non-member
+/// gate) and records how to scope them: `is_fleet_admin` for the fleet
+/// owner / org member / repo collaborator, plus their org memberships for
+/// per-org deployment scoping. The admin/orgs lookups fail **closed** (a
+/// GitHub hiccup yields non-admin / no-orgs, never a spurious admin).
+async fn classify_user(
     http: &Client,
     token: &str,
     owner: &Principal,
     user: &GithubUser,
-) -> Result<()> {
-    match owner.kind {
-        PrincipalKind::User => {
-            if user.id == owner.id {
-                Ok(())
-            } else {
-                Err(Error::Unauthorized)
-            }
-        }
+) -> Result<Classification> {
+    let is_fleet_admin = match owner.kind {
+        PrincipalKind::User => user.id == owner.id,
         PrincipalKind::Org => {
-            let resp = http
-                .get(format!(
-                    "https://api.github.com/orgs/{}/public_members/{}",
-                    owner.name, user.login
-                ))
-                .bearer_auth(token)
-                .header(header::USER_AGENT, "devopsdefender")
-                .send()
-                .await?;
-            if resp.status().is_success() {
-                Ok(())
-            } else {
-                Err(Error::Unauthorized)
-            }
+            gh_ok(
+                http,
+                token,
+                &format!("orgs/{}/public_members/{}", owner.name, user.login),
+            )
+            .await
         }
-        PrincipalKind::Repo => {
-            let resp = http
-                .get(format!("https://api.github.com/repos/{}", owner.name))
-                .bearer_auth(token)
-                .header(header::USER_AGENT, "devopsdefender")
-                .send()
-                .await?;
-            if resp.status().is_success() {
-                Ok(())
-            } else {
-                Err(Error::Unauthorized)
-            }
-        }
+        PrincipalKind::Repo => gh_ok(http, token, &format!("repos/{}", owner.name)).await,
+    };
+    let orgs = fetch_user_orgs(http, token).await.unwrap_or_default();
+    Ok(Classification {
+        is_fleet_admin,
+        orgs,
+    })
+}
+
+/// `GET https://api.github.com/{path}` with the user token → did it 2xx?
+/// Any transport error or non-2xx → `false` (fail closed).
+async fn gh_ok(http: &Client, token: &str, path: &str) -> bool {
+    http.get(format!("https://api.github.com/{path}"))
+        .bearer_auth(token)
+        .header(header::USER_AGENT, "devopsdefender")
+        .send()
+        .await
+        .map(|r| r.status().is_success())
+        .unwrap_or(false)
+}
+
+/// The viewer's GitHub org logins (lowercased), for org-scoped
+/// visibility. Best-effort: errors → empty (the viewer just won't match
+/// any org-owned deployment).
+async fn fetch_user_orgs(http: &Client, token: &str) -> Result<Vec<String>> {
+    let resp = http
+        .get("https://api.github.com/user/orgs?per_page=100")
+        .bearer_auth(token)
+        .header(header::USER_AGENT, "devopsdefender")
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        return Ok(Vec::new());
     }
+    let orgs: Vec<serde_json::Value> = resp.json().await?;
+    Ok(orgs
+        .iter()
+        .filter_map(|o| o.get("login").and_then(|l| l.as_str()))
+        .map(|s| s.to_lowercase())
+        .collect())
 }
 
 fn sign<T: Serialize>(secret: &[u8], value: &T) -> Result<String> {
