@@ -348,6 +348,7 @@ pub async fn run() -> Result<()> {
         .route("/agent/{id}/logs/{app}", get(agent_logs))
         .route("/api/agents", get(api_agents))
         .route("/api/fleet", get(fleet_fragment))
+        .route("/admin/cf/snapshot", get(cf_snapshot_handler))
         .route("/api/v1/admin/export", get(export_state))
         .route("/admin/enroll", get(enroll_page))
         .with_state(state);
@@ -451,6 +452,12 @@ async fn hydrate_from_peer(
 
 // ── Routes ──────────────────────────────────────────────────────────────
 
+/// Commit SHA this binary was built from. Baked at compile time via the
+/// `DD_BUILD_SHA` env in the CI release build step; "dev" otherwise.
+fn build_sha() -> &'static str {
+    option_env!("DD_BUILD_SHA").unwrap_or("dev")
+}
+
 async fn health(
     State(s): State<St>,
     Query(q): Query<HashMap<String, String>>,
@@ -461,6 +468,12 @@ async fn health(
         "service": "cp",
         "hostname": s.cfg.hostname,
         "env": s.cfg.common.env_label,
+        // Commit this binary was built from, baked at compile time
+        // (`DD_BUILD_SHA` env in the release build step). "dev" for local
+        // builds. Lets a deploy confirm which build is actually live —
+        // observability, and a guard that the running CP isn't a stale
+        // leftover dev binary.
+        "build": build_sha(),
         "ita_mode": s.cfg.ita.mode.as_str(),
         "uptime_secs": s.started.elapsed().as_secs(),
         "agent_count": agents.len(),
@@ -1272,6 +1285,31 @@ async fn api_agents(
             })
             .collect(),
     ))
+}
+
+/// GET /admin/cf/snapshot — operator debug surface. Returns CP state,
+/// CF API state, and a server-computed `drift` block (orphans /
+/// missing / mismatches). Same auth as `/api/agents` (loopback OR GH
+/// OIDC OR ITA bearer). The iOS Manage view consumes this to surface
+/// reconciliation issues for operator triage. Read-only — no mutations.
+async fn cf_snapshot_handler(
+    State(s): State<St>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    headers: axum::http::HeaderMap,
+) -> Result<Json<crate::cf_snapshot::Snapshot>> {
+    if !agents_auth_ok(&s, peer, &headers).await {
+        return Err(Error::Unauthorized);
+    }
+    let http = cf::http_client();
+    let snap = crate::cf_snapshot::snapshot(
+        &http,
+        &s.cfg.cf,
+        &s.cfg.common.env_label,
+        &s.cfg.hostname,
+        &s.store,
+    )
+    .await;
+    Ok(Json(snap))
 }
 
 /// Accept the request if the caller is on the loopback interface

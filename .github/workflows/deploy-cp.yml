@@ -324,8 +324,15 @@ jobs:
           fi
           echo "Watching VM: $VM_NAME (zone: $GCP_ZONE)"
 
+          # Readiness gate: don't accept the first lucky 200. cloudflared
+          # brings up its HA edge connectors one at a time over ~30s and the
+          # tunnel flaps during that window (a probe gets 200, the next hangs
+          # on a cold connector). Require N *consecutive* good `/health`
+          # payloads so a flap can't masquerade as ready — this is what makes
+          # the downstream assertions race-free without blind --retry.
           LAST_LINES=0
-          for i in $(seq 1 60); do
+          need=3; ok=0
+          for i in $(seq 1 90); do
             # Stream serial console so boot failures (DHCP hang, release
             # fetch error, cloudflared exit, etc.) are visible without
             # shelling into GCP.
@@ -344,14 +351,20 @@ jobs:
               exit 1
             fi
 
-            if curl -fsS "${AGENT_URL}/health" >/dev/null 2>&1; then
-              echo "Agent healthy at ${AGENT_URL}"
-              exit 0
+            BODY=$(curl -fsS --max-time 8 "${AGENT_URL}/health" 2>/dev/null || true)
+            if [ -n "$BODY" ] && echo "$BODY" | jq -e '.ok == true and .service == "cp"' >/dev/null 2>&1; then
+              ok=$((ok + 1))
+              if [ "$ok" -ge "$need" ]; then
+                echo "CP stable at ${AGENT_URL} (${need} consecutive, build=$(echo "$BODY" | jq -r '.build // "?"'))"
+                exit 0
+              fi
+            else
+              ok=0
             fi
-            echo "  waiting for tunnel... (${i}/60)"
+            echo "  awaiting stable CP (streak ${ok}/${need})... (${i}/90)"
             sleep 5
           done
-          echo "::error::Agent not healthy within 5 minutes"
+          echo "::error::CP never stabilized within budget (gcp target)"
           echo "--- final serial tail ---"
           tail -80 /tmp/serial.log | sed 's/^/[serial] /'
           exit 1
@@ -412,11 +425,29 @@ jobs:
                  | stdbuf -oL tee -a "$mirror" &
           tail_pid=$!
           sleep 1
-          for i in $(seq 1 60); do
-            CODE=$(curl -s -o /dev/null -w '%{http_code}' "${AGENT_URL}/health" || echo "000")
-            if [ "$CODE" = "200" ]; then
-              echo "CP healthy at ${AGENT_URL} (HTTP 200)"
-              exit 0
+          # Readiness gate: require N *consecutive* good /health payloads, not
+          # the first lucky 200. cloudflared's HA connectors warm up over ~30s
+          # and the tunnel flaps (200, then a cold-connector hang) in that
+          # window — a single 200 then an un-retried verify is exactly how this
+          # step used to fail (curl 28, 0 bytes). The streak folds the old
+          # separate "Verify CP health payload" step in: payload correctness +
+          # stability + build identity, gated once, race-free.
+          need=3; ok=0
+          for i in $(seq 1 90); do
+            BODY=$(curl -fsS --max-time 8 "${AGENT_URL}/health" 2>/dev/null || true)
+            if [ -n "$BODY" ] && echo "$BODY" | jq -e '.ok == true and .service == "cp"' >/dev/null 2>&1; then
+              ok=$((ok + 1))
+              if [ "$ok" -ge "$need" ]; then
+                BUILD=$(echo "$BODY" | jq -r '.build // "?"')
+                echo "CP stable at ${AGENT_URL} (${need} consecutive, build=${BUILD})"
+                if [ "$BUILD" = "dev" ]; then
+                  echo "::error::CP /health reports build=dev — running CP is not a CI-built binary"
+                  exit 1
+                fi
+                exit 0
+              fi
+            else
+              ok=0
             fi
             if [ -s "$mirror" ] && grep -q 'devopsdefender: fatal:' "$mirror"; then
               echo "::group::Fatal line from CP console"
@@ -425,20 +456,11 @@ jobs:
               echo "::error::CP exited fatal; not polling /health further"
               exit 1
             fi
-            echo "  waiting for tunnel (got HTTP ${CODE})... (${i}/60)"
+            echo "  awaiting stable CP (streak ${ok}/${need})... (${i}/90)"
             sleep 5
           done
-          echo "::error::CP not healthy within 5 minutes (SSH target)"
+          echo "::error::CP never stabilized within budget (SSH target)"
           exit 1
-
-      - name: Verify CP health payload (SSH target)
-        if: inputs.target == 'ssh'
-        env:
-          AGENT_URL: https://${{ inputs.hostname }}
-        run: |
-          BODY=$(curl --fail --show-error --silent --max-time 10 "${AGENT_URL}/health")
-          echo "$BODY" | jq -e '.ok == true and .service == "cp"' >/dev/null
-          echo "CP health payload verified at ${AGENT_URL}"
 
       - name: Verify NEW VM health / TDX attestation
         if: inputs.target == 'gcp'

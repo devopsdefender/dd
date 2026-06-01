@@ -368,6 +368,22 @@ pub async fn list(http: &Client, cf: &CfCreds) -> Result<Vec<serde_json::Value>>
     Ok(out)
 }
 
+/// All CNAME records in the zone — used by the snapshot endpoint to
+/// reconcile against the CP's expected hostnames. `per_page=1000` is
+/// the same cap we use for Access apps; preview-heavy zones can
+/// have many records.
+pub async fn list_dns_records(http: &Client, cf: &CfCreds) -> Result<Vec<serde_json::Value>> {
+    let resp = call(
+        http,
+        cf,
+        Method::GET,
+        &format!("/zones/{}/dns_records?type=CNAME&per_page=1000", cf.zone_id),
+        None,
+    )
+    .await?;
+    Ok(resp["result"].as_array().cloned().unwrap_or_default())
+}
+
 /// `Some(true)` if present, `Some(false)` if confirmed deleted, `None`
 /// on ambiguous transport error — the watchdog uses `None` to mean
 /// "don't count as gone" and avoid flaky kernel_poweroffs.
@@ -401,7 +417,11 @@ pub async fn exists(http: &Client, cf: &CfCreds, tunnel_id: &str) -> Option<bool
 // before DD sees it. Registration/startup therefore delete DD-owned
 // Access apps for the hosts they publish instead of creating bypass apps.
 
-async fn list_access_apps(http: &Client, cf: &CfCreds) -> Result<Vec<serde_json::Value>> {
+/// All Access apps in the account — used by the snapshot endpoint
+/// alongside [`list_dns_records`] and [`list`] to reconcile CP-expected
+/// resources against CF's actual state. Also used by internal cleanup
+/// to find apps to delete by domain.
+pub async fn list_access_apps(http: &Client, cf: &CfCreds) -> Result<Vec<serde_json::Value>> {
     let resp = call(
         http,
         cf,
