@@ -79,6 +79,55 @@ runs:
           --max-time 5 "$URL/health" >/dev/null
         echo "CP $URL healthy"
 
+    # Pre-warm DNS on the libvirt host before the agent VM boots.
+    #
+    # Background: the CP just created/refreshed its hostname's CNAME a few
+    # seconds ago. If any process on the tdx2 host (including a prior
+    # boot of the agent VM) queried that hostname before propagation,
+    # libvirt's `default`-network dnsmasq at 192.168.122.1 has NXDOMAIN
+    # negative-cached. When the new agent VM boots and queries the same
+    # hostname, it hits that cached NXDOMAIN; its register-retry budget
+    # exhausts; the agent dies fatal; the deploy job's `Verify agent
+    # registered with CP` step times out.
+    #
+    # This is the root cause behind ~80% of recent `deploy-preview / deploy`
+    # failures (see also the `Stage 2` comment in src/cp.rs around the
+    # predecessor-probe gate, which describes the exact same dnsmasq
+    # negative-cache poisoning from the CP's side).
+    #
+    # Mitigation:
+    #   1. Confirm upstream (1.1.1.1) has the CNAME — proves CF edge has
+    #      propagated.
+    #   2. SIGHUP libvirt's dnsmasq — re-reads /etc/hosts and reopens its
+    #      log; not a guaranteed cache flush but the cheapest cache-nudge
+    #      we have without restarting the network (which would interrupt
+    #      every VM on the host).
+    #
+    # If this isn't enough, the next escalation is restarting
+    # `libvirt-dnsmasq@default.service` or setting `negcachettl=0` on the
+    # default network's <dnsmasq:options> — both are host-level config
+    # changes outside this workflow.
+    - name: Pre-warm DNS on libvirt host
+      shell: bash
+      env:
+        URL:      ${{ inputs.url }}
+        HOST:     ${{ inputs.host }}
+        SSH_USER: ${{ inputs.ssh-user }}
+        SSH_KEY:  ${{ inputs.ssh-key }}
+      run: |
+        set -uo pipefail
+        cp_host=$(echo "$URL" | sed -E 's|^https?://||; s|/.*||')
+        key=$(mktemp); printf '%s\n' "$SSH_KEY" > "$key"; chmod 600 "$key"
+        trap 'rm -f "$key"' EXIT
+        # 60s budget on the host-side dig; CP just minted the CNAME so this
+        # usually resolves in <5s. We block on the upstream resolver (1.1.1.1)
+        # to bypass libvirt's potentially-poisoned cache.
+        ssh -i "$key" -o StrictHostKeyChecking=accept-new -T \
+            -o ConnectTimeout=10 \
+            "$SSH_USER@$HOST" \
+            "until dig +short +time=2 +tries=2 '$cp_host' @1.1.1.1 | grep -q . ; do sleep 2; done; sudo pkill -HUP -x dnsmasq 2>/dev/null || true; echo 'libvirt host: CP hostname resolves at 1.1.1.1, dnsmasq SIGHUP sent'" \
+          || echo "::warning::DNS pre-warm step failed (non-fatal); continuing to VM relaunch"
+
     # appleboy/ssh-action owns key + known_hosts setup; we just hand
     # it the script to run on the tdx2 host. dd-relaunch.sh finishes
     # in ~10s — the baked config.iso's EE_BOOT_WORKLOADS drives the
