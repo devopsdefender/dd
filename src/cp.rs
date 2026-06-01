@@ -348,6 +348,7 @@ pub async fn run() -> Result<()> {
         .route("/agent/{id}/logs/{app}", get(agent_logs))
         .route("/api/agents", get(api_agents))
         .route("/api/fleet", get(fleet_fragment))
+        .route("/admin/cf/snapshot", get(cf_snapshot_handler))
         .route("/api/v1/admin/export", get(export_state))
         .route("/admin/enroll", get(enroll_page))
         .with_state(state);
@@ -1272,6 +1273,31 @@ async fn api_agents(
             })
             .collect(),
     ))
+}
+
+/// GET /admin/cf/snapshot — operator debug surface. Returns CP state,
+/// CF API state, and a server-computed `drift` block (orphans /
+/// missing / mismatches). Same auth as `/api/agents` (loopback OR GH
+/// OIDC OR ITA bearer). The iOS Manage view consumes this to surface
+/// reconciliation issues for operator triage. Read-only — no mutations.
+async fn cf_snapshot_handler(
+    State(s): State<St>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    headers: axum::http::HeaderMap,
+) -> Result<Json<crate::cf_snapshot::Snapshot>> {
+    if !agents_auth_ok(&s, peer, &headers).await {
+        return Err(Error::Unauthorized);
+    }
+    let http = cf::http_client();
+    let snap = crate::cf_snapshot::snapshot(
+        &http,
+        &s.cfg.cf,
+        &s.cfg.common.env_label,
+        &s.cfg.hostname,
+        &s.store,
+    )
+    .await;
+    Ok(Json(snap))
 }
 
 /// Accept the request if the caller is on the loopback interface
