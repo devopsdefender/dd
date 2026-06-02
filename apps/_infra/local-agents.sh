@@ -476,26 +476,45 @@ PY
   sed -i "s|/var/log/ee-local\\.log|/var/log/ee-local-$name.log|g" "$out"
   sed -i "s|<model type='e1000e'/>|<model type='virtio'/>|g" "$out"
 
-  # The local-tdx-qcow2 UKI is intentionally unsigned; this host's secure
-  # boot OVMF rejects it with UEFI "Access Denied". Use the non-secure
-  # ROM loader when present and disable firmware auto-selection below.
-  if [ -r /usr/share/ovmf/OVMF.fd ]; then
-    python3 - "$out" <<'PY'
-import re, sys
+  # The local-tdx-qcow2 UKI is intentionally unsigned, so a secure-boot
+  # OVMF (the ".ms" Microsoft-keys variant) rejects it with UEFI "Access
+  # Denied". But a TDX guest *also* cannot boot on the generic, non-TDX
+  # OVMF (`OVMF.fd`): its firmware faults with `#UD` (invalid opcode) and
+  # reset-loops before the kernel starts. Use a firmware that is both
+  # TDX-enlightened *and* non-secure-boot (`OVMF.inteltdx.fd`, the same one
+  # the easyenclave-local base domain boots); pin it as a stateless ROM
+  # loader and disable firmware auto-selection below.
+  #
+  # NB: render_domain_xml() streams the finished XML on stdout and the
+  # caller captures it — any logging here must go to stderr or it corrupts
+  # the domain XML fed to `virsh define`.
+  tdx_fw=""
+  for c in /usr/local/share/ovmf/OVMF.inteltdx.fd \
+           /usr/share/ovmf/OVMF.inteltdx.fd \
+           /usr/share/OVMF/OVMF.inteltdx.fd; do
+    if [ -r "$c" ]; then tdx_fw="$c"; break; fi
+  done
+  if [ -z "$tdx_fw" ]; then
+    echo "no TDX-enlightened OVMF found (looked for OVMF.inteltdx.fd in /usr/local/share/ovmf, /usr/share/ovmf, /usr/share/OVMF); cannot boot a TDX agent" >&2
+    exit 1
+  fi
+  echo "local-agents: TDX firmware -> $tdx_fw" >&2
+  TDX_FW="$tdx_fw" python3 - "$out" <<'PY'
+import re, sys, os
 p = sys.argv[1]
+fw = os.environ["TDX_FW"]
 with open(p) as f: x = f.read()
 x = re.sub(r"<os\s+firmware=['\"]efi['\"]>", "<os>", x, count=1)
 x = re.sub(r"\n\s*<firmware>.*?</firmware>", "", x, count=1, flags=re.DOTALL)
 x = re.sub(r"\n\s*<nvram[^>]*>.*?</nvram>", "", x, count=1, flags=re.DOTALL)
 x = re.sub(
     r"<loader[^>]*>.*?</loader>",
-    "<loader readonly='yes' secure='no' type='rom'>/usr/share/ovmf/OVMF.fd</loader>",
+    lambda _m: "<loader readonly='yes' secure='no' type='rom'>%s</loader>" % fw,
     x,
     count=1,
 )
 with open(p, "w") as f: f.write(x)
 PY
-  fi
 
   # CPU-only agent sizing. Dogfood is meant for real interactive
   # development, so give it enough room for Codex + nested containers.
