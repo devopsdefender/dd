@@ -7,6 +7,7 @@ pub mod config;
 pub mod cp;
 pub mod devices;
 pub mod ee;
+pub mod env;
 pub mod error;
 pub mod gh_oidc;
 pub mod html;

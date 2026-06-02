@@ -130,7 +130,7 @@ pub async fn run() -> Result<()> {
     // safe to run unconditionally — it doesn't touch the poisonable
     // hostname at all.
     let store: Store = Arc::new(Mutex::new(HashMap::new()));
-    let predecessor_prefix = cf::cp_prefix(&cfg.common.env_label);
+    let predecessor_prefix = cf::cp_prefix(cfg.common.env.label());
     let has_predecessor = match cf::list(&http, &cfg.cf).await {
         Ok(tunnels) => tunnels.iter().any(|t| {
             t["name"]
@@ -156,7 +156,7 @@ pub async fn run() -> Result<()> {
     // for `cfg.hostname` → our tunnel id; traffic moves to us the
     // moment CF's edge propagates that change.
     eprintln!("cp: self-provisioning tunnel for {}", cfg.hostname);
-    let self_name = cf::cp_tunnel_name(&cfg.common.env_label);
+    let self_name = cf::cp_tunnel_name(cfg.common.env.label());
     let cp_extras: Vec<(String, u16)> = vec![("shell".into(), 7682)];
     let tunnel = match cf::create(&http, &cfg.cf, &self_name, &cfg.hostname, &cp_extras).await {
         Ok(t) => t,
@@ -184,7 +184,7 @@ pub async fn run() -> Result<()> {
         match cf::delete_cp_access_apps(
             &http,
             &cfg.cf,
-            &cfg.common.env_label,
+            cfg.common.env.label(),
             &cfg.hostname,
             &cp_labels,
         )
@@ -217,7 +217,7 @@ pub async fn run() -> Result<()> {
         collector::Agent {
             agent_id: "control-plane".into(),
             hostname: cfg.hostname.clone(),
-            vm_name: format!("dd-{}-cp", cfg.common.env_label),
+            vm_name: format!("dd-{}-cp", cfg.common.env.label()),
             attestation_type: "tdx".into(),
             status: "healthy".into(),
             last_seen: chrono::Utc::now(),
@@ -309,7 +309,7 @@ pub async fn run() -> Result<()> {
     tokio::spawn(collector::run(
         store.clone(),
         cfg.cf.clone(),
-        cfg.common.env_label.clone(),
+        cfg.common.env.label().to_string(),
         cfg.hostname.clone(),
         ee.clone(),
         verifier.clone(),
@@ -467,7 +467,7 @@ async fn health(
         "ok": true,
         "service": "cp",
         "hostname": s.cfg.hostname,
-        "env": s.cfg.common.env_label,
+        "env": s.cfg.common.env.label(),
         // Commit this binary was built from, baked at compile time
         // (`DD_BUILD_SHA` env in the release build step). "dev" for local
         // builds. Lets a deploy confirm which build is actually live —
@@ -541,7 +541,7 @@ async fn register(
     }
 
     let http = cf::http_client();
-    let name = cf::agent_tunnel_name(&s.cfg.common.env_label);
+    let name = cf::agent_tunnel_name(s.cfg.common.env.label());
     let agent_hostname = format!("{name}.{}", s.cfg.cf.domain);
     let extras: Vec<(String, u16)> = req
         .extra_ingress
@@ -561,7 +561,7 @@ async fn register(
     if let Err(e) = cf::delete_agent_access_apps(
         &http,
         &s.cfg.cf,
-        &s.cfg.common.env_label,
+        s.cfg.common.env.label(),
         &agent_hostname,
         &labels,
     )
@@ -694,7 +694,7 @@ async fn ingress_replace(
     if let Err(e) = cf::delete_agent_access_apps(
         &http,
         &s.cfg.cf,
-        &s.cfg.common.env_label,
+        s.cfg.common.env.label(),
         &hostname,
         &labels,
     )
@@ -980,7 +980,7 @@ fn fleet_json(s: &St, by_id: &[(String, collector::Agent)]) -> serde_json::Value
     let oracle_total: usize = by_id.iter().map(|(_, a)| a.oracles.len()).sum();
     serde_json::json!({
         "generated_at": chrono::Utc::now().to_rfc3339(),
-        "env": s.cfg.common.env_label,
+        "env": s.cfg.common.env.label(),
         "hostname": s.cfg.hostname,
         "summary": {
             "agents": by_id.len(),
@@ -1111,7 +1111,7 @@ async fn fleet(State(s): State<St>, headers: HeaderMap, uri: Uri) -> Response {
         Err(resp) => return resp,
     };
     let by_id = scoped_snapshot(&s, &session).await;
-    let body = render_fleet_body(&s.cfg.hostname, &s.cfg.common.env_label, &by_id);
+    let body = render_fleet_body(&s.cfg.hostname, s.cfg.common.env.label(), &by_id);
     Html(shell(
         "DD Fleet",
         &html::nav(&[("Fleet", "/", true)]),
@@ -1141,7 +1141,7 @@ async fn fleet_fragment(State(s): State<St>, headers: HeaderMap, uri: Uri) -> Re
     } else {
         Html(render_fleet_body(
             &s.cfg.hostname,
-            &s.cfg.common.env_label,
+            s.cfg.common.env.label(),
             &by_id,
         ))
         .into_response()
@@ -1304,7 +1304,7 @@ async fn cf_snapshot_handler(
     let snap = crate::cf_snapshot::snapshot(
         &http,
         &s.cfg.cf,
-        &s.cfg.common.env_label,
+        s.cfg.common.env.label(),
         &s.cfg.hostname,
         &s.store,
     )

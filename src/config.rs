@@ -1,5 +1,6 @@
 //! Environment-derived configuration for both modes.
 
+use crate::env::Env;
 use crate::error::{Error, Result};
 use crate::gh_oidc::{Principal, PrincipalKind};
 use base64::Engine as _;
@@ -26,7 +27,7 @@ impl CfCreds {
 
 /// Configuration shared between modes.
 pub struct Common {
-    pub env_label: String,
+    pub env: Env,
     pub port: u16,
     pub owner: Principal,
     pub vm_name: String,
@@ -34,9 +35,9 @@ pub struct Common {
 
 impl Common {
     pub fn from_env() -> Result<Self> {
-        let env_label = std::env::var("DD_ENV").map_err(|_| {
+        let env = Env::parse(&std::env::var("DD_ENV").map_err(|_| {
             Error::Internal("DD_ENV required (dev / staging / production / pr-*)".into())
-        })?;
+        })?)?;
         let port = std::env::var("DD_PORT")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -79,7 +80,7 @@ impl Common {
                 .unwrap_or_else(|| "unknown".into())
         });
         Ok(Self {
-            env_label,
+            env,
             port,
             owner,
             vm_name,
@@ -119,7 +120,7 @@ impl ItaMode {
 }
 
 impl Ita {
-    pub fn from_env(env_label: &str) -> Result<Self> {
+    pub fn from_env(env: &Env) -> Result<Self> {
         let get = |k: &str| {
             std::env::var(k)
                 .ok()
@@ -134,7 +135,7 @@ impl Ita {
         {
             "" | "intel" => ItaMode::Intel,
             "local" => {
-                if env_label == "production" || env_label == "staging" {
+                if env.requires_intel_ita() {
                     return Err(Error::Internal(
                         "DD_ITA_MODE=local is not allowed for production or staging".into(),
                     ));
@@ -201,7 +202,7 @@ impl Cp {
                 "DD_SCRAPER_SHARD_INDEX ({scraper_shard_index}) must be less than DD_SCRAPER_SHARD_TOTAL ({scraper_shard_total})"
             )));
         }
-        let ita = Ita::from_env(&common.env_label)?;
+        let ita = Ita::from_env(&common.env)?;
         Ok(Self {
             common,
             cf,
@@ -295,7 +296,7 @@ impl Agent {
             .unwrap_or_else(|_| "/var/lib/easyenclave/data/dd-agent/devices.json".into())
             .into();
         let oracles = parse_oracles()?;
-        let ita = Ita::from_env(&common.env_label)?;
+        let ita = Ita::from_env(&common.env)?;
         Ok(Self {
             common,
             cp_url,
