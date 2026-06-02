@@ -265,7 +265,10 @@ PY
     echo "no TDX-enlightened OVMF found (looked for OVMF.inteltdx.fd in /usr/local/share/ovmf, /usr/share/ovmf, /usr/share/OVMF); cannot boot a TDX CP" >&2
     exit 1
   fi
-  echo "local-cp: TDX firmware -> $tdx_fw"
+  # NB: render_domain_xml() streams the finished XML on stdout (`cat "$out"`
+  # at the end) and the caller captures it — so any progress logging here
+  # must go to stderr, or it corrupts the domain XML fed to `virsh define`.
+  echo "local-cp: TDX firmware -> $tdx_fw" >&2
   TDX_FW="$tdx_fw" python3 - "$out" <<'PY'
 import re, sys, os
 p = sys.argv[1]
