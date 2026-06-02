@@ -77,3 +77,10 @@ for vm in "${vms[@]}"; do
   virsh start "$vm"
   echo "relaunched $vm against $CP"
 done
+
+# The prod agent must come back on its own after a host reboot. Preview
+# agents are ephemeral (recreated each preview deploy and torn down with
+# the PR), so leave their autostart off.
+if [ "$KIND" = prod ]; then
+  virsh autostart dd-local-prod >/dev/null && echo "autostart enabled for dd-local-prod (survives host reboot)"
+fi
