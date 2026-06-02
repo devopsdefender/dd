@@ -361,3 +361,10 @@ build_config_iso
 xml=$(render_domain_xml)
 echo "$xml" | virsh define /dev/stdin >/dev/null
 echo "  defined $VM"
+
+# Persistent envs must come back on their own after a host reboot.
+# Ephemeral pr-N preview CPs are torn down by cleanup, so leave their
+# autostart off (avoids resurrecting a stale preview on reboot).
+if [ "$ENV_LABEL" = production ]; then
+  virsh autostart "$VM" >/dev/null && echo "  autostart enabled for $VM (survives host reboot)"
+fi

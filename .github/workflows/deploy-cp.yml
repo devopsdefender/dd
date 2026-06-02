@@ -95,7 +95,11 @@ jobs:
     env:
       DD_ENV: ${{ inputs.env }}
       DD_HOSTNAME: ${{ inputs.hostname }}
-      DD_BOOT_GITHUB_TOKEN: ${{ github.token }}
+      # Long-lived PAT (not the run-scoped github.token) so the EE VM can
+      # re-fetch its release assets on ANY later boot — a host reboot must
+      # self-heal. github.token dies with the job, which made the
+      # 2026-05-29 reboot an unrecoverable 401-on-boot outage.
+      DD_BOOT_GITHUB_TOKEN: ${{ secrets.DD_MGMT_PAT }}
       GCP_ZONE: us-central1-c
       DD_AUTH_BROKER_URL: https://app.${{ vars.DD_CF_DOMAIN || 'devopsdefender.com' }}
       DD_AUTH_COOKIE_DOMAIN: .${{ vars.DD_CF_DOMAIN || 'devopsdefender.com' }}
@@ -170,7 +174,10 @@ jobs:
           ee-channel:    ${{ steps.ee.outputs.channel }}
           ee-tag:        ${{ inputs.ee_tag }}
           owner:         ${{ inputs.owner }}
-          github-token:  ${{ github.token }}
+          # Long-lived PAT, not run-scoped github.token: EE re-fetches its
+          # release assets on every boot, so the token must outlive the job
+          # or a reboot 401s and panics. See DD_BOOT_GITHUB_TOKEN above.
+          github-token:  ${{ secrets.DD_MGMT_PAT }}
 
       - name: Create TDX VM (boots from easyenclave-mini, fetches dd from GitHub releases)
         if: inputs.target == 'gcp'
@@ -603,7 +610,9 @@ jobs:
           ee-channel: ${{ steps.ee.outputs.channel }}
           ee-tag: ${{ inputs.ee_tag }}
           owner: ${{ inputs.owner }}
-          github-token: ${{ github.token }}
+          # Long-lived PAT, not run-scoped github.token (boot-time asset
+          # fetch must survive reboots). See DD_BOOT_GITHUB_TOKEN above.
+          github-token: ${{ secrets.DD_MGMT_PAT }}
 
       # Preview only: deploy hello-world as the end-to-end canary.
       # Exercises the full GH-OIDC auth path (mint → agent verify
