@@ -61,6 +61,10 @@ jobs:
       contents: read
       id-token: write
       pull-requests: read
+      # The orphan sweep checks for in-flight Release runs before deleting
+      # agent CF state (see "Orphan agent-hostname sweep"); `gh run list`
+      # needs actions:read.
+      actions: read
     env:
       GCP_PROJECT_ID:    ${{ secrets.GCP_PROJECT_ID }}
       CF_API_TOKEN:      ${{ secrets.DD_CP_CF_API_TOKEN }}
@@ -321,6 +325,32 @@ jobs:
             echo ""
             echo "Orphan agent-hostname sweep..."
 
+            # Never sweep agent orphans while a deploy could be registering a
+            # fresh agent (new tunnel + apps + dns): the top-of-job CF snapshot
+            # may predate that registration, so a healthy agent's apps/dns would
+            # look orphaned and get deleted. The sweep is a catch-up safety net
+            # (also runs on the 6h cron and the next Release completion), so
+            # skipping a cycle is harmless. Any non-"0"/error result (status
+            # unknown) is treated as "active" and skips — fail safe, never
+            # delete on uncertainty.
+            inflight=$(gh run list --repo "$REPO" --workflow=release.yml --status in_progress --json databaseId --jq 'length' 2>/dev/null || echo ERR)
+            queued=$(gh run list --repo "$REPO" --workflow=release.yml --status queued --json databaseId --jq 'length' 2>/dev/null || echo ERR)
+            if [ "$inflight" != "0" ] || [ "$queued" != "0" ]; then
+              echo "Release active or status unknown (in_progress=$inflight queued=$queued); skipping orphan sweep this cycle."
+            else
+            # Re-fetch CF state fresh — the per-env teardown above can take
+            # minutes, during which an agent may have registered (a deploy, or
+            # autostart re-registration after a host reboot). Fetch tunnels
+            # LAST so the liveness oracle is the newest view: any apps/dns that
+            # appear belong to an agent whose tunnel is already in this list, so
+            # a live agent is never misjudged as orphaned.
+            apps=$(curl -fsS "${AUTH[@]}" \
+              "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/access/apps?per_page=1000")
+            dns=$(curl -fsS "${AUTH[@]}" \
+              "https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/dns_records?per_page=500&type=CNAME")
+            tunnels=$(curl -fsS "${AUTH[@]}" \
+              "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/cfd_tunnel?is_deleted=false&per_page=200")
+
             live_tunnel_names=$(echo "$tunnels" | jq -r '.result[].name' \
               | grep -E '^dd-[a-zA-Z0-9-]+-agent-' | sort -u || true)
 
@@ -371,6 +401,7 @@ jobs:
                   >/dev/null 2>&1 && echo "  - dns $name" || echo "  ! dns $name FAILED"
               done
             fi
+            fi  # end: no Release active → orphan sweep ran
           fi
 
           # Explicit success — prior `[ -n "$x" ] && cmd` short-circuit
