@@ -26,6 +26,13 @@ pub struct Snapshot {
     pub cf_account_id: String,
     pub cf_zone_id: String,
     pub cf_api_reachable: bool,
+    /// True when at least one of the three CF list calls (tunnels / dns /
+    /// apps) failed, so `cf_state` is partial. Drift is NOT computed in
+    /// this state, and any future reconcile must refuse to run — acting on
+    /// a partial CF view would manufacture false orphans/missing.
+    pub degraded: bool,
+    /// Which CF sub-fetches failed, e.g. `["dns: <err>"]`. Empty when clean.
+    pub cf_fetch_errors: Vec<String>,
     pub cp_state: CpState,
     pub cf_state: CfState,
     pub drift: Drift,
@@ -129,19 +136,13 @@ pub async fn snapshot(
 ) -> Snapshot {
     let cp_state = build_cp_state(env_label, cp_hostname, store).await;
 
-    let (cf_state, reachable) = match build_cf_state(http, cf_creds, env_label, cp_hostname).await {
-        Ok(s) => (s, true),
-        Err(_) => (
-            CfState {
-                tunnels: vec![],
-                dns: vec![],
-                apps: vec![],
-            },
-            false,
-        ),
-    };
+    let (cf_state, fetch_errors) = build_cf_state(http, cf_creds, env_label, cp_hostname).await;
+    // Reachable = at least one list call returned; degraded = any failed.
+    // Drift (and any future reconcile) only runs on a complete view.
+    let reachable = fetch_errors.len() < 3;
+    let degraded = !fetch_errors.is_empty();
 
-    let drift = if reachable {
+    let drift = if reachable && !degraded {
         compute_drift(&cp_state, &cf_state, env_label, cp_hostname)
     } else {
         Drift::default()
@@ -152,6 +153,8 @@ pub async fn snapshot(
         cf_account_id: cf_creds.account_id.clone(),
         cf_zone_id: cf_creds.zone_id.clone(),
         cf_api_reachable: reachable,
+        degraded,
+        cf_fetch_errors: fetch_errors,
         cp_state,
         cf_state,
         drift,
@@ -184,15 +187,38 @@ async fn build_cp_state(
     }
 }
 
+/// Fetch CF state with each list call independently fallible: one flaky
+/// endpoint degrades the snapshot (reported in the returned error list)
+/// instead of blanking the whole thing. Returns the (possibly partial)
+/// state plus the list of which sub-fetches failed.
 async fn build_cf_state(
     http: &Client,
     cf_creds: &CfCreds,
     env_label: &str,
     cp_hostname: &str,
-) -> crate::error::Result<CfState> {
-    let raw_tunnels = cf::list(http, cf_creds).await?;
-    let raw_dns = cf::list_dns_records(http, cf_creds).await?;
-    let raw_apps = cf::list_access_apps(http, cf_creds).await?;
+) -> (CfState, Vec<String>) {
+    let mut fetch_errors = Vec::new();
+    let raw_tunnels = match cf::list(http, cf_creds).await {
+        Ok(v) => v,
+        Err(e) => {
+            fetch_errors.push(format!("tunnels: {e}"));
+            Vec::new()
+        }
+    };
+    let raw_dns = match cf::list_dns_records(http, cf_creds).await {
+        Ok(v) => v,
+        Err(e) => {
+            fetch_errors.push(format!("dns: {e}"));
+            Vec::new()
+        }
+    };
+    let raw_apps = match cf::list_access_apps(http, cf_creds).await {
+        Ok(v) => v,
+        Err(e) => {
+            fetch_errors.push(format!("apps: {e}"));
+            Vec::new()
+        }
+    };
 
     // Scope: staging + dev (and any other env in the same Cloudflare account)
     // share a zone, so listing tunnels/dns/apps returns everything. We filter
@@ -278,7 +304,7 @@ async fn build_cf_state(
         })
         .collect();
 
-    Ok(CfState { tunnels, dns, apps })
+    (CfState { tunnels, dns, apps }, fetch_errors)
 }
 
 /// Heuristic: bypass apps have a single policy with `decision="bypass"`
