@@ -95,6 +95,22 @@ impl Env {
     pub fn is_ephemeral(&self) -> bool {
         matches!(self.kind, EnvKind::Preview)
     }
+
+    /// Attribute a Cloudflare resource to its installation by parsing the
+    /// env out of a `dd-{env}-{cp|agent|api}-…` name. The env segment is
+    /// everything between the `dd-` prefix and the first role marker, so a
+    /// hyphenated label like `pr-42` is recovered intact
+    /// (`dd-pr-42-agent-<uuid>` → `pr-42`). Returns `None` for names that
+    /// don't follow the convention (so the caller can bucket them as
+    /// unattributed). Used by the cross-env CF map.
+    pub fn from_resource_name(name: &str) -> Option<Self> {
+        let rest = name.strip_prefix("dd-")?;
+        let cut = ["-cp-", "-agent-", "-api-"]
+            .iter()
+            .filter_map(|m| rest.find(m))
+            .min()?;
+        Env::parse(&rest[..cut]).ok()
+    }
 }
 
 impl std::fmt::Display for Env {
@@ -152,5 +168,28 @@ mod tests {
         assert!(Env::parse("pr-42").unwrap().is_ephemeral());
         assert!(!Env::parse("production").unwrap().is_ephemeral());
         assert!(!Env::parse("bot").unwrap().is_ephemeral());
+    }
+
+    #[test]
+    fn from_resource_name_attributes_env() {
+        let cases = [
+            ("dd-production-cp-1a2b", "production"),
+            ("dd-production-agent-9f8e", "production"),
+            ("dd-pr-42-cp-aaaa", "pr-42"), // hyphenated label recovered
+            ("dd-pr-42-agent-bbbb", "pr-42"),
+            ("dd-pr-42-api-cccc.devopsdefender.com", "pr-42"), // api hostname
+            ("dd-bot-agent-dddd", "bot"),
+        ];
+        for (name, want) in cases {
+            assert_eq!(
+                Env::from_resource_name(name).unwrap().label(),
+                want,
+                "name={name}"
+            );
+        }
+        // Non-conforming names → None (caller buckets as unattributed).
+        assert!(Env::from_resource_name("app.devopsdefender.com").is_none());
+        assert!(Env::from_resource_name("some-other-tunnel").is_none());
+        assert!(Env::from_resource_name("dd-no-marker-here").is_none());
     }
 }
