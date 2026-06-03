@@ -73,36 +73,29 @@ pub fn plan(map: &CfMap, cp: &CpState) -> ReconcilePlan {
         return out;
     }
 
-    // Serving CP's ground truth: the tunnel ids it knows + the hostnames it
-    // expects to exist (agent hostnames + their per-workload labels).
+    // The tunnel ids the serving CP knows it owns.
     let known_tunnel_ids: HashSet<&str> = cp
         .agents
         .iter()
         .filter(|a| !a.tunnel_id.is_empty())
         .map(|a| a.tunnel_id.as_str())
         .collect();
-    let mut expected_hostnames: HashSet<String> = HashSet::new();
-    for a in &cp.agents {
-        expected_hostnames.insert(a.hostname.clone());
-        for (label, _) in &a.extras {
-            expected_hostnames.insert(crate::cf::label_hostname(&a.hostname, label));
-        }
-    }
 
+    // Pass 1 — tunnels. Decide adopt/prune/keep and record which tunnels
+    // are being pruned, so DNS can follow its tunnel (pass 2).
+    let mut prune_tunnel_ids: HashSet<String> = HashSet::new();
     for inst in &map.installations {
         let serving = inst.env == cp.env_label;
         let unattributed = inst.kind == "unattributed";
+        let leaked_env = unattributed || !inst.has_live_cp;
 
-        if serving {
-            // Agent tunnels the CP store doesn't know: adopt if live
-            // (healthy), prune if dead. Never touch the CP's own `-cp-`
-            // tunnel or already soft-deleted tunnels.
-            for t in &inst.tunnels {
-                if t.name.contains("-cp-") || t.deleted_at.is_some() {
-                    continue;
-                }
-                if known_tunnel_ids.contains(t.id.as_str()) {
-                    continue;
+        for t in &inst.tunnels {
+            if t.deleted_at.is_some() {
+                continue; // already soft-deleted
+            }
+            if serving {
+                if t.name.contains("-cp-") || known_tunnel_ids.contains(t.id.as_str()) {
+                    continue; // the CP's own tunnel, or a claimed agent → keep
                 }
                 if t.status.as_deref() == Some("healthy") {
                     out.adopt.push(item(
@@ -113,69 +106,93 @@ pub fn plan(map: &CfMap, cp: &CpState) -> ReconcilePlan {
                         "live CF agent tunnel not in the CP store — adopt (fill-only)",
                     ));
                 } else {
+                    prune_tunnel_ids.insert(t.id.clone());
                     out.prune.push(item(
                         &inst.env,
                         "tunnel",
                         &t.id,
                         &t.name,
                         &format!(
-                            "agent tunnel unclaimed by any CP agent and not healthy (status={}) — prune",
+                            "serving-env agent tunnel unclaimed by any CP agent and not healthy (status={}) — prune",
                             t.status.as_deref().unwrap_or("unknown")
                         ),
                     ));
                 }
-            }
-            // DNS: unexpected CNAME → prune; expected-but-absent → refill.
-            let cf_dns_names: HashSet<&str> = inst.dns.iter().map(|d| d.name.as_str()).collect();
-            for d in &inst.dns {
-                if d.name != cp.control_plane_hostname && !expected_hostnames.contains(&d.name) {
-                    out.prune.push(item(
-                        &inst.env,
-                        "dns",
-                        &d.id,
-                        &d.name,
-                        "CNAME not claimed by any CP agent — prune",
-                    ));
-                }
-            }
-            for h in &expected_hostnames {
-                if h != &cp.control_plane_hostname && !cf_dns_names.contains(h.as_str()) {
-                    out.refill.push(item(
-                        &inst.env,
-                        "dns",
-                        "",
-                        h,
-                        "CP expects this hostname but no CF CNAME exists — refill",
-                    ));
-                }
-            }
-        } else if unattributed || !inst.has_live_cp {
-            // A whole env with no live control plane (e.g. a closed PR), or
-            // the unattributed leak bucket → every live resource is prunable.
-            let why = if unattributed {
-                "resource has no parseable env / its target tunnel is gone — prune"
-            } else {
-                "env has no live control plane (torn-down install) — prune"
-            };
-            for t in &inst.tunnels {
-                if t.deleted_at.is_some() {
-                    continue;
-                }
+            } else if leaked_env {
+                prune_tunnel_ids.insert(t.id.clone());
+                let why = if unattributed {
+                    "tunnel name has no parseable env — prune"
+                } else {
+                    "tunnel for an env with no live control plane (torn-down install) — prune"
+                };
                 out.prune
                     .push(item(&inst.env, "tunnel", &t.id, &t.name, why));
             }
-            for d in &inst.dns {
-                out.prune.push(item(&inst.env, "dns", &d.id, &d.name, why));
-            }
-        } else {
-            // Another live env whose CP store this CP doesn't hold — only
-            // its own CP can safely judge its agent set.
+            // live foreign env → leave its tunnels alone (noted below)
+        }
+        if !serving && !leaked_env {
             out.notes.push(format!(
                 "{}: live foreign env ({} tunnels, {} dns) left untouched — reconcile from its own CP",
                 inst.env,
                 inst.tunnels.len(),
                 inst.dns.len()
             ));
+        }
+    }
+
+    // Pass 2 — DNS, keyed purely on the tunnel it targets. We never guess
+    // by hostname: the CP creates more CNAMEs (agent-api, oracle, shell)
+    // than it records in its store, so a name-based "orphan" check would
+    // falsely prune live records. A CNAME is prunable only if its target
+    // tunnel is gone (unattributed bucket) or is itself being pruned.
+    for inst in &map.installations {
+        let unattributed = inst.kind == "unattributed";
+        for d in &inst.dns {
+            let targets_pruned_tunnel = d
+                .tunnel_id_ref
+                .as_deref()
+                .map(|t| prune_tunnel_ids.contains(t))
+                .unwrap_or(false);
+            if unattributed {
+                out.prune.push(item(
+                    &inst.env,
+                    "dns",
+                    &d.id,
+                    &d.name,
+                    "CNAME targets a tunnel that no longer exists — prune",
+                ));
+            } else if targets_pruned_tunnel {
+                out.prune.push(item(
+                    &inst.env,
+                    "dns",
+                    &d.id,
+                    &d.name,
+                    "CNAME targets a tunnel being pruned — prune",
+                ));
+            }
+        }
+    }
+
+    // Refill — only the reliably-known primary agent hostname. Extras
+    // (agent-api / oracle / shell) aren't tracked in the store, so we never
+    // synthesize them; a missing primary CNAME means the agent is
+    // unreachable and is safe to flag.
+    if let Some(serving_inst) = map.installations.iter().find(|i| i.env == cp.env_label) {
+        let cf_dns_names: HashSet<&str> =
+            serving_inst.dns.iter().map(|d| d.name.as_str()).collect();
+        for a in &cp.agents {
+            if !a.tunnel_id.is_empty()
+                && a.hostname != cp.control_plane_hostname
+                && !cf_dns_names.contains(a.hostname.as_str())
+            {
+                out.refill.push(item(
+                    &cp.env_label,
+                    "dns",
+                    "",
+                    &a.hostname,
+                    "CP knows this agent but its primary CNAME is missing in CF — refill",
+                ));
+            }
         }
     }
 
