@@ -129,6 +129,11 @@ pub async fn build_map(
                 .get("deleted_at")
                 .and_then(|v| v.as_str())
                 .map(String::from),
+            status: t.get("status").and_then(|v| v.as_str()).map(String::from),
+            created_at: t
+                .get("created_at")
+                .and_then(|v| v.as_str())
+                .map(String::from),
         };
         tunnel_env.insert(cft.id.clone(), env.clone());
         buckets.entry(env).or_default().tunnels.push(cft);

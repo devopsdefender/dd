@@ -2,6 +2,7 @@ pub mod agent;
 pub mod auth;
 pub mod cf;
 pub mod cf_map;
+pub mod cf_reconcile;
 pub mod cf_snapshot;
 pub mod collector;
 pub mod config;
