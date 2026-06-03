@@ -350,6 +350,7 @@ pub async fn run() -> Result<()> {
         .route("/api/fleet", get(fleet_fragment))
         .route("/admin/cf/snapshot", get(cf_snapshot_handler))
         .route("/admin/cf/map", get(cf_map_handler))
+        .route("/admin/cf/reconcile", post(cf_reconcile_handler))
         .route("/api/v1/admin/export", get(export_state))
         .route("/admin/enroll", get(enroll_page))
         .with_state(state);
@@ -1330,6 +1331,41 @@ async fn cf_map_handler(
     let http = cf::http_client();
     let map = crate::cf_map::build_map(&http, &s.cfg.cf, s.cfg.common.env.label(), &s.store).await;
     Ok(Json(map))
+}
+
+#[derive(Debug, Deserialize)]
+struct ReconcileParams {
+    #[serde(default)]
+    apply: bool,
+}
+
+/// POST /admin/cf/reconcile — cross-env reconcile. Returns the dry-run
+/// plan (adopt / prune / refill, each env-labelled) computed over the
+/// unified CF map + the serving CP's store. This build is **dry-run only**:
+/// `?apply=true` is acknowledged but performs NO mutations — the guarded,
+/// operator-gated apply path lands in a follow-up. Same auth as the other
+/// `/admin/cf/*` surfaces.
+async fn cf_reconcile_handler(
+    State(s): State<St>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    axum::extract::Query(params): axum::extract::Query<ReconcileParams>,
+    headers: axum::http::HeaderMap,
+) -> Result<Json<serde_json::Value>> {
+    if !agents_auth_ok(&s, peer, &headers).await {
+        return Err(Error::Unauthorized);
+    }
+    let http = cf::http_client();
+    let map = crate::cf_map::build_map(&http, &s.cfg.cf, s.cfg.common.env.label(), &s.store).await;
+    let cp =
+        crate::cf_snapshot::build_cp_state(s.cfg.common.env.label(), &s.cfg.hostname, &s.store)
+            .await;
+    let plan = crate::cf_reconcile::plan(&map, &cp);
+    Ok(Json(serde_json::json!({
+        "dry_run": true,
+        "applied": false,
+        "apply_requested": params.apply,
+        "plan": plan,
+    })))
 }
 
 /// Accept the request if the caller is on the loopback interface

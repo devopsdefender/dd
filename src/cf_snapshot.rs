@@ -68,6 +68,12 @@ pub struct CfTunnel {
     pub id: String,
     pub name: String,
     pub deleted_at: Option<String>,
+    /// Cloudflare tunnel status: `healthy` (≥1 live connection), else
+    /// `degraded` / `down` / `inactive`. Used to tell a live agent (adopt)
+    /// from a dead/leaked tunnel (prune).
+    pub status: Option<String>,
+    /// RFC3339 creation time, for the prune age (TTL) guard.
+    pub created_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -161,7 +167,7 @@ pub async fn snapshot(
     }
 }
 
-async fn build_cp_state(
+pub(crate) async fn build_cp_state(
     env_label: &str,
     cp_hostname: &str,
     store: &Arc<tokio::sync::Mutex<HashMap<String, collector::Agent>>>,
@@ -241,6 +247,11 @@ async fn build_cf_state(
                 name,
                 deleted_at: t
                     .get("deleted_at")
+                    .and_then(|v| v.as_str())
+                    .map(String::from),
+                status: t.get("status").and_then(|v| v.as_str()).map(String::from),
+                created_at: t
+                    .get("created_at")
                     .and_then(|v| v.as_str())
                     .map(String::from),
             })
@@ -568,6 +579,8 @@ mod tests {
             id: id.into(),
             name: name.into(),
             deleted_at: None,
+            status: Some("healthy".into()),
+            created_at: None,
         }
     }
 
