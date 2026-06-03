@@ -310,7 +310,7 @@ async fn build_cf_state(
 /// Heuristic: bypass apps have a single policy with `decision="bypass"`
 /// and `include` containing "everyone"; human apps have `decision="allow"`
 /// with GitHub-org inclusion. Anything else is `unknown`.
-fn infer_policy_kind(app: &serde_json::Value) -> String {
+pub(crate) fn infer_policy_kind(app: &serde_json::Value) -> String {
     let policies = app.get("policies").and_then(|p| p.as_array());
     let Some(policies) = policies else {
         return "unknown".into();

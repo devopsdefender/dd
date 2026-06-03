@@ -349,6 +349,7 @@ pub async fn run() -> Result<()> {
         .route("/api/agents", get(api_agents))
         .route("/api/fleet", get(fleet_fragment))
         .route("/admin/cf/snapshot", get(cf_snapshot_handler))
+        .route("/admin/cf/map", get(cf_map_handler))
         .route("/api/v1/admin/export", get(export_state))
         .route("/admin/enroll", get(enroll_page))
         .with_state(state);
@@ -1310,6 +1311,25 @@ async fn cf_snapshot_handler(
     )
     .await;
     Ok(Json(snap))
+}
+
+/// GET /admin/cf/map — unified cross-env view. Enumerates EVERY `dd-*`
+/// Cloudflare resource in the account and groups it by installation
+/// (production / each pr-N / bot / dogfood / unattributed), so prod and
+/// PR previews — which share one CF account — are seen together. Built
+/// from CF directly, so it reflects reality regardless of which CPs are
+/// up. Same auth as `/admin/cf/snapshot`. Read-only.
+async fn cf_map_handler(
+    State(s): State<St>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    headers: axum::http::HeaderMap,
+) -> Result<Json<crate::cf_map::CfMap>> {
+    if !agents_auth_ok(&s, peer, &headers).await {
+        return Err(Error::Unauthorized);
+    }
+    let http = cf::http_client();
+    let map = crate::cf_map::build_map(&http, &s.cfg.cf, s.cfg.common.env.label(), &s.store).await;
+    Ok(Json(map))
 }
 
 /// Accept the request if the caller is on the loopback interface
